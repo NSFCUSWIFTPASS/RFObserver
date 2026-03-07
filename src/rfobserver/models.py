@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from pathlib import Path  # noqa: TCH003 -- Pydantic needs runtime access
+from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Vendored from rf-shared (MetadataRecord, IQStatistics, PSDData, Envelope)

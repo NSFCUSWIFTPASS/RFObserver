@@ -23,7 +23,7 @@ from rfobserver.processing.spectral import PSDGridConfig, compute_psd_grid, comp
 if TYPE_CHECKING:
     from datetime import datetime
 
-    from rfobserver.capture.receiver import IReceiver
+    from rfobserver.capture.receiver import CaptureResult, IReceiver
     from rfobserver.config import AppSettings
     from rfobserver.models import BurstFingerprint, IQStatistics, PSDData
     from rfobserver.storage.database import SensorDatabase
@@ -54,7 +54,7 @@ class ContinuousProcessor:
         self._running = False
 
     async def run(self) -> None:
-        """Run the continuous processing loop."""
+        """Run the continuous processing loop with overlapped capture/processing."""
         self._running = True
         s = self._settings
         freqs = self._build_frequency_list()
@@ -65,25 +65,39 @@ class ContinuousProcessor:
             s.BANDWIDTH,
         )
 
+        pending_process: asyncio.Task[None] | None = None
+
         while self._running:
             for center_freq in freqs:
                 if not self._running:
                     break
                 try:
-                    await self._process_one_capture(center_freq)
+                    # 1. Capture (blocks for DURATION_SEC on real hardware)
+                    result = await self._receiver.receive_samples(center_freq)
+
+                    # 2. Wait for previous processing to finish before starting new one
+                    if pending_process is not None:
+                        await pending_process
+                        pending_process = None
+
+                    # 3. Kick off processing while next capture can proceed
+                    pending_process = asyncio.create_task(
+                        self._process_and_broadcast(result, center_freq)
+                    )
                 except Exception:
-                    logger.exception("Error processing capture at %d Hz", center_freq)
+                    logger.exception("Error in capture at %d Hz", center_freq)
                     await asyncio.sleep(1.0)
+
+        # Drain any pending work
+        if pending_process is not None:
+            await pending_process
 
     def stop(self) -> None:
         self._running = False
 
-    async def _process_one_capture(self, center_freq_hz: int) -> None:
-        """Capture, process, detect, store, and broadcast for one frequency."""
+    async def _process_and_broadcast(self, result: CaptureResult, center_freq_hz: int) -> None:
+        """Process a completed capture: compute, detect, store, broadcast."""
         s = self._settings
-
-        # 1. Capture
-        result = await self._receiver.receive_samples(center_freq_hz)
         capture_time = result.raw_capture.capture_timestamp
         iq_bytes = result.raw_capture.iq_data_bytes
 
@@ -95,13 +109,13 @@ class ContinuousProcessor:
             len(iq_bytes),
         )
 
-        # 2. Save raw file
+        # 1. Save raw file
         filename = (
             f"{self._receiver.serial}-{s.HOSTNAME}-{capture_time.strftime('%Y%m%dT%H%M%S')}.sc16"
         )
         self._storage.save_capture(filename, iq_bytes)
 
-        # 3. Process (CPU-bound, run in executor)
+        # 2. Process (CPU-bound, run in executor)
         loop = asyncio.get_running_loop()
         iq_stats, summary_psd, bursts = await loop.run_in_executor(
             self._executor,

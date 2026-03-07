@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 
@@ -43,9 +44,20 @@ class MockReceiver:
     async def receive_samples(self, center_freq_hz: int) -> CaptureResult:
         num_samples = self._config.num_samples
 
-        # Generate noise + optional tone
+        # Simulate real capture duration so double-buffer timing is realistic
+        await asyncio.sleep(self._config.duration_sec)
+
+        # Generate noise floor
         noise_i = self._rng.integers(-500, 500, size=num_samples, dtype=np.int16)
         noise_q = self._rng.integers(-500, 500, size=num_samples, dtype=np.int16)
+
+        # Inject a strong tone every 5th capture to create a visible spike
+        if self._capture_count % 5 == 0:
+            t = np.arange(num_samples) / self._config.bandwidth_hz
+            tone_freq = self._config.bandwidth_hz * 0.2  # offset from center
+            amplitude = 8000
+            noise_i = noise_i + (amplitude * np.cos(2 * np.pi * tone_freq * t)).astype(np.int16)
+            noise_q = noise_q + (amplitude * np.sin(2 * np.pi * tone_freq * t)).astype(np.int16)
 
         # Interleave I/Q as SC16
         iq = np.empty(num_samples * 2, dtype=np.int16)

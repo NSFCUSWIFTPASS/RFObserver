@@ -7,6 +7,8 @@
             <span class="card-header-label" hx-get="/api/status-bar" hx-trigger="load, every 2s" hx-swap="innerHTML">Loading...</span>
             <span class="status-sep">&middot;</span>
             <span id="ups-counter" class="card-header-label" style="opacity: 0.5;">-- ups</span>
+            <span id="timing-sep" class="status-sep" style="display: none;">&middot;</span>
+            <span id="timing-info" class="card-header-label" style="opacity: 0.5;"></span>
         </div>
         <div class="graph-group">
             <canvas id="timeseries-canvas" width="920" height="160" style="width: 100%; height: 160px;"></canvas>
@@ -298,6 +300,24 @@
             const data = JSON.parse(evt.data);
             if (data.type === "psd") {
                 recordUpdate();
+
+                // Timing info
+                const timingEl = document.getElementById("timing-info");
+                if (timingEl) {
+                    const procMs = data.process_ms || 0;
+                    const excessMs = data.excess_ms || 0;
+                    let txt = procMs.toFixed(0) + " ms proc";
+                    if (excessMs > 0) {
+                        txt += " (+" + excessMs.toFixed(0) + " ms excess)";
+                        timingEl.style.color = "#ff453a";
+                    } else {
+                        timingEl.style.color = "";
+                    }
+                    timingEl.textContent = txt;
+                    const sep = document.getElementById("timing-sep");
+                    if (sep) sep.style.display = "";
+                }
+
                 // Time-series
                 tsAvgPower.push(data.avg_power_db);
                 tsKurtosis.push(data.kurtosis || 0);

@@ -6,6 +6,9 @@ vector for outbound reporting.
 
 The PSD grid replaces the separate waterfall/spectrogram computation --
 it IS the spectrogram, with better per-cell SNR from averaging.
+
+All FFT windows are extracted and processed as a single vectorized numpy
+operation, using pocketfft's internal multi-threading for full CPU utilization.
 """
 
 from __future__ import annotations
@@ -13,7 +16,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-import scipy.signal
 
 from rfobserver.models import PSDData
 
@@ -25,6 +27,7 @@ class PSDGridConfig:
     num_bins: int = 256
     time_resolution_ms: float = 0.2
     overlap: float = 0.5  # FFT overlap ratio
+    num_workers: int = 1  # kept for API compat; numpy handles threading internally
 
 
 @dataclass
@@ -45,9 +48,10 @@ def compute_psd_grid(
 ) -> PSDGridResult:
     """Compute a high-resolution PSD grid from complex IQ data.
 
-    Divides the capture into time slices of `config.time_resolution_ms` duration.
-    Each slice gets its own averaged Welch PSD. The result is a 2D grid that
-    serves as both the internal spectrogram and the basis for burst detection.
+    Fully vectorized: extracts all FFT windows at once using stride tricks,
+    applies Hann window via broadcasting, computes all FFTs in a single
+    np.fft.fft call (pocketfft multi-threaded), then reshapes and averages
+    per time slice.
 
     Args:
         data: Complex numpy array of IQ samples.
@@ -72,49 +76,71 @@ def compute_psd_grid(
     # How many FFTs fit in one time slice
     ffts_per_slice = max(1, (slice_samples - nperseg) // hop + 1)
 
-    # Actual samples consumed per slice (may differ slightly from slice_samples)
+    # Actual samples consumed per slice
     actual_slice_samples = nperseg + (ffts_per_slice - 1) * hop
 
     # Number of non-overlapping time slices
     n_slices = n_samples // actual_slice_samples
     if n_slices == 0:
-        # Fall back to a single slice using all data
         n_slices = 1
         actual_slice_samples = n_samples
         ffts_per_slice = max(1, (actual_slice_samples - nperseg) // hop + 1)
 
-    # Compute the frequency axis (same for all slices)
+    total_ffts = n_slices * ffts_per_slice
+
+    # Truncate data to exact multiple
+    usable_samples = n_slices * actual_slice_samples
+    data = data[:usable_samples]
+
+    # --- Vectorized window extraction using stride tricks ---
+    # Reshape into (n_slices, actual_slice_samples)
+    slices = data.reshape(n_slices, actual_slice_samples)
+
+    # Extract overlapping FFT windows from each slice: (n_slices, ffts_per_slice, nperseg)
+    # Use stride_tricks to create views without copying
+    stride_slice = slices.strides[1]  # bytes per sample
+    stride_row = slices.strides[0]  # bytes per slice row
+    windows = np.lib.stride_tricks.as_strided(
+        slices,
+        shape=(n_slices, ffts_per_slice, nperseg),
+        strides=(stride_row, hop * stride_slice, stride_slice),
+    )
+
+    # Flatten to (total_ffts, nperseg) for batch FFT
+    windows_flat = windows.reshape(total_ffts, nperseg).copy()  # copy to make contiguous
+
+    # --- Hann window + FFT + power (all vectorized) ---
+    hann = np.hanning(nperseg).astype(np.complex64)
+    window_power = np.sum(np.abs(hann) ** 2)
+
+    # Apply window
+    windows_flat *= hann
+
+    # Batch FFT across all windows at once (pocketfft uses all cores)
+    spectra = np.fft.fft(windows_flat, axis=1)
+
+    # Power spectral density: |X|^2 / (fs * window_power)
+    psd_linear = (np.abs(spectra) ** 2) / (sampling_rate * window_power)
+
+    # Reshape back to (n_slices, ffts_per_slice, nperseg) and average per slice
+    psd_per_slice = psd_linear.reshape(n_slices, ffts_per_slice, nperseg)
+    psd_avg = np.mean(psd_per_slice, axis=1)  # (n_slices, nperseg)
+
+    # Convert to dB and fftshift
+    psd_db = np.fft.fftshift(
+        np.nan_to_num(10.0 * np.log10(psd_avg)).astype(np.float32),
+        axes=1,
+    )
+
+    # Frequency axis
     freq_axis = np.fft.fftshift(np.fft.fftfreq(nperseg, 1.0 / sampling_rate))
-
-    # Build the grid: one averaged PSD per time slice
-    grid = np.empty((n_slices, nperseg), dtype=np.float32)
-    total_ffts = 0
-
-    for i in range(n_slices):
-        start = i * actual_slice_samples
-        end = start + actual_slice_samples
-        slice_data = data[start:end]
-
-        # Welch PSD for this slice
-        _, psd_linear = scipy.signal.welch(
-            slice_data,
-            sampling_rate,
-            window="hann",
-            nperseg=nperseg,
-            noverlap=nperseg - hop,
-            return_onesided=False,
-        )
-
-        psd_db = np.nan_to_num(10.0 * np.log10(psd_linear).astype(np.float32))
-        grid[i, :] = np.fft.fftshift(psd_db)
-        total_ffts += ffts_per_slice
 
     # Time axis: center of each slice
     slice_duration = actual_slice_samples / sampling_rate
     time_axis = np.arange(n_slices) * slice_duration + slice_duration / 2
 
     return PSDGridResult(
-        grid=grid,
+        grid=psd_db,
         time_axis=time_axis,
         freq_axis=freq_axis,
         ffts_per_slice=ffts_per_slice,
@@ -132,7 +158,6 @@ def compute_summary_psd(
     This is the PSD published to NATS and used for champion selection.
     Averaging in dB domain (the grid is already in dB).
     """
-    # Average across all time slices (axis=0)
     summary_db = np.mean(psd_grid.grid, axis=0)
     frequencies = psd_grid.freq_axis + center_freq
 

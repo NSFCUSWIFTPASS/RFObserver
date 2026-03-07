@@ -2,6 +2,9 @@
 
 Ported from rf_survey.receiver. Wraps UHD Python bindings for USRP
 acquisition with thread-safe reconfiguration.
+
+Uses double-buffering: two pre-allocated numpy arrays alternate between
+capture and processing so the SDR never stalls waiting for the CPU.
 """
 
 from __future__ import annotations
@@ -59,12 +62,17 @@ class IReceiver(Protocol):
 
 
 class Receiver:
-    """USRP hardware receiver wrapping UHD Python bindings."""
+    """USRP hardware receiver wrapping UHD Python bindings.
+
+    Uses two pre-allocated capture buffers (A/B) that alternate each call.
+    While the caller processes buffer A, the next capture fills buffer B.
+    """
 
     def __init__(self, receiver_config: ReceiverConfig) -> None:
         self._hardware_lock = threading.Lock()
         self._config = receiver_config
-        self._capture_buffer: np.ndarray | None = None
+        self._buffers: tuple[np.ndarray, np.ndarray] | None = None
+        self._active_buf: int = 0  # index into _buffers: 0 or 1
         self._serial = ""
 
     @property
@@ -99,11 +107,19 @@ class Receiver:
         self.rx_metadata = uhd.types.RXMetadata()
         self.rx_streamer = self.usrp.get_rx_stream(st_args)
 
-        total_samples = self._config.num_samples
-        if self._capture_buffer is None or self._capture_buffer.size != total_samples:
-            self._capture_buffer = np.zeros(total_samples, dtype=np.int32)
+        # Allocate double buffers
+        n = self._config.num_samples
+        self._buffers = (
+            np.zeros(n, dtype=np.int32),
+            np.zeros(n, dtype=np.int32),
+        )
+        self._active_buf = 0
 
-        logger.info("USRP initialization complete (serial=%s)", self._serial)
+        logger.info(
+            "USRP initialization complete (serial=%s, double-buffer=%d samples)",
+            self._serial,
+            n,
+        )
 
     async def reconfigure(self, new_config: ReceiverConfig) -> None:
         loop = asyncio.get_running_loop()
@@ -123,10 +139,12 @@ class Receiver:
         import uhd
 
         assert self.rx_streamer is not None
-        assert self._capture_buffer is not None
+        assert self._buffers is not None
 
         with self._hardware_lock:
             config_snapshot = deepcopy(self._config)
+            buf = self._buffers[self._active_buf]
+            self._active_buf ^= 1  # swap for next call
 
             self.usrp.set_rx_freq(uhd.libpyuhd.types.tune_request(center_freq_hz), 0)
 
@@ -147,9 +165,7 @@ class Receiver:
             capture_timestamp = datetime.now(UTC)
             rx_metadata = uhd.types.RXMetadata()
 
-            samples_received = self.rx_streamer.recv(
-                self._capture_buffer, rx_metadata, timeout=timeout
-            )
+            samples_received = self.rx_streamer.recv(buf, rx_metadata, timeout=timeout)
 
             if rx_metadata.error_code != uhd.types.RXMetadataErrorCode.none:
                 raise RuntimeError(f"UHD recv error: {rx_metadata.strerror()}")
@@ -161,7 +177,7 @@ class Receiver:
 
             return CaptureResult(
                 raw_capture=RawCapture(
-                    iq_data_bytes=self._capture_buffer.tobytes(),
+                    iq_data_bytes=buf.tobytes(),
                     center_freq_hz=center_freq_hz,
                     capture_timestamp=capture_timestamp,
                 ),

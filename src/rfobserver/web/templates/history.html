@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Detection History - RFObserver{% endblock %}
+{% block content %}
+<div class="page-header">
+    <h1>Detection History</h1>
+</div>
+
+<div class="card full-width">
+    <div class="card-header">Recent Bursts</div>
+    <div class="card-body">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Frequency</th>
+                    <th>Bandwidth</th>
+                    <th>Duration</th>
+                    <th>Peak Power</th>
+                </tr>
+            </thead>
+            <tbody hx-get="/api/detections" hx-trigger="load, every 10s" hx-swap="innerHTML">
+                <tr><td colspan="5" class="placeholder-text">Loading...</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}

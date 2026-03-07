@@ -1,0 +1,24 @@
+[Unit]
+Description=RFObserver Sensor Pipeline
+After=network-online.target nats-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rfobserver
+Group=rfobserver
+EnvironmentFile=/etc/rfobserver/rfobserver.env
+ExecStart=/usr/local/bin/rfobserver run
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rfobserver
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/rfobserver /tmp/rfobserver
+
+[Install]
+WantedBy=multi-user.target

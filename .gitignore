@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+*.env.local
+
+# Local storage (runtime data)
+/tmp/rfobserver/
+
+# Logs
+*.log
+
+# Local dev scripts
+run_local.sh
+
+# Reference software (private, not distributed)
+reference_software/

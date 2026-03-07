@@ -1,0 +1,309 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - RFObserver{% endblock %}
+{% block content %}
+<div class="graph-stack">
+    <div class="card">
+        <div class="card-header">
+            <span class="card-header-label" hx-get="/api/status-bar" hx-trigger="load, every 2s" hx-swap="innerHTML">Loading...</span>
+        </div>
+        <div class="graph-group">
+            <canvas id="timeseries-canvas" width="920" height="160" style="width: 100%; height: 160px;"></canvas>
+            <canvas id="psd-canvas" width="920" height="160" style="width: 100%; height: 160px;"></canvas>
+            <canvas id="waterfall-canvas" width="920" height="260" style="width: 100%; height: 260px;"></canvas>
+        </div>
+        <div class="spectrogram-legend">
+            <span class="legend-label">Low</span>
+            <canvas id="legend-canvas" width="200" height="12" style="width: 200px; height: 12px; border-radius: 3px;"></canvas>
+            <span class="legend-label">High</span>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <span class="card-header-label">Recent Detections</span>
+        </div>
+        <div class="card-body" style="padding: 0; max-height: 260px; overflow-y: auto;">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Freq</th>
+                        <th>BW</th>
+                        <th>Duration</th>
+                        <th>Peak</th>
+                    </tr>
+                </thead>
+                <tbody hx-get="/api/detections" hx-trigger="load, every 5s" hx-swap="innerHTML">
+                    <tr><td colspan="5" class="placeholder-text">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<script>
+(function() {
+    const WS_URL = "ws://" + location.host + "/ws/live";
+    const WATERFALL_ROWS = 260;
+    const TS_MAX_POINTS = 120;
+
+    // Time-series buffers
+    const tsAvgPower = [];
+    const tsKurtosis = [];
+    const tsLabels = [];
+
+    // Color map: viridis-like
+    function powerToColor(val, min, max) {
+        let t = (val - min) / (max - min);
+        t = Math.max(0, Math.min(1, t));
+        const r = Math.floor(t < 0.5 ? t * 2 * 80 : 80 + (t - 0.5) * 2 * 175);
+        const g = Math.floor(t < 0.25 ? t * 4 * 20 : t < 0.75 ? 20 + (t - 0.25) * 2 * 235 : 255);
+        const b = Math.floor(t < 0.5 ? 80 + (1 - t * 2) * 175 : t < 0.75 ? 80 - (t - 0.5) * 4 * 80 : 0);
+        return [r, g, b];
+    }
+
+    // Draw color legend
+    const legendCanvas = document.getElementById("legend-canvas");
+    const legendCtx = legendCanvas.getContext("2d");
+    for (let x = 0; x < 200; x++) {
+        const [r, g, b] = powerToColor(x, 0, 199);
+        legendCtx.fillStyle = `rgb(${r},${g},${b})`;
+        legendCtx.fillRect(x, 0, 1, 12);
+    }
+
+    // --- Time-series chart ---
+    const tsCanvas = document.getElementById("timeseries-canvas");
+    const tsCtx = tsCanvas.getContext("2d");
+
+    function drawTimeSeries() {
+        const W = tsCanvas.width;
+        const H = tsCanvas.height;
+        tsCtx.clearRect(0, 0, W, H);
+
+        tsCtx.fillStyle = "#1a1a2e";
+        tsCtx.fillRect(0, 0, W, H);
+
+        const N = tsAvgPower.length;
+        if (N < 2) return;
+
+        // Grid
+        tsCtx.strokeStyle = "rgba(255,255,255,0.06)";
+        tsCtx.lineWidth = 1;
+        for (let i = 1; i < 4; i++) {
+            const y = (H / 4) * i;
+            tsCtx.beginPath(); tsCtx.moveTo(0, y); tsCtx.lineTo(W, y); tsCtx.stroke();
+        }
+
+        // Power range
+        let pMin = Infinity, pMax = -Infinity;
+        for (let i = 0; i < N; i++) {
+            if (tsAvgPower[i] < pMin) pMin = tsAvgPower[i];
+            if (tsAvgPower[i] > pMax) pMax = tsAvgPower[i];
+        }
+        const pPad = Math.max((pMax - pMin) * 0.1, 2);
+        pMin -= pPad; pMax += pPad;
+
+        // Kurtosis range
+        let kMin = Infinity, kMax = -Infinity;
+        for (let i = 0; i < N; i++) {
+            if (tsKurtosis[i] < kMin) kMin = tsKurtosis[i];
+            if (tsKurtosis[i] > kMax) kMax = tsKurtosis[i];
+        }
+        const kPad = Math.max((kMax - kMin) * 0.1, 0.5);
+        kMin -= kPad; kMax += kPad;
+
+        // Draw power line (blue)
+        tsCtx.beginPath();
+        for (let i = 0; i < N; i++) {
+            const x = (i / (TS_MAX_POINTS - 1)) * W;
+            const y = H - ((tsAvgPower[i] - pMin) / (pMax - pMin)) * H;
+            if (i === 0) tsCtx.moveTo(x, y); else tsCtx.lineTo(x, y);
+        }
+        tsCtx.strokeStyle = "#0071e3";
+        tsCtx.lineWidth = 1.5;
+        tsCtx.stroke();
+
+        // Draw kurtosis line (orange)
+        tsCtx.beginPath();
+        for (let i = 0; i < N; i++) {
+            const x = (i / (TS_MAX_POINTS - 1)) * W;
+            const y = H - ((tsKurtosis[i] - kMin) / (kMax - kMin)) * H;
+            if (i === 0) tsCtx.moveTo(x, y); else tsCtx.lineTo(x, y);
+        }
+        tsCtx.strokeStyle = "#ff9f0a";
+        tsCtx.lineWidth = 1.5;
+        tsCtx.stroke();
+
+        // Labels
+        tsCtx.font = "10px -apple-system, sans-serif";
+        tsCtx.fillStyle = "#0071e3";
+        tsCtx.textAlign = "left";
+        tsCtx.fillText("Power " + tsAvgPower[N-1].toFixed(1) + " dB", 4, 12);
+        tsCtx.fillStyle = "#ff9f0a";
+        tsCtx.fillText("Kurtosis " + tsKurtosis[N-1].toFixed(2), 4, 24);
+
+        // Y-axis labels
+        tsCtx.fillStyle = "rgba(255,255,255,0.4)";
+        tsCtx.textAlign = "right";
+        tsCtx.fillText(pMax.toFixed(0) + " dB", W - 4, 12);
+        tsCtx.fillText(pMin.toFixed(0) + " dB", W - 4, H - 4);
+    }
+
+    // --- PSD line chart ---
+    const psdCanvas = document.getElementById("psd-canvas");
+    const psdCtx = psdCanvas.getContext("2d");
+
+    let dynamicMin = -120;
+    let dynamicMax = -40;
+
+    function drawPSD(powers, frequencies) {
+        const W = psdCanvas.width;
+        const H = psdCanvas.height;
+        psdCtx.clearRect(0, 0, W, H);
+
+        psdCtx.fillStyle = "#1a1a2e";
+        psdCtx.fillRect(0, 0, W, H);
+
+        psdCtx.strokeStyle = "rgba(255,255,255,0.06)";
+        psdCtx.lineWidth = 1;
+        for (let i = 1; i < 5; i++) {
+            const y = (H / 5) * i;
+            psdCtx.beginPath(); psdCtx.moveTo(0, y); psdCtx.lineTo(W, y); psdCtx.stroke();
+        }
+
+        const min = dynamicMin, max = dynamicMax;
+        const N = powers.length;
+        if (N === 0) return;
+
+        // Fill
+        psdCtx.beginPath();
+        psdCtx.moveTo(0, H);
+        for (let i = 0; i < N; i++) {
+            const x = (i / (N - 1)) * W;
+            const y = H - ((powers[i] - min) / (max - min)) * H;
+            psdCtx.lineTo(x, Math.max(0, Math.min(H, y)));
+        }
+        psdCtx.lineTo(W, H);
+        psdCtx.closePath();
+        const grad = psdCtx.createLinearGradient(0, 0, 0, H);
+        grad.addColorStop(0, "rgba(0,113,227,0.3)");
+        grad.addColorStop(1, "rgba(0,113,227,0.02)");
+        psdCtx.fillStyle = grad;
+        psdCtx.fill();
+
+        // Line
+        psdCtx.beginPath();
+        for (let i = 0; i < N; i++) {
+            const x = (i / (N - 1)) * W;
+            const y = H - ((powers[i] - min) / (max - min)) * H;
+            if (i === 0) psdCtx.moveTo(x, y); else psdCtx.lineTo(x, y);
+        }
+        psdCtx.strokeStyle = "#0071e3";
+        psdCtx.lineWidth = 1.5;
+        psdCtx.stroke();
+
+        // Axis labels
+        psdCtx.fillStyle = "rgba(255,255,255,0.5)";
+        psdCtx.font = "10px -apple-system, sans-serif";
+        psdCtx.textAlign = "left";
+        psdCtx.fillText(max.toFixed(0) + " dB", 4, 12);
+        psdCtx.fillText(min.toFixed(0) + " dB", 4, H - 4);
+
+        if (frequencies.length > 0) {
+            const fMin = (frequencies[0] / 1e6).toFixed(0);
+            const fMax = (frequencies[frequencies.length - 1] / 1e6).toFixed(0);
+            const fMid = (frequencies[Math.floor(frequencies.length / 2)] / 1e6).toFixed(0);
+            psdCtx.textAlign = "left";
+            psdCtx.fillText(fMin + " MHz", 4, H - 14);
+            psdCtx.textAlign = "center";
+            psdCtx.fillText(fMid + " MHz", W / 2, H - 14);
+            psdCtx.textAlign = "right";
+            psdCtx.fillText(fMax + " MHz", W - 4, H - 14);
+        }
+    }
+
+    // --- Waterfall ---
+    const wfCanvas = document.getElementById("waterfall-canvas");
+    const wfCtx = wfCanvas.getContext("2d");
+    const wfWidth = wfCanvas.width;
+    const wfHeight = wfCanvas.height;
+
+    let wfImageData = wfCtx.createImageData(wfWidth, wfHeight);
+    for (let i = 0; i < wfImageData.data.length; i += 4) {
+        wfImageData.data[i] = 15; wfImageData.data[i+1] = 15;
+        wfImageData.data[i+2] = 20; wfImageData.data[i+3] = 255;
+    }
+
+    let lineCount = 0;
+    let connected = false;
+
+    function addWaterfallLine(powers) {
+        const N = powers.length;
+        const min = dynamicMin, max = dynamicMax;
+        const rowBytes = wfWidth * 4;
+        wfImageData.data.copyWithin(rowBytes, 0, (wfHeight - 1) * rowBytes);
+
+        for (let x = 0; x < wfWidth; x++) {
+            const binIdx = Math.floor((x / wfWidth) * N);
+            const val = binIdx < N ? powers[binIdx] : min;
+            const [r, g, b] = powerToColor(val, min, max);
+            const idx = x * 4;
+            wfImageData.data[idx] = r;
+            wfImageData.data[idx+1] = g;
+            wfImageData.data[idx+2] = b;
+            wfImageData.data[idx+3] = 255;
+        }
+
+        wfCtx.putImageData(wfImageData, 0, 0);
+        lineCount++;
+    }
+
+    function updateDynamicRange(powers) {
+        let pMin = Infinity, pMax = -Infinity;
+        for (let i = 0; i < powers.length; i++) {
+            if (powers[i] < pMin) pMin = powers[i];
+            if (powers[i] > pMax) pMax = powers[i];
+        }
+        dynamicMin = dynamicMin * 0.95 + (pMin - 5) * 0.05;
+        dynamicMax = dynamicMax * 0.95 + (pMax + 5) * 0.05;
+    }
+
+    // --- WebSocket ---
+    function connectWS() {
+        const ws = new WebSocket(WS_URL);
+
+        ws.onopen = function() {
+            connected = true;
+        };
+
+        ws.onmessage = function(evt) {
+            const data = JSON.parse(evt.data);
+            if (data.type === "psd") {
+                // Time-series
+                tsAvgPower.push(data.avg_power_db);
+                tsKurtosis.push(data.kurtosis || 0);
+                tsLabels.push(data.capture_num);
+                if (tsAvgPower.length > TS_MAX_POINTS) {
+                    tsAvgPower.shift(); tsKurtosis.shift(); tsLabels.shift();
+                }
+                drawTimeSeries();
+
+                // PSD
+                updateDynamicRange(data.powers);
+                drawPSD(data.powers, data.frequencies);
+                addWaterfallLine(data.powers);
+            }
+        };
+
+        ws.onclose = function() {
+            connected = false;
+            setTimeout(connectWS, 2000);
+        };
+
+        ws.onerror = function() { ws.close(); };
+    }
+
+    connectWS();
+})();
+</script>
+{% endblock %}

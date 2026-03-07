@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tools
+        run: pip install ruff mypy pydantic pydantic-settings
+
+      - name: Ruff check
+        run: ruff check src/rfobserver/
+
+      - name: Ruff format check
+        run: ruff format --check src/rfobserver/
+
+      - name: Mypy
+        run: mypy src/rfobserver/
+
+  test-unit:
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install hatch
+        run: pip install hatch
+
+      - name: Run unit tests
+        run: hatch run test:unit
+
+  test-integration:
+    needs: [lint, test-unit]
+    runs-on: ubuntu-latest
+    services:
+      nats:
+        image: nats:latest
+        ports:
+          - 4222:4222
+        options: --health-cmd "nats-server --help" --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install hatch
+        run: pip install hatch
+
+      - name: Run integration tests
+        run: hatch run test:integration
+        env:
+          RFOBS_NATS_HOST: localhost
+          RFOBS_NATS_PORT: 4222

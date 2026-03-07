@@ -1,0 +1,128 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rfobserver"
+dynamic = ["version"]
+description = "Unified RF monitoring sensor for NVIDIA Jetson Orin Nano -- continuous capture, processing, burst detection, and local WebUI."
+readme = "README.md"
+license = {text = "BSD-3-Clause"}
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26,<2",
+    "scipy==1.13.*",
+    "pydantic>=2.10,<3",
+    "pydantic-settings>=2.6,<3",
+    "aiosqlite>=0.20,<1",
+    "nats-py>=2.9,<3",
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.34,<1",
+    "jinja2>=3.1,<4",
+    "httpx>=0.27,<1",
+    "prometheus-client>=0.21,<1",
+]
+
+[project.optional-dependencies]
+uhd = []  # UHD provided by system packages on Jetson
+zms = [
+    "zms-client @ git+https://gitlab.flux.utah.edu/openzms/zms-client-py.git@fd4a5a0902bfe91fad0112c75bf1eb1723d6098d",
+]
+
+[project.urls]
+source = "https://github.com/NSFCUSWIFTPASS/RFObserver"
+
+[project.scripts]
+rfobserver = "rfobserver.cli:main"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.version]
+path = "src/rfobserver/__about__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rfobserver"]
+
+[tool.hatch.envs.default]
+python = "3.11"
+
+[tool.hatch.envs.test]
+dependencies = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.24,<1",
+    "pytest-mock>=3.14,<4",
+    "respx>=0.22,<1",
+]
+
+[tool.hatch.envs.test.scripts]
+unit = "pytest tests/unit {args}"
+integration = "pytest tests/integration {args}"
+all = "pytest tests {args}"
+
+[[tool.hatch.envs.test.matrix]]
+python = ["3.11", "3.12"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "TCH", # flake8-type-checking
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["rfobserver"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = [
+    "uhd.*",
+    "nats.*",
+    "scipy.*",
+    "numpy.*",
+    "aiosqlite.*",
+    "fastapi.*",
+    "uvicorn.*",
+    "httpx.*",
+    "prometheus_client.*",
+    "websockets.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "rfobserver.web.routes.*",
+    "rfobserver.web.app",
+]
+disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
+module = [
+    "rfobserver.processing.spectral",
+    "rfobserver.processing.iq_utils",
+    "rfobserver.processing.burst",
+    "rfobserver.capture.trigger",
+    "rfobserver.capture.receiver",
+    "rfobserver.capture.buffer",
+]
+disallow_any_generics = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

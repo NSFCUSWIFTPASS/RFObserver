@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Configuration - RFObserver{% endblock %}
+{% block content %}
+<div class="page-header">
+    <h1>Sensor Configuration</h1>
+</div>
+
+<div class="card">
+    <div class="card-header">Receiver</div>
+    <div class="card-body">
+        <form class="config-form">
+            <div class="form-group">
+                <label for="freq-start">Start Frequency (Hz)</label>
+                <input type="number" id="freq-start" value="{{ settings.FREQUENCY_START }}" readonly>
+            </div>
+            <div class="form-group">
+                <label for="freq-end">End Frequency (Hz)</label>
+                <input type="number" id="freq-end" value="{{ settings.FREQUENCY_END }}" readonly>
+            </div>
+            <div class="form-group">
+                <label for="bandwidth">Bandwidth (Hz)</label>
+                <input type="number" id="bandwidth" value="{{ settings.BANDWIDTH }}" readonly>
+            </div>
+            <div class="form-group">
+                <label for="gain">Gain (dB)</label>
+                <input type="number" id="gain" value="{{ settings.GAIN }}" min="0" max="76" readonly>
+            </div>
+            <div class="form-group">
+                <label for="duration">Duration (s)</label>
+                <input type="number" id="duration" value="{{ settings.DURATION_SEC }}" step="0.1" readonly>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">Burst Detection</div>
+    <div class="card-body">
+        <form class="config-form">
+            <div class="form-group">
+                <label for="threshold">Threshold High (dB)</label>
+                <input type="number" id="threshold" value="{{ settings.BURST_THRESHOLD_HIGH_DB }}" step="0.5" readonly>
+            </div>
+            <div class="form-group">
+                <label for="time-res">PSD Time Resolution (ms)</label>
+                <input type="number" id="time-res" value="{{ settings.PSD_TIME_RESOLUTION_MS }}" step="0.1" readonly>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}

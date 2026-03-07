@@ -1,0 +1,294 @@
+/* RFObserver -- Apple-style minimal UI */
+
+:root {
+    --bg: #f5f5f7;
+    --card-bg: #ffffff;
+    --text-primary: #1d1d1f;
+    --text-secondary: #6e6e73;
+    --border: #d2d2d7;
+    --accent: #0071e3;
+    --nav-bg: rgba(255, 255, 255, 0.72);
+    --radius: 12px;
+    --shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text-primary);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+}
+
+/* Navigation */
+.nav-bar {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 24px;
+    height: 48px;
+    background: var(--nav-bg);
+    backdrop-filter: saturate(180%) blur(20px);
+    border-bottom: 1px solid var(--border);
+}
+
+.nav-title {
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+}
+
+.nav-links {
+    display: flex;
+    gap: 24px;
+}
+
+.nav-link {
+    color: var(--text-secondary);
+    text-decoration: none;
+    font-size: 13px;
+    font-weight: 400;
+    transition: color 0.2s;
+}
+
+.nav-link:hover {
+    color: var(--accent);
+}
+
+/* Content */
+.content {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 16px 24px;
+}
+
+.page-header {
+    margin-bottom: 24px;
+}
+
+.page-header h1 {
+    font-size: 28px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+}
+
+.subtitle {
+    color: var(--text-secondary);
+    font-size: 14px;
+    font-weight: 400;
+}
+
+/* Card grid */
+.card-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 16px;
+}
+
+.card {
+    background: var(--card-bg);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+}
+
+.card.full-width {
+    grid-column: 1 / -1;
+}
+
+.card-header {
+    padding: 8px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    letter-spacing: 0.01em;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.card-header-label {
+    white-space: nowrap;
+}
+
+.card-header-detail {
+    font-weight: 400;
+    font-size: 11px;
+    text-transform: none;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.card-body {
+    padding: 16px;
+}
+
+.card-body-tight {
+    padding: 6px;
+}
+
+/* Stats */
+.stat-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 0;
+}
+
+.stat-row + .stat-row {
+    border-top: 1px solid var(--border);
+}
+
+.stat-label {
+    color: var(--text-secondary);
+    font-size: 13px;
+}
+
+.stat-value {
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+}
+
+/* Forms */
+.config-form {
+    display: grid;
+    gap: 12px;
+}
+
+.form-group {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.form-group label {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+
+.form-group input {
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 14px;
+    font-family: inherit;
+    background: var(--bg);
+    color: var(--text-primary);
+}
+
+.form-group input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.15);
+}
+
+/* Table */
+.data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.data-table th {
+    text-align: left;
+    padding: 8px 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    border-bottom: 1px solid var(--border);
+}
+
+.data-table td {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    font-variant-numeric: tabular-nums;
+}
+
+.data-table tr:last-child td {
+    border-bottom: none;
+}
+
+/* Graph stack layout */
+.graph-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.graph-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 6px;
+}
+
+.graph-group canvas {
+    display: block;
+}
+
+/* Status bar in card header */
+.status-bar {
+    font-variant-numeric: tabular-nums;
+}
+
+.status-sep {
+    color: var(--border);
+    margin: 0 4px;
+}
+
+/* Spectrogram legend */
+.spectrogram-legend {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 8px 0 10px;
+}
+
+.legend-label {
+    font-size: 10px;
+    color: var(--text-secondary);
+}
+
+/* Status indicators */
+.status-running {
+    color: #30d158;
+}
+
+.status-stopped {
+    color: var(--text-secondary);
+}
+
+/* Misc */
+.placeholder-text {
+    color: var(--text-secondary);
+    font-size: 13px;
+    text-align: center;
+    padding: 24px;
+}
+
+@media (max-width: 640px) {
+    .card-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .nav-links {
+        gap: 16px;
+    }
+}

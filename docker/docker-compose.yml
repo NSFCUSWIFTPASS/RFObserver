@@ -1,0 +1,29 @@
+services:
+  nats:
+    image: nats:latest
+    ports:
+      - "4222:4222"
+      - "8222:8222"  # monitoring
+    command: ["--js"]  # enable JetStream
+
+  rfobserver:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment:
+      RFOBS_MOCK_RECEIVER: "true"
+      RFOBS_NATS_HOST: nats
+      RFOBS_NATS_PORT: 4222
+      RFOBS_STORAGE_PATH: /data
+      RFOBS_DB_PATH: /data/rfobserver.db
+      RFOBS_LOG_LEVEL: DEBUG
+    volumes:
+      - rfobs-data:/data
+    depends_on:
+      - nats
+
+volumes:
+  rfobs-data:

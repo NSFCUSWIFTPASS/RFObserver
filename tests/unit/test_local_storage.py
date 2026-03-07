@@ -40,5 +40,5 @@ def test_fifo_rotation(tmp_path):
 
 def test_creates_directory(tmp_path):
     path = tmp_path / "sub" / "dir"
-    storage = LocalStorage(str(path))
+    LocalStorage(str(path))
     assert path.exists()

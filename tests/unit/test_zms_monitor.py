@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -12,8 +12,8 @@ from rfobserver.config import ZmsSettingsGroup
 from rfobserver.models import (
     IQStatistics,
     MetadataRecord,
-    PSDData,
     ProcessedDataEnvelope,
+    PSDData,
 )
 from rfobserver.zms.monitor import ZmsMonitor
 
@@ -41,7 +41,7 @@ def envelope():
         hostname="jetson",
         organization="test",
         frequency=915_000_000,
-        timestamp=datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
+        timestamp=datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC),
         source_path=Path("/tmp/test.sc16"),
         gain=35,
         sampling_rate=26_000_000,

@@ -1,7 +1,6 @@
 """Tests for rfobserver.processing.iq_utils."""
 
 import numpy as np
-import pytest
 
 from rfobserver.processing.iq_utils import calculate_iq_statistics, convert_bytes_to_complex
 

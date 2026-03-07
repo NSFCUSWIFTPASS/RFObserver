@@ -10,8 +10,8 @@ from rfobserver.models import (
     ChampionRecord,
     IQStatistics,
     MetadataRecord,
-    PSDData,
     ProcessedDataEnvelope,
+    PSDData,
     SensorStatus,
 )
 

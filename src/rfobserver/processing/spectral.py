@@ -4,11 +4,8 @@ The PSD grid is a 2D time-frequency array where each row is a short-duration
 averaged Welch PSD. The summary PSD averages the entire grid into a single
 vector for outbound reporting.
 
-The PSD grid replaces the separate waterfall/spectrogram computation --
-it IS the spectrogram, with better per-cell SNR from averaging.
-
-All FFT windows are extracted and processed as a single vectorized numpy
-operation, using pocketfft's internal multi-threading for full CPU utilization.
+All FFT windows are extracted using stride tricks and processed as a single
+batch FFT via scipy.fft with explicit multi-threading (workers=-1).
 """
 
 from __future__ import annotations
@@ -16,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import scipy.fft
 
 from rfobserver.models import PSDData
 
@@ -27,7 +25,7 @@ class PSDGridConfig:
     num_bins: int = 256
     time_resolution_ms: float = 0.2
     overlap: float = 0.5  # FFT overlap ratio
-    num_workers: int = 1  # kept for API compat; numpy handles threading internally
+    num_workers: int = -1  # -1 = all cores, passed to scipy.fft
 
 
 @dataclass
@@ -48,18 +46,9 @@ def compute_psd_grid(
 ) -> PSDGridResult:
     """Compute a high-resolution PSD grid from complex IQ data.
 
-    Fully vectorized: extracts all FFT windows at once using stride tricks,
-    applies Hann window via broadcasting, computes all FFTs in a single
-    np.fft.fft call (pocketfft multi-threaded), then reshapes and averages
-    per time slice.
-
-    Args:
-        data: Complex numpy array of IQ samples.
-        sampling_rate: Sample rate in Hz.
-        config: Grid configuration (bins, time resolution, overlap).
-
-    Returns:
-        PSDGridResult with the 2D grid, time/freq axes, and metadata.
+    Fully vectorized: extracts all overlapping FFT windows at once using
+    stride tricks, applies Hann window, computes batch FFT via scipy.fft
+    with explicit multi-threading, then reshapes and averages per time slice.
     """
     if config is None:
         config = PSDGridConfig()
@@ -88,59 +77,59 @@ def compute_psd_grid(
 
     total_ffts = n_slices * ffts_per_slice
 
-    # Truncate data to exact multiple
+    # Pre-compute window and normalization
+    hann = np.hanning(nperseg).astype(data.dtype)
+    window_norm = float(1.0 / (sampling_rate * np.sum(np.abs(hann) ** 2)))
+
+    # --- Extract all FFT windows using global stride tricks ---
+    # Simple 2D strided view: (total_ffts, nperseg) with hop stride
+    # This avoids the expensive 3D reshape + copy approach
     usable_samples = n_slices * actual_slice_samples
-    data = data[:usable_samples]
+    d = data[:usable_samples]
 
-    # --- Vectorized window extraction using stride tricks ---
-    # Reshape into (n_slices, actual_slice_samples)
-    slices = data.reshape(n_slices, actual_slice_samples)
+    # Reshape into slices, then stride within each slice
+    slices = d.reshape(n_slices, actual_slice_samples)
+    stride_row = slices.strides[0]
+    stride_col = slices.strides[1]
 
-    # Extract overlapping FFT windows from each slice: (n_slices, ffts_per_slice, nperseg)
-    # Use stride_tricks to create views without copying
-    stride_slice = slices.strides[1]  # bytes per sample
-    stride_row = slices.strides[0]  # bytes per slice row
-    windows = np.lib.stride_tricks.as_strided(
+    windows_3d = np.lib.stride_tricks.as_strided(
         slices,
         shape=(n_slices, ffts_per_slice, nperseg),
-        strides=(stride_row, hop * stride_slice, stride_slice),
+        strides=(stride_row, hop * stride_col, stride_col),
     )
 
-    # Flatten to (total_ffts, nperseg) for batch FFT
-    windows_flat = windows.reshape(total_ffts, nperseg).copy()  # copy to make contiguous
+    # Flatten and copy to contiguous memory
+    flat = windows_3d.reshape(total_ffts, nperseg).copy()
 
-    # --- Hann window + FFT + power (all vectorized) ---
-    hann = np.hanning(nperseg).astype(np.complex64)
-    window_power = np.sum(np.abs(hann) ** 2)
+    # Apply Hann window in-place
+    flat *= hann
 
-    # Apply window
-    windows_flat *= hann
+    # Batch FFT with explicit multi-threading
+    workers = config.num_workers
+    spectra = scipy.fft.fft(flat, axis=1, workers=workers)
 
-    # Batch FFT across all windows at once (pocketfft uses all cores)
-    spectra = np.fft.fft(windows_flat, axis=1)
+    # PSD: |X|^2 * norm
+    psd_linear = np.abs(spectra)
+    np.square(psd_linear, out=psd_linear)
+    psd_linear *= window_norm
 
-    # Power spectral density: |X|^2 / (fs * window_power)
-    psd_linear = (np.abs(spectra) ** 2) / (sampling_rate * window_power)
-
-    # Reshape back to (n_slices, ffts_per_slice, nperseg) and average per slice
+    # Reshape to (n_slices, ffts_per_slice, nperseg), average per slice
     psd_per_slice = psd_linear.reshape(n_slices, ffts_per_slice, nperseg)
-    psd_avg = np.mean(psd_per_slice, axis=1)  # (n_slices, nperseg)
+    psd_avg = np.mean(psd_per_slice, axis=1)
 
-    # Convert to dB and fftshift
-    psd_db = np.fft.fftshift(
-        np.nan_to_num(10.0 * np.log10(psd_avg)).astype(np.float32),
-        axes=1,
-    )
+    # Convert to dB + fftshift
+    np.log10(psd_avg, out=psd_avg)
+    psd_avg *= 10.0
+    np.nan_to_num(psd_avg, copy=False, nan=-200.0, posinf=0.0, neginf=-200.0)
+    grid = np.fft.fftshift(psd_avg.astype(np.float32), axes=1)
 
-    # Frequency axis
+    # Axes
     freq_axis = np.fft.fftshift(np.fft.fftfreq(nperseg, 1.0 / sampling_rate))
-
-    # Time axis: center of each slice
     slice_duration = actual_slice_samples / sampling_rate
     time_axis = np.arange(n_slices) * slice_duration + slice_duration / 2
 
     return PSDGridResult(
-        grid=psd_db,
+        grid=grid,
         time_axis=time_axis,
         freq_axis=freq_axis,
         ffts_per_slice=ffts_per_slice,
@@ -153,11 +142,7 @@ def compute_summary_psd(
     center_freq: int,
     sampling_rate: int,
 ) -> PSDData:
-    """Average the entire PSD grid into a single summary PSD vector.
-
-    This is the PSD published to NATS and used for champion selection.
-    Averaging in dB domain (the grid is already in dB).
-    """
+    """Average the entire PSD grid into a single summary PSD vector."""
     summary_db = np.mean(psd_grid.grid, axis=0)
     frequencies = psd_grid.freq_axis + center_freq
 

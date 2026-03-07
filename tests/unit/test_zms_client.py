@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import pytest
+from unittest.mock import AsyncMock
+
 import httpx
-from unittest.mock import AsyncMock, patch
+import pytest
 
 from rfobserver.zms.client import ZmsClient
 

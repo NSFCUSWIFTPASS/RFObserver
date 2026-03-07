@@ -93,7 +93,9 @@ def test_dual_threshold_hysteresis():
     # High-power core (above T_H)
     _inject_burst(grid, 35, 45, 20, 30, -40.0)  # 20 dB above noise
 
-    config = BurstDetectionConfig(threshold_high_db=10.0, threshold_low_ratio=0.6, min_duration_sec=0.0)
+    config = BurstDetectionConfig(
+        threshold_high_db=10.0, threshold_low_ratio=0.6, min_duration_sec=0.0,
+    )
     result = detect_bursts(grid, config, capture_time=datetime(2026, 1, 1))
 
     assert len(result.bursts) == 1

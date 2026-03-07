@@ -16,7 +16,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from rfobserver.zms.client import ZmsClient
@@ -121,7 +121,7 @@ class ZmsMonitor:
             try:
                 wait_time = self._heartbeat_interval
                 if self._status_ack_by:
-                    now = datetime.now(UTC)
+                    now = datetime.now(timezone.utc)
                     remaining = (self._status_ack_by - now).total_seconds()
                     wait_time = max(0.0, remaining)
 
@@ -146,7 +146,7 @@ class ZmsMonitor:
                 try:
                     self._status_ack_by = datetime.fromisoformat(info["status_ack_by"])
                 except (ValueError, TypeError):
-                    self._status_ack_by = datetime.now(UTC) + timedelta(
+                    self._status_ack_by = datetime.now(timezone.utc) + timedelta(
                         seconds=self._heartbeat_interval
                     )
             logger.debug(

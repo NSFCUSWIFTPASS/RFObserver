@@ -44,6 +44,7 @@ Thumbs.db
 
 # Local dev scripts
 run_local.sh
+CLAUDE.md
 
 # Reference software (private, not distributed)
 reference_software/

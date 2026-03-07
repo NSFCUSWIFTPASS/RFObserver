@@ -79,6 +79,9 @@ select = [
     "SIM", # flake8-simplify
     "TCH", # flake8-type-checking
 ]
+ignore = [
+    "UP017", # datetime.UTC requires Python 3.11+, we support 3.10
+]
 
 [tool.ruff.lint.isort]
 known-first-party = ["rfobserver"]

@@ -35,13 +35,13 @@ class AppSettings(BaseSettings):
         extra="ignore",
     )
 
-    # Receiver
-    FREQUENCY_START: int = 915_000_000
-    FREQUENCY_END: int = 915_000_000
+    # Receiver (defaults to WiFi 2.4 GHz, B200-mini full BW)
+    FREQUENCY_START: int = 2_437_000_000
+    FREQUENCY_END: int = 2_437_000_000
     FREQUENCY_STEP: int = 0
-    BANDWIDTH: int = 26_000_000
-    DURATION_SEC: float = 1.0
-    GAIN: int = 35
+    BANDWIDTH: int = 56_000_000
+    DURATION_SEC: float = 0.5
+    GAIN: int = 40
 
     # Sweep
     CYCLES: int = 0  # 0 = infinite

@@ -4,8 +4,9 @@ The PSD grid is a 2D time-frequency array where each row is a short-duration
 averaged Welch PSD. The summary PSD averages the entire grid into a single
 vector for outbound reporting.
 
-All FFT windows are extracted using stride tricks and processed as a single
-batch FFT via scipy.fft with explicit multi-threading (workers=-1).
+FFT windows are extracted via stride tricks and processed in cache-friendly
+chunks (~200 slices at a time) to avoid thrashing main memory with a single
+giant copy. Each chunk's copy fits in L3 cache for efficient processing.
 """
 
 from __future__ import annotations
@@ -81,47 +82,48 @@ def compute_psd_grid(
     hann = np.hanning(nperseg).astype(data.dtype)
     window_norm = float(1.0 / (sampling_rate * np.sum(np.abs(hann) ** 2)))
 
-    # --- Extract all FFT windows using global stride tricks ---
-    # Simple 2D strided view: (total_ffts, nperseg) with hop stride
-    # This avoids the expensive 3D reshape + copy approach
     usable_samples = n_slices * actual_slice_samples
     d = data[:usable_samples]
-
-    # Reshape into slices, then stride within each slice
     slices = d.reshape(n_slices, actual_slice_samples)
     stride_row = slices.strides[0]
     stride_col = slices.strides[1]
 
-    windows_3d = np.lib.stride_tricks.as_strided(
-        slices,
-        shape=(n_slices, ffts_per_slice, nperseg),
-        strides=(stride_row, hop * stride_col, stride_col),
-    )
-
-    # Flatten and copy to contiguous memory
-    flat = windows_3d.reshape(total_ffts, nperseg).copy()
-
-    # Apply Hann window in-place
-    flat *= hann
-
-    # Batch FFT with explicit multi-threading
     workers = config.num_workers
-    spectra = scipy.fft.fft(flat, axis=1, workers=workers)
 
-    # PSD: |X|^2 * norm
-    psd_linear = np.abs(spectra)
-    np.square(psd_linear, out=psd_linear)
-    psd_linear *= window_norm
+    # --- Chunked processing to keep copies in L3 cache ---
+    # Processing all 216K windows at once copies ~443MB (at 56 MHz BW).
+    # Instead, process ~200 slices at a time so each copy is ~15MB.
+    chunk_sz = 50
+    grid_f64 = np.empty((n_slices, nperseg), dtype=np.float64)
 
-    # Reshape to (n_slices, ffts_per_slice, nperseg), average per slice
-    psd_per_slice = psd_linear.reshape(n_slices, ffts_per_slice, nperseg)
-    psd_avg = np.mean(psd_per_slice, axis=1)
+    for ci in range(0, n_slices, chunk_sz):
+        ce = min(ci + chunk_sz, n_slices)
+        ns = ce - ci
+        chunk = slices[ci:ce]
+
+        w3d = np.lib.stride_tricks.as_strided(
+            chunk,
+            shape=(ns, ffts_per_slice, nperseg),
+            strides=(stride_row, hop * stride_col, stride_col),
+        )
+        flat = w3d.reshape(ns * ffts_per_slice, nperseg).copy()
+        flat *= hann
+
+        spectra = scipy.fft.fft(flat, axis=1, workers=workers)
+
+        psd_linear = np.abs(spectra)
+        np.square(psd_linear, out=psd_linear)
+
+        psd_rs = psd_linear.reshape(ns, ffts_per_slice, nperseg)
+        grid_f64[ci:ce] = np.mean(psd_rs, axis=1)
+
+    grid_f64 *= window_norm
 
     # Convert to dB + fftshift
-    np.log10(psd_avg, out=psd_avg)
-    psd_avg *= 10.0
-    np.nan_to_num(psd_avg, copy=False, nan=-200.0, posinf=0.0, neginf=-200.0)
-    grid = np.fft.fftshift(psd_avg.astype(np.float32), axes=1)
+    np.log10(grid_f64, out=grid_f64)
+    grid_f64 *= 10.0
+    np.nan_to_num(grid_f64, copy=False, nan=-200.0, posinf=0.0, neginf=-200.0)
+    grid = np.fft.fftshift(grid_f64.astype(np.float32), axes=1)
 
     # Axes
     freq_axis = np.fft.fftshift(np.fft.fftfreq(nperseg, 1.0 / sampling_rate))

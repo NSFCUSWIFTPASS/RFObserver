@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -70,7 +70,7 @@ class MockReceiver:
             raw_capture=RawCapture(
                 iq_data_bytes=iq.tobytes(),
                 center_freq_hz=center_freq_hz,
-                capture_timestamp=datetime.now(UTC),
+                capture_timestamp=datetime.now(timezone.utc),
             ),
             receiver_config=self._config,
         )

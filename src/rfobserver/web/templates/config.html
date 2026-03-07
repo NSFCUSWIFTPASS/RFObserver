@@ -5,47 +5,183 @@
     <h1>Sensor Configuration</h1>
 </div>
 
-<div class="card">
+<form id="config-form" method="post">
+<div class="card" style="margin-bottom: 16px;">
     <div class="card-header">Receiver</div>
     <div class="card-body">
-        <form class="config-form">
-            <div class="form-group">
-                <label for="freq-start">Start Frequency (Hz)</label>
-                <input type="number" id="freq-start" value="{{ settings.FREQUENCY_START }}" readonly>
+        <div class="config-form">
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="freq-start">Start Frequency (Hz)</label>
+                    <input type="number" id="freq-start" name="frequency_start" value="{{ settings.FREQUENCY_START }}">
+                </div>
+                <div class="form-group">
+                    <label for="freq-end">End Frequency (Hz)</label>
+                    <input type="number" id="freq-end" name="frequency_end" value="{{ settings.FREQUENCY_END }}">
+                </div>
             </div>
-            <div class="form-group">
-                <label for="freq-end">End Frequency (Hz)</label>
-                <input type="number" id="freq-end" value="{{ settings.FREQUENCY_END }}" readonly>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="bandwidth">Bandwidth (Hz)</label>
+                    <input type="number" id="bandwidth" name="bandwidth" value="{{ settings.BANDWIDTH }}">
+                </div>
+                <div class="form-group">
+                    <label for="gain">Gain (dB)</label>
+                    <input type="number" id="gain" name="gain" value="{{ settings.GAIN }}" min="0" max="76">
+                </div>
             </div>
-            <div class="form-group">
-                <label for="bandwidth">Bandwidth (Hz)</label>
-                <input type="number" id="bandwidth" value="{{ settings.BANDWIDTH }}" readonly>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="duration">Duration (s)</label>
+                    <input type="number" id="duration" name="duration_sec" value="{{ settings.DURATION_SEC }}" step="0.1" min="0.1" max="10">
+                </div>
+                <div class="form-group">
+                    <label for="freq-step">Frequency Step (Hz)</label>
+                    <input type="number" id="freq-step" name="frequency_step" value="{{ settings.FREQUENCY_STEP }}">
+                </div>
             </div>
-            <div class="form-group">
-                <label for="gain">Gain (dB)</label>
-                <input type="number" id="gain" value="{{ settings.GAIN }}" min="0" max="76" readonly>
-            </div>
-            <div class="form-group">
-                <label for="duration">Duration (s)</label>
-                <input type="number" id="duration" value="{{ settings.DURATION_SEC }}" step="0.1" readonly>
-            </div>
-        </form>
+        </div>
     </div>
 </div>
 
-<div class="card">
+<div class="card" style="margin-bottom: 16px;">
     <div class="card-header">Burst Detection</div>
     <div class="card-body">
-        <form class="config-form">
-            <div class="form-group">
-                <label for="threshold">Threshold High (dB)</label>
-                <input type="number" id="threshold" value="{{ settings.BURST_THRESHOLD_HIGH_DB }}" step="0.5" readonly>
+        <div class="config-form">
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="threshold">Threshold High (dB)</label>
+                    <input type="number" id="threshold" name="burst_threshold_high_db" value="{{ settings.BURST_THRESHOLD_HIGH_DB }}" step="0.5">
+                </div>
+                <div class="form-group">
+                    <label for="threshold-low">Threshold Low Ratio</label>
+                    <input type="number" id="threshold-low" name="burst_threshold_low_ratio" value="{{ settings.BURST_THRESHOLD_LOW_RATIO }}" step="0.05" min="0" max="1">
+                </div>
             </div>
-            <div class="form-group">
-                <label for="time-res">PSD Time Resolution (ms)</label>
-                <input type="number" id="time-res" value="{{ settings.PSD_TIME_RESOLUTION_MS }}" step="0.1" readonly>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="time-res">PSD Time Resolution (ms)</label>
+                    <input type="number" id="time-res" name="psd_time_resolution_ms" value="{{ settings.PSD_TIME_RESOLUTION_MS }}" step="0.1">
+                </div>
+                <div class="form-group">
+                    <label for="fft-bins">FFT Bins</label>
+                    <input type="number" id="fft-bins" name="num_fft_bins" value="{{ settings.NUM_FFT_BINS }}">
+                </div>
             </div>
-        </form>
+        </div>
     </div>
 </div>
+
+<div class="card" style="margin-bottom: 16px;">
+    <div class="card-header">Storage</div>
+    <div class="card-body">
+        <div class="config-form">
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="archive-max">Archive Max (GB)</label>
+                    <input type="number" id="archive-max" name="archive_max_gb" value="{{ settings.ARCHIVE_MAX_GB }}" step="1" min="1">
+                </div>
+                <div class="form-group">
+                    <label for="history-days">History Days</label>
+                    <input type="number" id="history-days" name="history_days" value="{{ settings.HISTORY_DAYS }}" min="1">
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="form-actions">
+    <button type="submit" id="apply-btn" class="btn-apply" disabled>
+        <span id="btn-label">Apply</span>
+        <span id="btn-spinner" class="spinner" style="display: none;"></span>
+    </button>
+</div>
+</form>
+
+<script>
+(function() {
+    const form = document.getElementById('config-form');
+    const btn = document.getElementById('apply-btn');
+    const label = document.getElementById('btn-label');
+    const spinner = document.getElementById('btn-spinner');
+    let initial = new FormData(form);
+    let initialMap = {};
+    for (const [k, v] of initial.entries()) initialMap[k] = v;
+
+    function hasChanges() {
+        const current = new FormData(form);
+        for (const [k, v] of current.entries()) {
+            if (initialMap[k] !== v) return true;
+        }
+        return false;
+    }
+
+    function setState(state) {
+        if (state === 'dirty') {
+            btn.disabled = false;
+            btn.classList.remove('btn-applied');
+            label.textContent = 'Apply';
+            spinner.style.display = 'none';
+        } else if (state === 'submitting') {
+            btn.disabled = true;
+            label.textContent = '';
+            spinner.style.display = 'inline-block';
+        } else if (state === 'applied') {
+            btn.disabled = true;
+            btn.classList.add('btn-applied');
+            label.textContent = 'Applied';
+            spinner.style.display = 'none';
+        } else if (state === 'error') {
+            btn.disabled = false;
+            btn.classList.remove('btn-applied');
+            label.textContent = 'Retry';
+            spinner.style.display = 'none';
+        } else {
+            btn.disabled = true;
+            btn.classList.remove('btn-applied');
+            label.textContent = 'Apply';
+            spinner.style.display = 'none';
+        }
+    }
+
+    form.addEventListener('input', function() {
+        if (hasChanges()) {
+            setState('dirty');
+        } else {
+            setState('clean');
+        }
+    });
+
+    form.addEventListener('submit', async function(e) {
+        e.preventDefault();
+        setState('submitting');
+
+        const data = {};
+        const fd = new FormData(form);
+        for (const [k, v] of fd.entries()) data[k] = v;
+
+        try {
+            const resp = await fetch('/config/apply', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(data),
+            });
+            if (!resp.ok) {
+                const err = await resp.json();
+                alert(err.detail || 'Failed to apply configuration');
+                setState('error');
+                return;
+            }
+            // Update initial values to current
+            const current = new FormData(form);
+            initialMap = {};
+            for (const [k, v] of current.entries()) initialMap[k] = v;
+            setState('applied');
+        } catch (err) {
+            alert('Network error: ' + err.message);
+            setState('error');
+        }
+    });
+})();
+</script>
 {% endblock %}

@@ -7,9 +7,9 @@ def test_default_settings():
     settings = AppSettings(
         _env_file=None,  # don't read .env during tests
     )
-    assert settings.FREQUENCY_START == 915_000_000
-    assert settings.BANDWIDTH == 26_000_000
-    assert settings.GAIN == 35
+    assert settings.FREQUENCY_START == 2_437_000_000
+    assert settings.BANDWIDTH == 56_000_000
+    assert settings.GAIN == 40
     assert settings.MOCK_RECEIVER is False
     assert settings.NUM_FFT_BINS == 256
     assert settings.PSD_TIME_RESOLUTION_MS == 0.2

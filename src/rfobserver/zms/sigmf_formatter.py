@@ -11,7 +11,7 @@ import io
 import json
 import stat
 import tarfile
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
@@ -200,7 +200,7 @@ def make_archive(
     gzip: bool = True,
 ) -> bytes:
     """Create a SigMF tar(.gz) archive in memory."""
-    now = datetime.now(UTC)
+    now = datetime.now(timezone.utc)
     ts = int(now.timestamp() * 1e6)
     prefix = f"{basename}-{monitor_id}-{ts}"
 

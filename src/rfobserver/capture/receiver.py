@@ -15,7 +15,7 @@ import threading
 import time
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Protocol
 
 import numpy as np
@@ -162,7 +162,7 @@ class Receiver:
             self.rx_streamer.issue_stream_cmd(stream_cmd)
 
             timeout = config_snapshot.duration_sec + 2.0
-            capture_timestamp = datetime.now(UTC)
+            capture_timestamp = datetime.now(timezone.utc)
             rx_metadata = uhd.types.RXMetadata()
 
             samples_received = self.rx_streamer.recv(buf, rx_metadata, timeout=timeout)

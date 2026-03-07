@@ -6,9 +6,9 @@ import numpy as np
 from rfobserver.processing.iq_utils import calculate_iq_statistics, convert_bytes_to_complex
 from rfobserver.processing.spectral import PSDGridConfig, compute_psd_grid, compute_summary_psd
 from rfobserver.processing.burst import BurstDetectionConfig, detect_bursts
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 
-SAMPLE_RATE = 26_000_000
+SAMPLE_RATE = 56_000_000
 DURATION_SEC = 0.5
 NUM_SAMPLES = int(SAMPLE_RATE * DURATION_SEC)
 NUM_FFT_BINS = 256
@@ -78,7 +78,7 @@ for i in range(RUNS):
         psd_grid,
         config=burst_config,
         center_freq_hz=915_000_000.0,
-        capture_time=datetime.now(UTC),
+        capture_time=datetime.now(timezone.utc),
     )
     times["detect_bursts"].append((time.monotonic() - t0) * 1000)
 

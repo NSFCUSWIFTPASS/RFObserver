@@ -63,7 +63,8 @@ async def apply_config(request: Request) -> dict[str, Any]:
             new_val = cast(body[form_key])
         except (ValueError, TypeError) as exc:
             raise HTTPException(
-                status_code=400, detail=f"Invalid value for {form_key}",
+                status_code=400,
+                detail=f"Invalid value for {form_key}",
             ) from exc
 
         old_val = getattr(settings, attr)

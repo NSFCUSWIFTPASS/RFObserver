@@ -52,21 +52,35 @@ async def run(settings: AppSettings) -> None:
     local_storage = LocalStorage(settings.STORAGE_PATH, max_gb=settings.ARCHIVE_MAX_GB)
     broadcast = LiveBroadcast()
 
+    # ZMS monitor (optional)
+    zms_monitor = None
+    if settings.zms:
+        from rfobserver.zms.monitor import ZmsMonitor
+
+        zms_monitor = ZmsMonitor(settings.zms)
+        await zms_monitor.start()
+        logger.info("ZMS monitor enabled (id=%s)", settings.zms.monitor_id)
+
     processor = ContinuousProcessor(
         receiver=receiver,
         database=db,
         local_storage=local_storage,
         settings=settings,
         broadcast=broadcast,
+        zms_monitor=zms_monitor,
     )
 
     tasks = [processor.run()]
+    if zms_monitor is not None:
+        tasks.append(zms_monitor.run())
     if settings.WEB_PORT > 0:
         tasks.append(_run_web_server(settings, processor, db, broadcast))
 
     try:
         await asyncio.gather(*tasks)
     finally:
+        if zms_monitor is not None:
+            await zms_monitor.stop()
         await db.close()
 
 

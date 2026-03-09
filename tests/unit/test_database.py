@@ -51,14 +51,24 @@ async def test_duplicate_burst_id_ignored(db):
 
 async def test_query_with_freq_filter(db):
     await db.insert_detection(
-        burst_id="low", start_time=datetime(2026, 1, 1), stop_time=datetime(2026, 1, 1, 0, 0, 1),
-        center_freq_hz=900e6, bandwidth_hz=1e6, peak_power_db=-30.0,
-        duration_ms=1000.0, detection_timestamp=datetime(2026, 1, 1),
+        burst_id="low",
+        start_time=datetime(2026, 1, 1),
+        stop_time=datetime(2026, 1, 1, 0, 0, 1),
+        center_freq_hz=900e6,
+        bandwidth_hz=1e6,
+        peak_power_db=-30.0,
+        duration_ms=1000.0,
+        detection_timestamp=datetime(2026, 1, 1),
     )
     await db.insert_detection(
-        burst_id="high", start_time=datetime(2026, 1, 1), stop_time=datetime(2026, 1, 1, 0, 0, 1),
-        center_freq_hz=930e6, bandwidth_hz=1e6, peak_power_db=-30.0,
-        duration_ms=1000.0, detection_timestamp=datetime(2026, 1, 1),
+        burst_id="high",
+        start_time=datetime(2026, 1, 1),
+        stop_time=datetime(2026, 1, 1, 0, 0, 1),
+        center_freq_hz=930e6,
+        bandwidth_hz=1e6,
+        peak_power_db=-30.0,
+        duration_ms=1000.0,
+        detection_timestamp=datetime(2026, 1, 1),
     )
     results = await db.query_detections(min_freq=920e6)
     assert len(results) == 1
@@ -89,14 +99,24 @@ async def test_insert_stats(db):
 async def test_cleanup_old_data(db):
     old_time = datetime.utcnow() - timedelta(days=10)
     await db.insert_detection(
-        burst_id="old", start_time=old_time, stop_time=old_time + timedelta(seconds=1),
-        center_freq_hz=915e6, bandwidth_hz=1e6, peak_power_db=-30.0,
-        duration_ms=1000.0, detection_timestamp=old_time,
+        burst_id="old",
+        start_time=old_time,
+        stop_time=old_time + timedelta(seconds=1),
+        center_freq_hz=915e6,
+        bandwidth_hz=1e6,
+        peak_power_db=-30.0,
+        duration_ms=1000.0,
+        detection_timestamp=old_time,
     )
     await db.insert_detection(
-        burst_id="new", start_time=datetime.utcnow(), stop_time=datetime.utcnow(),
-        center_freq_hz=915e6, bandwidth_hz=1e6, peak_power_db=-30.0,
-        duration_ms=1000.0, detection_timestamp=datetime.utcnow(),
+        burst_id="new",
+        start_time=datetime.utcnow(),
+        stop_time=datetime.utcnow(),
+        center_freq_hz=915e6,
+        bandwidth_hz=1e6,
+        peak_power_db=-30.0,
+        duration_ms=1000.0,
+        detection_timestamp=datetime.utcnow(),
     )
 
     removed = await db.cleanup_old_data(days=7)

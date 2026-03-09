@@ -327,7 +327,7 @@ class ZmsMonitor:
             gzip=False,
         )
 
-        ok = await self._client.send_sigmf_archive(archive)
+        ok = await self._client.send_sigmf_archive(archive, gzip=False)
         if ok:
             self._message_count += 1
         return ok

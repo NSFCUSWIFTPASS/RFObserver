@@ -125,17 +125,18 @@ class ZmsClient:
     # SigMF archive submission
     # ------------------------------------------------------------------
 
-    async def send_sigmf_archive(self, archive_bytes: bytes) -> bool:
+    async def send_sigmf_archive(self, archive_bytes: bytes, *, gzip: bool = False) -> bool:
         """Upload a SigMF tar(.gz) archive to DST.
 
         Returns True on success (HTTP 200/201).
         """
-        headers = {
+        headers: dict[str, str] = {
             "Content-Type": "application/sigmf-archive",
-            "Content-Encoding": "gzip",
             "X-Api-Token": self._api_token,
             "X-Api-Monitor-Id": self._monitor_id,
         }
+        if gzip:
+            headers["Content-Encoding"] = "gzip"
         try:
             r = await self._client.post(
                 f"{self._dst_http}/observations",

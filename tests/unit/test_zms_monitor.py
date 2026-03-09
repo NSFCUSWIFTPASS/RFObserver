@@ -93,11 +93,13 @@ class TestZmsMonitor:
         assert monitor._running is False
 
     def test_enqueue_reconfiguration(self, monitor):
-        monitor.enqueue_reconfiguration({
-            "status": "paused",
-            "parameters": {"gain_db": 40},
-            "pending_id": "p-1",
-        })
+        monitor.enqueue_reconfiguration(
+            {
+                "status": "paused",
+                "parameters": {"gain_db": 40},
+                "pending_id": "p-1",
+            }
+        )
         assert monitor._command_queue.qsize() == 1
 
     @pytest.mark.asyncio
@@ -107,11 +109,13 @@ class TestZmsMonitor:
         monitor._client.test_connection = AsyncMock(return_value=(True, True))
         monitor._client.get_monitor_info = AsyncMock(return_value={})
 
-        await monitor._process_reconfiguration({
-            "status": "paused",
-            "parameters": {"gain_db": 40},
-            "pending_id": "p-1",
-        })
+        await monitor._process_reconfiguration(
+            {
+                "status": "paused",
+                "parameters": {"gain_db": 40},
+                "pending_id": "p-1",
+            }
+        )
 
         callback.assert_called_once_with("paused", {"gain_db": 40})
         assert monitor.op_status == "paused"
@@ -123,10 +127,12 @@ class TestZmsMonitor:
         monitor._client.test_connection = AsyncMock(return_value=(True, True))
         monitor._client.get_monitor_info = AsyncMock(return_value={})
 
-        await monitor._process_reconfiguration({
-            "status": "active",
-            "parameters": {"gain_db": 35},
-        })
+        await monitor._process_reconfiguration(
+            {
+                "status": "active",
+                "parameters": {"gain_db": 35},
+            }
+        )
 
         assert monitor.op_status == "active"
 

@@ -80,7 +80,10 @@ class TestCreateSigMFMetadata:
         violations = [False] * 16
         violations[5] = True
         meta = create_sigmf_metadata(
-            **psd_kwargs, violations=violations, zones=zones, interference=True,
+            **psd_kwargs,
+            violations=violations,
+            zones=zones,
+            interference=True,
         )
         values = meta["global"]["openzms-core:values"]
         assert len(values) == 2

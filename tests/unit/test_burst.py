@@ -64,7 +64,7 @@ def test_single_burst_detected():
 
 def test_two_separate_bursts():
     grid = _make_grid(n_rows=200, n_bins=64, noise_db=-60.0)
-    _inject_burst(grid, 10, 20, 5, 10, -25.0)   # burst 1
+    _inject_burst(grid, 10, 20, 5, 10, -25.0)  # burst 1
     _inject_burst(grid, 150, 170, 40, 50, -30.0)  # burst 2
 
     config = BurstDetectionConfig(threshold_high_db=10.0, min_duration_sec=0.0)
@@ -94,7 +94,9 @@ def test_dual_threshold_hysteresis():
     _inject_burst(grid, 35, 45, 20, 30, -40.0)  # 20 dB above noise
 
     config = BurstDetectionConfig(
-        threshold_high_db=10.0, threshold_low_ratio=0.6, min_duration_sec=0.0,
+        threshold_high_db=10.0,
+        threshold_low_ratio=0.6,
+        min_duration_sec=0.0,
     )
     result = detect_bursts(grid, config, capture_time=datetime(2026, 1, 1))
 

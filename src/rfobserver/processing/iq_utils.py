@@ -44,9 +44,7 @@ def calculate_iq_statistics(data: np.ndarray) -> IQStatistics:
 
     # Approximate median from subsample (~65K samples)
     step = max(1, len(power_sq) // (1 << 16))
-    median_db = float(
-        10.0 * np.log10(np.median(power_sq[::step])) + db_offset
-    )
+    median_db = float(10.0 * np.log10(np.median(power_sq[::step])) + db_offset)
 
     variance = np.mean(power_sq) - np.mean(data.real) ** 2 - np.mean(data.imag) ** 2
     standard_dev = float(np.sqrt(variance))

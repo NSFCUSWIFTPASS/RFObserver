@@ -14,6 +14,7 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from rfobserver.processing.burst import BurstDetectionConfig, detect_bursts
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.storage.local import LocalStorage
     from rfobserver.web.websocket import LiveBroadcast
+    from rfobserver.zms.monitor import ZmsMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +51,14 @@ class ContinuousProcessor:
         local_storage: LocalStorage,
         settings: AppSettings,
         broadcast: LiveBroadcast | None = None,
+        zms_monitor: ZmsMonitor | None = None,
     ) -> None:
         self._receiver = receiver
         self._db = database
         self._storage = local_storage
         self._settings = settings
         self._broadcast = broadcast
+        self._zms_monitor = zms_monitor
 
         # 1 thread for capture, N-3 cores for processing, 2 cores left free for OS/web
         total_cores = os.cpu_count() or 4
@@ -179,6 +183,34 @@ class ContinuousProcessor:
                 pr.center_freq_hz,
                 pr.capture_num,
             )
+
+        # Submit to OpenZMS
+        if self._zms_monitor is not None:
+            try:
+                from pathlib import Path
+
+                from rfobserver.models import MetadataRecord, ProcessedDataEnvelope
+
+                meta = MetadataRecord(
+                    hostname=self._settings.HOSTNAME,
+                    organization=self._settings.ORGANIZATION,
+                    serial=self._receiver.serial,
+                    frequency=pr.center_freq_hz,
+                    timestamp=datetime.now(timezone.utc),
+                    source_path=Path(pr.filename),
+                    gain=self._settings.GAIN,
+                    sampling_rate=self._settings.BANDWIDTH,
+                )
+                envelope = ProcessedDataEnvelope(
+                    metadata=meta,
+                    statistics=pr.iq_stats,
+                    psd_data=pr.summary_psd,
+                )
+                ok = await self._zms_monitor.submit_observation(envelope)
+                if ok:
+                    logger.debug("ZMS observation submitted (capture #%d)", pr.capture_num)
+            except Exception:
+                logger.exception("ZMS observation submission failed")
 
         # Broadcast to WebSocket
         if self._broadcast is not None:

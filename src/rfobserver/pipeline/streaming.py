@@ -50,7 +50,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Sentinel used to signal threads to shut down.
-_STOP = None
+# Must not be None (timeout returns None, causing false shutdown).
+_STOP = object()
 
 
 class _StreamResult:
@@ -151,14 +152,10 @@ class StreamingProcessor:
         self._recompute_chunk_params()
 
         # Inter-thread queues (these survive reconfiguration)
-        self._chunk_queue: queue.Queue[tuple[np.ndarray[Any, np.dtype[Any]], float] | None] = (
-            queue.Queue(maxsize=4)
-        )
-        self._burst_queue: queue.Queue[tuple[PSDGridResult, int, int] | None] = queue.Queue(
-            maxsize=16
-        )
+        self._chunk_queue: queue.Queue[Any] = queue.Queue(maxsize=4)
+        self._burst_queue: queue.Queue[Any] = queue.Queue(maxsize=16)
         self._dropped_chunks = 0
-        self._result_queue: asyncio.Queue[_StreamResult | None] = asyncio.Queue(maxsize=8)
+        self._result_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=8)
         self._loop: asyncio.AbstractEventLoop | None = None
 
         # Trigger state
@@ -287,12 +284,18 @@ class StreamingProcessor:
                     logger.info("Receiver loop reconfigured")
 
                 freqs = self._build_frequency_list()
+                logger.debug(
+                    "Receiver loop: sweep %d freqs, running=%s",
+                    len(freqs),
+                    self._running,
+                )
 
                 for center_freq in freqs:
                     if not self._running:
+                        logger.info("Receiver loop: stopping (running=False)")
                         return
-                    # Break out of freq loop on reconfig to pick up new params
                     if self._config_generation != my_gen:
+                        logger.info("Receiver loop: breaking for reconfig")
                         break
 
                     self._receiver.start_streaming(center_freq)
@@ -347,6 +350,7 @@ class StreamingProcessor:
         except Exception:
             logger.exception("Receiver loop crashed")
         finally:
+            logger.info("Receiver loop exiting (running=%s)", self._running)
             self._chunk_queue.put(_STOP)
 
     def _check_trigger_sc16(self, sc16_buf: np.ndarray[Any, np.dtype[Any]]) -> None:
@@ -646,14 +650,13 @@ class StreamingProcessor:
             try:
                 result = await asyncio.wait_for(self._result_queue.get(), timeout=0.5)
             except TimeoutError:
-                result = None
+                await self._drain_burst_results()
+                continue
 
             await self._drain_burst_results()
 
             if result is _STOP:
                 break
-            if result is None:
-                continue
 
             if self._broadcast is not None:
                 await self._broadcast.publish(

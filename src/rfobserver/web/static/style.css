@@ -348,6 +348,150 @@ body {
     padding: 24px;
 }
 
+/* Inline editable values in status bar */
+.editable-val {
+    cursor: pointer;
+    border-bottom: 1px dashed rgba(0, 0, 0, 0.2);
+    transition: all 0.2s;
+}
+
+.editable-val:hover {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+}
+
+.editable-val.edit-success {
+    color: #34c759;
+    border-bottom-color: #34c759;
+}
+
+.inline-edit {
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    padding: 1px 4px;
+    font-size: inherit;
+    font-family: inherit;
+    background: var(--card-bg);
+    color: var(--text-primary);
+    outline: none;
+    box-shadow: 0 0 0 2px rgba(0, 113, 227, 0.15);
+}
+
+.inline-apply-btn {
+    margin-left: 4px;
+    padding: 1px 8px;
+    font-size: 10px;
+    font-weight: 600;
+    border: none;
+    border-radius: 4px;
+    background: var(--accent);
+    color: white;
+    cursor: pointer;
+    vertical-align: middle;
+}
+
+.inline-apply-btn:hover {
+    filter: brightness(1.1);
+}
+
+.inline-apply-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+/* Graph legend (clickable traces) */
+.graph-legend {
+    position: absolute;
+    top: 4px;
+    right: 8px;
+    display: flex;
+    gap: 10px;
+    z-index: 1;
+}
+
+.legend-item {
+    font-size: 10px;
+    font-weight: 500;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: rgba(255, 255, 255, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    user-select: none;
+    transition: all 0.2s;
+}
+
+.legend-item.active {
+    color: var(--color);
+    border-color: var(--color);
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.legend-item:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+/* PSD tooltip */
+.graph-tooltip {
+    position: absolute;
+    font-size: 11px;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.9);
+    background: rgba(0, 0, 0, 0.7);
+    padding: 3px 8px;
+    border-radius: 4px;
+    pointer-events: none;
+    z-index: 2;
+    white-space: nowrap;
+    backdrop-filter: blur(4px);
+}
+
+/* High-res toggle */
+.toggle-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--text-secondary);
+    user-select: none;
+}
+
+.toggle-label input[type="checkbox"] {
+    appearance: none;
+    width: 32px;
+    height: 18px;
+    border-radius: 9px;
+    background: var(--border);
+    position: relative;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.toggle-label input[type="checkbox"]::after {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: white;
+    transition: transform 0.2s;
+}
+
+.toggle-label input[type="checkbox"]:checked {
+    background: var(--accent);
+}
+
+.toggle-label input[type="checkbox"]:checked::after {
+    transform: translateX(14px);
+}
+
+.toggle-text {
+    font-weight: 500;
+}
+
 @media (max-width: 640px) {
     .card-grid {
         grid-template-columns: 1fr;

@@ -3,17 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from rfobserver.__about__ import __version__
 from rfobserver.config import AppSettings
-
-if TYPE_CHECKING:
-    from rfobserver.web.websocket import LiveBroadcast
+from rfobserver.web.websocket import LiveBroadcast, websocket_endpoint
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -58,17 +55,6 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             await websocket.close(code=1011)
             return
 
-        await websocket.accept()
-        queue = broadcast.subscribe()
-        try:
-            while True:
-                data = await queue.get()
-                await websocket.send_json(data)
-        except WebSocketDisconnect:
-            pass
-        except Exception:
-            pass
-        finally:
-            broadcast.unsubscribe(queue)
+        await websocket_endpoint(websocket, broadcast)
 
     return app

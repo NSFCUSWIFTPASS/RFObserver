@@ -9,10 +9,24 @@
             <span id="ups-counter" class="card-header-label" style="opacity: 0.5;">-- ups</span>
             <span id="timing-sep" class="status-sep" style="display: none;">&middot;</span>
             <span id="timing-info" class="card-header-label" style="opacity: 0.5;"></span>
+            <span style="flex: 1;"></span>
+            <label class="toggle-label" title="Per-chunk updates (off = duration-averaged)">
+                <input type="checkbox" id="highres-toggle">
+                <span class="toggle-text">High Res</span>
+            </label>
         </div>
         <div class="graph-group">
-            <canvas id="timeseries-canvas" width="920" height="160" style="width: 100%; height: 160px;"></canvas>
-            <canvas id="psd-canvas" width="920" height="160" style="width: 100%; height: 160px;"></canvas>
+            <div style="position: relative;">
+                <canvas id="timeseries-canvas" width="920" height="160" style="width: 100%; height: 160px;"></canvas>
+                <div class="graph-legend" id="ts-legend">
+                    <span class="legend-item active" data-trace="power" style="--color: #0071e3;">Power</span>
+                    <span class="legend-item" data-trace="kurtosis" style="--color: #ff9f0a;">Kurtosis</span>
+                </div>
+            </div>
+            <div style="position: relative;">
+                <canvas id="psd-canvas" width="920" height="160" style="width: 100%; height: 160px;"></canvas>
+                <div id="psd-tooltip" class="graph-tooltip" style="display: none;"></div>
+            </div>
             <canvas id="waterfall-canvas" width="920" height="260" style="width: 100%; height: 260px;"></canvas>
         </div>
         <div class="spectrogram-legend">
@@ -48,13 +62,38 @@
 <script>
 (function() {
     const WS_URL = "ws://" + location.host + "/ws/live";
-    const WATERFALL_ROWS = 260;
     const TS_MAX_POINTS = 120;
+
+    // High-res mode state
+    let highRes = false;
+    let ws = null;
+
+    const toggle = document.getElementById("highres-toggle");
+    toggle.addEventListener("change", function() {
+        highRes = this.checked;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({type: "set_mode", high_res: highRes}));
+        }
+    });
+
+    // Trace visibility (clickable legend)
+    const traceVisible = {power: true, kurtosis: false};
+
+    document.querySelectorAll("#ts-legend .legend-item").forEach(function(el) {
+        const trace = el.dataset.trace;
+        if (traceVisible[trace]) el.classList.add("active");
+        else el.classList.remove("active");
+
+        el.addEventListener("click", function() {
+            traceVisible[trace] = !traceVisible[trace];
+            el.classList.toggle("active", traceVisible[trace]);
+            drawTimeSeries();
+        });
+    });
 
     // Time-series buffers
     const tsAvgPower = [];
     const tsKurtosis = [];
-    const tsLabels = [];
 
     // Color map: viridis-like
     function powerToColor(val, min, max) {
@@ -83,7 +122,6 @@
         const W = tsCanvas.width;
         const H = tsCanvas.height;
         tsCtx.clearRect(0, 0, W, H);
-
         tsCtx.fillStyle = "#1a1a2e";
         tsCtx.fillRect(0, 0, W, H);
 
@@ -98,73 +136,107 @@
             tsCtx.beginPath(); tsCtx.moveTo(0, y); tsCtx.lineTo(W, y); tsCtx.stroke();
         }
 
-        // Power range
-        let pMin = Infinity, pMax = -Infinity;
-        for (let i = 0; i < N; i++) {
-            if (tsAvgPower[i] < pMin) pMin = tsAvgPower[i];
-            if (tsAvgPower[i] > pMax) pMax = tsAvgPower[i];
+        // Power trace
+        if (traceVisible.power) {
+            let pMin = Infinity, pMax = -Infinity;
+            for (let i = 0; i < N; i++) {
+                if (tsAvgPower[i] < pMin) pMin = tsAvgPower[i];
+                if (tsAvgPower[i] > pMax) pMax = tsAvgPower[i];
+            }
+            const pPad = Math.max((pMax - pMin) * 0.1, 2);
+            pMin -= pPad; pMax += pPad;
+
+            tsCtx.beginPath();
+            for (let i = 0; i < N; i++) {
+                const x = (i / (TS_MAX_POINTS - 1)) * W;
+                const y = H - ((tsAvgPower[i] - pMin) / (pMax - pMin)) * H;
+                if (i === 0) tsCtx.moveTo(x, y); else tsCtx.lineTo(x, y);
+            }
+            tsCtx.strokeStyle = "#0071e3";
+            tsCtx.lineWidth = 1.5;
+            tsCtx.stroke();
+
+            tsCtx.font = "10px -apple-system, sans-serif";
+            tsCtx.fillStyle = "#0071e3";
+            tsCtx.textAlign = "left";
+            tsCtx.fillText("Power " + tsAvgPower[N-1].toFixed(1) + " dB", 4, 12);
+
+            tsCtx.fillStyle = "rgba(255,255,255,0.4)";
+            tsCtx.textAlign = "right";
+            tsCtx.fillText(pMax.toFixed(0) + " dB", W - 4, 12);
+            tsCtx.fillText(pMin.toFixed(0) + " dB", W - 4, H - 4);
         }
-        const pPad = Math.max((pMax - pMin) * 0.1, 2);
-        pMin -= pPad; pMax += pPad;
 
-        // Kurtosis range
-        let kMin = Infinity, kMax = -Infinity;
-        for (let i = 0; i < N; i++) {
-            if (tsKurtosis[i] < kMin) kMin = tsKurtosis[i];
-            if (tsKurtosis[i] > kMax) kMax = tsKurtosis[i];
+        // Kurtosis trace
+        if (traceVisible.kurtosis) {
+            let kMin = Infinity, kMax = -Infinity;
+            for (let i = 0; i < N; i++) {
+                if (tsKurtosis[i] < kMin) kMin = tsKurtosis[i];
+                if (tsKurtosis[i] > kMax) kMax = tsKurtosis[i];
+            }
+            const kPad = Math.max((kMax - kMin) * 0.1, 0.5);
+            kMin -= kPad; kMax += kPad;
+
+            tsCtx.beginPath();
+            for (let i = 0; i < N; i++) {
+                const x = (i / (TS_MAX_POINTS - 1)) * W;
+                const y = H - ((tsKurtosis[i] - kMin) / (kMax - kMin)) * H;
+                if (i === 0) tsCtx.moveTo(x, y); else tsCtx.lineTo(x, y);
+            }
+            tsCtx.strokeStyle = "#ff9f0a";
+            tsCtx.lineWidth = 1.5;
+            tsCtx.stroke();
+
+            tsCtx.font = "10px -apple-system, sans-serif";
+            tsCtx.fillStyle = "#ff9f0a";
+            tsCtx.textAlign = "left";
+            tsCtx.fillText("Kurtosis " + tsKurtosis[N-1].toFixed(2), 4, traceVisible.power ? 24 : 12);
         }
-        const kPad = Math.max((kMax - kMin) * 0.1, 0.5);
-        kMin -= kPad; kMax += kPad;
-
-        // Draw power line (blue)
-        tsCtx.beginPath();
-        for (let i = 0; i < N; i++) {
-            const x = (i / (TS_MAX_POINTS - 1)) * W;
-            const y = H - ((tsAvgPower[i] - pMin) / (pMax - pMin)) * H;
-            if (i === 0) tsCtx.moveTo(x, y); else tsCtx.lineTo(x, y);
-        }
-        tsCtx.strokeStyle = "#0071e3";
-        tsCtx.lineWidth = 1.5;
-        tsCtx.stroke();
-
-        // Draw kurtosis line (orange)
-        tsCtx.beginPath();
-        for (let i = 0; i < N; i++) {
-            const x = (i / (TS_MAX_POINTS - 1)) * W;
-            const y = H - ((tsKurtosis[i] - kMin) / (kMax - kMin)) * H;
-            if (i === 0) tsCtx.moveTo(x, y); else tsCtx.lineTo(x, y);
-        }
-        tsCtx.strokeStyle = "#ff9f0a";
-        tsCtx.lineWidth = 1.5;
-        tsCtx.stroke();
-
-        // Labels
-        tsCtx.font = "10px -apple-system, sans-serif";
-        tsCtx.fillStyle = "#0071e3";
-        tsCtx.textAlign = "left";
-        tsCtx.fillText("Power " + tsAvgPower[N-1].toFixed(1) + " dB", 4, 12);
-        tsCtx.fillStyle = "#ff9f0a";
-        tsCtx.fillText("Kurtosis " + tsKurtosis[N-1].toFixed(2), 4, 24);
-
-        // Y-axis labels
-        tsCtx.fillStyle = "rgba(255,255,255,0.4)";
-        tsCtx.textAlign = "right";
-        tsCtx.fillText(pMax.toFixed(0) + " dB", W - 4, 12);
-        tsCtx.fillText(pMin.toFixed(0) + " dB", W - 4, H - 4);
     }
 
-    // --- PSD line chart ---
+    // --- PSD line chart with crosshair ---
     const psdCanvas = document.getElementById("psd-canvas");
     const psdCtx = psdCanvas.getContext("2d");
+    const psdTooltip = document.getElementById("psd-tooltip");
 
     let dynamicMin = -120;
     let dynamicMax = -40;
+    let lastPowers = [];
+    let lastFrequencies = [];
 
-    function drawPSD(powers, frequencies) {
+    // Crosshair on PSD
+    psdCanvas.addEventListener("mousemove", function(e) {
+        if (lastPowers.length === 0) return;
+        const rect = psdCanvas.getBoundingClientRect();
+        const scaleX = psdCanvas.width / rect.width;
+        const x = (e.clientX - rect.left) * scaleX;
+        const N = lastPowers.length;
+        const binIdx = Math.min(N - 1, Math.max(0, Math.floor((x / psdCanvas.width) * N)));
+
+        const freq = lastFrequencies[binIdx] || 0;
+        const power = lastPowers[binIdx] || 0;
+
+        psdTooltip.style.display = "block";
+        psdTooltip.textContent = (freq / 1e6).toFixed(2) + " MHz  " + power.toFixed(1) + " dB";
+        const tipX = e.clientX - rect.left;
+        psdTooltip.style.left = Math.min(tipX + 10, rect.width - 140) + "px";
+        psdTooltip.style.top = "4px";
+
+        // Redraw with crosshair
+        drawPSD(lastPowers, lastFrequencies, binIdx);
+    });
+
+    psdCanvas.addEventListener("mouseleave", function() {
+        psdTooltip.style.display = "none";
+        drawPSD(lastPowers, lastFrequencies, -1);
+    });
+
+    function drawPSD(powers, frequencies, crosshairBin) {
+        if (typeof crosshairBin === "undefined") crosshairBin = -1;
+
         const W = psdCanvas.width;
         const H = psdCanvas.height;
         psdCtx.clearRect(0, 0, W, H);
-
         psdCtx.fillStyle = "#1a1a2e";
         psdCtx.fillRect(0, 0, W, H);
 
@@ -206,6 +278,24 @@
         psdCtx.lineWidth = 1.5;
         psdCtx.stroke();
 
+        // Crosshair
+        if (crosshairBin >= 0 && crosshairBin < N) {
+            const cx = (crosshairBin / (N - 1)) * W;
+            const cy = H - ((powers[crosshairBin] - min) / (max - min)) * H;
+            psdCtx.strokeStyle = "rgba(255,255,255,0.4)";
+            psdCtx.lineWidth = 1;
+            psdCtx.setLineDash([4, 4]);
+            psdCtx.beginPath(); psdCtx.moveTo(cx, 0); psdCtx.lineTo(cx, H); psdCtx.stroke();
+            psdCtx.beginPath(); psdCtx.moveTo(0, cy); psdCtx.lineTo(W, cy); psdCtx.stroke();
+            psdCtx.setLineDash([]);
+
+            // Dot
+            psdCtx.beginPath();
+            psdCtx.arc(cx, cy, 3, 0, Math.PI * 2);
+            psdCtx.fillStyle = "#ffffff";
+            psdCtx.fill();
+        }
+
         // Axis labels
         psdCtx.fillStyle = "rgba(255,255,255,0.5)";
         psdCtx.font = "10px -apple-system, sans-serif";
@@ -214,9 +304,9 @@
         psdCtx.fillText(min.toFixed(0) + " dB", 4, H - 4);
 
         if (frequencies.length > 0) {
-            const fMin = (frequencies[0] / 1e6).toFixed(0);
-            const fMax = (frequencies[frequencies.length - 1] / 1e6).toFixed(0);
-            const fMid = (frequencies[Math.floor(frequencies.length / 2)] / 1e6).toFixed(0);
+            const fMin = (frequencies[0] / 1e6).toFixed(1);
+            const fMax = (frequencies[frequencies.length - 1] / 1e6).toFixed(1);
+            const fMid = (frequencies[Math.floor(frequencies.length / 2)] / 1e6).toFixed(1);
             psdCtx.textAlign = "left";
             psdCtx.fillText(fMin + " MHz", 4, H - 14);
             psdCtx.textAlign = "center";
@@ -238,15 +328,11 @@
         wfImageData.data[i+2] = 20; wfImageData.data[i+3] = 255;
     }
 
-    let lineCount = 0;
-    let connected = false;
-
     // Updates-per-second tracker
     let upsTimestamps = [];
     function recordUpdate() {
         const now = performance.now();
         upsTimestamps.push(now);
-        // Keep only last 3 seconds of timestamps
         const cutoff = now - 3000;
         while (upsTimestamps.length > 0 && upsTimestamps[0] < cutoff) {
             upsTimestamps.shift();
@@ -275,7 +361,6 @@
         }
 
         wfCtx.putImageData(wfImageData, 0, 0);
-        lineCount++;
     }
 
     function updateDynamicRange(powers) {
@@ -290,10 +375,12 @@
 
     // --- WebSocket ---
     function connectWS() {
-        const ws = new WebSocket(WS_URL);
+        ws = new WebSocket(WS_URL);
 
         ws.onopen = function() {
-            connected = true;
+            if (highRes) {
+                ws.send(JSON.stringify({type: "set_mode", high_res: true}));
+            }
         };
 
         ws.onmessage = function(evt) {
@@ -321,21 +408,22 @@
                 // Time-series
                 tsAvgPower.push(data.avg_power_db);
                 tsKurtosis.push(data.kurtosis || 0);
-                tsLabels.push(data.capture_num);
                 if (tsAvgPower.length > TS_MAX_POINTS) {
-                    tsAvgPower.shift(); tsKurtosis.shift(); tsLabels.shift();
+                    tsAvgPower.shift(); tsKurtosis.shift();
                 }
                 drawTimeSeries();
 
-                // PSD
+                // PSD + waterfall
+                lastPowers = data.powers;
+                lastFrequencies = data.frequencies;
                 updateDynamicRange(data.powers);
-                drawPSD(data.powers, data.frequencies);
+                drawPSD(data.powers, data.frequencies, -1);
                 addWaterfallLine(data.powers);
             }
         };
 
         ws.onclose = function() {
-            connected = false;
+            ws = null;
             setTimeout(connectWS, 2000);
         };
 
@@ -343,6 +431,95 @@
     }
 
     connectWS();
+
+    // --- Inline-editable status bar values ---
+    let editing = false;  // pause htmx polling while editing
+
+    // Pause htmx status-bar refresh while an inline edit is active
+    document.body.addEventListener("htmx:beforeRequest", function(e) {
+        if (editing && e.detail.elt && e.detail.elt.getAttribute("hx-get") === "/api/status-bar") {
+            e.preventDefault();
+        }
+    });
+
+    document.addEventListener("click", function(e) {
+        const span = e.target.closest(".editable-val");
+        if (!span || span.querySelector("input")) return;
+
+        const field = span.dataset.field;
+        const raw = span.dataset.raw;
+        const suffix = span.dataset.suffix || "";
+
+        editing = true;
+
+        const input = document.createElement("input");
+        input.type = "text";
+        input.className = "inline-edit";
+        input.value = raw;
+        input.style.width = Math.max(80, span.offsetWidth + 20) + "px";
+
+        const btn = document.createElement("button");
+        btn.className = "inline-apply-btn";
+        btn.textContent = "Apply";
+
+        span.textContent = "";
+        span.appendChild(input);
+        span.appendChild(btn);
+        input.focus();
+        input.select();
+
+        function cancel() {
+            editing = false;
+            span.textContent = formatVal(field, raw, suffix);
+        }
+
+        async function commit() {
+            const val = input.value.trim();
+            if (!val || val === raw) { cancel(); return; }
+
+            btn.textContent = "...";
+            btn.disabled = true;
+
+            const body = {};
+            body[field] = val;
+            if (field === "frequency_start") body["frequency_end"] = val;
+
+            try {
+                const resp = await fetch("/config/apply", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify(body),
+                });
+                if (resp.ok) {
+                    editing = false;
+                    span.dataset.raw = val;
+                    span.textContent = formatVal(field, val, suffix);
+                    span.classList.add("edit-success");
+                    setTimeout(function() { span.classList.remove("edit-success"); }, 1000);
+                } else {
+                    cancel();
+                }
+            } catch (_) {
+                cancel();
+            }
+        }
+
+        btn.addEventListener("click", function(ev) {
+            ev.stopPropagation();
+            commit();
+        });
+        input.addEventListener("keydown", function(ev) {
+            if (ev.key === "Enter") { ev.preventDefault(); commit(); }
+            if (ev.key === "Escape") cancel();
+        });
+    });
+
+    function formatVal(field, raw, suffix) {
+        const v = parseFloat(raw);
+        if (field === "frequency_start") return (v / 1e6).toFixed(1) + suffix;
+        if (field === "bandwidth") return (v / 1e6).toFixed(0) + suffix;
+        return v + suffix;
+    }
 })();
 </script>
 {% endblock %}

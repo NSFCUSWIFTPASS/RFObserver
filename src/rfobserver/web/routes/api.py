@@ -122,11 +122,17 @@ async def status_bar(request: Request) -> str:
     return (
         f"{hostname} "
         f'<span class="status-sep">&middot;</span> '
-        f"{freq:.1f} MHz "
+        f'<span class="editable-val" data-field="frequency_start" '
+        f'data-raw="{settings.FREQUENCY_START}" data-suffix=" MHz">'
+        f"{freq:.1f} MHz</span> "
         f'<span class="status-sep">&middot;</span> '
-        f"{bw:.0f} MHz BW "
+        f'<span class="editable-val" data-field="bandwidth" '
+        f'data-raw="{settings.BANDWIDTH}" data-suffix=" MHz BW">'
+        f"{bw:.0f} MHz BW</span> "
         f'<span class="status-sep">&middot;</span> '
-        f"{dur}s capture"
+        f'<span class="editable-val" data-field="duration_sec" '
+        f'data-raw="{dur}" data-suffix="s">'
+        f"{dur}s</span> capture"
     )
 
 

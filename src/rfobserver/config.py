@@ -88,7 +88,7 @@ class AppSettings(BaseSettings):
     # Streaming pipeline
     STREAMING_CHUNK_SLICES: int = 200  # PSD time slices per recv chunk
     BURST_WINDOW_ROWS: int = 500  # rolling burst detection window (rows)
-    BURST_EVAL_INTERVAL_ROWS: int = 1000  # how often to run burst detection (rows)
+    BURST_EVAL_INTERVAL_ROWS: int = 250  # how often to run burst detection (rows)
 
     # Metrics
     METRICS_ENABLED: bool = False

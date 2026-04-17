@@ -643,14 +643,36 @@ class StreamingProcessor:
     # -- Async result consumer (event loop) --
 
     async def _result_consumer_loop(self) -> None:
-        """Broadcast results to WebSocket, store bursts, submit to ZMS."""
-        last_zms_time = time.monotonic()
+        """Broadcast results to WebSocket, store bursts, submit to ZMS.
+
+        The UI has two modes controlled by a High Res toggle:
+        - **Normal** (high_res off): accumulate PSD over DURATION_SEC,
+          broadcast one averaged update — same cadence as the old batch mode.
+        - **High Res** (high_res on): broadcast each chunk's PSD immediately
+          for maximum time resolution (~25 updates/sec).
+
+        ZMS always receives DURATION_SEC-averaged data regardless of toggle.
+        """
+        # Accumulation for normal-mode UI and ZMS
+        import numpy as _np
+
+        accum_powers: list[list[float]] = []
+        accum_start = time.monotonic()
+        last_result: _StreamResult | None = None
 
         while self._running:
             try:
                 result = await asyncio.wait_for(self._result_queue.get(), timeout=0.5)
             except TimeoutError:
                 await self._drain_burst_results()
+                # Flush accumulator on timeout if data pending
+                if accum_powers and last_result is not None:
+                    avg = _np.mean(accum_powers, axis=0).tolist()
+                    await self._broadcast_averaged(avg, last_result, len(accum_powers))
+                    await self._submit_zms(avg, last_result)
+                    accum_powers.clear()
+                    accum_start = time.monotonic()
+                    last_result = None
                 continue
 
             await self._drain_burst_results()
@@ -658,7 +680,27 @@ class StreamingProcessor:
             if result is _STOP:
                 break
 
-            if self._broadcast is not None:
+            # --- Accumulate for normal-mode UI + ZMS ---
+            accum_powers.append(result.summary_psd.powers)
+            last_result = result
+
+            elapsed = time.monotonic() - accum_start
+            if elapsed >= self._settings.DURATION_SEC:
+                avg = _np.mean(accum_powers, axis=0).tolist()
+
+                # Normal-mode UI broadcast (only if no high-res subscribers)
+                if self._broadcast is not None and not self._broadcast.has_high_res_subscribers():
+                    await self._broadcast_averaged(avg, result, len(accum_powers))
+
+                # ZMS always gets DURATION_SEC averaged data
+                await self._submit_zms(avg, result)
+
+                accum_powers.clear()
+                accum_start = time.monotonic()
+                last_result = None
+
+            # --- High-res UI broadcast (every chunk) ---
+            if self._broadcast is not None and self._broadcast.has_high_res_subscribers():
                 await self._broadcast.publish(
                     {
                         "type": "psd",
@@ -677,34 +719,70 @@ class StreamingProcessor:
                     }
                 )
 
-            now = time.monotonic()
-            if self._zms_monitor is not None and (now - last_zms_time) >= 0.5:
-                last_zms_time = now
-                try:
-                    from pathlib import Path
+    async def _broadcast_averaged(
+        self,
+        avg_powers: list[float],
+        result: _StreamResult,
+        chunk_count: int,
+    ) -> None:
+        """Broadcast a DURATION_SEC-averaged PSD to the UI."""
+        if self._broadcast is None:
+            return
+        await self._broadcast.publish(
+            {
+                "type": "psd",
+                "center_freq_hz": result.center_freq_hz,
+                "bandwidth_hz": self._settings.BANDWIDTH,
+                "powers": avg_powers,
+                "frequencies": result.summary_psd.frequencies,
+                "num_bins": result.summary_psd.num_bins,
+                "avg_power_db": result.iq_stats.average,
+                "max_power_db": result.iq_stats.max,
+                "kurtosis": result.iq_stats.kurtosis,
+                "burst_count": 0,
+                "capture_num": result.capture_num,
+                "process_ms": result.process_ms,
+                "excess_ms": result.latency_ms,
+                "chunks_averaged": chunk_count,
+            }
+        )
 
-                    from rfobserver.models import MetadataRecord, ProcessedDataEnvelope
+    async def _submit_zms(self, avg_powers: list[float], result: _StreamResult) -> None:
+        """Submit DURATION_SEC-averaged observation to ZMS."""
+        if self._zms_monitor is None:
+            return
+        try:
+            from pathlib import Path
 
-                    meta = MetadataRecord(
-                        hostname=self._settings.HOSTNAME,
-                        organization=self._settings.ORGANIZATION,
-                        serial=self._receiver.serial,
-                        frequency=result.center_freq_hz,
-                        timestamp=datetime.now(timezone.utc),
-                        source_path=Path("/tmp/rfobserver/streaming"),
-                        gain=self._settings.GAIN,
-                        sampling_rate=self._settings.BANDWIDTH,
-                    )
-                    envelope = ProcessedDataEnvelope(
-                        metadata=meta,
-                        statistics=result.iq_stats,
-                        psd_data=result.summary_psd,
-                    )
-                    ok = await self._zms_monitor.submit_observation(envelope)
-                    if ok:
-                        logger.debug("ZMS observation submitted (chunk #%d)", result.capture_num)
-                except Exception:
-                    logger.exception("ZMS observation submission failed")
+            from rfobserver.models import MetadataRecord, ProcessedDataEnvelope, PSDData
+
+            averaged_psd = PSDData(
+                powers=avg_powers,
+                frequencies=result.summary_psd.frequencies,
+                center_freq=result.summary_psd.center_freq,
+                sample_rate=result.summary_psd.sample_rate,
+                num_bins=result.summary_psd.num_bins,
+            )
+            meta = MetadataRecord(
+                hostname=self._settings.HOSTNAME,
+                organization=self._settings.ORGANIZATION,
+                serial=self._receiver.serial,
+                frequency=result.center_freq_hz,
+                timestamp=datetime.now(timezone.utc),
+                source_path=Path("/tmp/rfobserver/streaming"),
+                gain=self._settings.GAIN,
+                sampling_rate=self._settings.BANDWIDTH,
+            )
+            envelope = ProcessedDataEnvelope(
+                metadata=meta,
+                statistics=result.iq_stats,
+                psd_data=averaged_psd,
+            )
+            ok = await self._zms_monitor.submit_observation(envelope)
+            if ok:
+                logger.debug("ZMS observation submitted (chunk #%d)", result.capture_num)
+        except Exception:
+            logger.exception("ZMS observation submission failed")
 
     async def _drain_burst_results(self) -> None:
         """Process all pending burst results from the burst detection thread."""

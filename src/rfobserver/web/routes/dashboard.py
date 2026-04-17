@@ -18,6 +18,7 @@ async def dashboard(request: Request) -> Any:
         request,
         "dashboard.html",
         {
+            "settings": settings,
             "hostname": settings.HOSTNAME,
             "frequency_start": settings.FREQUENCY_START,
             "frequency_end": settings.FREQUENCY_END,

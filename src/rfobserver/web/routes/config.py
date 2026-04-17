@@ -8,8 +8,6 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-from rfobserver.capture.receiver import ReceiverConfig
-
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -67,23 +65,44 @@ async def apply_config(request: Request) -> dict[str, Any]:
                 detail=f"Invalid value for {form_key}",
             ) from exc
 
+        # Validate FFT bins: must be a power of 2 in [256, 8192]
+        if attr == "NUM_FFT_BINS":
+            valid_bins = {256, 512, 1024, 2048, 4096, 8192}
+            if new_val not in valid_bins:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"num_fft_bins must be one of {sorted(valid_bins)}",
+                )
+
         old_val = getattr(settings, attr)
         if old_val != new_val:
             object.__setattr__(settings, attr, new_val)
             changed.append(attr)
 
-    # If receiver-affecting settings changed, reconfigure the receiver
-    receiver_fields = {"BANDWIDTH", "GAIN", "DURATION_SEC"}
-    if changed and receiver_fields & set(changed) and processor is not None:
-        receiver = getattr(processor, "_receiver", None)
-        if receiver is not None:
-            new_config = ReceiverConfig(
-                gain_db=settings.GAIN,
-                bandwidth_hz=settings.BANDWIDTH,
-                duration_sec=settings.DURATION_SEC,
-            )
-            await receiver.reconfigure(new_config)
-            logger.info("Receiver reconfigured: %s", changed)
+    if not changed:
+        logger.info("Config applied: no changes")
+        return {"status": "ok", "changed": changed}
 
-    logger.info("Config applied: %s", changed if changed else "no changes")
+    # Signal the processor to pick up pipeline-affecting changes.
+    # The receiver loop will stop streaming, reconfigure hardware if needed,
+    # rebuild buffers, and resume — all safely between stream stop/start.
+    pipeline_fields = {
+        "BANDWIDTH",
+        "GAIN",
+        "DURATION_SEC",
+        "NUM_FFT_BINS",
+        "PSD_TIME_RESOLUTION_MS",
+        "FREQUENCY_START",
+        "FREQUENCY_END",
+        "FREQUENCY_STEP",
+        "BURST_THRESHOLD_HIGH_DB",
+        "BURST_THRESHOLD_LOW_RATIO",
+    }
+    if pipeline_fields & set(changed) and processor is not None:
+        reconfigure = getattr(processor, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure()
+            logger.info("Pipeline reconfigured: %s", changed)
+
+    logger.info("Config applied: %s", changed)
     return {"status": "ok", "changed": changed}

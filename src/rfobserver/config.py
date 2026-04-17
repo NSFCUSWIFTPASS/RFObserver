@@ -82,7 +82,7 @@ class AppSettings(BaseSettings):
     WEB_PORT: int = 8080
 
     # Processing
-    NUM_FFT_BINS: int = 256
+    NUM_FFT_BINS: int = 1024
     PSD_TIME_RESOLUTION_MS: float = 0.2  # internal PSD grid time resolution
 
     # Streaming pipeline

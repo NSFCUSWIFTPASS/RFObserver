@@ -61,11 +61,16 @@ class RollingBurstDetector:
         new_rows = psd_grid.grid
         n_new = new_rows.shape[0]
 
-        # Write rows into the circular window
-        for i in range(n_new):
-            self._window[self._write_pos] = new_rows[i]
-            self._write_pos = (self._write_pos + 1) % self._window_rows
-            self._rows_filled = min(self._rows_filled + 1, self._window_rows)
+        # Write rows into the circular window (vectorized, max 2 slices)
+        end = self._write_pos + n_new
+        if end <= self._window_rows:
+            self._window[self._write_pos : end] = new_rows
+        else:
+            first = self._window_rows - self._write_pos
+            self._window[self._write_pos :] = new_rows[:first]
+            self._window[: n_new - first] = new_rows[first:]
+        self._write_pos = end % self._window_rows
+        self._rows_filled = min(self._rows_filled + n_new, self._window_rows)
 
         self._rows_since_eval += n_new
 

@@ -65,7 +65,11 @@
                 </div>
                 <div class="form-group">
                     <label for="fft-bins">FFT Bins</label>
-                    <input type="number" id="fft-bins" name="num_fft_bins" value="{{ settings.NUM_FFT_BINS }}">
+                    <select id="fft-bins" name="num_fft_bins">
+                        {% for n in [256, 512, 1024, 2048, 4096, 8192] %}
+                        <option value="{{ n }}" {{ "selected" if settings.NUM_FFT_BINS == n else "" }}>{{ n }}</option>
+                        {% endfor %}
+                    </select>
                 </div>
             </div>
         </div>

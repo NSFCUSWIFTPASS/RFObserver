@@ -79,7 +79,7 @@ async def run(settings: AppSettings) -> None:
     else:
         from rfobserver.pipeline.continuous import ContinuousProcessor
 
-        processor = ContinuousProcessor(
+        processor = ContinuousProcessor(  # type: ignore[assignment]
             receiver=receiver,
             database=db,
             local_storage=local_storage,

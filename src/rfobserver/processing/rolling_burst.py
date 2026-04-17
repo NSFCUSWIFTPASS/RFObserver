@@ -11,7 +11,7 @@ and merged with continuations in the next evaluation pass.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -33,7 +33,7 @@ class RollingBurstDetector:
         num_bins: int,
         burst_config: BurstDetectionConfig,
         center_freq_hz: float,
-        freq_axis: np.ndarray,
+        freq_axis: np.ndarray[Any, np.dtype[Any]],
         time_resolution_s: float,
     ) -> None:
         self._window_rows = window_rows

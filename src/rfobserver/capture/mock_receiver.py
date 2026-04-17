@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone
+from typing import Any
 
 import numpy as np
 
@@ -85,7 +86,7 @@ class MockReceiver:
         self._stream_center_freq = center_freq_hz
         logger.info("MockReceiver started streaming at %d Hz", center_freq_hz)
 
-    def recv_chunk(self, out_buf: np.ndarray) -> int:
+    def recv_chunk(self, out_buf: np.ndarray[Any, np.dtype[Any]]) -> int:
         """Fill *out_buf* (int32, SC16) with synthetic samples.
 
         Sleeps for the equivalent real-time duration to simulate hardware pacing.

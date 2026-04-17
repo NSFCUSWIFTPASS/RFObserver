@@ -27,7 +27,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -111,7 +111,7 @@ class _ChunkResult:
         capture_num: int,
         recv_time: float,
         process_ms: float,
-        sc16_buf: np.ndarray,
+        sc16_buf: np.ndarray[Any, np.dtype[Any]],
     ) -> None:
         self.psd_grid = psd_grid
         self.iq_stats = iq_stats
@@ -151,7 +151,9 @@ class StreamingProcessor:
         self._recompute_chunk_params()
 
         # Inter-thread queues (these survive reconfiguration)
-        self._chunk_queue: queue.Queue[tuple[np.ndarray, float] | None] = queue.Queue(maxsize=4)
+        self._chunk_queue: queue.Queue[tuple[np.ndarray[Any, np.dtype[Any]], float] | None] = (
+            queue.Queue(maxsize=4)
+        )
         self._burst_queue: queue.Queue[tuple[PSDGridResult, int, int] | None] = queue.Queue(
             maxsize=16
         )
@@ -193,7 +195,7 @@ class StreamingProcessor:
         self._chunk_duration = self._chunk_samples / s.BANDWIDTH
 
         # Buffer pool: 12 pre-allocated SC16 (int32) buffers
-        self._buf_pool: queue.Queue[np.ndarray] = queue.Queue(maxsize=12)
+        self._buf_pool: queue.Queue[np.ndarray[Any, np.dtype[Any]]] = queue.Queue(maxsize=12)
         for _ in range(12):
             self._buf_pool.put(np.zeros(self._chunk_samples, dtype=np.int32))
 
@@ -345,7 +347,7 @@ class StreamingProcessor:
         finally:
             self._chunk_queue.put(_STOP)
 
-    def _check_trigger_sc16(self, sc16_buf: np.ndarray) -> None:
+    def _check_trigger_sc16(self, sc16_buf: np.ndarray[Any, np.dtype[Any]]) -> None:
         """Check power trigger from raw SC16 data (no complex conversion)."""
         s = self._settings
 
@@ -376,7 +378,7 @@ class StreamingProcessor:
             else:
                 self._below_threshold_count = 0
 
-    def _start_triggered_capture(self, first_sc16: np.ndarray) -> None:
+    def _start_triggered_capture(self, first_sc16: np.ndarray[Any, np.dtype[Any]]) -> None:
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         self._trigger_file = (
             f"{self._receiver.serial}-{self._settings.HOSTNAME}-{ts}-triggered.sc16"
@@ -390,7 +392,7 @@ class StreamingProcessor:
         self._trigger_active = True
         self._below_threshold_count = 0
 
-    def _append_triggered_capture(self, sc16_buf: np.ndarray) -> None:
+    def _append_triggered_capture(self, sc16_buf: np.ndarray[Any, np.dtype[Any]]) -> None:
         if self._trigger_file is None:
             return
         filepath = self._storage.storage_path / self._trigger_file
@@ -484,7 +486,7 @@ class StreamingProcessor:
 
     def _process_one_chunk(
         self,
-        sc16_buf: np.ndarray,
+        sc16_buf: np.ndarray[Any, np.dtype[Any]],
         recv_time: float,
         capture_num: int,
         center_freq: int,

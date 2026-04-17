@@ -174,8 +174,9 @@ class StreamingProcessor:
             maxsize=32
         )
 
-        # Reconfiguration signal — threads check this and refresh their state
-        self._reconfigure_event = threading.Event()
+        # Reconfiguration generation counter — each thread tracks its own
+        # last-seen generation and reconfigures when it changes.
+        self._config_generation = 0
 
     def _recompute_chunk_params(self) -> None:
         """(Re)compute chunk sizing, buffer pool, and pre-trigger buffer from settings."""
@@ -253,8 +254,8 @@ class StreamingProcessor:
         rebuild buffers, and resume.  The dispatch and burst threads will
         rebuild their PSD / burst configs on the next iteration.
         """
-        self._reconfigure_event.set()
-        logger.info("Reconfiguration requested")
+        self._config_generation += 1
+        logger.info("Reconfiguration requested (gen=%d)", self._config_generation)
 
     def manual_trigger(self) -> None:
         """Activate the manual IQ capture trigger."""
@@ -272,16 +273,17 @@ class StreamingProcessor:
         """Runs on a dedicated thread.  Calls recv_chunk() and feeds queues."""
         s = self._settings
         recv_count = 0
+        my_gen = self._config_generation
 
         try:
             while self._running:
                 # Check for reconfiguration before each frequency sweep.
                 # Hardware reconfigure + chunk param rebuild happens here,
                 # safely between stream stop/start.
-                if self._reconfigure_event.is_set():
+                if self._config_generation != my_gen:
+                    my_gen = self._config_generation
                     self._reconfigure_receiver()
                     self._recompute_chunk_params()
-                    self._reconfigure_event.clear()
                     logger.info("Receiver loop reconfigured")
 
                 freqs = self._build_frequency_list()
@@ -290,7 +292,7 @@ class StreamingProcessor:
                     if not self._running:
                         return
                     # Break out of freq loop on reconfig to pick up new params
-                    if self._reconfigure_event.is_set():
+                    if self._config_generation != my_gen:
                         break
 
                     self._receiver.start_streaming(center_freq)
@@ -299,7 +301,7 @@ class StreamingProcessor:
                     chunks_per_dwell = max(1, int(s.DURATION_SEC / self._chunk_duration))
 
                     for _ in range(chunks_per_dwell):
-                        if not self._running or self._reconfigure_event.is_set():
+                        if not self._running or self._config_generation != my_gen:
                             break
 
                         # Get a buffer — never block the receiver thread
@@ -413,6 +415,7 @@ class StreamingProcessor:
         grid_config = self._make_grid_config()
         freqs = self._build_frequency_list()
         center_freq = freqs[0] if freqs else s.FREQUENCY_START
+        my_gen = self._config_generation
 
         capture_num = 0
         executor = ThreadPoolExecutor(max_workers=self._num_proc_workers, thread_name_prefix="psd")
@@ -423,7 +426,8 @@ class StreamingProcessor:
         try:
             while self._running:
                 # Check for reconfiguration — rebuild PSD grid config
-                if self._reconfigure_event.is_set():
+                if self._config_generation != my_gen:
+                    my_gen = self._config_generation
                     grid_config = self._make_grid_config()
                     freqs = self._build_frequency_list()
                     center_freq = freqs[0] if freqs else s.FREQUENCY_START
@@ -536,6 +540,7 @@ class StreamingProcessor:
         with contextlib.suppress(queue.Full):
             self._burst_queue.put_nowait((cr.psd_grid, cr.center_freq_hz, cr.capture_num))
 
+        self._capture_count = cr.capture_num
         latency_ms = (time.monotonic() - cr.recv_time) * 1000.0
 
         if cr.capture_num % 50 == 0:
@@ -569,11 +574,13 @@ class StreamingProcessor:
         s = self._settings
         burst_config = self._make_burst_config()
         rolling_detector: RollingBurstDetector | None = None
+        my_gen = self._config_generation
 
         try:
             while self._running:
                 # Reconfigure: rebuild burst config, reset detector
-                if self._reconfigure_event.is_set():
+                if self._config_generation != my_gen:
+                    my_gen = self._config_generation
                     burst_config = self._make_burst_config()
                     rolling_detector = None  # re-init on next grid
                     logger.info("Burst detection loop reconfigured")

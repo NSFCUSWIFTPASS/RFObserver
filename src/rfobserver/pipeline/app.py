@@ -23,7 +23,6 @@ async def run(settings: AppSettings) -> None:
     """Start the full sensor pipeline."""
     from rfobserver.capture.mock_receiver import MockReceiver
     from rfobserver.capture.receiver import ReceiverConfig
-    from rfobserver.pipeline.continuous import ContinuousProcessor
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.storage.local import LocalStorage
 
@@ -61,14 +60,34 @@ async def run(settings: AppSettings) -> None:
         await zms_monitor.start()
         logger.info("ZMS monitor enabled (id=%s)", settings.zms.monitor_id)
 
-    processor = ContinuousProcessor(
-        receiver=receiver,
-        database=db,
-        local_storage=local_storage,
-        settings=settings,
-        broadcast=broadcast,
-        zms_monitor=zms_monitor,
-    )
+    # Choose pipeline mode: streaming for single-freq / trigger, batch for sweeps
+    is_sweep = settings.FREQUENCY_STEP > 0 and settings.FREQUENCY_END > settings.FREQUENCY_START
+    use_streaming = settings.TRIGGER_ENABLED or not is_sweep
+
+    if use_streaming:
+        from rfobserver.pipeline.streaming import StreamingProcessor
+
+        processor = StreamingProcessor(
+            receiver=receiver,
+            database=db,
+            local_storage=local_storage,
+            settings=settings,
+            broadcast=broadcast,
+            zms_monitor=zms_monitor,
+        )
+        logger.info("Using streaming pipeline")
+    else:
+        from rfobserver.pipeline.continuous import ContinuousProcessor
+
+        processor = ContinuousProcessor(
+            receiver=receiver,
+            database=db,
+            local_storage=local_storage,
+            settings=settings,
+            broadcast=broadcast,
+            zms_monitor=zms_monitor,
+        )
+        logger.info("Using batch pipeline (sweep mode)")
 
     tasks = [processor.run()]
     if zms_monitor is not None:

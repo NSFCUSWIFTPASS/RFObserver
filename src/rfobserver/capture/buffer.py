@@ -10,10 +10,14 @@ import numpy as np
 
 
 class CircularBuffer:
-    """Fixed-size circular buffer for complex IQ samples."""
+    """Fixed-size circular buffer for IQ samples.
 
-    def __init__(self, max_samples: int) -> None:
-        self._buffer = np.zeros(max_samples, dtype=np.complex64)
+    Supports any numpy dtype — use ``np.complex64`` for complex samples
+    or ``np.int32`` for raw SC16 data (halves memory usage).
+    """
+
+    def __init__(self, max_samples: int, dtype: np.dtype | type = np.complex64) -> None:
+        self._buffer = np.zeros(max_samples, dtype=dtype)
         self._max_samples = max_samples
         self._write_pos = 0
         self._total_written = 0

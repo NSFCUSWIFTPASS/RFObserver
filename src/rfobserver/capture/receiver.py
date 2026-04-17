@@ -50,9 +50,15 @@ class CaptureResult:
 class IReceiver(Protocol):
     """Protocol for receiver implementations (real + mock)."""
 
+    # Batch capture (existing)
     async def receive_samples(self, center_freq_hz: int) -> CaptureResult: ...
     async def reconfigure(self, new_config: ReceiverConfig) -> None: ...
     async def get_temperature(self) -> float | None: ...
+
+    # Streaming capture
+    def start_streaming(self, center_freq_hz: int) -> None: ...
+    def recv_chunk(self, out_buf: np.ndarray) -> int: ...
+    def stop_streaming(self) -> None: ...
 
     @property
     def serial(self) -> str: ...
@@ -74,6 +80,7 @@ class Receiver:
         self._buffers: tuple[np.ndarray, np.ndarray] | None = None
         self._active_buf: int = 0  # index into _buffers: 0 or 1
         self._serial = ""
+        self._streaming = False
 
     @property
     def serial(self) -> str:
@@ -183,6 +190,69 @@ class Receiver:
                 ),
                 receiver_config=config_snapshot,
             )
+
+    # -- Streaming methods (called from a dedicated receiver thread) --
+
+    def start_streaming(self, center_freq_hz: int) -> None:
+        """Tune to *center_freq_hz* and begin continuous streaming."""
+        import uhd
+
+        assert self.rx_streamer is not None
+
+        with self._hardware_lock:
+            self.usrp.set_rx_freq(uhd.libpyuhd.types.tune_request(center_freq_hz), 0)
+
+            # Wait for LO lock
+            max_wait = 1.0
+            start = time.monotonic()
+            while not self.usrp.get_rx_sensor("lo_locked", 0).to_bool():
+                if time.monotonic() - start > max_wait:
+                    logger.error("LO failed to lock within %.1fs", max_wait)
+                    break
+
+            stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.start_cont)
+            stream_cmd.stream_now = True
+            self.rx_streamer.issue_stream_cmd(stream_cmd)
+            self._streaming = True
+
+        logger.info("Started continuous streaming at %d Hz", center_freq_hz)
+
+    def recv_chunk(self, out_buf: np.ndarray) -> int:
+        """Fill *out_buf* (int32, SC16) with samples from the running stream.
+
+        Calls ``rx_streamer.recv()`` in a loop until the buffer is full.
+        Returns the number of samples actually received.  Overflow errors
+        are logged but not raised so the pipeline can keep running.
+        """
+        import uhd
+
+        assert self.rx_streamer is not None
+        total = 0
+        target = len(out_buf)
+        rx_md = uhd.types.RXMetadata()
+
+        while total < target:
+            n = self.rx_streamer.recv(out_buf[total:], rx_md, timeout=1.0)
+            if rx_md.error_code == uhd.types.RXMetadataErrorCode.overflow:
+                logger.warning("UHD overflow (O) — lost samples")
+            elif rx_md.error_code != uhd.types.RXMetadataErrorCode.none:
+                logger.error("UHD recv error: %s", rx_md.strerror())
+                break
+            total += n
+
+        return total
+
+    def stop_streaming(self) -> None:
+        """Stop the continuous stream."""
+        import uhd
+
+        assert self.rx_streamer is not None
+
+        stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont)
+        stream_cmd.stream_now = True
+        self.rx_streamer.issue_stream_cmd(stream_cmd)
+        self._streaming = False
+        logger.info("Stopped continuous streaming")
 
     async def get_temperature(self) -> float | None:
         loop = asyncio.get_running_loop()

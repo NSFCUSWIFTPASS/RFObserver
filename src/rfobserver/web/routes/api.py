@@ -130,6 +130,26 @@ async def status_bar(request: Request) -> str:
     )
 
 
+@router.post("/trigger")
+async def trigger_capture(request: Request) -> dict[str, str]:
+    """Activate manual IQ capture trigger."""
+    proc = _get_processor(request)
+    if proc is not None and hasattr(proc, "manual_trigger"):
+        proc.manual_trigger()
+        return {"status": "triggered"}
+    return {"status": "not_supported", "detail": "Streaming mode not active"}
+
+
+@router.post("/trigger/stop")
+async def stop_trigger(request: Request) -> dict[str, str]:
+    """Deactivate manual IQ capture trigger."""
+    proc = _get_processor(request)
+    if proc is not None and hasattr(proc, "stop_trigger"):
+        proc.stop_trigger()
+        return {"status": "stopped"}
+    return {"status": "not_supported", "detail": "Streaming mode not active"}
+
+
 @router.get("/detections", response_class=HTMLResponse)
 async def detections_fragment(request: Request) -> str:
     """Return HTML table rows for HTMX detection history."""

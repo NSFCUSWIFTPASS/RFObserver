@@ -85,6 +85,11 @@ class AppSettings(BaseSettings):
     NUM_FFT_BINS: int = 256
     PSD_TIME_RESOLUTION_MS: float = 0.2  # internal PSD grid time resolution
 
+    # Streaming pipeline
+    STREAMING_CHUNK_SLICES: int = 200  # PSD time slices per recv chunk
+    BURST_WINDOW_ROWS: int = 500  # rolling burst detection window (rows)
+    BURST_EVAL_INTERVAL_ROWS: int = 1000  # how often to run burst detection (rows)
+
     # Metrics
     METRICS_ENABLED: bool = False
     METRICS_PORT: int = 9090

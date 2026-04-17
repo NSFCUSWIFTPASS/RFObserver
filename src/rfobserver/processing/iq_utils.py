@@ -10,19 +10,28 @@ import numpy as np
 from rfobserver.models import IQStatistics
 
 
-def convert_bytes_to_complex(iq_data_bytes: bytes) -> np.ndarray:
-    """Convert raw SC16 (interleaved int16 I/Q) bytes to complex64 numpy array.
+def convert_sc16_to_complex(sc16_data: np.ndarray) -> np.ndarray:
+    """Convert SC16 int32 array to complex64, normalizing to [-1, 1].
 
-    Normalizes to [-1, 1] range by dividing by 32768.
-    Uses direct real/imag assignment to avoid an intermediate 2x float32 array.
+    Each int32 element packs two int16 values (I in low 16 bits, Q in high 16).
+    This avoids a bytes round-trip when working with numpy arrays directly.
     """
-    raw16 = np.frombuffer(iq_data_bytes, dtype=np.int16).reshape(-1, 2)
+    raw16 = sc16_data.view(np.int16).reshape(-1, 2)
     n = raw16.shape[0]
     out = np.empty(n, dtype=np.complex64)
     out.real = raw16[:, 0]
     out.imag = raw16[:, 1]
     out *= 1.0 / 32768.0
     return out
+
+
+def convert_bytes_to_complex(iq_data_bytes: bytes) -> np.ndarray:
+    """Convert raw SC16 (interleaved int16 I/Q) bytes to complex64 numpy array.
+
+    Normalizes to [-1, 1] range by dividing by 32768.
+    """
+    sc16 = np.frombuffer(iq_data_bytes, dtype=np.int32)
+    return convert_sc16_to_complex(sc16)
 
 
 def calculate_iq_statistics(data: np.ndarray) -> IQStatistics:

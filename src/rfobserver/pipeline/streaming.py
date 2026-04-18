@@ -614,7 +614,19 @@ class StreamingProcessor:
         json_path.write_text(_json.dumps(meta, indent=2))
 
     def _file_writer_loop(self) -> None:
-        """Dedicated thread: drains recording queue and writes to disk."""
+        """Dedicated thread: drains recording queue and writes to disk.
+
+        Pinned to the last CPU core so PSD workers can't starve it.
+        """
+        # Pin writer to dedicated core (last core) for guaranteed CPU time
+        try:
+            total_cores = os.cpu_count() or 6
+            writer_core = total_cores - 1
+            os.sched_setaffinity(0, {writer_core})
+            logger.info("Writer thread pinned to core %d", writer_core)
+        except OSError:
+            logger.debug("Could not pin writer thread to core")
+
         filepath = self._storage.storage_path / (self._recording_file or "recording.sc16")
         try:
             with open(filepath, "wb", buffering=8 * 1024 * 1024) as f:
@@ -639,7 +651,20 @@ class StreamingProcessor:
         my_gen = self._config_generation
 
         capture_num = 0
-        executor = ThreadPoolExecutor(max_workers=self._num_proc_workers, thread_name_prefix="psd")
+        # Pin PSD workers to cores 0..N-2, reserving the last core for the
+        # file writer thread during recording.
+        total_cores = os.cpu_count() or 6
+        worker_cores = set(range(total_cores - 1))  # exclude last core
+
+        def _pin_worker() -> None:
+            with contextlib.suppress(OSError):
+                os.sched_setaffinity(0, worker_cores)
+
+        executor = ThreadPoolExecutor(
+            max_workers=self._num_proc_workers,
+            thread_name_prefix="psd",
+            initializer=_pin_worker,
+        )
 
         max_inflight = self._num_proc_workers * 2
         pending_futures: list[Future[_ChunkResult]] = []

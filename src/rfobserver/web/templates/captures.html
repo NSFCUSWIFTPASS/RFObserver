@@ -15,10 +15,17 @@
     </div>
 </div>
 
+<div id="captures-viewer-container" class="card" style="margin-top: 16px; display: none;">
+    <div class="card-body" id="captures-viewer">
+    </div>
+</div>
+
 <script>
 (function() {
     const listEl = document.getElementById("captures-list");
     const detailEl = document.getElementById("captures-detail");
+    const viewerContainer = document.getElementById("captures-viewer-container");
+    const viewerEl = document.getElementById("captures-viewer");
 
     function formatBytes(b) {
         if (b < 1024) return b + " B";
@@ -122,17 +129,16 @@
             if (m.serial) html += row("Serial", m.serial);
             html += '</table>';
 
-            // Viewer placeholder
-            if (hasPsd) {
-                html += '<div class="capture-viewer" id="viewer">';
-                html += '<div class="viewer-label">Loading PSD data...</div>';
-                html += '</div>';
-            }
-
             detailEl.innerHTML = html;
 
+            // Show viewer below in full-width container
             if (hasPsd) {
+                viewerContainer.style.display = "";
+                viewerEl.innerHTML = '<div class="viewer-label">Loading PSD data...</div>';
                 loadPsdViewer(filename);
+            } else {
+                viewerContainer.style.display = "none";
+                viewerEl.innerHTML = "";
             }
 
         } catch (_) {
@@ -141,8 +147,6 @@
     }
 
     async function loadPsdViewer(filename) {
-        const viewerEl = document.getElementById("viewer");
-        if (!viewerEl) return;
 
         try {
             const r = await fetch("/captures/psd/" + encodeURIComponent(filename) + "?start=0&count=2000&max_bins=512");

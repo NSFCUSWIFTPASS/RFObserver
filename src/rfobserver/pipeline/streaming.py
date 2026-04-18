@@ -527,6 +527,11 @@ class StreamingProcessor:
 
     def _end_recording(self) -> None:
         """Stop recording, flush to disk, write metadata."""
+        # Set state to idle FIRST so dispatch thread stops appending grids
+        self._recording_state = "idle"
+        # Brief sleep lets any in-flight _handle_chunk_result finish its append
+        time.sleep(0.05)
+
         duration = time.monotonic() - self._recording_start
         base_name = self._recording_file or "recording.sc16"
 

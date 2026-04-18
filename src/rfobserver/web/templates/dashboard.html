@@ -14,6 +14,13 @@
                 <input type="checkbox" id="highres-toggle">
                 <span class="toggle-text">High Res</span>
             </label>
+            <span class="status-sep">&middot;</span>
+            <span id="rec-controls">
+                <button id="rec-btn" class="rec-btn rec-start" title="Start recording">REC</button>
+                <button id="arm-btn" class="rec-btn rec-arm" title="Arm trigger">ARM</button>
+                <button id="stop-btn" class="rec-btn rec-stop" style="display:none;" title="Stop">STOP</button>
+                <span id="rec-status" class="rec-status-label"></span>
+            </span>
         </div>
         <div class="graph-group">
             <div style="position: relative;">
@@ -488,6 +495,62 @@
     }
 
     connectWS();
+
+    // --- Recording controls ---
+    const recBtn = document.getElementById("rec-btn");
+    const armBtn = document.getElementById("arm-btn");
+    const stopBtn = document.getElementById("stop-btn");
+    const recStatus = document.getElementById("rec-status");
+
+    function formatBytes(b) {
+        if (b < 1024) return b + " B";
+        if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
+        if (b < 1073741824) return (b / 1048576).toFixed(1) + " MB";
+        return (b / 1073741824).toFixed(2) + " GB";
+    }
+
+    function updateRecUI(state, file, bytes, dur, dropped) {
+        if (state === "recording") {
+            recBtn.style.display = "none";
+            armBtn.style.display = "none";
+            stopBtn.style.display = "";
+            let info = '<span class="pulse-red"></span> '
+                + formatBytes(bytes) + " &middot; " + dur.toFixed(1) + "s";
+            if (dropped > 0) info += ' <span style="color:#ff3b30;">(' + dropped + ' dropped)</span>';
+            recStatus.innerHTML = info;
+        } else if (state === "armed") {
+            recBtn.style.display = "none";
+            armBtn.style.display = "none";
+            stopBtn.style.display = "";
+            recStatus.innerHTML = '<span class="pulse-yellow"></span> Armed';
+        } else {
+            recBtn.style.display = "";
+            armBtn.style.display = "";
+            stopBtn.style.display = "none";
+            recStatus.textContent = "";
+        }
+    }
+
+    // Poll recording status
+    setInterval(async function() {
+        try {
+            const r = await fetch("/api/recording/status");
+            if (r.ok) {
+                const d = await r.json();
+                updateRecUI(d.state, d.file, d.bytes, d.duration_sec, d.dropped_chunks || 0);
+            }
+        } catch (_) { /* ignore */ }
+    }, 1000);
+
+    recBtn.addEventListener("click", async function() {
+        await fetch("/api/recording/start", {method: "POST"});
+    });
+    armBtn.addEventListener("click", async function() {
+        await fetch("/api/recording/arm", {method: "POST"});
+    });
+    stopBtn.addEventListener("click", async function() {
+        await fetch("/api/recording/stop", {method: "POST"});
+    });
 
     // --- Inline-editable status bar values ---
     let editing = false;

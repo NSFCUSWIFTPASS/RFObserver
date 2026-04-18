@@ -158,11 +158,22 @@ class StreamingProcessor:
         self._result_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=8)
         self._loop: asyncio.AbstractEventLoop | None = None
 
-        # Trigger state
-        self._manual_trigger = threading.Event()
-        self._trigger_active = False
-        self._trigger_file: str | None = None
+        # Recording state machine: "idle" | "armed" | "recording"
+        self._recording_state: str = "idle"
+        self._recording_file: str | None = None
+        self._recording_bytes: int = 0
+        self._recording_start: float = 0.0
+        self._recording_dropped: int = 0
+        self._trigger_initiated: bool = False  # True if trigger fired (vs manual)
         self._below_threshold_count = 0
+
+        # Disk-streaming write queue (default mode)
+        self._recording_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=32)
+        self._writer_thread: threading.Thread | None = None
+
+        # RAM-buffered recording (when RECORDING_RAM_BUFFER=True)
+        self._recording_buf: np.ndarray[Any, np.dtype[Any]] | None = None
+        self._recording_buf_pos: int = 0
 
         self._capture_count = 0
 
@@ -233,6 +244,10 @@ class StreamingProcessor:
             await self._result_consumer_loop()
         finally:
             self._running = False
+            # Stop any active recording
+            if self._recording_state == "recording":
+                self._end_recording()
+            self._recording_state = "idle"
             # Unblock threads
             self._chunk_queue.put(_STOP)
             self._burst_queue.put(_STOP)
@@ -254,15 +269,47 @@ class StreamingProcessor:
         self._config_generation += 1
         logger.info("Reconfiguration requested (gen=%d)", self._config_generation)
 
+    def start_recording(self) -> None:
+        """Start recording IQ data immediately (manual mode)."""
+        if self._recording_state == "recording":
+            return
+        self._trigger_initiated = False
+        self._begin_recording()
+
+    def arm_trigger(self) -> None:
+        """Arm the power trigger — recording starts when threshold is exceeded."""
+        if self._recording_state == "recording":
+            return
+        self._recording_state = "armed"
+        logger.info("Trigger armed (threshold=%.1f dB)", self._settings.TRIGGER_THRESHOLD_DB)
+
+    def stop_recording(self) -> None:
+        """Stop recording or disarm trigger, return to idle."""
+        if self._recording_state == "recording":
+            self._end_recording()
+        self._recording_state = "idle"
+        self._trigger_initiated = False
+        logger.info("Recording stopped / trigger disarmed")
+
+    def recording_status(self) -> dict[str, object]:
+        """Return current recording state for the API."""
+        duration = 0.0
+        if self._recording_state == "recording" and self._recording_start > 0:
+            duration = time.monotonic() - self._recording_start
+        return {
+            "state": self._recording_state,
+            "file": self._recording_file,
+            "bytes": self._recording_bytes,
+            "duration_sec": round(duration, 1),
+            "dropped_chunks": self._recording_dropped,
+        }
+
+    # Backward-compat aliases for existing /api/trigger endpoints
     def manual_trigger(self) -> None:
-        """Activate the manual IQ capture trigger."""
-        self._manual_trigger.set()
-        logger.info("Manual trigger activated")
+        self.start_recording()
 
     def stop_trigger(self) -> None:
-        """Deactivate the manual IQ capture trigger."""
-        self._manual_trigger.clear()
-        logger.info("Manual trigger deactivated")
+        self.stop_recording()
 
     # -- Receiver thread --
 
@@ -323,8 +370,8 @@ class StreamingProcessor:
                         # Store raw SC16 in pre-trigger buffer
                         self._pre_trigger_buf.write(buf[:n])
 
-                        # Check trigger
-                        self._check_trigger_sc16(buf[:n])
+                        # Handle recording / trigger
+                        self._check_trigger_and_record(buf[:n])
 
                         # Enqueue for processing — best-effort, drop if behind
                         try:
@@ -353,63 +400,207 @@ class StreamingProcessor:
             logger.info("Receiver loop exiting (running=%s)", self._running)
             self._chunk_queue.put(_STOP)
 
-    def _check_trigger_sc16(self, sc16_buf: np.ndarray[Any, np.dtype[Any]]) -> None:
-        """Check power trigger from raw SC16 data (no complex conversion)."""
-        s = self._settings
+    def _check_trigger_and_record(self, sc16_buf: np.ndarray[Any, np.dtype[Any]]) -> None:
+        """Handle recording and trigger logic for each chunk."""
+        state = self._recording_state
 
-        if not s.TRIGGER_ENABLED and not self._manual_trigger.is_set():
-            if self._trigger_active:
-                self._end_triggered_capture()
+        if state == "recording":
+            self._write_recording_chunk(sc16_buf)
+
+            # Auto-stop on max duration
+            max_sec = self._settings.RECORDING_MAX_SEC
+            if max_sec > 0 and (time.monotonic() - self._recording_start) >= max_sec:
+                self.stop_recording()
+                return
+
+            # Auto-stop for trigger-initiated recordings when power drops
+            if self._trigger_initiated:
+                if not self._check_power_above_threshold(sc16_buf):
+                    self._below_threshold_count += 1
+                    if self._below_threshold_count >= self._settings.TRIGGER_HYSTERESIS:
+                        self.stop_recording()
+                else:
+                    self._below_threshold_count = 0
             return
 
+        # If armed, check threshold to start recording
+        if state == "armed" and self._check_power_above_threshold(sc16_buf):
+            self._trigger_initiated = True
+            self._begin_recording()
+            self._write_recording_chunk(sc16_buf)
+
+    def _check_power_above_threshold(self, sc16_buf: np.ndarray[Any, np.dtype[Any]]) -> bool:
+        """Fast subsampled power estimate from raw SC16 data."""
         raw16 = sc16_buf.view(np.int16).reshape(-1, 2)
         step = max(1, len(raw16) // 4096)
         sub = raw16[::step].astype(np.float32) / 32768.0
         power_sq = sub[:, 0] ** 2 + sub[:, 1] ** 2
         mean_power_db = float(10.0 * np.log10(np.mean(power_sq) + 1e-30))
+        return mean_power_db > self._settings.TRIGGER_THRESHOLD_DB
 
-        above_threshold = mean_power_db > s.TRIGGER_THRESHOLD_DB
-        manual = self._manual_trigger.is_set()
+    def _write_recording_chunk(self, sc16_buf: np.ndarray[Any, np.dtype[Any]]) -> None:
+        """Write a chunk to the active recording (RAM buffer or disk queue)."""
+        n = len(sc16_buf)
 
-        if not self._trigger_active:
-            if above_threshold or manual:
-                self._start_triggered_capture(sc16_buf)
-        else:
-            self._append_triggered_capture(sc16_buf)
-
-            if not manual and not above_threshold:
-                self._below_threshold_count += 1
-                if self._below_threshold_count >= s.TRIGGER_HYSTERESIS:
-                    self._end_triggered_capture()
+        if self._recording_buf is not None:
+            # RAM-buffered mode
+            end = self._recording_buf_pos + n
+            if end <= len(self._recording_buf):
+                self._recording_buf[self._recording_buf_pos : end] = sc16_buf
+                self._recording_buf_pos = end
+                self._recording_bytes = end * 4  # int32 = 4 bytes
             else:
-                self._below_threshold_count = 0
+                self._recording_dropped += 1
+                logger.warning("RAM buffer full — dropped chunk")
+        else:
+            # Disk-streaming mode
+            try:
+                self._recording_queue.put_nowait(sc16_buf.tobytes())
+                self._recording_bytes += n * 4
+            except queue.Full:
+                self._recording_dropped += 1
+                logger.warning("Recording queue full — dropped chunk")
 
-    def _start_triggered_capture(self, first_sc16: np.ndarray[Any, np.dtype[Any]]) -> None:
+    def _begin_recording(self) -> None:
+        """Start recording: allocate RAM buffer or start disk writer."""
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        self._trigger_file = (
-            f"{self._receiver.serial}-{self._settings.HOSTNAME}-{ts}-triggered.sc16"
-        )
-        logger.info("Triggered capture started: %s", self._trigger_file)
+        self._recording_file = f"{self._receiver.serial}-{self._settings.HOSTNAME}-{ts}.sc16"
+        self._recording_bytes = 0
+        self._recording_dropped = 0
+        self._recording_start = time.monotonic()
+        self._below_threshold_count = 0
+        self._recording_state = "recording"
 
+        s = self._settings
         pre_data = self._pre_trigger_buf.read()
-        pre_bytes = pre_data.tobytes()
 
-        self._storage.save_capture(self._trigger_file, pre_bytes + first_sc16.tobytes())
-        self._trigger_active = True
-        self._below_threshold_count = 0
+        if s.RECORDING_RAM_BUFFER:
+            # Pre-allocate RAM for max recording duration
+            max_sec = s.RECORDING_MAX_SEC if s.RECORDING_MAX_SEC > 0 else 30.0
+            total_samples = int((s.TRIGGER_PRE_SEC + max_sec) * s.BANDWIDTH)
+            self._recording_buf = np.zeros(total_samples, dtype=np.int32)
+            self._recording_buf_pos = 0
 
-    def _append_triggered_capture(self, sc16_buf: np.ndarray[Any, np.dtype[Any]]) -> None:
-        if self._trigger_file is None:
-            return
-        filepath = self._storage.storage_path / self._trigger_file
-        with open(filepath, "ab") as f:
-            f.write(sc16_buf.tobytes())
+            if len(pre_data) > 0:
+                n = min(len(pre_data), total_samples)
+                self._recording_buf[:n] = pre_data[:n]
+                self._recording_buf_pos = n
+                self._recording_bytes = n * 4
 
-    def _end_triggered_capture(self) -> None:
-        logger.info("Triggered capture ended: %s", self._trigger_file)
-        self._trigger_active = False
-        self._trigger_file = None
-        self._below_threshold_count = 0
+            logger.info(
+                "Recording started (RAM): %s (%.1f MB allocated)",
+                self._recording_file,
+                total_samples * 4 / 1e6,
+            )
+        else:
+            self._recording_buf = None
+            self._recording_buf_pos = 0
+
+            # Drain stale queue data
+            while not self._recording_queue.empty():
+                try:
+                    self._recording_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+            if len(pre_data) > 0:
+                try:
+                    self._recording_queue.put_nowait(pre_data.tobytes())
+                    self._recording_bytes = len(pre_data) * 4
+                except queue.Full:
+                    logger.warning("Recording queue full — pre-trigger dropped")
+
+            self._writer_thread = threading.Thread(
+                target=self._file_writer_loop, name="writer", daemon=True
+            )
+            self._writer_thread.start()
+            logger.info("Recording started (disk): %s", self._recording_file)
+
+    def _end_recording(self) -> None:
+        """Stop recording, flush to disk, write metadata."""
+        duration = time.monotonic() - self._recording_start
+        base_name = self._recording_file or "recording.sc16"
+
+        # Add drop count to filename if any chunks were lost
+        if self._recording_dropped > 0:
+            base_name = base_name.replace(".sc16", f"_drop{self._recording_dropped}.sc16")
+            self._recording_file = base_name
+
+        if self._recording_buf is not None:
+            # RAM mode: flush buffer to disk
+            filepath = self._storage.storage_path / base_name
+            used = self._recording_buf[: self._recording_buf_pos]
+            filepath.write_bytes(used.tobytes())
+            self._recording_bytes = self._recording_buf_pos * 4
+            self._recording_buf = None
+            self._recording_buf_pos = 0
+        else:
+            # Disk mode: stop writer thread
+            self._recording_queue.put(None)
+            if self._writer_thread is not None:
+                self._writer_thread.join(timeout=10)
+                self._writer_thread = None
+
+            # Rename file if drops occurred
+            if self._recording_dropped > 0:
+                orig_name = base_name.replace(f"_drop{self._recording_dropped}.sc16", ".sc16")
+                orig = self._storage.storage_path / orig_name
+                dest = self._storage.storage_path / base_name
+                if orig.exists():
+                    orig.rename(dest)
+
+        # Write companion metadata JSON
+        self._write_recording_metadata(base_name, duration)
+
+        logger.info(
+            "Recording saved: %s (%d bytes, %.1fs, %d dropped)",
+            base_name,
+            self._recording_bytes,
+            duration,
+            self._recording_dropped,
+        )
+
+    def _write_recording_metadata(self, filename: str, duration: float) -> None:
+        """Write companion .json with capture metadata."""
+        import json as _json
+
+        s = self._settings
+        meta = {
+            "file": filename,
+            "format": "sc16",
+            "sample_rate_hz": s.BANDWIDTH,
+            "center_freq_hz": s.FREQUENCY_START,
+            "bandwidth_hz": s.BANDWIDTH,
+            "gain_db": s.GAIN,
+            "start_time": datetime.fromtimestamp(
+                time.time() - duration, tz=timezone.utc
+            ).isoformat(),
+            "duration_sec": round(duration, 3),
+            "total_bytes": self._recording_bytes,
+            "total_samples": self._recording_bytes // 4,
+            "dropped_chunks": self._recording_dropped,
+            "pre_trigger_sec": s.TRIGGER_PRE_SEC,
+            "trigger_initiated": self._trigger_initiated,
+            "ram_buffered": s.RECORDING_RAM_BUFFER,
+            "hostname": s.HOSTNAME,
+            "serial": self._receiver.serial,
+        }
+        json_path = self._storage.storage_path / filename.replace(".sc16", ".json")
+        json_path.write_text(_json.dumps(meta, indent=2))
+
+    def _file_writer_loop(self) -> None:
+        """Dedicated thread: drains recording queue and writes to disk."""
+        filepath = self._storage.storage_path / (self._recording_file or "recording.sc16")
+        try:
+            with open(filepath, "wb") as f:
+                while True:
+                    data = self._recording_queue.get()
+                    if data is None:
+                        break
+                    f.write(data)
+                    f.flush()
+        except Exception:
+            logger.exception("File writer crashed")
 
     # -- Dispatch thread --
 

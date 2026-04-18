@@ -51,6 +51,18 @@ def test_dashboard_page(client):
     assert "Dashboard" in response.text
 
 
+def test_captures_page(client):
+    response = client.get("/captures")
+    assert response.status_code == 200
+    assert "Captures" in response.text
+
+
+def test_captures_list_returns_json(client):
+    response = client.get("/captures/list")
+    assert response.status_code == 200
+    assert isinstance(response.json(), list)
+
+
 def test_config_page(client):
     response = client.get("/config")
     assert response.status_code == 200
@@ -149,3 +161,188 @@ class TestConfigApply:
         assert "num_fft_bins" in resp.text
         for n in [256, 512, 1024, 2048, 4096, 8192]:
             assert f'value="{n}"' in resp.text
+
+
+# -- Recording API tests --
+
+
+class TestRecordingAPI:
+    def test_recording_status_idle(self, client_with_processor):
+        client, _, processor = client_with_processor
+        processor.recording_status.return_value = {
+            "state": "idle",
+            "file": None,
+            "bytes": 0,
+            "duration_sec": 0,
+            "dropped_chunks": 0,
+        }
+        resp = client.get("/api/recording/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["state"] == "idle"
+        assert data["bytes"] == 0
+        assert data["dropped_chunks"] == 0
+
+    def test_recording_start(self, client_with_processor):
+        client, _, processor = client_with_processor
+        processor.recording_status.return_value = {
+            "state": "recording",
+            "file": "test.sc16",
+            "bytes": 0,
+            "duration_sec": 0,
+            "dropped_chunks": 0,
+        }
+        resp = client.post("/api/recording/start")
+        assert resp.status_code == 200
+        processor.start_recording.assert_called_once()
+        assert resp.json()["state"] == "recording"
+
+    def test_recording_start_returns_file(self, client_with_processor):
+        client, _, processor = client_with_processor
+        processor.recording_status.return_value = {
+            "state": "recording",
+            "file": "322750B-ubuntu-20260418T120000.sc16",
+            "bytes": 0,
+            "duration_sec": 0,
+            "dropped_chunks": 0,
+        }
+        resp = client.post("/api/recording/start")
+        data = resp.json()
+        assert data["file"] is not None
+        assert data["file"].endswith(".sc16")
+
+    def test_recording_arm(self, client_with_processor):
+        client, _, processor = client_with_processor
+        processor.recording_status.return_value = {
+            "state": "armed",
+            "file": None,
+            "bytes": 0,
+            "duration_sec": 0,
+            "dropped_chunks": 0,
+        }
+        resp = client.post("/api/recording/arm")
+        assert resp.status_code == 200
+        processor.arm_trigger.assert_called_once()
+        assert resp.json()["state"] == "armed"
+
+    def test_recording_stop(self, client_with_processor):
+        client, _, processor = client_with_processor
+        processor.recording_status.return_value = {
+            "state": "idle",
+            "file": None,
+            "bytes": 0,
+            "duration_sec": 0,
+            "dropped_chunks": 0,
+        }
+        resp = client.post("/api/recording/stop")
+        assert resp.status_code == 200
+        processor.stop_recording.assert_called_once()
+        assert resp.json()["state"] == "idle"
+
+    def test_recording_stop_from_armed(self, client_with_processor):
+        """Stop while armed should return to idle."""
+        client, _, processor = client_with_processor
+        processor.recording_status.return_value = {
+            "state": "idle",
+            "file": None,
+            "bytes": 0,
+            "duration_sec": 0,
+            "dropped_chunks": 0,
+        }
+        resp = client.post("/api/recording/stop")
+        assert resp.status_code == 200
+        processor.stop_recording.assert_called_once()
+
+    def test_recording_status_all_fields(self, client_with_processor):
+        client, _, processor = client_with_processor
+        processor.recording_status.return_value = {
+            "state": "recording",
+            "file": "test-capture.sc16",
+            "bytes": 1048576,
+            "duration_sec": 2.5,
+            "dropped_chunks": 3,
+        }
+        resp = client.get("/api/recording/status")
+        data = resp.json()
+        assert data["state"] == "recording"
+        assert data["file"] == "test-capture.sc16"
+        assert data["bytes"] == 1048576
+        assert data["duration_sec"] == 2.5
+        assert data["dropped_chunks"] == 3
+
+    def test_recording_status_no_processor(self, client):
+        """Status without processor returns idle defaults."""
+        resp = client.get("/api/recording/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["state"] == "idle"
+
+    def test_recording_start_no_processor(self, client):
+        """Start without processor returns idle."""
+        resp = client.post("/api/recording/start")
+        assert resp.status_code == 200
+        assert resp.json()["state"] == "idle"
+
+    def test_recording_dashboard_has_controls(self, client):
+        """Dashboard page should have record/arm/stop buttons."""
+        resp = client.get("/")
+        assert resp.status_code == 200
+        assert "rec-btn" in resp.text
+        assert "arm-btn" in resp.text
+        assert "stop-btn" in resp.text
+
+
+# -- Storage path tests --
+
+
+class TestStoragePath:
+    def test_set_path_valid(self, client_with_processor, tmp_path):
+        client, settings, _ = client_with_processor
+        new_path = str(tmp_path / "captures")
+        resp = client.post("/api/storage/set-path", json={"path": new_path})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["path"] == new_path
+        assert new_path == settings.STORAGE_PATH
+        # Directory should have been created
+        from pathlib import Path
+
+        assert Path(new_path).is_dir()
+
+    def test_set_path_creates_nested_dirs(self, client_with_processor, tmp_path):
+        client, settings, _ = client_with_processor
+        new_path = str(tmp_path / "a" / "b" / "c" / "captures")
+        resp = client.post("/api/storage/set-path", json={"path": new_path})
+        assert resp.status_code == 200
+        from pathlib import Path
+
+        assert Path(new_path).is_dir()
+
+    def test_set_path_empty_rejected(self, client_with_processor):
+        client, _, _ = client_with_processor
+        resp = client.post("/api/storage/set-path", json={"path": ""})
+        assert resp.status_code == 400
+
+    def test_set_path_no_write_access(self, client_with_processor):
+        client, _, _ = client_with_processor
+        resp = client.post("/api/storage/set-path", json={"path": "/root/nope"})
+        assert resp.status_code == 400
+
+    def test_set_path_updates_processor_storage(self, client_with_processor, tmp_path):
+        client, _, processor = client_with_processor
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        mock_storage = MagicMock()
+        processor._storage = mock_storage
+        new_path = str(tmp_path / "new_storage")
+        resp = client.post("/api/storage/set-path", json={"path": new_path})
+        assert resp.status_code == 200
+        assert mock_storage.storage_path == Path(new_path)
+
+    def test_config_page_shows_storage_path(self, client):
+        resp = client.get("/config")
+        assert resp.status_code == 200
+        assert "storage-path" in resp.text
+        assert "set-path-btn" in resp.text

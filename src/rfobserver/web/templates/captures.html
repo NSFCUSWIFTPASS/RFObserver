@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+{% block title %}Captures - RFObserver{% endblock %}
+{% block content %}
+<div class="page-header">
+    <h1>IQ Captures</h1>
+</div>
+
+<div class="captures-layout">
+    <div class="captures-list" id="captures-list">
+        <div class="placeholder-text">Loading...</div>
+    </div>
+    <div class="captures-detail" id="captures-detail">
+        <div class="placeholder-text">Select a capture to view details</div>
+    </div>
+</div>
+
+<script>
+(function() {
+    const listEl = document.getElementById("captures-list");
+    const detailEl = document.getElementById("captures-detail");
+
+    function formatBytes(b) {
+        if (b < 1024) return b + " B";
+        if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
+        if (b < 1073741824) return (b / 1048576).toFixed(1) + " MB";
+        return (b / 1073741824).toFixed(2) + " GB";
+    }
+
+    function formatDuration(sec) {
+        if (sec < 1) return (sec * 1000).toFixed(0) + " ms";
+        if (sec < 60) return sec.toFixed(1) + " s";
+        return (sec / 60).toFixed(1) + " min";
+    }
+
+    function formatFreq(hz) {
+        if (hz >= 1e9) return (hz / 1e9).toFixed(3) + " GHz";
+        if (hz >= 1e6) return (hz / 1e6).toFixed(1) + " MHz";
+        if (hz >= 1e3) return (hz / 1e3).toFixed(1) + " kHz";
+        return hz + " Hz";
+    }
+
+    async function loadList() {
+        try {
+            const r = await fetch("/captures/list");
+            if (!r.ok) return;
+            const captures = await r.json();
+
+            if (captures.length === 0) {
+                listEl.innerHTML = '<div class="placeholder-text">No captures yet</div>';
+                return;
+            }
+
+            let html = "";
+            for (const c of captures) {
+                const m = c.meta || {};
+                const freq = m.center_freq_hz ? formatFreq(m.center_freq_hz) : "";
+                const dur = m.duration_sec ? formatDuration(m.duration_sec) : "";
+                const dropped = m.dropped_chunks || 0;
+                const mode = m.ram_buffered ? "RAM" : "Disk";
+                const trigger = m.trigger_initiated ? "Triggered" : "Manual";
+                const time = m.start_time ? new Date(m.start_time).toLocaleString() : "";
+
+                html += '<div class="capture-item" data-file="' + c.filename + '">';
+                html += '<div class="capture-name">' + c.filename + '</div>';
+                html += '<div class="capture-info">';
+                html += formatBytes(c.size_bytes);
+                if (dur) html += ' &middot; ' + dur;
+                if (freq) html += ' &middot; ' + freq;
+                if (dropped > 0) html += ' &middot; <span style="color:#ff3b30;">' + dropped + ' dropped</span>';
+                html += '</div>';
+                if (time) html += '<div class="capture-time">' + time + '</div>';
+                html += '</div>';
+            }
+            listEl.innerHTML = html;
+
+        } catch (_) {
+            listEl.innerHTML = '<div class="placeholder-text">Failed to load</div>';
+        }
+    }
+
+    async function showDetail(filename) {
+        // Highlight selected
+        document.querySelectorAll(".capture-item").forEach(function(el) {
+            el.classList.toggle("selected", el.dataset.file === filename);
+        });
+
+        try {
+            const r = await fetch("/captures/detail/" + encodeURIComponent(filename));
+            if (!r.ok) return;
+            const d = await r.json();
+
+            const m = d.meta || {};
+            let html = '<div class="detail-header">' + d.filename + '</div>';
+            html += '<table class="detail-table">';
+            html += row("Size", formatBytes(d.size_bytes));
+            if (m.format) html += row("Format", m.format.toUpperCase());
+            if (m.sample_rate_hz) html += row("Sample Rate", formatFreq(m.sample_rate_hz));
+            if (m.center_freq_hz) html += row("Center Freq", formatFreq(m.center_freq_hz));
+            if (m.bandwidth_hz) html += row("Bandwidth", formatFreq(m.bandwidth_hz));
+            if (m.gain_db != null) html += row("Gain", m.gain_db + " dB");
+            if (m.duration_sec != null) html += row("Duration", formatDuration(m.duration_sec));
+            if (m.total_samples != null) html += row("Samples", m.total_samples.toLocaleString());
+            if (m.start_time) html += row("Start Time", new Date(m.start_time).toLocaleString());
+            html += row("Trigger", m.trigger_initiated ? "Power threshold" : "Manual");
+            html += row("Mode", m.ram_buffered ? "RAM buffered" : "Disk streaming");
+            if (m.pre_trigger_sec != null) html += row("Pre-trigger", m.pre_trigger_sec + " s");
+            if (m.dropped_chunks != null) {
+                const cls = m.dropped_chunks > 0 ? ' style="color:#ff3b30;font-weight:600;"' : '';
+                html += '<tr><td class="detail-label">Dropped Chunks</td>'
+                    + '<td class="detail-value"' + cls + '>' + m.dropped_chunks + '</td></tr>';
+            }
+            if (m.hostname) html += row("Hostname", m.hostname);
+            if (m.serial) html += row("Serial", m.serial);
+            html += '</table>';
+            detailEl.innerHTML = html;
+
+        } catch (_) {
+            detailEl.innerHTML = '<div class="placeholder-text">Failed to load details</div>';
+        }
+    }
+
+    function row(label, value) {
+        return '<tr><td class="detail-label">' + label + '</td><td class="detail-value">' + value + '</td></tr>';
+    }
+
+    // Click handler (delegated)
+    listEl.addEventListener("click", function(e) {
+        const item = e.target.closest(".capture-item");
+        if (item) showDetail(item.dataset.file);
+    });
+
+    // Initial load + auto-refresh
+    loadList();
+    setInterval(loadList, 10000);
+})();
+</script>
+{% endblock %}

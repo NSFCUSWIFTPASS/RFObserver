@@ -90,6 +90,10 @@ class AppSettings(BaseSettings):
     BURST_WINDOW_ROWS: int = 500  # rolling burst detection window (rows)
     BURST_EVAL_INTERVAL_ROWS: int = 250  # how often to run burst detection (rows)
 
+    # Recording
+    RECORDING_MAX_SEC: float = 30.0  # auto-stop after this duration (0 = no limit)
+    RECORDING_RAM_BUFFER: bool = False  # buffer entire capture in RAM, flush on stop
+
     # Metrics
     METRICS_ENABLED: bool = False
     METRICS_PORT: int = 9090

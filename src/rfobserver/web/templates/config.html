@@ -81,6 +81,16 @@
     <div class="card-body">
         <div class="config-form">
             <div class="form-row">
+                <div class="form-group" style="flex: 2;">
+                    <label for="storage-path">Storage Path</label>
+                    <div style="display: flex; gap: 6px;">
+                        <input type="text" id="storage-path" value="{{ settings.STORAGE_PATH }}" style="flex: 1;">
+                        <button type="button" id="set-path-btn" class="btn-apply" style="padding: 4px 12px; font-size: 12px;">Set</button>
+                    </div>
+                    <span id="path-status" style="font-size: 10px; margin-top: 2px; display: block;"></span>
+                </div>
+            </div>
+            <div class="form-row">
                 <div class="form-group">
                     <label for="archive-max">Archive Max (GB)</label>
                     <input type="number" id="archive-max" name="archive_max_gb" value="{{ settings.ARCHIVE_MAX_GB }}" step="1" min="1">
@@ -199,6 +209,43 @@
             alert('Network error: ' + err.message);
             setState('error');
         }
+    });
+    // --- Storage path Set button ---
+    const setPathBtn = document.getElementById('set-path-btn');
+    const pathInput = document.getElementById('storage-path');
+    const pathStatus = document.getElementById('path-status');
+
+    setPathBtn.addEventListener('click', async function() {
+        const path = pathInput.value.trim();
+        if (!path) return;
+
+        setPathBtn.disabled = true;
+        setPathBtn.textContent = '...';
+        pathStatus.textContent = '';
+        pathStatus.style.color = '';
+
+        try {
+            const resp = await fetch('/api/storage/set-path', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({path: path}),
+            });
+            const data = await resp.json();
+            if (resp.ok) {
+                pathStatus.textContent = data.message || 'Path set';
+                pathStatus.style.color = '#34c759';
+                setPathBtn.textContent = 'Set';
+            } else {
+                pathStatus.textContent = data.detail || 'Failed';
+                pathStatus.style.color = '#ff3b30';
+                setPathBtn.textContent = 'Set';
+            }
+        } catch (err) {
+            pathStatus.textContent = 'Network error';
+            pathStatus.style.color = '#ff3b30';
+            setPathBtn.textContent = 'Set';
+        }
+        setPathBtn.disabled = false;
     });
 })();
 </script>

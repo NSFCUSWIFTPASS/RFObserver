@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from rfobserver.__about__ import __version__
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -138,7 +141,7 @@ async def status_bar(request: Request) -> str:
 
 @router.post("/trigger")
 async def trigger_capture(request: Request) -> dict[str, str]:
-    """Activate manual IQ capture trigger."""
+    """Activate manual IQ capture trigger (backward compat)."""
     proc = _get_processor(request)
     if proc is not None and hasattr(proc, "manual_trigger"):
         proc.manual_trigger()
@@ -148,12 +151,118 @@ async def trigger_capture(request: Request) -> dict[str, str]:
 
 @router.post("/trigger/stop")
 async def stop_trigger(request: Request) -> dict[str, str]:
-    """Deactivate manual IQ capture trigger."""
+    """Deactivate manual IQ capture trigger (backward compat)."""
     proc = _get_processor(request)
     if proc is not None and hasattr(proc, "stop_trigger"):
         proc.stop_trigger()
         return {"status": "stopped"}
     return {"status": "not_supported", "detail": "Streaming mode not active"}
+
+
+# -- Recording API --
+
+
+def _idle_status() -> dict[str, Any]:
+    return {"state": "idle", "file": None, "bytes": 0, "duration_sec": 0}
+
+
+def _rec_status(proc: Any) -> dict[str, Any]:
+    result: dict[str, Any] = proc.recording_status()
+    return result
+
+
+@router.get("/recording/status")
+async def recording_status(request: Request) -> dict[str, Any]:
+    """Get current recording state."""
+    proc = _get_processor(request)
+    if proc is not None and hasattr(proc, "recording_status"):
+        return _rec_status(proc)
+    return _idle_status()
+
+
+@router.post("/recording/start")
+async def recording_start(request: Request) -> dict[str, Any]:
+    """Start recording IQ data immediately."""
+    proc = _get_processor(request)
+    if proc is not None and hasattr(proc, "start_recording"):
+        proc.start_recording()
+        return _rec_status(proc)
+    return _idle_status()
+
+
+@router.post("/recording/arm")
+async def recording_arm(request: Request) -> dict[str, Any]:
+    """Arm the power trigger — recording starts when threshold exceeded."""
+    proc = _get_processor(request)
+    if proc is not None and hasattr(proc, "arm_trigger"):
+        proc.arm_trigger()
+        return _rec_status(proc)
+    return _idle_status()
+
+
+@router.post("/recording/stop")
+async def recording_stop(request: Request) -> dict[str, Any]:
+    """Stop recording or disarm trigger."""
+    proc = _get_processor(request)
+    if proc is not None and hasattr(proc, "stop_recording"):
+        proc.stop_recording()
+        return _rec_status(proc)
+    return _idle_status()
+
+
+@router.post("/storage/set-path")
+async def set_storage_path(request: Request) -> dict[str, Any]:
+    """Set the storage path for IQ captures.
+
+    Creates the directory if it doesn't exist. Validates write access
+    by writing and removing a test file.
+    """
+    from pathlib import Path
+
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+
+    new_path = body.get("path", "").strip()
+    if not new_path:
+        raise HTTPException(status_code=400, detail="Path is required")
+
+    target = Path(new_path)
+
+    # Create directory structure if it doesn't exist
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot create directory: {exc}",
+        ) from exc
+
+    # Verify write access with a test file
+    test_file = target / ".rfobs_write_test"
+    try:
+        test_file.write_text("test")
+        test_file.unlink()
+    except OSError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No write access to {new_path}: {exc}",
+        ) from exc
+
+    # Update settings and local storage
+    settings = request.app.state.settings
+    object.__setattr__(settings, "STORAGE_PATH", new_path)
+
+    # Update LocalStorage instance on the processor if available
+    proc = _get_processor(request)
+    if proc is not None:
+        storage = getattr(proc, "_storage", None)
+        if storage is not None:
+            storage.storage_path = target
+
+    logger.info("Storage path set to: %s", new_path)
+    return {"status": "ok", "path": new_path, "message": f"Storage path set to {new_path}"}
 
 
 @router.get("/detections", response_class=HTMLResponse)

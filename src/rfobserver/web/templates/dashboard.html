@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Dashboard - RFObserver{% endblock %}
 {% block content %}
+<script src="/static/shared-charts.js"></script>
 <div class="graph-stack">
     <div class="card">
         <div class="card-header">
@@ -104,15 +105,7 @@
     const tsAvgPower = [];
     const tsKurtosis = [];
 
-    // Color map: viridis-like
-    function powerToColor(val, min, max) {
-        let t = (val - min) / (max - min);
-        t = Math.max(0, Math.min(1, t));
-        const r = Math.floor(t < 0.5 ? t * 2 * 80 : 80 + (t - 0.5) * 2 * 175);
-        const g = Math.floor(t < 0.25 ? t * 4 * 20 : t < 0.75 ? 20 + (t - 0.25) * 2 * 235 : 255);
-        const b = Math.floor(t < 0.5 ? 80 + (1 - t * 2) * 175 : t < 0.75 ? 80 - (t - 0.5) * 4 * 80 : 0);
-        return [r, g, b];
-    }
+    // powerToColor() and drawPSD() are in shared-charts.js
 
     // Dynamic range (must be declared before drawLegendBar)
     let dynamicMin = -120;
@@ -288,95 +281,18 @@
         psdTooltip.style.left = Math.min(tipX + 10, rect.width - 160) + "px";
         psdTooltip.style.top = "4px";
 
-        drawPSD(lastPowers, lastFrequencies);
+        redrawPSD();
     });
 
     psdCanvas.addEventListener("mouseleave", function() {
         psdCrosshairBin = -1;
         psdTooltip.style.display = "none";
-        drawPSD(lastPowers, lastFrequencies);
+        redrawPSD();
     });
 
-    function drawPSD(powers, frequencies) {
-        const W = psdCanvas.width;
-        const H = psdCanvas.height;
-        psdCtx.clearRect(0, 0, W, H);
-        psdCtx.fillStyle = "#1a1a2e";
-        psdCtx.fillRect(0, 0, W, H);
-
-        psdCtx.strokeStyle = "rgba(255,255,255,0.06)";
-        psdCtx.lineWidth = 1;
-        for (let i = 1; i < 5; i++) {
-            const y = (H / 5) * i;
-            psdCtx.beginPath(); psdCtx.moveTo(0, y); psdCtx.lineTo(W, y); psdCtx.stroke();
-        }
-
-        const min = dynamicMin, max = dynamicMax;
-        const N = powers.length;
-        if (N === 0) return;
-
-        // Fill
-        psdCtx.beginPath();
-        psdCtx.moveTo(0, H);
-        for (let i = 0; i < N; i++) {
-            const x = (i / (N - 1)) * W;
-            const y = H - ((powers[i] - min) / (max - min)) * H;
-            psdCtx.lineTo(x, Math.max(0, Math.min(H, y)));
-        }
-        psdCtx.lineTo(W, H);
-        psdCtx.closePath();
-        const grad = psdCtx.createLinearGradient(0, 0, 0, H);
-        grad.addColorStop(0, "rgba(0,113,227,0.3)");
-        grad.addColorStop(1, "rgba(0,113,227,0.02)");
-        psdCtx.fillStyle = grad;
-        psdCtx.fill();
-
-        // Line
-        psdCtx.beginPath();
-        for (let i = 0; i < N; i++) {
-            const x = (i / (N - 1)) * W;
-            const y = H - ((powers[i] - min) / (max - min)) * H;
-            if (i === 0) psdCtx.moveTo(x, y); else psdCtx.lineTo(x, y);
-        }
-        psdCtx.strokeStyle = "#0071e3";
-        psdCtx.lineWidth = 1.5;
-        psdCtx.stroke();
-
-        // Crosshair (uses persistent psdCrosshairBin)
-        if (psdCrosshairBin >= 0 && psdCrosshairBin < N) {
-            const cx = (psdCrosshairBin / (N - 1)) * W;
-            const cy = H - ((powers[psdCrosshairBin] - min) / (max - min)) * H;
-            psdCtx.strokeStyle = "rgba(255,255,255,0.4)";
-            psdCtx.lineWidth = 1;
-            psdCtx.setLineDash([4, 4]);
-            psdCtx.beginPath(); psdCtx.moveTo(cx, 0); psdCtx.lineTo(cx, H); psdCtx.stroke();
-            psdCtx.beginPath(); psdCtx.moveTo(0, cy); psdCtx.lineTo(W, cy); psdCtx.stroke();
-            psdCtx.setLineDash([]);
-
-            psdCtx.beginPath();
-            psdCtx.arc(cx, cy, 3, 0, Math.PI * 2);
-            psdCtx.fillStyle = "#ffffff";
-            psdCtx.fill();
-        }
-
-        // Axis labels
-        psdCtx.fillStyle = "rgba(255,255,255,0.5)";
-        psdCtx.font = "10px -apple-system, sans-serif";
-        psdCtx.textAlign = "left";
-        psdCtx.fillText(max.toFixed(0) + " dBFS", 4, 12);
-        psdCtx.fillText(min.toFixed(0) + " dBFS", 4, H - 4);
-
-        if (frequencies.length > 0) {
-            const fMin = (frequencies[0] / 1e6).toFixed(1);
-            const fMax = (frequencies[frequencies.length - 1] / 1e6).toFixed(1);
-            const fMid = (frequencies[Math.floor(frequencies.length / 2)] / 1e6).toFixed(1);
-            psdCtx.textAlign = "left";
-            psdCtx.fillText(fMin + " MHz", 4, H - 14);
-            psdCtx.textAlign = "center";
-            psdCtx.fillText(fMid + " MHz", W / 2, H - 14);
-            psdCtx.textAlign = "right";
-            psdCtx.fillText(fMax + " MHz", W - 4, H - 14);
-        }
+    function redrawPSD() {
+        drawPSD(psdCtx, psdCanvas.width, psdCanvas.height,
+            lastPowers, lastFrequencies, dynamicMin, dynamicMax, psdCrosshairBin);
     }
 
     // --- Waterfall ---
@@ -407,22 +323,9 @@
     }
 
     function addWaterfallLine(powers) {
-        const N = powers.length;
-        const min = dynamicMin, max = dynamicMax;
         const rowBytes = wfWidth * 4;
         wfImageData.data.copyWithin(rowBytes, 0, (wfHeight - 1) * rowBytes);
-
-        for (let x = 0; x < wfWidth; x++) {
-            const binIdx = Math.floor((x / wfWidth) * N);
-            const val = binIdx < N ? powers[binIdx] : min;
-            const [r, g, b] = powerToColor(val, min, max);
-            const idx = x * 4;
-            wfImageData.data[idx] = r;
-            wfImageData.data[idx+1] = g;
-            wfImageData.data[idx+2] = b;
-            wfImageData.data[idx+3] = 255;
-        }
-
+        renderWaterfallRow(wfImageData, wfWidth, 0, powers, dynamicMin, dynamicMax);
         wfCtx.putImageData(wfImageData, 0, 0);
     }
 
@@ -480,7 +383,7 @@
                 lastPowers = data.powers;
                 lastFrequencies = data.frequencies;
                 updateDynamicRange(data.powers);
-                drawPSD(data.powers, data.frequencies);
+                redrawPSD();
                 addWaterfallLine(data.powers);
                 drawLegendBar();
             }

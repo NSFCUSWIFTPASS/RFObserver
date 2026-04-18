@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Captures - RFObserver{% endblock %}
 {% block content %}
+<script src="/static/shared-charts.js"></script>
 <div class="page-header">
     <h1>IQ Captures</h1>
 </div>
@@ -56,12 +57,12 @@
                 const freq = m.center_freq_hz ? formatFreq(m.center_freq_hz) : "";
                 const dur = m.duration_sec ? formatDuration(m.duration_sec) : "";
                 const dropped = m.dropped_chunks || 0;
-                const mode = m.ram_buffered ? "RAM" : "Disk";
-                const trigger = m.trigger_initiated ? "Triggered" : "Manual";
                 const time = m.start_time ? new Date(m.start_time).toLocaleString() : "";
+                const psdBadge = c.has_psd ? '<span class="psd-badge">PSD</span>' : '';
 
-                html += '<div class="capture-item" data-file="' + c.filename + '">';
-                html += '<div class="capture-name">' + c.filename + '</div>';
+                html += '<div class="capture-item" data-file="' + c.filename + '"'
+                    + ' data-has-psd="' + (c.has_psd ? '1' : '0') + '">';
+                html += '<div class="capture-name">' + c.filename + ' ' + psdBadge + '</div>';
                 html += '<div class="capture-info">';
                 html += formatBytes(c.size_bytes);
                 if (dur) html += ' &middot; ' + dur;
@@ -78,8 +79,16 @@
         }
     }
 
-    async function showDetail(filename) {
-        // Highlight selected
+    // --- Viewer state ---
+    let viewerGrid = null;     // loaded PSD rows (2D array)
+    let viewerFreqs = null;    // freq axis
+    let viewerTimeRes = 0;     // seconds per row
+    let viewerTotalRows = 0;
+    let viewerMin = -120;
+    let viewerMax = -40;
+    let viewerCrosshairBin = -1;
+
+    async function showDetail(filename, hasPsd) {
         document.querySelectorAll(".capture-item").forEach(function(el) {
             el.classList.toggle("selected", el.dataset.file === filename);
         });
@@ -112,10 +121,172 @@
             if (m.hostname) html += row("Hostname", m.hostname);
             if (m.serial) html += row("Serial", m.serial);
             html += '</table>';
+
+            // Viewer placeholder
+            if (hasPsd) {
+                html += '<div class="capture-viewer" id="viewer">';
+                html += '<div class="viewer-label">Loading PSD data...</div>';
+                html += '</div>';
+            }
+
             detailEl.innerHTML = html;
+
+            if (hasPsd) {
+                loadPsdViewer(filename);
+            }
 
         } catch (_) {
             detailEl.innerHTML = '<div class="placeholder-text">Failed to load details</div>';
+        }
+    }
+
+    async function loadPsdViewer(filename) {
+        const viewerEl = document.getElementById("viewer");
+        if (!viewerEl) return;
+
+        try {
+            const r = await fetch("/captures/psd/" + encodeURIComponent(filename) + "?start=0&count=2000&max_bins=512");
+            if (!r.ok) { viewerEl.innerHTML = '<div class="placeholder-text">PSD data unavailable</div>'; return; }
+            const d = await r.json();
+
+            viewerGrid = d.grid;
+            viewerFreqs = d.freq_axis;
+            viewerTimeRes = d.time_resolution_s;
+            viewerTotalRows = d.total_rows;
+            viewerCrosshairBin = -1;
+
+            // Compute dynamic range from data
+            let gMin = Infinity, gMax = -Infinity;
+            for (let r = 0; r < viewerGrid.length; r++) {
+                for (let c = 0; c < viewerGrid[r].length; c++) {
+                    const v = viewerGrid[r][c];
+                    if (v < gMin) gMin = v;
+                    if (v > gMax) gMax = v;
+                }
+            }
+            viewerMin = gMin - 3;
+            viewerMax = gMax + 3;
+
+            const totalDuration = (viewerTotalRows * viewerTimeRes).toFixed(3);
+            const loadedRows = viewerGrid.length;
+            const wfRows = Math.min(loadedRows, 400);
+
+            let html = '';
+            html += '<div class="viewer-label">Waterfall (' + loadedRows + ' / ' + viewerTotalRows + ' rows, '
+                + totalDuration + 's total)</div>';
+            html += '<div style="position:relative;">';
+            html += '<canvas id="viewer-wf" width="920" height="' + wfRows + '" class="viewer-canvas"></canvas>';
+            html += '</div>';
+            html += '<div class="viewer-slider-row">';
+            html += '<input type="range" id="viewer-slider" min="0" max="' + (loadedRows - 1)
+                + '" value="0" class="viewer-slider">';
+            html += '<span id="viewer-time" class="viewer-time">0.000s</span>';
+            html += '</div>';
+            html += '<div class="viewer-label">PSD at selected time</div>';
+            html += '<div style="position:relative;">';
+            html += '<canvas id="viewer-psd" width="920" height="160" class="viewer-canvas"></canvas>';
+            html += '<div id="viewer-psd-tooltip" class="graph-tooltip" style="display:none;"></div>';
+            html += '</div>';
+            html += '<div class="spectrogram-legend">';
+            html += '<span class="legend-label">' + viewerMin.toFixed(0) + '</span>';
+            html += '<canvas id="viewer-legend" width="200" height="12" style="width:200px;height:12px;border-radius:3px;"></canvas>';
+            html += '<span class="legend-label">' + viewerMax.toFixed(0) + '</span>';
+            html += '<span class="legend-label" style="margin-left:2px;">dBFS</span>';
+            html += '</div>';
+
+            viewerEl.innerHTML = html;
+
+            // Render waterfall
+            const wfCanvas = document.getElementById("viewer-wf");
+            const wfCtx = wfCanvas.getContext("2d");
+            const wfImgData = wfCtx.createImageData(920, wfRows);
+            for (let r = 0; r < wfRows; r++) {
+                renderWaterfallRow(wfImgData, 920, r, viewerGrid[r], viewerMin, viewerMax);
+            }
+            wfCtx.putImageData(wfImgData, 0, 0);
+
+            // Draw legend bar
+            const legCanvas = document.getElementById("viewer-legend");
+            const legCtx = legCanvas.getContext("2d");
+            for (let x = 0; x < 200; x++) {
+                const [cr, cg, cb] = powerToColor(x, 0, 199);
+                legCtx.fillStyle = "rgb(" + cr + "," + cg + "," + cb + ")";
+                legCtx.fillRect(x, 0, 1, 12);
+            }
+
+            // PSD view
+            const psdCanvas = document.getElementById("viewer-psd");
+            const psdCtx = psdCanvas.getContext("2d");
+            const psdTooltip = document.getElementById("viewer-psd-tooltip");
+
+            function drawViewerPSD(rowIdx) {
+                if (rowIdx < 0 || rowIdx >= viewerGrid.length) return;
+                const powers = viewerGrid[rowIdx];
+                drawPSD(psdCtx, 920, 160, powers, viewerFreqs, viewerMin, viewerMax, viewerCrosshairBin);
+            }
+
+            // Slider
+            const slider = document.getElementById("viewer-slider");
+            const timeLabel = document.getElementById("viewer-time");
+            slider.addEventListener("input", function() {
+                const idx = parseInt(this.value);
+                timeLabel.textContent = (idx * viewerTimeRes).toFixed(3) + "s";
+                drawViewerPSD(idx);
+                // Highlight row on waterfall
+                wfCtx.putImageData(wfImgData, 0, 0);
+                if (idx < wfRows) {
+                    wfCtx.strokeStyle = "rgba(255,255,255,0.6)";
+                    wfCtx.lineWidth = 1;
+                    wfCtx.beginPath();
+                    wfCtx.moveTo(0, idx + 0.5);
+                    wfCtx.lineTo(920, idx + 0.5);
+                    wfCtx.stroke();
+                }
+            });
+
+            // Waterfall click → set slider
+            wfCanvas.addEventListener("click", function(e) {
+                const rect = wfCanvas.getBoundingClientRect();
+                const scaleY = wfCanvas.height / rect.height;
+                const row = Math.floor((e.clientY - rect.top) * scaleY);
+                if (row >= 0 && row < loadedRows) {
+                    slider.value = row;
+                    slider.dispatchEvent(new Event("input"));
+                }
+            });
+
+            // PSD crosshair
+            psdCanvas.addEventListener("mousemove", function(e) {
+                const rect = psdCanvas.getBoundingClientRect();
+                const scaleX = psdCanvas.width / rect.width;
+                const x = (e.clientX - rect.left) * scaleX;
+                const N = viewerFreqs.length;
+                viewerCrosshairBin = Math.min(N - 1, Math.max(0, Math.floor((x / 920) * N)));
+
+                const freq = viewerFreqs[viewerCrosshairBin] || 0;
+                const idx = parseInt(slider.value);
+                const power = viewerGrid[idx] ? viewerGrid[idx][viewerCrosshairBin] || 0 : 0;
+
+                psdTooltip.style.display = "block";
+                psdTooltip.textContent = (freq / 1e6).toFixed(2) + " MHz  " + power.toFixed(1) + " dBFS";
+                const tipX = e.clientX - rect.left;
+                psdTooltip.style.left = Math.min(tipX + 10, rect.width - 160) + "px";
+                psdTooltip.style.top = "4px";
+
+                drawViewerPSD(idx);
+            });
+
+            psdCanvas.addEventListener("mouseleave", function() {
+                viewerCrosshairBin = -1;
+                psdTooltip.style.display = "none";
+                drawViewerPSD(parseInt(slider.value));
+            });
+
+            // Initial draw
+            drawViewerPSD(0);
+
+        } catch (_) {
+            viewerEl.innerHTML = '<div class="placeholder-text">Failed to load PSD data</div>';
         }
     }
 
@@ -123,13 +294,11 @@
         return '<tr><td class="detail-label">' + label + '</td><td class="detail-value">' + value + '</td></tr>';
     }
 
-    // Click handler (delegated)
     listEl.addEventListener("click", function(e) {
         const item = e.target.closest(".capture-item");
-        if (item) showDetail(item.dataset.file);
+        if (item) showDetail(item.dataset.file, item.dataset.hasPsd === "1");
     });
 
-    // Initial load + auto-refresh
     loadList();
     setInterval(loadList, 10000);
 })();

@@ -550,7 +550,6 @@ body {
     box-shadow: var(--shadow);
     padding: 16px;
     overflow-y: auto;
-    max-height: 600px;
 }
 
 .detail-header {
@@ -585,6 +584,58 @@ body {
     color: var(--text-primary);
     padding: 5px 0;
     word-break: break-all;
+}
+
+/* Capture viewer */
+.capture-viewer {
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+}
+
+.viewer-label {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    margin-bottom: 4px;
+}
+
+.viewer-canvas {
+    width: 100%;
+    border-radius: 6px;
+    display: block;
+}
+
+.viewer-slider-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 6px 0;
+}
+
+.viewer-slider {
+    flex: 1;
+    height: 4px;
+    accent-color: var(--accent);
+}
+
+.viewer-time {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    min-width: 60px;
+    text-align: right;
+}
+
+.psd-badge {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: 3px;
+    background: rgba(0, 113, 227, 0.12);
+    color: var(--accent);
+    vertical-align: middle;
 }
 
 /* Recording controls */

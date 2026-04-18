@@ -63,6 +63,119 @@ def test_captures_list_returns_json(client):
     assert isinstance(response.json(), list)
 
 
+class TestCapturesPSD:
+    def test_psd_missing_file(self, client):
+        resp = client.get("/captures/psd/nonexistent.sc16")
+        assert resp.status_code == 404
+
+    def test_psd_path_traversal(self, client):
+        resp = client.get("/captures/psd/../../../etc/passwd")
+        # FastAPI normalizes ../  so this is either 400 (validation) or 404 (route)
+        assert resp.status_code in (400, 404)
+
+    def test_psd_returns_data(self, client, settings, tmp_path):
+        # Create a mock .npz file in the storage path
+        from pathlib import Path
+
+        import numpy as np
+
+        storage = Path(settings.STORAGE_PATH)
+        storage.mkdir(parents=True, exist_ok=True)
+
+        grid = np.random.uniform(-100, -60, (100, 64)).astype(np.float32)
+        freq_axis = np.linspace(-500000, 500000, 64)
+        npz_path = storage / "test-capture.npz"
+        np.savez_compressed(
+            npz_path,
+            grid=grid,
+            freq_axis=freq_axis,
+            time_resolution_s=np.float64(0.001),
+            center_freq_hz=np.int64(915000000),
+            bandwidth_hz=np.int64(1000000),
+        )
+        # Also create the .sc16 so the capture shows up
+        (storage / "test-capture.sc16").write_bytes(b"\x00" * 100)
+
+        resp = client.get("/captures/psd/test-capture.sc16?start=0&count=50")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total_rows"] == 100
+        assert data["count"] == 50
+        assert data["start"] == 0
+        assert len(data["grid"]) == 50
+        assert len(data["freq_axis"]) > 0
+        assert data["center_freq_hz"] == 915000000
+
+        # Cleanup
+        npz_path.unlink(missing_ok=True)
+        (storage / "test-capture.sc16").unlink(missing_ok=True)
+
+    def test_psd_pagination(self, client, settings):
+        from pathlib import Path
+
+        import numpy as np
+
+        storage = Path(settings.STORAGE_PATH)
+        storage.mkdir(parents=True, exist_ok=True)
+
+        grid = np.random.uniform(-100, -60, (200, 32)).astype(np.float32)
+        freq_axis = np.linspace(-500000, 500000, 32)
+        npz_path = storage / "page-test.npz"
+        np.savez_compressed(
+            npz_path,
+            grid=grid,
+            freq_axis=freq_axis,
+            time_resolution_s=np.float64(0.001),
+            center_freq_hz=np.int64(915000000),
+            bandwidth_hz=np.int64(1000000),
+        )
+
+        # Page 2
+        resp = client.get("/captures/psd/page-test.npz?start=100&count=50")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["start"] == 100
+        assert data["count"] == 50
+        assert data["total_rows"] == 200
+
+        npz_path.unlink(missing_ok=True)
+
+    def test_captures_list_has_psd_field(self, client, settings):
+        from pathlib import Path
+
+        import numpy as np
+
+        storage = Path(settings.STORAGE_PATH)
+        storage.mkdir(parents=True, exist_ok=True)
+
+        # Create .sc16 without .npz
+        (storage / "no-psd.sc16").write_bytes(b"\x00" * 10)
+        # Create .sc16 with .npz
+        (storage / "with-psd.sc16").write_bytes(b"\x00" * 10)
+        np.savez_compressed(
+            storage / "with-psd.npz",
+            grid=np.zeros((10, 8)),
+            freq_axis=np.zeros(8),
+            time_resolution_s=np.float64(0.001),
+            center_freq_hz=np.int64(915000000),
+            bandwidth_hz=np.int64(1000000),
+        )
+
+        resp = client.get("/captures/list")
+        captures = resp.json()
+        by_name = {c["filename"]: c for c in captures}
+
+        if "no-psd.sc16" in by_name:
+            assert by_name["no-psd.sc16"]["has_psd"] is False
+        if "with-psd.sc16" in by_name:
+            assert by_name["with-psd.sc16"]["has_psd"] is True
+
+        # Cleanup
+        (storage / "no-psd.sc16").unlink(missing_ok=True)
+        (storage / "with-psd.sc16").unlink(missing_ok=True)
+        (storage / "with-psd.npz").unlink(missing_ok=True)
+
+
 def test_config_page(client):
     response = client.get("/config")
     assert response.status_code == 200

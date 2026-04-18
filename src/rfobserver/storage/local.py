@@ -37,8 +37,9 @@ class LocalStorage:
             oldest = files.pop(0)
             size = oldest.stat().st_size
             oldest.unlink()
-            # Also remove companion .json if present
+            # Also remove companion .json and .npz if present
             oldest.with_suffix(".json").unlink(missing_ok=True)
+            oldest.with_suffix(".npz").unlink(missing_ok=True)
             current_usage -= size
             logger.info("Rotated old file: %s (freed %d bytes)", oldest.name, size)
 

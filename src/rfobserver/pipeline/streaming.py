@@ -175,6 +175,11 @@ class StreamingProcessor:
         self._recording_buf: np.ndarray[Any, np.dtype[Any]] | None = None
         self._recording_buf_pos: int = 0
 
+        # PSD grid accumulation during recording (for .npz companion file)
+        self._recording_grids: list[np.ndarray[Any, np.dtype[Any]]] = []
+        self._recording_freq_axis: np.ndarray[Any, np.dtype[Any]] | None = None
+        self._recording_time_res: float = 0.0
+
         self._capture_count = 0
 
         # Burst results from burst thread -> event loop
@@ -470,6 +475,9 @@ class StreamingProcessor:
         self._recording_start = time.monotonic()
         self._below_threshold_count = 0
         self._recording_state = "recording"
+        self._recording_grids = []
+        self._recording_freq_axis = None
+        self._recording_time_res = 0.0
 
         s = self._settings
         pre_data = self._pre_trigger_buf.read()
@@ -548,6 +556,22 @@ class StreamingProcessor:
                 dest = self._storage.storage_path / base_name
                 if orig.exists():
                     orig.rename(dest)
+
+        # Save PSD grid data as .npz companion
+        grids = self._recording_grids
+        self._recording_grids = []
+        if grids and self._recording_freq_axis is not None:
+            full_grid = np.concatenate(grids, axis=0)
+            npz_path = self._storage.storage_path / base_name.replace(".sc16", ".npz")
+            np.savez_compressed(
+                npz_path,
+                grid=full_grid,
+                freq_axis=self._recording_freq_axis,
+                time_resolution_s=np.float64(self._recording_time_res),
+                center_freq_hz=np.int64(self._settings.FREQUENCY_START),
+                bandwidth_hz=np.int64(self._settings.BANDWIDTH),
+            )
+            logger.info("PSD data saved: %s (%d rows)", npz_path.name, full_grid.shape[0])
 
         # Write companion metadata JSON
         self._write_recording_metadata(base_name, duration)
@@ -734,6 +758,15 @@ class StreamingProcessor:
 
         with contextlib.suppress(queue.Full):
             self._burst_queue.put_nowait((cr.psd_grid, cr.center_freq_hz, cr.capture_num))
+
+        # Accumulate PSD grids during recording (for .npz companion file)
+        if self._recording_state == "recording":
+            self._recording_grids.append(cr.psd_grid.grid.copy())
+            self._recording_freq_axis = cr.psd_grid.freq_axis
+            if len(cr.psd_grid.time_axis) > 1:
+                self._recording_time_res = float(
+                    cr.psd_grid.time_axis[1] - cr.psd_grid.time_axis[0]
+                )
 
         self._capture_count = cr.capture_num
         latency_ms = (time.monotonic() - cr.recv_time) * 1000.0

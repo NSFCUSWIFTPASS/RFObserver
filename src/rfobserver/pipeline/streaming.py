@@ -168,7 +168,7 @@ class StreamingProcessor:
         self._below_threshold_count = 0
 
         # Disk-streaming write queue (default mode)
-        self._recording_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=32)
+        self._recording_queue: queue.Queue[Any] = queue.Queue(maxsize=64)
         self._writer_thread: threading.Thread | None = None
 
         # RAM-buffered recording (when RECORDING_RAM_BUFFER=True)
@@ -458,7 +458,8 @@ class StreamingProcessor:
                 self._recording_dropped += 1
                 logger.warning("RAM buffer full — dropped chunk")
         else:
-            # Disk-streaming mode
+            # Disk-streaming mode — convert to bytes on receiver thread
+            # (.tobytes() is a fast C-level copy that plays well with GIL)
             try:
                 self._recording_queue.put_nowait(sc16_buf.tobytes())
                 self._recording_bytes += n * 4
@@ -616,13 +617,14 @@ class StreamingProcessor:
         """Dedicated thread: drains recording queue and writes to disk."""
         filepath = self._storage.storage_path / (self._recording_file or "recording.sc16")
         try:
-            with open(filepath, "wb") as f:
+            with open(filepath, "wb", buffering=8 * 1024 * 1024) as f:
                 while True:
                     data = self._recording_queue.get()
                     if data is None:
                         break
                     f.write(data)
-                    f.flush()
+                    # No flush — let OS buffer writes for throughput.
+                    # Data is flushed on file close in _end_recording.
         except Exception:
             logger.exception("File writer crashed")
 

@@ -22,6 +22,7 @@
                     <span class="legend-item active" data-trace="power" style="--color: #0071e3;">Power</span>
                     <span class="legend-item" data-trace="kurtosis" style="--color: #ff9f0a;">Kurtosis</span>
                 </div>
+                <div id="ts-tooltip" class="graph-tooltip" style="display: none;"></div>
             </div>
             <div style="position: relative;">
                 <canvas id="psd-canvas" width="920" height="160" style="width: 100%; height: 160px;"></canvas>
@@ -30,9 +31,10 @@
             <canvas id="waterfall-canvas" width="920" height="260" style="width: 100%; height: 260px;"></canvas>
         </div>
         <div class="spectrogram-legend">
-            <span class="legend-label">Low</span>
+            <span class="legend-label" id="legend-min">--</span>
             <canvas id="legend-canvas" width="200" height="12" style="width: 200px; height: 12px; border-radius: 3px;"></canvas>
-            <span class="legend-label">High</span>
+            <span class="legend-label" id="legend-max">--</span>
+            <span class="legend-label" style="margin-left: 2px;">dBFS</span>
         </div>
     </div>
 
@@ -105,18 +107,57 @@
         return [r, g, b];
     }
 
+    // Dynamic range (must be declared before drawLegendBar)
+    let dynamicMin = -120;
+    let dynamicMax = -40;
+
     // Draw color legend
     const legendCanvas = document.getElementById("legend-canvas");
     const legendCtx = legendCanvas.getContext("2d");
-    for (let x = 0; x < 200; x++) {
-        const [r, g, b] = powerToColor(x, 0, 199);
-        legendCtx.fillStyle = `rgb(${r},${g},${b})`;
-        legendCtx.fillRect(x, 0, 1, 12);
+    function drawLegendBar() {
+        for (let x = 0; x < 200; x++) {
+            const [r, g, b] = powerToColor(x, 0, 199);
+            legendCtx.fillStyle = `rgb(${r},${g},${b})`;
+            legendCtx.fillRect(x, 0, 1, 12);
+        }
+        document.getElementById("legend-min").textContent = dynamicMin.toFixed(0);
+        document.getElementById("legend-max").textContent = dynamicMax.toFixed(0);
     }
+    drawLegendBar();
 
-    // --- Time-series chart ---
+    // --- Time-series chart with crosshair ---
     const tsCanvas = document.getElementById("timeseries-canvas");
     const tsCtx = tsCanvas.getContext("2d");
+    const tsTooltip = document.getElementById("ts-tooltip");
+    let tsCrosshairIdx = -1;
+
+    tsCanvas.addEventListener("mousemove", function(e) {
+        const N = tsAvgPower.length;
+        if (N < 2) return;
+        const rect = tsCanvas.getBoundingClientRect();
+        const scaleX = tsCanvas.width / rect.width;
+        const x = (e.clientX - rect.left) * scaleX;
+        tsCrosshairIdx = Math.min(N - 1, Math.max(0, Math.round((x / tsCanvas.width) * (TS_MAX_POINTS - 1))));
+        if (tsCrosshairIdx >= N) tsCrosshairIdx = N - 1;
+
+        let tip = "Avg " + tsAvgPower[tsCrosshairIdx].toFixed(1) + " dBFS";
+        if (traceVisible.kurtosis) {
+            tip += "  K " + tsKurtosis[tsCrosshairIdx].toFixed(2);
+        }
+        tsTooltip.textContent = tip;
+        tsTooltip.style.display = "block";
+        const tipX = e.clientX - rect.left;
+        tsTooltip.style.left = Math.min(tipX + 10, rect.width - 150) + "px";
+        tsTooltip.style.top = "4px";
+
+        drawTimeSeries();
+    });
+
+    tsCanvas.addEventListener("mouseleave", function() {
+        tsCrosshairIdx = -1;
+        tsTooltip.style.display = "none";
+        drawTimeSeries();
+    });
 
     function drawTimeSeries() {
         const W = tsCanvas.width;
@@ -136,16 +177,17 @@
             tsCtx.beginPath(); tsCtx.moveTo(0, y); tsCtx.lineTo(W, y); tsCtx.stroke();
         }
 
+        // Power range (needed for crosshair even if trace hidden)
+        let pMin = Infinity, pMax = -Infinity;
+        for (let i = 0; i < N; i++) {
+            if (tsAvgPower[i] < pMin) pMin = tsAvgPower[i];
+            if (tsAvgPower[i] > pMax) pMax = tsAvgPower[i];
+        }
+        const pPad = Math.max((pMax - pMin) * 0.1, 2);
+        pMin -= pPad; pMax += pPad;
+
         // Power trace
         if (traceVisible.power) {
-            let pMin = Infinity, pMax = -Infinity;
-            for (let i = 0; i < N; i++) {
-                if (tsAvgPower[i] < pMin) pMin = tsAvgPower[i];
-                if (tsAvgPower[i] > pMax) pMax = tsAvgPower[i];
-            }
-            const pPad = Math.max((pMax - pMin) * 0.1, 2);
-            pMin -= pPad; pMax += pPad;
-
             tsCtx.beginPath();
             for (let i = 0; i < N; i++) {
                 const x = (i / (TS_MAX_POINTS - 1)) * W;
@@ -159,12 +201,12 @@
             tsCtx.font = "10px -apple-system, sans-serif";
             tsCtx.fillStyle = "#0071e3";
             tsCtx.textAlign = "left";
-            tsCtx.fillText("Power " + tsAvgPower[N-1].toFixed(1) + " dB", 4, 12);
+            tsCtx.fillText("Power " + tsAvgPower[N-1].toFixed(1) + " dBFS", 4, 12);
 
             tsCtx.fillStyle = "rgba(255,255,255,0.4)";
             tsCtx.textAlign = "right";
-            tsCtx.fillText(pMax.toFixed(0) + " dB", W - 4, 12);
-            tsCtx.fillText(pMin.toFixed(0) + " dB", W - 4, H - 4);
+            tsCtx.fillText(pMax.toFixed(0) + " dBFS", W - 4, 12);
+            tsCtx.fillText(pMin.toFixed(0) + " dBFS", W - 4, H - 4);
         }
 
         // Kurtosis trace
@@ -192,48 +234,63 @@
             tsCtx.textAlign = "left";
             tsCtx.fillText("Kurtosis " + tsKurtosis[N-1].toFixed(2), 4, traceVisible.power ? 24 : 12);
         }
+
+        // Crosshair
+        if (tsCrosshairIdx >= 0 && tsCrosshairIdx < N) {
+            const cx = (tsCrosshairIdx / (TS_MAX_POINTS - 1)) * W;
+            tsCtx.strokeStyle = "rgba(255,255,255,0.4)";
+            tsCtx.lineWidth = 1;
+            tsCtx.setLineDash([4, 4]);
+            tsCtx.beginPath(); tsCtx.moveTo(cx, 0); tsCtx.lineTo(cx, H); tsCtx.stroke();
+            tsCtx.setLineDash([]);
+
+            // Dot on power trace
+            if (traceVisible.power) {
+                const py = H - ((tsAvgPower[tsCrosshairIdx] - pMin) / (pMax - pMin)) * H;
+                tsCtx.beginPath();
+                tsCtx.arc(cx, py, 3, 0, Math.PI * 2);
+                tsCtx.fillStyle = "#0071e3";
+                tsCtx.fill();
+            }
+        }
     }
 
-    // --- PSD line chart with crosshair ---
+    // --- PSD line chart with persistent crosshair ---
     const psdCanvas = document.getElementById("psd-canvas");
     const psdCtx = psdCanvas.getContext("2d");
     const psdTooltip = document.getElementById("psd-tooltip");
 
-    let dynamicMin = -120;
-    let dynamicMax = -40;
     let lastPowers = [];
     let lastFrequencies = [];
+    let psdCrosshairBin = -1;  // persists across redraws
 
-    // Crosshair on PSD
     psdCanvas.addEventListener("mousemove", function(e) {
         if (lastPowers.length === 0) return;
         const rect = psdCanvas.getBoundingClientRect();
         const scaleX = psdCanvas.width / rect.width;
         const x = (e.clientX - rect.left) * scaleX;
         const N = lastPowers.length;
-        const binIdx = Math.min(N - 1, Math.max(0, Math.floor((x / psdCanvas.width) * N)));
+        psdCrosshairBin = Math.min(N - 1, Math.max(0, Math.floor((x / psdCanvas.width) * N)));
 
-        const freq = lastFrequencies[binIdx] || 0;
-        const power = lastPowers[binIdx] || 0;
+        const freq = lastFrequencies[psdCrosshairBin] || 0;
+        const power = lastPowers[psdCrosshairBin] || 0;
 
         psdTooltip.style.display = "block";
-        psdTooltip.textContent = (freq / 1e6).toFixed(2) + " MHz  " + power.toFixed(1) + " dB";
+        psdTooltip.textContent = (freq / 1e6).toFixed(2) + " MHz  " + power.toFixed(1) + " dBFS";
         const tipX = e.clientX - rect.left;
-        psdTooltip.style.left = Math.min(tipX + 10, rect.width - 140) + "px";
+        psdTooltip.style.left = Math.min(tipX + 10, rect.width - 160) + "px";
         psdTooltip.style.top = "4px";
 
-        // Redraw with crosshair
-        drawPSD(lastPowers, lastFrequencies, binIdx);
+        drawPSD(lastPowers, lastFrequencies);
     });
 
     psdCanvas.addEventListener("mouseleave", function() {
+        psdCrosshairBin = -1;
         psdTooltip.style.display = "none";
-        drawPSD(lastPowers, lastFrequencies, -1);
+        drawPSD(lastPowers, lastFrequencies);
     });
 
-    function drawPSD(powers, frequencies, crosshairBin) {
-        if (typeof crosshairBin === "undefined") crosshairBin = -1;
-
+    function drawPSD(powers, frequencies) {
         const W = psdCanvas.width;
         const H = psdCanvas.height;
         psdCtx.clearRect(0, 0, W, H);
@@ -278,10 +335,10 @@
         psdCtx.lineWidth = 1.5;
         psdCtx.stroke();
 
-        // Crosshair
-        if (crosshairBin >= 0 && crosshairBin < N) {
-            const cx = (crosshairBin / (N - 1)) * W;
-            const cy = H - ((powers[crosshairBin] - min) / (max - min)) * H;
+        // Crosshair (uses persistent psdCrosshairBin)
+        if (psdCrosshairBin >= 0 && psdCrosshairBin < N) {
+            const cx = (psdCrosshairBin / (N - 1)) * W;
+            const cy = H - ((powers[psdCrosshairBin] - min) / (max - min)) * H;
             psdCtx.strokeStyle = "rgba(255,255,255,0.4)";
             psdCtx.lineWidth = 1;
             psdCtx.setLineDash([4, 4]);
@@ -289,7 +346,6 @@
             psdCtx.beginPath(); psdCtx.moveTo(0, cy); psdCtx.lineTo(W, cy); psdCtx.stroke();
             psdCtx.setLineDash([]);
 
-            // Dot
             psdCtx.beginPath();
             psdCtx.arc(cx, cy, 3, 0, Math.PI * 2);
             psdCtx.fillStyle = "#ffffff";
@@ -300,8 +356,8 @@
         psdCtx.fillStyle = "rgba(255,255,255,0.5)";
         psdCtx.font = "10px -apple-system, sans-serif";
         psdCtx.textAlign = "left";
-        psdCtx.fillText(max.toFixed(0) + " dB", 4, 12);
-        psdCtx.fillText(min.toFixed(0) + " dB", 4, H - 4);
+        psdCtx.fillText(max.toFixed(0) + " dBFS", 4, 12);
+        psdCtx.fillText(min.toFixed(0) + " dBFS", 4, H - 4);
 
         if (frequencies.length > 0) {
             const fMin = (frequencies[0] / 1e6).toFixed(1);
@@ -417,8 +473,9 @@
                 lastPowers = data.powers;
                 lastFrequencies = data.frequencies;
                 updateDynamicRange(data.powers);
-                drawPSD(data.powers, data.frequencies, -1);
+                drawPSD(data.powers, data.frequencies);
                 addWaterfallLine(data.powers);
+                drawLegendBar();
             }
         };
 
@@ -433,9 +490,8 @@
     connectWS();
 
     // --- Inline-editable status bar values ---
-    let editing = false;  // pause htmx polling while editing
+    let editing = false;
 
-    // Pause htmx status-bar refresh while an inline edit is active
     document.body.addEventListener("htmx:beforeRequest", function(e) {
         if (editing && e.detail.elt && e.detail.elt.getAttribute("hx-get") === "/api/status-bar") {
             e.preventDefault();
@@ -474,8 +530,13 @@
         }
 
         async function commit() {
-            const val = input.value.trim();
-            if (!val || val === raw) { cancel(); return; }
+            const rawInput = input.value.trim();
+            if (!rawInput || rawInput === raw) { cancel(); return; }
+
+            // Parse scientific notation (e.g. 2.437e9, 56e6)
+            const parsed = parseFloat(rawInput);
+            if (isNaN(parsed)) { cancel(); return; }
+            const val = (field === "duration_sec") ? String(parsed) : String(Math.round(parsed));
 
             btn.textContent = "...";
             btn.disabled = true;

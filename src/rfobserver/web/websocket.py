@@ -79,5 +79,7 @@ async def websocket_endpoint(websocket: WebSocket, broadcast: LiveBroadcast) -> 
         await asyncio.gather(send_loop(), recv_loop())
     except WebSocketDisconnect:
         pass
+    except Exception:
+        logger.exception("WebSocket handler error")
     finally:
         broadcast.unsubscribe(sub)

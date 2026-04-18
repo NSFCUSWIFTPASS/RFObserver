@@ -13,17 +13,17 @@
             <div class="form-row">
                 <div class="form-group">
                     <label for="freq-start">Start Frequency (Hz)</label>
-                    <input type="number" id="freq-start" name="frequency_start" value="{{ settings.FREQUENCY_START }}">
+                    <input type="text" id="freq-start" name="frequency_start" class="sci-input" value="{{ settings.FREQUENCY_START }}" placeholder="e.g. 2.437e9">
                 </div>
                 <div class="form-group">
                     <label for="freq-end">End Frequency (Hz)</label>
-                    <input type="number" id="freq-end" name="frequency_end" value="{{ settings.FREQUENCY_END }}">
+                    <input type="text" id="freq-end" name="frequency_end" class="sci-input" value="{{ settings.FREQUENCY_END }}" placeholder="e.g. 2.437e9">
                 </div>
             </div>
             <div class="form-row">
                 <div class="form-group">
                     <label for="bandwidth">Bandwidth (Hz)</label>
-                    <input type="number" id="bandwidth" name="bandwidth" value="{{ settings.BANDWIDTH }}">
+                    <input type="text" id="bandwidth" name="bandwidth" class="sci-input" value="{{ settings.BANDWIDTH }}" placeholder="e.g. 56e6">
                 </div>
                 <div class="form-group">
                     <label for="gain">Gain (dB)</label>
@@ -37,7 +37,7 @@
                 </div>
                 <div class="form-group">
                     <label for="freq-step">Frequency Step (Hz)</label>
-                    <input type="number" id="freq-step" name="frequency_step" value="{{ settings.FREQUENCY_STEP }}">
+                    <input type="text" id="freq-step" name="frequency_step" class="sci-input" value="{{ settings.FREQUENCY_STEP }}" placeholder="e.g. 1e6">
                 </div>
             </div>
         </div>
@@ -162,7 +162,21 @@
 
         const data = {};
         const fd = new FormData(form);
-        for (const [k, v] of fd.entries()) data[k] = v;
+        for (const [k, v] of fd.entries()) {
+            // Parse scientific notation (e.g. 2.437e9, 56e6) for sci-input fields
+            const el = form.querySelector('[name="' + k + '"]');
+            if (el && el.classList.contains('sci-input')) {
+                const parsed = parseFloat(v);
+                if (isNaN(parsed)) {
+                    alert('Invalid value for ' + k + ': ' + v);
+                    setState('error');
+                    return;
+                }
+                data[k] = String(Math.round(parsed));
+            } else {
+                data[k] = v;
+            }
+        }
 
         try {
             const resp = await fetch('/config/apply', {

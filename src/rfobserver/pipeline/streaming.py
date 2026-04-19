@@ -190,6 +190,9 @@ class StreamingProcessor:
             maxsize=32
         )
 
+        # Module manager — attached externally by pipeline/app.py (optional)
+        self._module_manager: Any = None
+
         # Reconfiguration generation counter — each thread tracks its own
         # last-seen generation and reconfigures when it changes.
         self._config_generation = 0
@@ -377,6 +380,10 @@ class StreamingProcessor:
 
                         # Store raw SC16 in pre-trigger buffer
                         self._pre_trigger_buf.write(buf[:n])
+
+                        # Feed upstream modules (GPU processing, non-blocking)
+                        if self._module_manager is not None:
+                            self._module_manager.feed_all(buf[:n], center_freq, s.BANDWIDTH)
 
                         # Handle recording / trigger
                         self._check_trigger_and_record(buf[:n])

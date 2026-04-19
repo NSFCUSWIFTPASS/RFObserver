@@ -75,6 +75,12 @@ async def run(settings: AppSettings) -> None:
             broadcast=broadcast,
             zms_monitor=zms_monitor,
         )
+
+        # Attach module manager for upstream signal processing
+        from rfobserver.modules.manager import ModuleManager
+
+        processor._module_manager = ModuleManager()
+
         logger.info("Using streaming pipeline")
     else:
         from rfobserver.pipeline.continuous import ContinuousProcessor

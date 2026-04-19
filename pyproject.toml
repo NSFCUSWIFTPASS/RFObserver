@@ -99,6 +99,7 @@ module = [
     "nats.*",
     "scipy.*",
     "numpy.*",
+    "cupy.*",
     "aiosqlite.*",
     "fastapi.*",
     "uvicorn.*",
@@ -123,6 +124,7 @@ module = [
     "rfobserver.capture.trigger",
     "rfobserver.capture.receiver",
     "rfobserver.capture.buffer",
+    "rfobserver.modules.*",
 ]
 disallow_any_generics = false
 

@@ -37,13 +37,14 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-    from rfobserver.web.routes import api, captures, config, dashboard, history
+    from rfobserver.web.routes import api, captures, config, dashboard, history, modules
 
     app.include_router(dashboard.router)
     app.include_router(config.router, prefix="/config")
     app.include_router(history.router, prefix="/history")
     app.include_router(captures.router, prefix="/captures")
     app.include_router(api.router, prefix="/api")
+    app.include_router(modules.router, prefix="/api")
 
     @app.get("/api/health")
     async def health() -> dict[str, str]:

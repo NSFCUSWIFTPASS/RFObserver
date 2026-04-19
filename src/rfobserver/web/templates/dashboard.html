@@ -75,6 +75,17 @@
             </table>
         </div>
     </div>
+
+    <div class="card">
+        <div class="card-header">
+            <span class="card-header-label">Signal Modules</span>
+            <span style="flex: 1;"></span>
+            <button id="add-module-btn" class="rec-btn rec-arm" style="font-size: 11px;">+ Add</button>
+        </div>
+        <div class="card-body" id="modules-container" style="padding: 8px;">
+            <div class="placeholder-text" id="modules-empty">No modules active</div>
+        </div>
+    </div>
 </div>
 
 <script>
@@ -662,6 +673,110 @@
         if (field === "bandwidth") return (v / 1e6).toFixed(0) + suffix;
         return v + suffix;
     }
+
+    // --- Signal Modules ---
+    const modulesContainer = document.getElementById("modules-container");
+    const modulesEmpty = document.getElementById("modules-empty");
+    const addModuleBtn = document.getElementById("add-module-btn");
+    let audioContexts = {};  // module_id → {ctx, ws, node}
+
+    addModuleBtn.addEventListener("click", function() {
+        const freq = prompt("FM channel frequency in Hz (e.g. 100.1e6 for 100.1 MHz):");
+        if (!freq) return;
+        const parsed = parseFloat(freq);
+        if (isNaN(parsed)) { alert("Invalid frequency"); return; }
+
+        fetch("/api/modules", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({type: "fm_demod", params: {channel_freq_hz: Math.round(parsed)}}),
+        }).then(r => r.json()).then(d => {
+            if (d.module_id) refreshModules();
+        }).catch(e => alert("Error: " + e.message));
+    });
+
+    function refreshModules() {
+        fetch("/api/modules").then(r => r.json()).then(d => {
+            const mods = d.modules || [];
+            if (mods.length === 0) {
+                modulesEmpty.style.display = "";
+                return;
+            }
+            modulesEmpty.style.display = "none";
+
+            let html = "";
+            for (const m of mods) {
+                const freq = (m.channel_freq_hz / 1e6).toFixed(1);
+                const playing = audioContexts[m.module_id] ? true : false;
+                html += '<div class="module-card" data-id="' + m.module_id + '">';
+                html += '<span class="module-type">FM</span> ';
+                html += '<span>' + freq + ' MHz</span>';
+                html += ' <span style="opacity:0.5;">#' + m.module_id + '</span>';
+                html += ' &middot; ' + m.chunks_processed + ' chunks';
+                html += ' <button class="rec-btn rec-start" onclick="toggleAudio(\'' + m.module_id + '\')">'
+                    + (playing ? '■ Stop' : '▶ Play') + '</button>';
+                html += ' <button class="rec-btn rec-stop" onclick="removeModule(\'' + m.module_id + '\')">✕</button>';
+                html += '</div>';
+            }
+            modulesContainer.innerHTML = html;
+        }).catch(() => {});
+    }
+
+    // Expose to onclick handlers
+    window.toggleAudio = function(moduleId) {
+        if (audioContexts[moduleId]) {
+            // Stop
+            const a = audioContexts[moduleId];
+            if (a.ws) a.ws.close();
+            if (a.ctx) a.ctx.close();
+            delete audioContexts[moduleId];
+            refreshModules();
+            return;
+        }
+
+        // Start audio playback
+        const wsUrl = "ws://" + location.host + "/api/ws/audio/" + moduleId;
+        const aws = new WebSocket(wsUrl);
+        let audioCtx = null;
+        let workletNode = null;
+
+        aws.onmessage = async function(evt) {
+            if (typeof evt.data === "string") {
+                // Config frame
+                const cfg = JSON.parse(evt.data);
+                audioCtx = new AudioContext({sampleRate: cfg.sample_rate});
+                await audioCtx.audioWorklet.addModule("/static/audio-worklet.js");
+                workletNode = new AudioWorkletNode(audioCtx, "pcm-player");
+                workletNode.connect(audioCtx.destination);
+                audioContexts[moduleId] = {ctx: audioCtx, ws: aws, node: workletNode};
+                refreshModules();
+            } else {
+                // PCM data
+                if (workletNode) {
+                    workletNode.port.postMessage(evt.data);
+                }
+            }
+        };
+
+        aws.onerror = function() { aws.close(); };
+        aws.onclose = function() {
+            if (audioContexts[moduleId]) {
+                delete audioContexts[moduleId];
+                refreshModules();
+            }
+        };
+    };
+
+    window.removeModule = function(moduleId) {
+        if (audioContexts[moduleId]) {
+            window.toggleAudio(moduleId);  // stop audio first
+        }
+        fetch("/api/modules/" + moduleId, {method: "DELETE"}).then(() => refreshModules());
+    };
+
+    // Poll module status
+    setInterval(refreshModules, 3000);
+    refreshModules();
 })();
 </script>
 {% endblock %}

@@ -23,8 +23,9 @@ function powerToColor(val, min, max) {
  * @param {number} min - dynamic range minimum (dBFS)
  * @param {number} max - dynamic range maximum (dBFS)
  * @param {number} crosshairBin - bin index for crosshair (-1 = none)
+ * @param {number|null} triggerLevel - absolute dBFS level for trigger line (null = hidden)
  */
-function drawPSD(ctx, W, H, powers, frequencies, min, max, crosshairBin) {
+function drawPSD(ctx, W, H, powers, frequencies, min, max, crosshairBin, triggerLevel) {
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = "#1a1a2e";
     ctx.fillRect(0, 0, W, H);
@@ -81,6 +82,25 @@ function drawPSD(ctx, W, H, powers, frequencies, min, max, crosshairBin) {
         ctx.arc(cx, cy, 3, 0, Math.PI * 2);
         ctx.fillStyle = "#ffffff";
         ctx.fill();
+    }
+
+    // Trigger level line
+    if (triggerLevel != null) {
+        const ty = H - ((triggerLevel - min) / (max - min)) * H;
+        if (ty >= 0 && ty <= H) {
+            ctx.strokeStyle = "rgba(255, 60, 60, 0.7)";
+            ctx.lineWidth = 1;
+            ctx.setLineDash([6, 4]);
+            ctx.beginPath();
+            ctx.moveTo(0, ty);
+            ctx.lineTo(W, ty);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.fillStyle = "rgba(255, 60, 60, 0.9)";
+            ctx.font = "10px -apple-system, sans-serif";
+            ctx.textAlign = "right";
+            ctx.fillText("Trigger " + triggerLevel.toFixed(1) + " dBFS", W - 4, ty - 4);
+        }
     }
 
     // Axis labels

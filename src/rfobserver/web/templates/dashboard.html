@@ -294,11 +294,67 @@
     let lastFrequencies = [];
     let psdCrosshairBin = -1;  // persists across redraws
 
+    // Trigger line state
+    let burstThresholdDb = {{ settings.BURST_THRESHOLD_HIGH_DB }};
+    let noiseFloor = -100;
+    let triggerLevel = noiseFloor + burstThresholdDb;
+    let draggingTrigger = false;
+
+    function computeNoiseFloor(powers) {
+        if (!powers.length) return -100;
+        const sorted = [...powers].sort((a, b) => a - b);
+        return sorted[Math.floor(sorted.length * 0.1)];
+    }
+
+    // Trigger line drag interaction
+    psdCanvas.addEventListener("mousedown", function(e) {
+        const rect = psdCanvas.getBoundingClientRect();
+        const scaleY = psdCanvas.height / rect.height;
+        const my = (e.clientY - rect.top) * scaleY;
+        const H = psdCanvas.height;
+        const ty = H - ((triggerLevel - dynamicMin) / (dynamicMax - dynamicMin)) * H;
+        if (Math.abs(my - ty) < 8) {
+            draggingTrigger = true;
+            e.preventDefault();
+        }
+    });
+
+    psdCanvas.addEventListener("mouseup", function() {
+        if (draggingTrigger) {
+            draggingTrigger = false;
+            // Save new threshold
+            const newThreshold = Math.round((triggerLevel - noiseFloor) * 10) / 10;
+            burstThresholdDb = newThreshold;
+            fetch("/config/apply", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({burst_threshold_high_db: String(newThreshold)}),
+            });
+            psdCanvas.style.cursor = "";
+        }
+    });
+
     psdCanvas.addEventListener("mousemove", function(e) {
         if (lastPowers.length === 0) return;
         const rect = psdCanvas.getBoundingClientRect();
         const scaleX = psdCanvas.width / rect.width;
+        const scaleY = psdCanvas.height / rect.height;
         const x = (e.clientX - rect.left) * scaleX;
+        const my = (e.clientY - rect.top) * scaleY;
+        const H = psdCanvas.height;
+
+        // Handle trigger line dragging
+        if (draggingTrigger) {
+            triggerLevel = dynamicMax - (my / H) * (dynamicMax - dynamicMin);
+            psdCanvas.style.cursor = "ns-resize";
+            redrawPSD();
+            return;
+        }
+
+        // Show resize cursor near trigger line
+        const ty = H - ((triggerLevel - dynamicMin) / (dynamicMax - dynamicMin)) * H;
+        psdCanvas.style.cursor = Math.abs(my - ty) < 8 ? "ns-resize" : "";
+
         const N = lastPowers.length;
         psdCrosshairBin = Math.min(N - 1, Math.max(0, Math.floor((x / psdCanvas.width) * N)));
 
@@ -315,6 +371,10 @@
     });
 
     psdCanvas.addEventListener("mouseleave", function() {
+        if (draggingTrigger) {
+            draggingTrigger = false;
+            psdCanvas.style.cursor = "";
+        }
         psdCrosshairBin = -1;
         psdTooltip.style.display = "none";
         redrawPSD();
@@ -322,7 +382,8 @@
 
     function redrawPSD() {
         drawPSD(psdCtx, psdCanvas.width, psdCanvas.height,
-            lastPowers, lastFrequencies, dynamicMin, dynamicMax, psdCrosshairBin);
+            lastPowers, lastFrequencies, dynamicMin, dynamicMax,
+            psdCrosshairBin, triggerLevel);
     }
 
     // --- Waterfall ---
@@ -379,7 +440,7 @@
         // 1. Shift all existing bursts down 1 pixel (waterfall scrolled 1 row)
         for (let i = activeBursts.length - 1; i >= 0; i--) {
             activeBursts[i].y += 1;
-            if (activeBursts[i].y - activeBursts[i].h > wfHeight) {
+            if (activeBursts[i].y > wfHeight) {
                 activeBursts.splice(i, 1);
             }
         }
@@ -398,13 +459,13 @@
                 if (!isDup) {
                     const x = b.freq_start * wfWidth;
                     const w = Math.max(3, (b.freq_end - b.freq_start) * wfWidth);
-                    // New burst appears at top of waterfall (y=0), height
-                    // based on duration relative to the update rate.
                     const ups = upsTimestamps.length > 1
                         ? (upsTimestamps.length - 1) / ((upsTimestamps[upsTimestamps.length - 1] - upsTimestamps[0]) / 1000)
                         : 2;
                     const h = Math.max(3, (b.duration_ms / 1000) * ups);
-                    activeBursts.push({x, y: 0, w, h, key, meta: b});
+                    // Position using age_sec — how far back in time
+                    const y = Math.round((b.age_sec || 0) * ups);
+                    activeBursts.push({x, y, w, h, key, meta: b});
                 }
             }
         }
@@ -506,6 +567,11 @@
                 lastPowers = data.powers;
                 lastFrequencies = data.frequencies;
                 updateDynamicRange(data.powers);
+                // Update noise floor + trigger level (unless dragging)
+                if (!draggingTrigger) {
+                    noiseFloor = computeNoiseFloor(data.powers);
+                    triggerLevel = noiseFloor + burstThresholdDb;
+                }
                 redrawPSD();
                 addWaterfallLine(data.powers);
                 updateBurstOverlay(data.bursts);

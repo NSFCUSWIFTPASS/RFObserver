@@ -226,7 +226,7 @@
             function drawViewerPSD(rowIdx) {
                 if (rowIdx < 0 || rowIdx >= viewerGrid.length) return;
                 const powers = viewerGrid[rowIdx];
-                drawPSD(psdCtx, 920, 160, powers, viewerFreqs, viewerMin, viewerMax, viewerCrosshairBin);
+                drawPSD(psdCtx, 920, 160, powers, viewerFreqs, viewerMin, viewerMax, viewerCrosshairBin, null);
             }
 
             // Slider

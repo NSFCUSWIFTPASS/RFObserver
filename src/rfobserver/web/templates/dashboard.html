@@ -17,7 +17,7 @@
             </label>
             <label class="toggle-label" title="Show detected bursts on waterfall">
                 <input type="checkbox" id="burst-toggle" checked>
-                <span style="display:inline-block;width:10px;height:10px;border:1.5px solid #ff3b30;border-radius:2px;vertical-align:middle;"></span>
+                <span style="display:inline-block;width:15px;height:13px;border:1.5px solid #ff3b30;border-radius:2px;vertical-align:middle;"></span>
             </label>
             <span class="status-sep">&middot;</span>
             <span id="rec-controls">
@@ -478,15 +478,7 @@
                 const timingEl = document.getElementById("timing-info");
                 if (timingEl) {
                     const procMs = data.process_ms || 0;
-                    const excessMs = data.excess_ms || 0;
-                    let txt = procMs.toFixed(0) + " ms proc";
-                    if (excessMs > 0) {
-                        txt += " (+" + excessMs.toFixed(0) + " ms excess)";
-                        timingEl.style.color = "#ff453a";
-                    } else {
-                        timingEl.style.color = "";
-                    }
-                    timingEl.textContent = txt;
+                    timingEl.textContent = procMs.toFixed(0) + " ms proc";
                     const sep = document.getElementById("timing-sep");
                     if (sep) sep.style.display = "";
                 }

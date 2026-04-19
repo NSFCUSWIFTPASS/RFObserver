@@ -24,10 +24,17 @@ def _get_manager(request: Request) -> Any:
 async def list_modules(request: Request) -> dict[str, Any]:
     mgr = _get_manager(request)
     if mgr is None:
-        return {"modules": [], "available_types": []}
+        return {"modules": [], "available_types": {}}
+    modules = mgr.list_modules()
+    # Add has_audio to each module status
+    for m_status in modules:
+        mid = m_status.get("module_id")
+        mod = mgr.get_module(mid) if mid else None
+        if mod:
+            m_status["has_audio"] = mod.has_audio_output
     return {
-        "modules": mgr.list_modules(),
-        "available_types": mgr.available_types(),
+        "modules": modules,
+        "available_types": mgr.registry_info(),
     }
 
 
@@ -52,6 +59,7 @@ async def create_module(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     result: dict[str, Any] = module.status()
+    result["has_audio"] = module.has_audio_output
     return result
 
 
@@ -66,6 +74,7 @@ async def get_module(request: Request, module_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Module not found")
 
     result: dict[str, Any] = module.status()
+    result["has_audio"] = module.has_audio_output
     return result
 
 
@@ -82,6 +91,7 @@ async def update_module(request: Request, module_id: str) -> dict[str, Any]:
     body = await request.json()
     module.configure(body)
     result: dict[str, Any] = module.status()
+    result["has_audio"] = module.has_audio_output
     return result
 
 
@@ -121,7 +131,7 @@ async def audio_websocket(websocket: WebSocket, module_id: str) -> None:
 
     config = {
         "type": "audio_config",
-        "sample_rate": module._params.get("audio_rate", 48000),
+        "sample_rate": module.audio_sample_rate,
         "channels": 1,
         "format": "int16",
     }

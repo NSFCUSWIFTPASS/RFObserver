@@ -741,61 +741,130 @@
     const modulesContainer = document.getElementById("modules-container");
     const modulesEmpty = document.getElementById("modules-empty");
     const addModuleBtn = document.getElementById("add-module-btn");
-    let audioContexts = {};  // module_id → {ctx, ws, node}
+    let audioContexts = {};
+    let moduleTypes = {};  // cached from API
 
     addModuleBtn.addEventListener("click", function() {
+        // Use first available type with its defaults
+        const types = Object.keys(moduleTypes);
+        const mtype = types.length > 0 ? types[0] : "fm_demod";
         fetch("/api/modules", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({type: "fm_demod", params: {channel_freq_hz: 101900000}}),
+            body: JSON.stringify({type: mtype, params: {}}),
         }).then(r => r.json()).then(d => {
             if (d.module_id) refreshModules();
         }).catch(e => alert("Error: " + e.message));
     });
 
     function refreshModules() {
+        // Skip refresh when an input is focused (prevents input destruction)
+        if (modulesContainer.querySelector("input:focus, select:focus")) return;
+
         fetch("/api/modules").then(r => r.json()).then(d => {
             const mods = d.modules || [];
+            moduleTypes = d.available_types || {};
+
             if (mods.length === 0) {
                 modulesEmpty.style.display = "";
+                modulesContainer.querySelectorAll(".module-card").forEach(e => e.remove());
                 return;
             }
             modulesEmpty.style.display = "none";
 
             let html = "";
             for (const m of mods) {
-                const freq = (m.channel_freq_hz / 1e6).toFixed(1);
-                const playing = audioContexts[m.module_id] ? true : false;
                 const mid = m.module_id;
+                const mtype = m.module_type;
+                const typeInfo = moduleTypes[mtype] || {};
+                const params = typeInfo.parameters || [];
+                const playing = !!audioContexts[mid];
+
                 html += '<div class="module-card" data-id="' + mid + '">';
-                html += '<span class="module-type">FM</span> ';
-                html += '<input type="text" class="module-freq-input" value="' + freq
-                    + '" data-mid="' + mid + '" title="Channel freq (MHz or Hz with e notation)">';
-                html += '<span class="qc-unit">MHz</span>';
-                html += ' <button class="rec-btn rec-start" onclick="toggleAudio(\'' + mid + '\')">'
-                    + (playing ? '■ Stop' : '▶ Play') + '</button>';
-                html += ' <button class="rec-btn rec-stop" onclick="removeModule(\'' + mid + '\')">✕</button>';
+                html += '<span class="module-type">' + mtype.replace("_", " ").toUpperCase() + '</span> ';
+
+                // Render each parameter generically
+                for (const p of params) {
+                    const val = m[p.name] !== undefined ? m[p.name] : p.default;
+                    if (p.type === "number") {
+                        let displayVal = val;
+                        let displayUnit = p.unit;
+                        if (p.unit === "Hz" && val >= 1e6) {
+                            displayVal = (val / 1e6).toFixed(1);
+                            displayUnit = "MHz";
+                        }
+                        html += '<input type="text" class="module-freq-input" value="' + displayVal
+                            + '" data-mid="' + mid + '" data-param="' + p.name
+                            + '" data-unit="' + p.unit + '" title="' + p.label + '">';
+                        html += '<span class="qc-unit">' + displayUnit + '</span> ';
+                    } else if (p.type === "range") {
+                        html += '<input type="range" class="module-range" value="' + val
+                            + '" min="' + (p.min||0) + '" max="' + (p.max||1) + '" step="' + (p.step||0.01)
+                            + '" data-mid="' + mid + '" data-param="' + p.name
+                            + '" title="' + p.label + '" style="width:60px;vertical-align:middle;"> ';
+                    } else if (p.type === "select") {
+                        html += '<select class="module-select" data-mid="' + mid + '" data-param="' + p.name
+                            + '" title="' + p.label + '" style="font-size:11px;">';
+                        for (const opt of (p.options || [])) {
+                            const sel = String(val) === opt ? " selected" : "";
+                            html += '<option value="' + opt + '"' + sel + '>' + opt + '</option>';
+                        }
+                        html += '</select> ';
+                    }
+                }
+
+                // Audio play button (only if module has audio output)
+                if (m.has_audio) {
+                    html += '<button class="rec-btn rec-start" onclick="toggleAudio(\'' + mid + '\')">'
+                        + (playing ? '■ Stop' : '▶ Play') + '</button> ';
+                }
+                html += '<button class="rec-btn rec-stop" onclick="removeModule(\'' + mid + '\')">✕</button>';
                 html += '</div>';
             }
             modulesContainer.innerHTML = html;
 
-            // Attach freq change handlers
+            // Attach generic param change handlers
             modulesContainer.querySelectorAll(".module-freq-input").forEach(function(inp) {
-                function commitFreq() {
+                function commit() {
                     let v = parseFloat(inp.value);
                     if (isNaN(v)) return;
-                    // If value looks like MHz (< 1e6), convert to Hz
-                    if (v < 1e6) v = v * 1e6;
+                    if (inp.dataset.unit === "Hz" && v < 1e6) v = v * 1e6;
+                    const body = {};
+                    body[inp.dataset.param] = v;
                     fetch("/api/modules/" + inp.dataset.mid, {
                         method: "PATCH",
                         headers: {"Content-Type": "application/json"},
-                        body: JSON.stringify({channel_freq_hz: Math.round(v)}),
+                        body: JSON.stringify(body),
                     });
                 }
                 inp.addEventListener("keydown", function(e) {
-                    if (e.key === "Enter") { e.preventDefault(); commitFreq(); inp.blur(); }
+                    if (e.key === "Enter") { e.preventDefault(); commit(); inp.blur(); }
                 });
-                inp.addEventListener("blur", commitFreq);
+                inp.addEventListener("blur", commit);
+            });
+
+            modulesContainer.querySelectorAll(".module-range").forEach(function(inp) {
+                inp.addEventListener("input", function() {
+                    const body = {};
+                    body[inp.dataset.param] = parseFloat(inp.value);
+                    fetch("/api/modules/" + inp.dataset.mid, {
+                        method: "PATCH",
+                        headers: {"Content-Type": "application/json"},
+                        body: JSON.stringify(body),
+                    });
+                });
+            });
+
+            modulesContainer.querySelectorAll(".module-select").forEach(function(sel) {
+                sel.addEventListener("change", function() {
+                    const body = {};
+                    body[sel.dataset.param] = sel.value;
+                    fetch("/api/modules/" + sel.dataset.mid, {
+                        method: "PATCH",
+                        headers: {"Content-Type": "application/json"},
+                        body: JSON.stringify(body),
+                    });
+                });
             });
         }).catch(() => {});
     }
@@ -803,7 +872,6 @@
     // Expose to onclick handlers
     window.toggleAudio = function(moduleId) {
         if (audioContexts[moduleId]) {
-            // Stop
             const a = audioContexts[moduleId];
             if (a.ws) a.ws.close();
             if (a.ctx) a.ctx.close();
@@ -812,26 +880,22 @@
             return;
         }
 
-        // Start audio playback
         const wsUrl = "ws://" + location.host + "/api/ws/audio/" + moduleId;
         const aws = new WebSocket(wsUrl);
         let audioCtx = null;
-        let workletNode = null;
-
         let scriptNode = null;
         let pcmBuffer = new Float32Array(0);
+        let started = false;
+        let preBufferSamples = 0;
 
         aws.binaryType = "arraybuffer";
         aws.onmessage = async function(evt) {
             if (typeof evt.data === "string") {
-                // Config frame
                 const cfg = JSON.parse(evt.data);
                 audioCtx = new AudioContext({sampleRate: cfg.sample_rate});
+                preBufferSamples = cfg.sample_rate * 0.3;  // 300ms pre-buffer
 
-                // Use ScriptProcessorNode (works on non-HTTPS)
-                // AudioWorklet requires secure context which isn't
-                // available when accessing via IP address
-                const bufSize = 4096;
+                const bufSize = 8192;
                 scriptNode = audioCtx.createScriptProcessor(bufSize, 0, 1);
                 scriptNode.onaudioprocess = function(e) {
                     const out = e.outputBuffer.getChannelData(0);
@@ -842,11 +906,10 @@
                         out.fill(0);
                     }
                 };
-                scriptNode.connect(audioCtx.destination);
+                // Don't connect yet — wait for pre-buffer
                 audioContexts[moduleId] = {ctx: audioCtx, ws: aws, node: scriptNode};
                 refreshModules();
             } else {
-                // PCM data — convert Int16 to Float32 and append to buffer
                 const int16 = new Int16Array(evt.data);
                 const f32 = new Float32Array(int16.length);
                 for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768.0;
@@ -854,8 +917,15 @@
                 newBuf.set(pcmBuffer);
                 newBuf.set(f32, pcmBuffer.length);
                 pcmBuffer = newBuf;
-                // Cap at 2 seconds to avoid memory growth
-                const maxSamples = (audioCtx ? audioCtx.sampleRate : 48000) * 2;
+
+                // Start playback after pre-buffer fills
+                if (!started && pcmBuffer.length >= preBufferSamples && scriptNode && audioCtx) {
+                    scriptNode.connect(audioCtx.destination);
+                    started = true;
+                }
+
+                // Cap at 4 seconds
+                const maxSamples = (audioCtx ? audioCtx.sampleRate : 48000) * 4;
                 if (pcmBuffer.length > maxSamples) {
                     pcmBuffer = pcmBuffer.slice(pcmBuffer.length - maxSamples);
                 }

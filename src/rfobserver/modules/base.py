@@ -5,12 +5,26 @@ from __future__ import annotations
 import asyncio
 import uuid
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from typing import Any
-
     import numpy as np
+
+
+@dataclass(frozen=True, slots=True)
+class ParamDescriptor:
+    """Describes a tunable module parameter for generic UI rendering."""
+
+    name: str  # key in _params dict
+    label: str  # human-readable label
+    type: str  # "number" | "range" | "select"
+    default: float | int | str
+    unit: str = ""  # e.g. "MHz", "Hz", "%"
+    min: float | None = None
+    max: float | None = None
+    step: float | None = None
+    options: list[str] = field(default_factory=list)  # for "select" type
 
 
 class UpstreamModule(ABC):
@@ -23,11 +37,18 @@ class UpstreamModule(ABC):
     """
 
     module_type: str = "base"
+    has_audio_output: bool = False
+    audio_sample_rate: int = 48_000
 
     def __init__(self, params: dict[str, Any] | None = None) -> None:
         self.module_id: str = str(uuid.uuid4())[:8]
         self._params: dict[str, Any] = params or {}
         self._output_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=64)
+
+    @classmethod
+    @abstractmethod
+    def parameters(cls) -> list[ParamDescriptor]:
+        """Declare tunable parameters for the dashboard UI."""
 
     @abstractmethod
     def configure(self, params: dict[str, Any]) -> None:
@@ -35,10 +56,7 @@ class UpstreamModule(ABC):
 
     @abstractmethod
     def feed(self, sc16_buf: np.ndarray, center_freq_hz: int, sample_rate: int) -> None:
-        """Receive a chunk of SC16 IQ data from the receiver thread.
-
-        Must not block — enqueue internally for async processing.
-        """
+        """Receive a chunk of SC16 IQ data from the receiver thread."""
 
     @abstractmethod
     def start(self) -> None:

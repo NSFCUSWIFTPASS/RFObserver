@@ -32,6 +32,19 @@ class ModuleManager:
     def available_types() -> list[str]:
         return list(_REGISTRY.keys())
 
+    @staticmethod
+    def registry_info() -> dict[str, dict[str, Any]]:
+        """Return parameter descriptors and capabilities for each module type."""
+        from dataclasses import asdict
+
+        info: dict[str, dict[str, Any]] = {}
+        for name, cls in _REGISTRY.items():
+            info[name] = {
+                "parameters": [asdict(p) for p in cls.parameters()],
+                "has_audio": cls.has_audio_output,
+            }
+        return info
+
     def create_module(
         self, module_type: str, params: dict[str, Any] | None = None
     ) -> UpstreamModule:

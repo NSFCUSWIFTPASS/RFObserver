@@ -15,7 +15,7 @@ from typing import Any
 
 import numpy as np
 
-from rfobserver.modules.base import UpstreamModule
+from rfobserver.modules.base import ParamDescriptor, UpstreamModule
 from rfobserver.modules.manager import register_module
 
 logger = logging.getLogger(__name__)
@@ -33,15 +33,56 @@ class FMDemodModule(UpstreamModule):
     """FM broadcast demodulator running on the Jetson GPU."""
 
     module_type = "fm_demod"
+    has_audio_output = True
+    audio_sample_rate = 48_000
 
     # Default parameters
     _DEFAULTS: dict[str, Any] = {
-        "channel_freq_hz": 0,  # required — FM station center freq
-        "channel_bw_hz": 200_000,  # standard broadcast FM
+        "channel_freq_hz": 101_900_000,
+        "channel_bw_hz": 200_000,
         "audio_rate": 48_000,
-        "deemphasis_tau": 75e-6,  # 75 μs (US), 50 μs (EU)
+        "deemphasis_tau": 75e-6,
         "volume": 0.8,
     }
+
+    @classmethod
+    def parameters(cls) -> list[ParamDescriptor]:
+        return [
+            ParamDescriptor(
+                name="channel_freq_hz",
+                label="Frequency",
+                type="number",
+                default=101_900_000,
+                unit="Hz",
+                step=100_000,
+            ),
+            ParamDescriptor(
+                name="channel_bw_hz",
+                label="Channel BW",
+                type="number",
+                default=200_000,
+                unit="Hz",
+                min=50_000,
+                max=300_000,
+                step=10_000,
+            ),
+            ParamDescriptor(
+                name="volume",
+                label="Volume",
+                type="range",
+                default=0.8,
+                min=0,
+                max=1,
+                step=0.05,
+            ),
+            ParamDescriptor(
+                name="deemphasis_tau",
+                label="De-emphasis",
+                type="select",
+                default="75e-6",
+                options=["75e-6", "50e-6"],
+            ),
+        ]
 
     def __init__(self, params: dict[str, Any] | None = None) -> None:
         super().__init__(params)
@@ -53,9 +94,8 @@ class FMDemodModule(UpstreamModule):
         for k, v in self._DEFAULTS.items():
             self._params.setdefault(k, v)
 
-        if not self._params["channel_freq_hz"]:
-            msg = "channel_freq_hz is required"
-            raise ValueError(msg)
+        if not self._params.get("channel_freq_hz"):
+            self._params["channel_freq_hz"] = 101_900_000
 
         self._running = False
         self._input_queue: queue.Queue[tuple[np.ndarray, int, int]] = queue.Queue(maxsize=8)

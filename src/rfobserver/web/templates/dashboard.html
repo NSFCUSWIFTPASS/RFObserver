@@ -755,20 +755,46 @@
         let audioCtx = null;
         let workletNode = null;
 
+        let scriptNode = null;
+        let pcmBuffer = new Float32Array(0);
+
+        aws.binaryType = "arraybuffer";
         aws.onmessage = async function(evt) {
             if (typeof evt.data === "string") {
                 // Config frame
                 const cfg = JSON.parse(evt.data);
                 audioCtx = new AudioContext({sampleRate: cfg.sample_rate});
-                await audioCtx.audioWorklet.addModule("/static/audio-worklet.js");
-                workletNode = new AudioWorkletNode(audioCtx, "pcm-player");
-                workletNode.connect(audioCtx.destination);
-                audioContexts[moduleId] = {ctx: audioCtx, ws: aws, node: workletNode};
+
+                // Use ScriptProcessorNode (works on non-HTTPS)
+                // AudioWorklet requires secure context which isn't
+                // available when accessing via IP address
+                const bufSize = 4096;
+                scriptNode = audioCtx.createScriptProcessor(bufSize, 0, 1);
+                scriptNode.onaudioprocess = function(e) {
+                    const out = e.outputBuffer.getChannelData(0);
+                    if (pcmBuffer.length >= out.length) {
+                        out.set(pcmBuffer.subarray(0, out.length));
+                        pcmBuffer = pcmBuffer.slice(out.length);
+                    } else {
+                        out.fill(0);
+                    }
+                };
+                scriptNode.connect(audioCtx.destination);
+                audioContexts[moduleId] = {ctx: audioCtx, ws: aws, node: scriptNode};
                 refreshModules();
             } else {
-                // PCM data
-                if (workletNode) {
-                    workletNode.port.postMessage(evt.data);
+                // PCM data — convert Int16 to Float32 and append to buffer
+                const int16 = new Int16Array(evt.data);
+                const f32 = new Float32Array(int16.length);
+                for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768.0;
+                const newBuf = new Float32Array(pcmBuffer.length + f32.length);
+                newBuf.set(pcmBuffer);
+                newBuf.set(f32, pcmBuffer.length);
+                pcmBuffer = newBuf;
+                // Cap at 2 seconds to avoid memory growth
+                const maxSamples = (audioCtx ? audioCtx.sampleRate : 48000) * 2;
+                if (pcmBuffer.length > maxSamples) {
+                    pcmBuffer = pcmBuffer.slice(pcmBuffer.length - maxSamples);
                 }
             }
         };

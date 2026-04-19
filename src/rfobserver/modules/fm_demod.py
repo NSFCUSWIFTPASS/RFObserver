@@ -165,7 +165,8 @@ class FMDemodModule(UpstreamModule):
 
         # 2. Frequency shift
         t = cp.arange(n, dtype=cp.float64) / sample_rate + self._phase_acc
-        shift = cp.exp(cp.float64(-2j * cp.pi * delta_f) * t).astype(cp.complex64)
+        phase = cp.float64(-2.0 * float(cp.pi) * delta_f) * t
+        shift = cp.exp(1j * phase).astype(cp.complex64)
         iq *= shift
         self._phase_acc += n / sample_rate
         # Keep phase accumulator bounded to avoid precision loss

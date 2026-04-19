@@ -15,6 +15,10 @@
                 <input type="checkbox" id="highres-toggle">
                 <span class="toggle-text">High Res</span>
             </label>
+            <label class="toggle-label" title="Show detected bursts on waterfall">
+                <input type="checkbox" id="burst-toggle" checked>
+                <span style="display:inline-block;width:10px;height:10px;border:1.5px solid #ff3b30;border-radius:2px;vertical-align:middle;"></span>
+            </label>
             <span class="status-sep">&middot;</span>
             <span id="rec-controls">
                 <button id="rec-btn" class="rec-btn rec-start" title="Start recording">REC</button>
@@ -80,7 +84,16 @@
 
     // High-res mode state
     let highRes = false;
+    let showBursts = true;
     let ws = null;
+
+    const burstToggle = document.getElementById("burst-toggle");
+    burstToggle.addEventListener("change", function() {
+        showBursts = this.checked;
+        if (!showBursts) {
+            burstCtx.clearRect(0, 0, wfWidth, wfHeight);
+        }
+    });
 
     const toggle = document.getElementById("highres-toggle");
     toggle.addEventListener("change", function() {
@@ -390,6 +403,7 @@
 
     function drawBurstOverlay() {
         burstCtx.clearRect(0, 0, wfWidth, wfHeight);
+        if (!showBursts) return;
         for (const b of activeBursts) {
             burstCtx.strokeStyle = "rgba(255, 60, 60, 0.9)";
             burstCtx.lineWidth = 1.5;

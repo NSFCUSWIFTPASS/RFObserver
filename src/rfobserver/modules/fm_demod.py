@@ -111,16 +111,14 @@ class FMDemodModule(UpstreamModule):
         self._decim1 = 0  # first decimation factor
         self._decim2 = 0  # second decimation factor (to audio rate)
         self._chunks_processed = 0
+        self._needs_reinit = False
 
     def configure(self, params: dict[str, Any]) -> None:
         for k, v in params.items():
             if k in self._DEFAULTS or k == "channel_freq_hz":
                 self._params[k] = v
-        # Reset DSP state on reconfigure
-        self._phase_acc = 0.0
-        self._prev_sample = None
-        self._deemph_state = 0.0
-        self._lp_taps = None
+        # Flag for reinit on next chunk (don't null taps — race with processing thread)
+        self._needs_reinit = True
 
     def feed(self, sc16_buf: np.ndarray, center_freq_hz: int, sample_rate: int) -> None:
         with contextlib.suppress(queue.Full):
@@ -190,8 +188,12 @@ class FMDemodModule(UpstreamModule):
         # Frequency offset from capture center
         delta_f = channel_freq - center_freq
 
-        # Initialize filter taps on first call or if sample rate changed
-        if self._lp_taps is None or self._intermediate_rate == 0:
+        # Initialize filter taps on first call or after reconfigure
+        if self._lp_taps is None or self._intermediate_rate == 0 or self._needs_reinit:
+            self._needs_reinit = False
+            self._phase_acc = 0.0
+            self._prev_sample = None
+            self._deemph_state = 0.0
             self._init_filters(sample_rate, channel_bw, audio_rate)
 
         # 1. SC16 → complex64 on GPU

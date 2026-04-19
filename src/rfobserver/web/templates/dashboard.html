@@ -300,10 +300,12 @@
     let triggerLevel = noiseFloor + burstThresholdDb;
     let draggingTrigger = false;
 
-    function computeNoiseFloor(powers) {
-        if (!powers.length) return -100;
+    function computeNoiseFloor(powers, prev) {
+        if (!powers.length) return prev;
         const sorted = [...powers].sort((a, b) => a - b);
-        return sorted[Math.floor(sorted.length * 0.1)];
+        const raw = sorted[Math.floor(sorted.length * 0.1)];
+        // Heavy EMA smoothing (99% old, 1% new) so the line is stable
+        return prev * 0.99 + raw * 0.01;
     }
 
     // Trigger line drag interaction
@@ -569,7 +571,7 @@
                 updateDynamicRange(data.powers);
                 // Update noise floor + trigger level (unless dragging)
                 if (!draggingTrigger) {
-                    noiseFloor = computeNoiseFloor(data.powers);
+                    noiseFloor = computeNoiseFloor(data.powers, noiseFloor);
                     triggerLevel = noiseFloor + burstThresholdDb;
                 }
                 redrawPSD();

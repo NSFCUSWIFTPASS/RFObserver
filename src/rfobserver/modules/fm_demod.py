@@ -105,11 +105,14 @@ class FMDemodModule(UpstreamModule):
         self._phase_acc = 0.0  # frequency shift phase accumulator
         self._prev_sample: Any = None  # for FM demod continuity
         self._deemph_state = 0.0  # de-emphasis filter state
-        self._lp_taps: Any = None  # GPU lowpass filter taps
+        self._lp_taps: Any = None  # GPU lowpass filter taps (stage 2)
+        self._lp_taps_a: Any = None  # GPU lowpass filter taps (stage 1)
         self._audio_lp_taps: Any = None  # GPU audio lowpass taps
         self._intermediate_rate = 0  # after first decimation
-        self._decim1 = 0  # first decimation factor
-        self._decim2 = 0  # second decimation factor (to audio rate)
+        self._decim1 = 0  # total first decimation factor
+        self._decim1_a = 1  # stage 1 decimation
+        self._decim1_b = 1  # stage 2 decimation
+        self._decim2 = 0  # final decimation (to audio rate)
         self._chunks_processed = 0
         self._needs_reinit = False
 
@@ -215,11 +218,12 @@ class FMDemodModule(UpstreamModule):
         if self._phase_acc > 1e6:
             self._phase_acc -= int(self._phase_acc)
 
-        # 3. Lowpass filter + decimate to intermediate rate
-        #    Decimate FIRST then filter the smaller signal (much faster)
+        # 3. Decimate to intermediate rate using box-car averaging
+        #    reshape(N, decim) + mean → sinc-shaped anti-alias filter
+        #    Fast on GPU (~2.5ms for 2.15M/224) vs FIR FFT (~40ms)
         if self._decim1 > 1:
-            iq_dec = iq[:: self._decim1]
-            iq_dec = self._fir_filter_gpu(iq_dec, self._lp_taps)
+            trim = (len(iq) // self._decim1) * self._decim1
+            iq_dec = iq[:trim].reshape(-1, self._decim1).mean(axis=1)
         else:
             iq_dec = iq
 
@@ -261,6 +265,7 @@ class FMDemodModule(UpstreamModule):
 
     def _init_filters(self, sample_rate: int, channel_bw: int, audio_rate: int) -> None:
         """Pre-compute FIR filter taps on the GPU."""
+
         from scipy.signal import firwin
 
         # First decimation: sample_rate → intermediate (~250 kHz)
@@ -268,12 +273,39 @@ class FMDemodModule(UpstreamModule):
         self._decim1 = max(1, sample_rate // self._intermediate_rate)
         self._intermediate_rate = sample_rate // self._decim1
 
-        # Lowpass taps for first decimation
+        # Split large decimation into 2 stages for speed.
+        # E.g. 224 = 14 × 16: first stage filters 2.15M→154K, second 154K→9.6K
+        if self._decim1 > 16:
+            # Find a good split near sqrt(decim1)
+            best_a = 1
+            for a in range(2, int(self._decim1**0.5) + 2):
+                if self._decim1 % a == 0:
+                    best_a = a
+            self._decim1_a = best_a
+            self._decim1_b = self._decim1 // best_a
+        else:
+            self._decim1_a = 1
+            self._decim1_b = self._decim1
+
+        # Stage 1 taps: filter at full sample rate, cutoff at intermediate/2
+        if self._decim1_a > 1:
+            mid_rate = sample_rate // self._decim1_a
+            cutoff_a = mid_rate / 2 * 0.8
+            ntaps_a = min(63, self._decim1_a * 4 + 1)
+            if ntaps_a % 2 == 0:
+                ntaps_a += 1
+            taps_a = firwin(ntaps_a, cutoff_a, fs=sample_rate).astype(np.float32)
+            self._lp_taps_a = cp.asarray(taps_a)
+        else:
+            self._lp_taps_a = None
+
+        # Stage 2 taps: filter at mid rate, cutoff at channel BW/2
+        mid_rate = sample_rate // self._decim1_a if self._decim1_a > 1 else sample_rate
         cutoff = channel_bw / 2
-        num_taps = min(255, self._decim1 * 8 + 1)
+        num_taps = min(127, self._decim1_b * 4 + 1)
         if num_taps % 2 == 0:
             num_taps += 1
-        taps1 = firwin(num_taps, cutoff, fs=sample_rate).astype(np.float32)
+        taps1 = firwin(num_taps, cutoff, fs=mid_rate).astype(np.float32)
         self._lp_taps = cp.asarray(taps1)
 
         # Second decimation: intermediate → audio_rate

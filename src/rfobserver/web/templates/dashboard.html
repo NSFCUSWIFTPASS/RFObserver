@@ -294,19 +294,9 @@
     let lastFrequencies = [];
     let psdCrosshairBin = -1;  // persists across redraws
 
-    // Trigger line state
-    let burstThresholdDb = {{ settings.BURST_THRESHOLD_HIGH_DB }};
-    let noiseFloor = -100;
-    let triggerLevel = noiseFloor + burstThresholdDb;
+    // Trigger line — fixed draggable dBFS value
+    let triggerLevel = {{ settings.TRIGGER_THRESHOLD_DB }};
     let draggingTrigger = false;
-
-    function computeNoiseFloor(powers, prev) {
-        if (!powers.length) return prev;
-        const sorted = [...powers].sort((a, b) => a - b);
-        const raw = sorted[Math.floor(sorted.length * 0.1)];
-        // Heavy EMA smoothing (99% old, 1% new) so the line is stable
-        return prev * 0.99 + raw * 0.01;
-    }
 
     // Trigger line drag interaction
     psdCanvas.addEventListener("mousedown", function(e) {
@@ -325,12 +315,13 @@
         if (draggingTrigger) {
             draggingTrigger = false;
             // Save new threshold
-            const newThreshold = Math.round((triggerLevel - noiseFloor) * 10) / 10;
-            burstThresholdDb = newThreshold;
+            // Save the absolute trigger level directly
+            const rounded = Math.round(triggerLevel * 10) / 10;
+            triggerLevel = rounded;
             fetch("/config/apply", {
                 method: "POST",
                 headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({burst_threshold_high_db: String(newThreshold)}),
+                body: JSON.stringify({trigger_threshold_db: String(rounded)}),
             });
             psdCanvas.style.cursor = "";
         }
@@ -570,10 +561,6 @@
                 lastFrequencies = data.frequencies;
                 updateDynamicRange(data.powers);
                 // Update noise floor + trigger level (unless dragging)
-                if (!draggingTrigger) {
-                    noiseFloor = computeNoiseFloor(data.powers, noiseFloor);
-                    triggerLevel = noiseFloor + burstThresholdDb;
-                }
                 redrawPSD();
                 addWaterfallLine(data.powers);
                 updateBurstOverlay(data.bursts);

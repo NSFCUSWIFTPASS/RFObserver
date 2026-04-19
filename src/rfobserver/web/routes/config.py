@@ -45,6 +45,7 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "bandwidth": ("BANDWIDTH", int),
         "gain": ("GAIN", int),
         "duration_sec": ("DURATION_SEC", float),
+        "trigger_threshold_db": ("TRIGGER_THRESHOLD_DB", float),
         "burst_threshold_high_db": ("BURST_THRESHOLD_HIGH_DB", float),
         "burst_threshold_low_ratio": ("BURST_THRESHOLD_LOW_RATIO", float),
         "psd_time_resolution_ms": ("PSD_TIME_RESOLUTION_MS", float),
@@ -95,6 +96,7 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "FREQUENCY_START",
         "FREQUENCY_END",
         "FREQUENCY_STEP",
+        "TRIGGER_THRESHOLD_DB",
         "BURST_THRESHOLD_HIGH_DB",
         "BURST_THRESHOLD_LOW_RATIO",
     }

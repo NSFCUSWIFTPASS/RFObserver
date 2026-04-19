@@ -182,6 +182,9 @@ class StreamingProcessor:
 
         self._capture_count = 0
 
+        # Active bursts for WebSocket overlay (written by burst thread, read by consumer)
+        self._active_bursts: list[dict[str, object]] = []
+
         # Burst results from burst thread -> event loop
         self._burst_result_queue: asyncio.Queue[list[BurstFingerprint] | None] = asyncio.Queue(
             maxsize=32
@@ -883,6 +886,40 @@ class StreamingProcessor:
                         self._burst_result_queue.put_nowait, completed_bursts
                     )
 
+                # Build active burst overlay data for WebSocket.
+                # Send freq as fractional position [0,1] and time as
+                # seconds so the frontend can map to any canvas size
+                # and update rate.
+                detection = rolling_detector.last_detection
+                if detection and detection.bursts:
+                    freq_axis = psd_grid.freq_axis
+                    num_bins = len(freq_axis)
+                    time_res = rolling_detector._time_resolution_s
+                    window_dur = rolling_detector._rows_filled * time_res
+                    active: list[dict[str, object]] = []
+                    for b in detection.bursts:
+                        f_lo = b.center_freq_hz - b.bandwidth_hz / 2 - center_freq
+                        f_hi = b.center_freq_hz + b.bandwidth_hz / 2 - center_freq
+                        bin_start = int(np.searchsorted(freq_axis, f_lo))
+                        bin_end = int(np.searchsorted(freq_axis, f_hi))
+                        # Time: how many seconds ago the burst ended
+                        t_end = (b.stop_time - b.detection_timestamp).total_seconds()
+                        age_sec = max(0.0, window_dur - t_end)
+                        active.append(
+                            {
+                                "center_freq_hz": b.center_freq_hz,
+                                "bandwidth_hz": b.bandwidth_hz,
+                                "peak_power_db": round(b.peak_power_db, 1),
+                                "duration_ms": round(b.duration_ms, 2),
+                                "freq_start": bin_start / num_bins,
+                                "freq_end": min(1.0, bin_end / num_bins),
+                                "age_sec": round(age_sec, 4),
+                            }
+                        )
+                    self._active_bursts = active
+                else:
+                    self._active_bursts = []
+
         except Exception:
             logger.exception("Burst detection loop crashed")
 
@@ -968,7 +1005,8 @@ class StreamingProcessor:
                         "avg_power_db": result.iq_stats.average,
                         "max_power_db": result.iq_stats.max,
                         "kurtosis": result.iq_stats.kurtosis,
-                        "burst_count": 0,
+                        "burst_count": len(self._active_bursts),
+                        "bursts": self._active_bursts,
                         "capture_num": result.capture_num,
                         "process_ms": result.process_ms,
                         "excess_ms": result.latency_ms,
@@ -995,7 +1033,8 @@ class StreamingProcessor:
                 "avg_power_db": result.iq_stats.average,
                 "max_power_db": result.iq_stats.max,
                 "kurtosis": result.iq_stats.kurtosis,
-                "burst_count": 0,
+                "burst_count": len(self._active_bursts),
+                "bursts": self._active_bursts,
                 "capture_num": result.capture_num,
                 "process_ms": result.process_ms,
                 "excess_ms": result.latency_ms,

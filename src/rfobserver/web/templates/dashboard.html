@@ -681,15 +681,10 @@
     let audioContexts = {};  // module_id → {ctx, ws, node}
 
     addModuleBtn.addEventListener("click", function() {
-        const freq = prompt("FM channel frequency in Hz (e.g. 100.1e6 for 100.1 MHz):");
-        if (!freq) return;
-        const parsed = parseFloat(freq);
-        if (isNaN(parsed)) { alert("Invalid frequency"); return; }
-
         fetch("/api/modules", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({type: "fm_demod", params: {channel_freq_hz: Math.round(parsed)}}),
+            body: JSON.stringify({type: "fm_demod", params: {channel_freq_hz: 101900000}}),
         }).then(r => r.json()).then(d => {
             if (d.module_id) refreshModules();
         }).catch(e => alert("Error: " + e.message));
@@ -708,17 +703,37 @@
             for (const m of mods) {
                 const freq = (m.channel_freq_hz / 1e6).toFixed(1);
                 const playing = audioContexts[m.module_id] ? true : false;
-                html += '<div class="module-card" data-id="' + m.module_id + '">';
+                const mid = m.module_id;
+                html += '<div class="module-card" data-id="' + mid + '">';
                 html += '<span class="module-type">FM</span> ';
-                html += '<span>' + freq + ' MHz</span>';
-                html += ' <span style="opacity:0.5;">#' + m.module_id + '</span>';
-                html += ' &middot; ' + m.chunks_processed + ' chunks';
-                html += ' <button class="rec-btn rec-start" onclick="toggleAudio(\'' + m.module_id + '\')">'
+                html += '<input type="text" class="module-freq-input" value="' + freq
+                    + '" data-mid="' + mid + '" title="Channel freq (MHz or Hz with e notation)">';
+                html += '<span class="qc-unit">MHz</span>';
+                html += ' <button class="rec-btn rec-start" onclick="toggleAudio(\'' + mid + '\')">'
                     + (playing ? '■ Stop' : '▶ Play') + '</button>';
-                html += ' <button class="rec-btn rec-stop" onclick="removeModule(\'' + m.module_id + '\')">✕</button>';
+                html += ' <button class="rec-btn rec-stop" onclick="removeModule(\'' + mid + '\')">✕</button>';
                 html += '</div>';
             }
             modulesContainer.innerHTML = html;
+
+            // Attach freq change handlers
+            modulesContainer.querySelectorAll(".module-freq-input").forEach(function(inp) {
+                function commitFreq() {
+                    let v = parseFloat(inp.value);
+                    if (isNaN(v)) return;
+                    // If value looks like MHz (< 1e6), convert to Hz
+                    if (v < 1e6) v = v * 1e6;
+                    fetch("/api/modules/" + inp.dataset.mid, {
+                        method: "PATCH",
+                        headers: {"Content-Type": "application/json"},
+                        body: JSON.stringify({channel_freq_hz: Math.round(v)}),
+                    });
+                }
+                inp.addEventListener("keydown", function(e) {
+                    if (e.key === "Enter") { e.preventDefault(); commitFreq(); inp.blur(); }
+                });
+                inp.addEventListener("blur", commitFreq);
+            });
         }).catch(() => {});
     }
 

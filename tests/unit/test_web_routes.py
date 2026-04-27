@@ -459,3 +459,78 @@ class TestStoragePath:
         assert resp.status_code == 200
         assert "storage-path" in resp.text
         assert "set-path-btn" in resp.text
+
+
+# -- ZMS/NATS API tests --
+
+
+class TestZmsNatsAPI:
+    def test_zms_status_no_processor(self, client):
+        resp = client.get("/api/zms/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["enabled"] is False
+        assert "connected" in data
+
+    def test_zms_status_with_processor(self, client_with_processor):
+        client, _, processor = client_with_processor
+        processor._zms_monitor = None
+        resp = client.get("/api/zms/status")
+        assert resp.status_code == 200
+        assert resp.json()["enabled"] is False
+
+    def test_zms_enable_incomplete_settings(self, client_with_processor):
+        client, settings, _ = client_with_processor
+        resp = client.post("/api/zms/enable")
+        assert resp.status_code == 200
+        # Settings incomplete (no ZMS fields set), should error
+        assert resp.json()["status"] == "error"
+
+    def test_zms_disable(self, client_with_processor):
+        client, _, processor = client_with_processor
+        processor._zms_monitor = None
+        resp = client.post("/api/zms/disable")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "disabled"
+
+    def test_nats_status(self, client):
+        resp = client.get("/api/nats/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "connected" in data
+        assert "host" in data
+        assert "port" in data
+
+    def test_config_page_shows_zms_section(self, client):
+        resp = client.get("/config")
+        assert resp.status_code == 200
+        assert "OpenZMS" in resp.text
+        assert "zms-toggle" in resp.text
+        assert "zms-zmc" in resp.text
+
+    def test_config_page_shows_nats_section(self, client):
+        resp = client.get("/config")
+        assert resp.status_code == 200
+        assert "NATS" in resp.text
+        assert "nats-host" in resp.text
+        assert "nats-port" in resp.text
+
+    def test_apply_nats_host(self, client_with_processor):
+        client, settings, _ = client_with_processor
+        resp = client.post("/config/apply", json={"nats_host": "nats.example.com"})
+        assert resp.status_code == 200
+        assert "NATS_HOST" in resp.json()["changed"]
+
+    def test_apply_zms_fields(self, client_with_processor):
+        client, settings, _ = client_with_processor
+        resp = client.post(
+            "/config/apply",
+            json={
+                "zms_zmc_http": "http://zmc.test",
+                "zms_monitor_id": "mon-1",
+            },
+        )
+        assert resp.status_code == 200
+        changed = resp.json()["changed"]
+        assert "ZMS_ZMC_HTTP" in changed
+        assert "ZMS_MONITOR_ID" in changed

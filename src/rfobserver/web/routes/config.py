@@ -52,6 +52,15 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "num_fft_bins": ("NUM_FFT_BINS", int),
         "archive_max_gb": ("ARCHIVE_MAX_GB", float),
         "history_days": ("HISTORY_DAYS", int),
+        # NATS
+        "nats_host": ("NATS_HOST", str),
+        "nats_port": ("NATS_PORT", int),
+        # ZMS
+        "zms_zmc_http": ("ZMS_ZMC_HTTP", str),
+        "zms_dst_http": ("ZMS_DST_HTTP", str),
+        "zms_identity_http": ("ZMS_IDENTITY_HTTP", str),
+        "zms_monitor_id": ("ZMS_MONITOR_ID", str),
+        "zms_monitor_name": ("ZMS_MONITOR_NAME", str),
     }
 
     changed = []

@@ -261,7 +261,8 @@ class FMDemodModule(UpstreamModule):
         self._deemph_state = float(zf[0] / (1.0 - alpha)) if (1.0 - alpha) != 0 else 0.0
 
         # 6. Decimate to audio rate
-        return audio_inter[:: self._decim2] if self._decim2 > 1 else audio_inter
+        result: np.ndarray = audio_inter[:: self._decim2] if self._decim2 > 1 else audio_inter
+        return result
 
     def _init_filters(self, sample_rate: int, channel_bw: int, audio_rate: int) -> None:
         """Pre-compute FIR filter taps on the GPU."""

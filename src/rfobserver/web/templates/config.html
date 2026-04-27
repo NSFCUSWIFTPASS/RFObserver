@@ -104,6 +104,80 @@
     </div>
 </div>
 
+<div class="card" style="margin-bottom: 16px;">
+    <div class="card-header">
+        NATS
+        <span style="flex:1;"></span>
+        <span id="nats-status" style="font-size:10px;opacity:0.6;">--</span>
+    </div>
+    <div class="card-body">
+        <div class="config-form">
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="nats-host">Host</label>
+                    <input type="text" id="nats-host" name="nats_host" value="{{ settings.NATS_HOST }}">
+                </div>
+                <div class="form-group">
+                    <label for="nats-port">Port</label>
+                    <input type="number" id="nats-port" name="nats_port" value="{{ settings.NATS_PORT }}">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group" style="flex:2;">
+                    <label for="nats-token">Token</label>
+                    <input type="password" id="nats-token" name="nats_token" value="" placeholder="(unchanged)">
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card" style="margin-bottom: 16px;">
+    <div class="card-header">
+        OpenZMS
+        <span style="flex:1;"></span>
+        <label class="toggle-label" title="Enable/disable ZMS submissions">
+            <input type="checkbox" id="zms-toggle" {% if settings.zms %}checked{% endif %}>
+            <span class="toggle-text">Enabled</span>
+        </label>
+        <span id="zms-status" style="font-size:10px;opacity:0.6;margin-left:8px;">--</span>
+    </div>
+    <div class="card-body">
+        <div class="config-form">
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="zms-zmc">ZMC URL</label>
+                    <input type="text" id="zms-zmc" name="zms_zmc_http" value="{{ settings.ZMS_ZMC_HTTP or '' }}" placeholder="http://zmc.example.com">
+                </div>
+                <div class="form-group">
+                    <label for="zms-dst">DST URL</label>
+                    <input type="text" id="zms-dst" name="zms_dst_http" value="{{ settings.ZMS_DST_HTTP or '' }}" placeholder="http://dst.example.com">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="zms-identity">Identity URL</label>
+                    <input type="text" id="zms-identity" name="zms_identity_http" value="{{ settings.ZMS_IDENTITY_HTTP or '' }}" placeholder="http://identity.example.com">
+                </div>
+                <div class="form-group">
+                    <label for="zms-monitor-id">Monitor ID</label>
+                    <input type="text" id="zms-monitor-id" name="zms_monitor_id" value="{{ settings.ZMS_MONITOR_ID or '' }}">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="zms-token">Token</label>
+                    <input type="password" id="zms-token" name="zms_token" value="" placeholder="(unchanged)">
+                </div>
+                <div class="form-group">
+                    <label for="zms-name">Monitor Name</label>
+                    <input type="text" id="zms-name" name="zms_monitor_name" value="{{ settings.ZMS_MONITOR_NAME }}">
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <div class="form-actions">
     <button type="submit" id="apply-btn" class="btn-apply" disabled>
         <span id="btn-label">Apply</span>
@@ -246,6 +320,43 @@
             setPathBtn.textContent = 'Set';
         }
         setPathBtn.disabled = false;
+    });
+
+    // --- ZMS/NATS status polling ---
+    async function pollStatus() {
+        try {
+            const r = await fetch('/api/zms/status');
+            if (r.ok) {
+                const d = await r.json();
+                const el = document.getElementById('zms-status');
+                if (d.enabled) {
+                    el.textContent = d.last_sent || 'enabled';
+                    el.style.color = d.connected ? '#34c759' : '#ff9f0a';
+                } else {
+                    el.textContent = 'disabled';
+                    el.style.color = '';
+                }
+            }
+        } catch (_) {}
+        try {
+            const r = await fetch('/api/nats/status');
+            if (r.ok) {
+                const d = await r.json();
+                const el = document.getElementById('nats-status');
+                el.textContent = d.connected ? 'connected' : 'disconnected';
+                el.style.color = d.connected ? '#34c759' : '';
+            }
+        } catch (_) {}
+    }
+    pollStatus();
+    setInterval(pollStatus, 5000);
+
+    // --- ZMS toggle ---
+    const zmsToggle = document.getElementById('zms-toggle');
+    zmsToggle.addEventListener('change', async function() {
+        const endpoint = this.checked ? '/api/zms/enable' : '/api/zms/disable';
+        await fetch(endpoint, {method: 'POST'});
+        pollStatus();
     });
 })();
 </script>

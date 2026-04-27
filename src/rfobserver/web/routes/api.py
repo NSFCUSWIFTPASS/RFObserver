@@ -265,6 +265,89 @@ async def set_storage_path(request: Request) -> dict[str, Any]:
     return {"status": "ok", "path": new_path, "message": f"Storage path set to {new_path}"}
 
 
+# -- ZMS status/toggle --
+
+
+@router.get("/zms/status")
+async def zms_status(request: Request) -> dict[str, Any]:
+    """Get ZMS connection status."""
+    settings = request.app.state.settings
+    proc = _get_processor(request)
+    zms = getattr(proc, "_zms_monitor", None) if proc else None
+
+    if zms is None:
+        return {
+            "enabled": False,
+            "connected": False,
+            "message_count": 0,
+            "last_sent": None,
+            "monitor_id": settings.ZMS_MONITOR_ID,
+        }
+
+    return {
+        "enabled": True,
+        "connected": True,
+        "message_count": zms.message_count,
+        "last_sent": f"{zms.message_count} observations sent",
+        "monitor_id": settings.ZMS_MONITOR_ID,
+        "op_status": getattr(zms, "_op_status", "unknown"),
+    }
+
+
+@router.post("/zms/enable")
+async def zms_enable(request: Request) -> dict[str, Any]:
+    """Enable ZMS monitor (requires ZMS settings to be configured)."""
+    settings = request.app.state.settings
+    proc = _get_processor(request)
+
+    if proc is None:
+        return {"status": "error", "detail": "Pipeline not running"}
+
+    if settings.zms is None:
+        return {"status": "error", "detail": "ZMS settings incomplete"}
+
+    if getattr(proc, "_zms_monitor", None) is not None:
+        return {"status": "already_enabled"}
+
+    from rfobserver.zms.monitor import ZmsMonitor
+
+    zms = ZmsMonitor(settings.zms)
+    await zms.start()
+    proc._zms_monitor = zms
+    logger.info("ZMS monitor enabled via API")
+    return {"status": "enabled"}
+
+
+@router.post("/zms/disable")
+async def zms_disable(request: Request) -> dict[str, Any]:
+    """Disable ZMS monitor."""
+    proc = _get_processor(request)
+    if proc is None:
+        return {"status": "error", "detail": "Pipeline not running"}
+
+    zms = getattr(proc, "_zms_monitor", None)
+    if zms is not None:
+        await zms.stop()
+        proc._zms_monitor = None
+        logger.info("ZMS monitor disabled via API")
+    return {"status": "disabled"}
+
+
+# -- NATS status --
+
+
+@router.get("/nats/status")
+async def nats_status(request: Request) -> dict[str, Any]:
+    """Get NATS connection status."""
+    settings = request.app.state.settings
+    return {
+        "connected": False,  # NATS producer not yet wired into pipeline
+        "host": settings.NATS_HOST,
+        "port": settings.NATS_PORT,
+        "url": settings.NATS_URL,
+    }
+
+
 @router.get("/detections", response_class=HTMLResponse)
 async def detections_fragment(request: Request) -> str:
     """Return HTML table rows for HTMX detection history."""

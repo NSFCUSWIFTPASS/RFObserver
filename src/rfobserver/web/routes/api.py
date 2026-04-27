@@ -261,6 +261,11 @@ async def set_storage_path(request: Request) -> dict[str, Any]:
         if storage is not None:
             storage.storage_path = target
 
+    # Persist to .env
+    from rfobserver.web.routes.config import _persist_settings
+
+    _persist_settings(settings)
+
     logger.info("Storage path set to: %s", new_path)
     return {"status": "ok", "path": new_path, "message": f"Storage path set to {new_path}"}
 

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
+from pydantic import SecretStr
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,43 @@ async def config_page(request: Request) -> Any:
             "settings": settings,
         },
     )
+
+
+def _persist_settings(settings: Any) -> None:
+    """Write current settings to .env for persistence across restarts.
+
+    Pydantic-settings reads .env on startup (env_prefix=RFOBS_),
+    so this ensures all runtime changes survive a restart.
+    """
+    from rfobserver.config import AppSettings
+
+    defaults = AppSettings(_env_file=None)
+    env_path = Path(".env")
+
+    lines: list[str] = []
+    for field_name in type(settings).model_fields:
+        if field_name in ("NATS_URL", "zms"):
+            continue  # computed properties, not settable
+        val = getattr(settings, field_name)
+        default_val = getattr(defaults, field_name)
+
+        # Skip unchanged defaults to keep .env clean
+        if val == default_val:
+            continue
+
+        # Handle SecretStr
+        if isinstance(val, SecretStr):
+            val = val.get_secret_value()
+        elif val is None:
+            continue
+
+        lines.append(f"RFOBS_{field_name}={val}")
+
+    try:
+        env_path.write_text("\n".join(lines) + "\n" if lines else "")
+        logger.debug("Settings persisted to %s (%d values)", env_path, len(lines))
+    except OSError:
+        logger.warning("Failed to persist settings to %s", env_path)
 
 
 @router.post("/apply")
@@ -114,6 +153,9 @@ async def apply_config(request: Request) -> dict[str, Any]:
         if reconfigure is not None:
             reconfigure()
             logger.info("Pipeline reconfigured: %s", changed)
+
+    # Persist settings to .env so they survive restarts
+    _persist_settings(settings)
 
     logger.info("Config applied: %s", changed)
     return {"status": "ok", "changed": changed}

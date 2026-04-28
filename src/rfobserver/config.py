@@ -67,6 +67,7 @@ class AppSettings(BaseSettings):
     COORDINATES: str = "0.0N,0.0W"
 
     # NATS
+    NATS_ENABLED: bool = False
     NATS_HOST: str = "localhost"
     NATS_PORT: int = 4222
     NATS_TOKEN: SecretStr | None = None

@@ -343,14 +343,74 @@ async def zms_disable(request: Request) -> dict[str, Any]:
 
 @router.get("/nats/status")
 async def nats_status(request: Request) -> dict[str, Any]:
-    """Get NATS connection status."""
+    """Get NATS connection status (reads live producer attached to processor)."""
     settings = request.app.state.settings
-    return {
-        "connected": False,  # NATS producer not yet wired into pipeline
+    proc = _get_processor(request)
+    producer = getattr(proc, "_nats_producer", None) if proc else None
+
+    base = {
         "host": settings.NATS_HOST,
         "port": settings.NATS_PORT,
         "url": settings.NATS_URL,
+        "enabled": bool(settings.NATS_ENABLED),
     }
+    if producer is None:
+        return {**base, "connected": False, "stats_count": 0, "dropped": 0}
+
+    return {
+        **base,
+        "connected": producer.connected,
+        "stats_count": producer.stats_count,
+        "dropped": producer.dropped,
+    }
+
+
+@router.post("/nats/enable")
+async def nats_enable(request: Request) -> dict[str, Any]:
+    """Enable NATS producer at runtime (connect + attach to processor)."""
+    settings = request.app.state.settings
+    proc = _get_processor(request)
+
+    if proc is None:
+        return {"status": "error", "detail": "Pipeline not running"}
+
+    if getattr(proc, "_nats_producer", None) is not None:
+        return {"status": "already_enabled"}
+
+    from rfobserver.transport.nats_producer import NatsProducer
+
+    token = settings.NATS_TOKEN.get_secret_value() if settings.NATS_TOKEN else None
+    producer = NatsProducer(url=settings.NATS_URL, token=token)
+    try:
+        await producer.connect()
+    except Exception as e:
+        logger.exception("NATS enable failed")
+        return {"status": "error", "detail": f"connect failed: {e}"}
+
+    proc._nats_producer = producer
+    settings.NATS_ENABLED = True
+    logger.info("NATS producer enabled via API (%s)", settings.NATS_URL)
+    return {"status": "enabled"}
+
+
+@router.post("/nats/disable")
+async def nats_disable(request: Request) -> dict[str, Any]:
+    """Disable NATS producer (close + detach from processor)."""
+    settings = request.app.state.settings
+    proc = _get_processor(request)
+    if proc is None:
+        return {"status": "error", "detail": "Pipeline not running"}
+
+    producer = getattr(proc, "_nats_producer", None)
+    if producer is not None:
+        try:
+            await producer.close()
+        except Exception:
+            logger.exception("NATS close raised; detaching anyway")
+        proc._nats_producer = None
+        logger.info("NATS producer disabled via API")
+    settings.NATS_ENABLED = False
+    return {"status": "disabled"}
 
 
 @router.get("/detections", response_class=HTMLResponse)

@@ -60,6 +60,21 @@ async def run(settings: AppSettings) -> None:
         await zms_monitor.start()
         logger.info("ZMS monitor enabled (id=%s)", settings.zms.monitor_id)
 
+    # NATS producer (optional). Pipeline tolerates connection failure: on
+    # error we log and proceed without NATS rather than aborting startup.
+    nats_producer = None
+    if settings.NATS_ENABLED:
+        from rfobserver.transport.nats_producer import NatsProducer
+
+        token = settings.NATS_TOKEN.get_secret_value() if settings.NATS_TOKEN else None
+        nats_producer = NatsProducer(url=settings.NATS_URL, token=token)
+        try:
+            await nats_producer.connect()
+            logger.info("NATS producer connected (%s)", settings.NATS_URL)
+        except Exception:
+            logger.exception("NATS connect failed; continuing without NATS")
+            nats_producer = None
+
     # Choose pipeline mode: streaming for single-freq / trigger, batch for sweeps
     is_sweep = settings.FREQUENCY_STEP > 0 and settings.FREQUENCY_END > settings.FREQUENCY_START
     use_streaming = settings.TRIGGER_ENABLED or not is_sweep
@@ -74,6 +89,7 @@ async def run(settings: AppSettings) -> None:
             settings=settings,
             broadcast=broadcast,
             zms_monitor=zms_monitor,
+            nats_producer=nats_producer,
         )
 
         # Attach module manager for upstream signal processing
@@ -92,6 +108,7 @@ async def run(settings: AppSettings) -> None:
             settings=settings,
             broadcast=broadcast,
             zms_monitor=zms_monitor,
+            nats_producer=nats_producer,
         )
         logger.info("Using batch pipeline (sweep mode)")
 
@@ -106,6 +123,8 @@ async def run(settings: AppSettings) -> None:
     finally:
         if zms_monitor is not None:
             await zms_monitor.stop()
+        if nats_producer is not None:
+            await nats_producer.close()
         await db.close()
 
 

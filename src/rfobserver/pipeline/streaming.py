@@ -40,10 +40,11 @@ from rfobserver.processing.spectral import PSDGridConfig, compute_psd_grid, comp
 if TYPE_CHECKING:
     from rfobserver.capture.receiver import IReceiver
     from rfobserver.config import AppSettings
-    from rfobserver.models import BurstFingerprint, IQStatistics, PSDData
+    from rfobserver.models import BurstFingerprint, IQStatistics, ProcessedDataEnvelope, PSDData
     from rfobserver.processing.spectral import PSDGridResult
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.storage.local import LocalStorage
+    from rfobserver.transport.nats_producer import NatsProducer
     from rfobserver.web.websocket import LiveBroadcast
     from rfobserver.zms.monitor import ZmsMonitor
 
@@ -135,6 +136,7 @@ class StreamingProcessor:
         settings: AppSettings,
         broadcast: LiveBroadcast | None = None,
         zms_monitor: ZmsMonitor | None = None,
+        nats_producer: NatsProducer | None = None,
     ) -> None:
         self._receiver = receiver
         self._db = database
@@ -142,6 +144,7 @@ class StreamingProcessor:
         self._settings = settings
         self._broadcast = broadcast
         self._zms_monitor = zms_monitor
+        self._nats_producer = nats_producer
         self._running = False
 
         total_cores = os.cpu_count() or 4
@@ -969,7 +972,7 @@ class StreamingProcessor:
                 if accum_powers and last_result is not None:
                     avg = _np.mean(accum_powers, axis=0).tolist()
                     await self._broadcast_averaged(avg, last_result, len(accum_powers))
-                    await self._submit_zms(avg, last_result)
+                    await self._publish_processed(avg, last_result)
                     accum_powers.clear()
                     accum_start = time.monotonic()
                     last_result = None
@@ -980,7 +983,7 @@ class StreamingProcessor:
             if result is _STOP:
                 break
 
-            # --- Accumulate for normal-mode UI + ZMS ---
+            # --- Accumulate for normal-mode UI + downstream publishing ---
             accum_powers.append(result.summary_psd.powers)
             last_result = result
 
@@ -992,8 +995,8 @@ class StreamingProcessor:
                 if self._broadcast is not None and not self._broadcast.has_high_res_subscribers():
                     await self._broadcast_averaged(avg, result, len(accum_powers))
 
-                # ZMS always gets DURATION_SEC averaged data
-                await self._submit_zms(avg, result)
+                # ZMS + NATS always get DURATION_SEC-averaged data
+                await self._publish_processed(avg, result)
 
                 accum_powers.clear()
                 accum_start = time.monotonic()
@@ -1049,42 +1052,70 @@ class StreamingProcessor:
             }
         )
 
-    async def _submit_zms(self, avg_powers: list[float], result: _StreamResult) -> None:
-        """Submit DURATION_SEC-averaged observation to ZMS."""
-        if self._zms_monitor is None:
+    def _build_envelope(
+        self, avg_powers: list[float], result: _StreamResult
+    ) -> ProcessedDataEnvelope:
+        """Construct a ProcessedDataEnvelope from a DURATION_SEC-averaged result.
+
+        Streaming mode has no on-disk source file (audio/PSD only), so
+        ``source_path`` is left empty rather than pointing at a fake path.
+        Downstream consumers that key off ``source_path`` should treat
+        empty as "sensor-processed; no IQ file available".
+        """
+        from pathlib import Path
+
+        from rfobserver.models import MetadataRecord, ProcessedDataEnvelope, PSDData
+
+        s = self._settings
+        averaged_psd = PSDData(
+            powers=avg_powers,
+            frequencies=result.summary_psd.frequencies,
+            center_freq=result.summary_psd.center_freq,
+            sample_rate=result.summary_psd.sample_rate,
+            num_bins=result.summary_psd.num_bins,
+        )
+        meta = MetadataRecord(
+            hostname=s.HOSTNAME,
+            organization=s.ORGANIZATION,
+            serial=self._receiver.serial,
+            frequency=result.center_freq_hz,
+            timestamp=datetime.now(timezone.utc),
+            source_path=Path(""),
+            gain=s.GAIN,
+            sampling_rate=s.BANDWIDTH,
+            length=s.DURATION_SEC,
+            interval=s.INTERVAL_SEC,
+            bit_depth=16,
+        )
+        return ProcessedDataEnvelope(
+            metadata=meta,
+            statistics=result.iq_stats,
+            psd_data=averaged_psd,
+        )
+
+    async def _publish_processed(self, avg_powers: list[float], result: _StreamResult) -> None:
+        """Build the per-window envelope once, fan out to ZMS + NATS."""
+        if self._zms_monitor is None and self._nats_producer is None:
             return
         try:
-            from pathlib import Path
-
-            from rfobserver.models import MetadataRecord, ProcessedDataEnvelope, PSDData
-
-            averaged_psd = PSDData(
-                powers=avg_powers,
-                frequencies=result.summary_psd.frequencies,
-                center_freq=result.summary_psd.center_freq,
-                sample_rate=result.summary_psd.sample_rate,
-                num_bins=result.summary_psd.num_bins,
-            )
-            meta = MetadataRecord(
-                hostname=self._settings.HOSTNAME,
-                organization=self._settings.ORGANIZATION,
-                serial=self._receiver.serial,
-                frequency=result.center_freq_hz,
-                timestamp=datetime.now(timezone.utc),
-                source_path=Path("/tmp/rfobserver/streaming"),
-                gain=self._settings.GAIN,
-                sampling_rate=self._settings.BANDWIDTH,
-            )
-            envelope = ProcessedDataEnvelope(
-                metadata=meta,
-                statistics=result.iq_stats,
-                psd_data=averaged_psd,
-            )
-            ok = await self._zms_monitor.submit_observation(envelope)
-            if ok:
-                logger.debug("ZMS observation submitted (chunk #%d)", result.capture_num)
+            envelope = self._build_envelope(avg_powers, result)
         except Exception:
-            logger.exception("ZMS observation submission failed")
+            logger.exception("Envelope construction failed (chunk #%d)", result.capture_num)
+            return
+
+        if self._zms_monitor is not None:
+            try:
+                ok = await self._zms_monitor.submit_observation(envelope)
+                if ok:
+                    logger.debug("ZMS observation submitted (chunk #%d)", result.capture_num)
+            except Exception:
+                logger.exception("ZMS observation submission failed")
+
+        if self._nats_producer is not None:
+            try:
+                await self._nats_producer.publish_stats(envelope, self._settings.HOSTNAME)
+            except Exception:
+                logger.exception("NATS stats publish failed")
 
     async def _drain_burst_results(self) -> None:
         """Process all pending burst results from the burst detection thread."""

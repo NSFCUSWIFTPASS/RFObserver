@@ -102,6 +102,13 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "zms_monitor_name": ("ZMS_MONITOR_NAME", str),
     }
 
+    # Tokens are SecretStr and use a "(unchanged)" placeholder in the UI;
+    # only update when a non-empty value is submitted.
+    secret_map: dict[str, str] = {
+        "nats_token": "NATS_TOKEN",
+        "zms_token": "ZMS_TOKEN",
+    }
+
     changed = []
     for form_key, (attr, cast) in field_map.items():
         if form_key not in body:
@@ -127,6 +134,15 @@ async def apply_config(request: Request) -> dict[str, Any]:
         if old_val != new_val:
             object.__setattr__(settings, attr, new_val)
             changed.append(attr)
+
+    for form_key, attr in secret_map.items():
+        if form_key not in body:
+            continue
+        raw = body[form_key]
+        if raw is None or raw == "":
+            continue  # placeholder: don't overwrite existing secret
+        object.__setattr__(settings, attr, SecretStr(str(raw)))
+        changed.append(attr)
 
     if not changed:
         logger.info("Config applied: no changes")

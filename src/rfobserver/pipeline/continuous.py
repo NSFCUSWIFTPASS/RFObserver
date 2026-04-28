@@ -24,9 +24,10 @@ from rfobserver.processing.spectral import PSDGridConfig, compute_psd_grid, comp
 if TYPE_CHECKING:
     from rfobserver.capture.receiver import CaptureResult, IReceiver
     from rfobserver.config import AppSettings
-    from rfobserver.models import BurstFingerprint, IQStatistics, PSDData
+    from rfobserver.models import BurstFingerprint, IQStatistics, ProcessedDataEnvelope, PSDData
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.storage.local import LocalStorage
+    from rfobserver.transport.nats_producer import NatsProducer
     from rfobserver.web.websocket import LiveBroadcast
     from rfobserver.zms.monitor import ZmsMonitor
 
@@ -52,6 +53,7 @@ class ContinuousProcessor:
         settings: AppSettings,
         broadcast: LiveBroadcast | None = None,
         zms_monitor: ZmsMonitor | None = None,
+        nats_producer: NatsProducer | None = None,
     ) -> None:
         self._receiver = receiver
         self._db = database
@@ -59,6 +61,7 @@ class ContinuousProcessor:
         self._settings = settings
         self._broadcast = broadcast
         self._zms_monitor = zms_monitor
+        self._nats_producer = nats_producer
 
         # 1 thread for capture, N-3 cores for processing, 2 cores left free for OS/web
         total_cores = os.cpu_count() or 4
@@ -184,33 +187,13 @@ class ContinuousProcessor:
                 pr.capture_num,
             )
 
-        # Submit to OpenZMS
-        if self._zms_monitor is not None:
+        # Build the processed envelope once; fan out to ZMS + NATS.
+        if self._zms_monitor is not None or self._nats_producer is not None:
             try:
-                from pathlib import Path
-
-                from rfobserver.models import MetadataRecord, ProcessedDataEnvelope
-
-                meta = MetadataRecord(
-                    hostname=self._settings.HOSTNAME,
-                    organization=self._settings.ORGANIZATION,
-                    serial=self._receiver.serial,
-                    frequency=pr.center_freq_hz,
-                    timestamp=datetime.now(timezone.utc),
-                    source_path=Path(pr.filename),
-                    gain=self._settings.GAIN,
-                    sampling_rate=self._settings.BANDWIDTH,
-                )
-                envelope = ProcessedDataEnvelope(
-                    metadata=meta,
-                    statistics=pr.iq_stats,
-                    psd_data=pr.summary_psd,
-                )
-                ok = await self._zms_monitor.submit_observation(envelope)
-                if ok:
-                    logger.debug("ZMS observation submitted (capture #%d)", pr.capture_num)
+                envelope = self._build_envelope(pr)
+                await self._fanout_envelope(envelope, pr.capture_num)
             except Exception:
-                logger.exception("ZMS observation submission failed")
+                logger.exception("Processed envelope fan-out failed")
 
         # Broadcast to WebSocket
         if self._broadcast is not None:
@@ -231,6 +214,53 @@ class ContinuousProcessor:
                     "excess_ms": excess_ms,
                 }
             )
+
+    def _build_envelope(self, pr: _ProcessResult) -> ProcessedDataEnvelope:
+        """Construct a ProcessedDataEnvelope from a per-capture result.
+
+        Fills in the metadata fields rf-shared / rf-processor read from the
+        DB schema (length, interval, sampling_rate, bit_depth) from settings
+        rather than leaving them at model defaults.
+        """
+        from pathlib import Path
+
+        from rfobserver.models import MetadataRecord, ProcessedDataEnvelope
+
+        s = self._settings
+        meta = MetadataRecord(
+            hostname=s.HOSTNAME,
+            organization=s.ORGANIZATION,
+            serial=self._receiver.serial,
+            frequency=pr.center_freq_hz,
+            timestamp=datetime.now(timezone.utc),
+            source_path=Path(pr.filename),
+            gain=s.GAIN,
+            sampling_rate=s.BANDWIDTH,
+            length=s.DURATION_SEC,
+            interval=s.INTERVAL_SEC,
+            bit_depth=16,
+        )
+        return ProcessedDataEnvelope(
+            metadata=meta,
+            statistics=pr.iq_stats,
+            psd_data=pr.summary_psd,
+        )
+
+    async def _fanout_envelope(self, envelope: ProcessedDataEnvelope, capture_num: int) -> None:
+        """Submit the processed envelope to ZMS (HTTP) and NATS (rfobs.stats)."""
+        if self._zms_monitor is not None:
+            try:
+                ok = await self._zms_monitor.submit_observation(envelope)
+                if ok:
+                    logger.debug("ZMS observation submitted (capture #%d)", capture_num)
+            except Exception:
+                logger.exception("ZMS observation submission failed")
+
+        if self._nats_producer is not None:
+            try:
+                await self._nats_producer.publish_stats(envelope, self._settings.HOSTNAME)
+            except Exception:
+                logger.exception("NATS stats publish failed")
 
     def _build_frequency_list(self) -> list[int]:
         s = self._settings

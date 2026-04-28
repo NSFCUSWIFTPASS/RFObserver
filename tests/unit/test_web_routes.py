@@ -500,6 +500,31 @@ class TestZmsNatsAPI:
         assert "connected" in data
         assert "host" in data
         assert "port" in data
+        assert "enabled" in data
+        # No processor attached -> not connected, no counts.
+        assert data["connected"] is False
+        assert data["stats_count"] == 0
+
+    def test_nats_status_reflects_attached_producer(self, client_with_processor):
+        client, _, processor = client_with_processor
+        producer = MagicMock()
+        producer.connected = True
+        producer.stats_count = 7
+        producer.dropped = 1
+        processor._nats_producer = producer
+        resp = client.get("/api/nats/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["connected"] is True
+        assert data["stats_count"] == 7
+        assert data["dropped"] == 1
+
+    def test_nats_disable_with_no_producer(self, client_with_processor):
+        client, _, processor = client_with_processor
+        processor._nats_producer = None
+        resp = client.post("/api/nats/disable")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "disabled"
 
     def test_config_page_shows_zms_section(self, client):
         resp = client.get("/config")
@@ -520,6 +545,28 @@ class TestZmsNatsAPI:
         resp = client.post("/config/apply", json={"nats_host": "nats.example.com"})
         assert resp.status_code == 200
         assert "NATS_HOST" in resp.json()["changed"]
+
+    def test_apply_nats_token_only_on_nonempty(self, client_with_processor):
+        """Empty token submission must not overwrite an existing token."""
+        from pydantic import SecretStr
+
+        client, settings, _ = client_with_processor
+        object.__setattr__(settings, "NATS_TOKEN", SecretStr("existing-token"))
+
+        resp = client.post("/config/apply", json={"nats_token": ""})
+        assert resp.status_code == 200
+        assert "NATS_TOKEN" not in resp.json()["changed"]
+        assert settings.NATS_TOKEN.get_secret_value() == "existing-token"
+
+        resp = client.post("/config/apply", json={"nats_token": "new-token"})
+        assert resp.status_code == 200
+        assert "NATS_TOKEN" in resp.json()["changed"]
+        assert settings.NATS_TOKEN.get_secret_value() == "new-token"
+
+    def test_config_page_shows_nats_toggle(self, client):
+        resp = client.get("/config")
+        assert resp.status_code == 200
+        assert "nats-toggle" in resp.text
 
     def test_apply_zms_fields(self, client_with_processor):
         client, settings, _ = client_with_processor

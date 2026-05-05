@@ -141,7 +141,7 @@ async def audio_websocket(websocket: WebSocket, module_id: str) -> None:
         while True:
             try:
                 pcm_data = await asyncio.wait_for(module.output_queue.get(), timeout=2.0)
-            except TimeoutError:
+            except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
                 if not module._running:
                     break
                 continue

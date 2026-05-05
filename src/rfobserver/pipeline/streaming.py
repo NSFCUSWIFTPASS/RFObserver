@@ -125,6 +125,12 @@ class _ChunkResult:
         self.sc16_buf = sc16_buf
 
 
+def _put_nowait_drop_full(q: asyncio.Queue[Any], item: Any) -> None:
+    """Loop-thread callback: put if there's room, drop on overflow."""
+    with contextlib.suppress(asyncio.QueueFull):
+        q.put_nowait(item)
+
+
 class StreamingProcessor:
     """Streaming pipeline: continuous recv → parallel PSD → rolling burst detection."""
 
@@ -837,8 +843,9 @@ class StreamingProcessor:
         )
 
         if self._loop is not None:
-            with contextlib.suppress(asyncio.QueueFull):
-                self._loop.call_soon_threadsafe(self._result_queue.put_nowait, result)
+            self._loop.call_soon_threadsafe(
+                _put_nowait_drop_full, self._result_queue, result
+            )
 
     # -- Burst detection thread --
 
@@ -893,7 +900,7 @@ class StreamingProcessor:
 
                 if completed_bursts and self._loop is not None:
                     self._loop.call_soon_threadsafe(
-                        self._burst_result_queue.put_nowait, completed_bursts
+                        _put_nowait_drop_full, self._burst_result_queue, completed_bursts
                     )
 
                 # Build active burst overlay data for WebSocket.
@@ -966,7 +973,7 @@ class StreamingProcessor:
         while self._running:
             try:
                 result = await asyncio.wait_for(self._result_queue.get(), timeout=0.5)
-            except TimeoutError:
+            except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
                 await self._drain_burst_results()
                 # Flush accumulator on timeout if data pending
                 if accum_powers and last_result is not None:
@@ -1104,10 +1111,19 @@ class StreamingProcessor:
             return
 
         if self._zms_monitor is not None:
+            timeout = max(15.0, 5.0 * self._settings.DURATION_SEC)
             try:
-                ok = await self._zms_monitor.submit_observation(envelope)
+                ok = await asyncio.wait_for(
+                    self._zms_monitor.submit_observation(envelope), timeout=timeout
+                )
                 if ok:
                     logger.debug("ZMS observation submitted (chunk #%d)", result.capture_num)
+            except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
+                logger.warning(
+                    "ZMS submit timed out (chunk #%d) after %.1fs",
+                    result.capture_num,
+                    timeout,
+                )
             except Exception:
                 logger.exception("ZMS observation submission failed")
 

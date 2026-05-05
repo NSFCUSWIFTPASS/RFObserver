@@ -25,7 +25,10 @@ class ZmsClient:
         self._zmc_http = (zmc_http or dst_http).rstrip("/")
         self._api_token = api_token
         self._monitor_id = monitor_id
-        self._client = httpx.AsyncClient(timeout=timeout)
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=timeout, write=timeout, pool=5.0),
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=2),
+        )
         self._connection_state: str = "unset"  # unset | up | down
 
     @property

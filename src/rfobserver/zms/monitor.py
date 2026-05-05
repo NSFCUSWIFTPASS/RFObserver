@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
@@ -168,7 +169,7 @@ class ZmsMonitor:
                     timeout=5.0,
                 )
                 await self._process_reconfiguration(command)
-            except TimeoutError:
+            except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
                 continue
             except asyncio.CancelledError:
                 raise
@@ -304,7 +305,10 @@ class ZmsMonitor:
         if kurtosis_per_bin is None:
             kurtosis_per_bin = [stats.kurtosis] * psd.num_bins
 
-        archive = create_sigmf_archive(
+        logger.debug("ZMS submit start (ts=%s)", meta.timestamp.isoformat())
+        t0 = time.perf_counter()
+        archive = await asyncio.to_thread(
+            create_sigmf_archive,
             psd_powers=psd.powers,
             psd_frequencies=psd.frequencies,
             kurtosis_f=kurtosis_per_bin,
@@ -326,8 +330,19 @@ class ZmsMonitor:
             zones=zones,
             gzip=False,
         )
+        logger.debug(
+            "ZMS archive built %d bytes in %.1fms",
+            len(archive),
+            (time.perf_counter() - t0) * 1000,
+        )
 
+        t1 = time.perf_counter()
         ok = await self._client.send_sigmf_archive(archive, gzip=False)
+        logger.debug(
+            "ZMS POST returned ok=%s in %.1fms",
+            ok,
+            (time.perf_counter() - t1) * 1000,
+        )
         if ok:
             self._message_count += 1
         return ok

@@ -285,6 +285,52 @@ async def test_streaming_reconfigure_does_not_crash(
 
 
 @pytest.mark.asyncio
+async def test_streaming_rapid_reconfigure_does_not_wedge(
+    streaming_processor: StreamingProcessor, settings: AppSettings
+) -> None:
+    """Burst many reconfigures (incl. NUM_FFT_BINS change) without wedging.
+
+    Regression test: in-flight results from the prior config interleaved with
+    new-config results in _result_queue. The consumer's accum_powers list
+    held mismatched-shape rows, np.mean() raised ValueError, and the
+    consumer task exited — taking _running=False and all threads with it.
+    """
+
+    async def burst_reconfigures_and_stop() -> None:
+        while streaming_processor._capture_count < 3:
+            await asyncio.sleep(0.02)
+
+        # Rapid pipeline-affecting changes including NUM_FFT_BINS (which
+        # changes PSD row shape). Fired in a tight loop so the consumer
+        # sees in-flight old-shape results interleaved with new-shape ones.
+        for attr, val in (
+            ("FREQUENCY_START", 916_000_000),
+            ("BANDWIDTH", 2_000_000),
+            ("GAIN", 30),
+            ("NUM_FFT_BINS", 512),
+            ("DURATION_SEC", 0.6),
+        ):
+            object.__setattr__(settings, attr, val)
+            streaming_processor.reconfigure()
+
+        # Let the pre-fix wedge pathway play out: when the consumer task
+        # crashes on np.mean shape mismatch, _running flips False and all
+        # threads exit. Sample count pre/post a settle window — if the
+        # pipeline wedged, t1 == t0 and the assertion fires.
+        await asyncio.sleep(1.0)
+        t0 = streaming_processor._capture_count
+        await asyncio.sleep(1.5)
+        t1 = streaming_processor._capture_count
+        streaming_processor.stop()
+        assert t1 > t0, f"pipeline wedged after rapid reconfigure (t0={t0} t1={t1})"
+
+    await asyncio.wait_for(
+        asyncio.gather(streaming_processor.run(), burst_reconfigures_and_stop()),
+        timeout=15.0,
+    )
+
+
+@pytest.mark.asyncio
 async def test_streaming_manual_recording(
     streaming_processor: StreamingProcessor, settings: AppSettings
 ) -> None:

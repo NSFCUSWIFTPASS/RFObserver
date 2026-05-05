@@ -993,7 +993,17 @@ class StreamingProcessor:
                 break
 
             # --- Accumulate for normal-mode UI + downstream publishing ---
-            accum_powers.append(result.summary_psd.powers)
+            # On reconfigure, NUM_FFT_BINS may change. In-flight results from
+            # the prior config can interleave with new-config results in
+            # _result_queue (worker pool finishes futures out of order), so
+            # detect shape changes per-row, not just on a generation flip,
+            # otherwise np.mean below raises on mismatched-shape rows.
+            new_powers = result.summary_psd.powers
+            if accum_powers and len(accum_powers[0]) != len(new_powers):
+                accum_powers.clear()
+                accum_start = time.monotonic()
+                last_result = None
+            accum_powers.append(new_powers)
             last_result = result
 
             elapsed = time.monotonic() - accum_start

@@ -843,9 +843,7 @@ class StreamingProcessor:
         )
 
         if self._loop is not None:
-            self._loop.call_soon_threadsafe(
-                _put_nowait_drop_full, self._result_queue, result
-            )
+            self._loop.call_soon_threadsafe(_put_nowait_drop_full, self._result_queue, result)
 
     # -- Burst detection thread --
 

@@ -223,10 +223,14 @@ class StreamingProcessor:
         self._chunk_samples = chunk_slices * actual_slice_samples
         self._chunk_duration = self._chunk_samples / s.BANDWIDTH
 
-        # Buffer pool: 12 pre-allocated SC16 (int32) buffers
-        self._buf_pool: queue.Queue[np.ndarray[Any, np.dtype[Any]]] = queue.Queue(maxsize=12)
+        # Buffer pool: 12 pre-allocated SC16 (int32) buffers.
+        # Fill a local pool first, then swap — otherwise concurrent put_nowait
+        # from in-flight dispatch results can race the fill and deadlock the
+        # receiver thread on its own put().
+        new_pool: queue.Queue[np.ndarray[Any, np.dtype[Any]]] = queue.Queue(maxsize=12)
         for _ in range(12):
-            self._buf_pool.put(np.zeros(self._chunk_samples, dtype=np.int32))
+            new_pool.put_nowait(np.zeros(self._chunk_samples, dtype=np.int32))
+        self._buf_pool = new_pool
 
         # Pre-trigger circular buffer (int32 = SC16)
         pre_trigger_samples = int(s.TRIGGER_PRE_SEC * s.BANDWIDTH)

@@ -84,7 +84,10 @@ function drawPSD(ctx, W, H, powers, frequencies, min, max, crosshairBin, trigger
         ctx.fill();
     }
 
-    // Trigger level line
+    // Burst-detection high threshold line (absolute = noise_floor + threshold_high_db).
+    // Drag to adjust BURST_THRESHOLD_HIGH_DB. Distinct from the IQ-recording
+    // trigger, which lives on the time-series chart (different units: per-bin
+    // PSD here, broadband mean power there).
     if (triggerLevel != null) {
         const ty = H - ((triggerLevel - min) / (max - min)) * H;
         if (ty >= 0 && ty <= H) {
@@ -99,7 +102,7 @@ function drawPSD(ctx, W, H, powers, frequencies, min, max, crosshairBin, trigger
             ctx.fillStyle = "rgba(255, 60, 60, 0.9)";
             ctx.font = "10px -apple-system, sans-serif";
             ctx.textAlign = "right";
-            ctx.fillText("Trigger " + triggerLevel.toFixed(1) + " dBFS", W - 4, ty - 4);
+            ctx.fillText("Burst Hi " + triggerLevel.toFixed(1) + " dB/bin", W - 4, ty - 4);
         }
     }
 

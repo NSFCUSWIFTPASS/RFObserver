@@ -1023,6 +1023,7 @@ class StreamingProcessor:
 
             # --- High-res UI broadcast (every chunk) ---
             if self._broadcast is not None and self._broadcast.has_high_res_subscribers():
+                noise_floor_db = float(np.percentile(result.summary_psd.powers, 10))
                 await self._broadcast.publish(
                     {
                         "type": "psd",
@@ -1040,6 +1041,8 @@ class StreamingProcessor:
                         "process_ms": result.process_ms,
                         "excess_ms": result.latency_ms,
                         "trigger_threshold_db": self._settings.TRIGGER_THRESHOLD_DB,
+                        "burst_threshold_high_db": self._settings.BURST_THRESHOLD_HIGH_DB,
+                        "noise_floor_db": noise_floor_db,
                         "chunk_time_ms": datetime.now(timezone.utc).timestamp() * 1000.0,
                     }
                 )
@@ -1060,6 +1063,7 @@ class StreamingProcessor:
         """
         if self._broadcast is None:
             return
+        noise_floor_db = float(np.percentile(avg_powers, 10)) if avg_powers else -200.0
         await self._broadcast.publish(
             {
                 "type": "psd",
@@ -1078,6 +1082,8 @@ class StreamingProcessor:
                 "excess_ms": result.latency_ms,
                 "chunks_averaged": chunk_count,
                 "trigger_threshold_db": self._settings.TRIGGER_THRESHOLD_DB,
+                "burst_threshold_high_db": self._settings.BURST_THRESHOLD_HIGH_DB,
+                "noise_floor_db": noise_floor_db,
                 "chunk_time_ms": datetime.now(timezone.utc).timestamp() * 1000.0,
             }
         )

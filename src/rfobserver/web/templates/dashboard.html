@@ -171,12 +171,66 @@
     const tsTooltip = document.getElementById("ts-tooltip");
     let tsCrosshairIdx = -1;
 
+    // Time-series trigger-line state — populated lazily once we have a
+    // power range (pMin/pMax) from the trace data.
+    let tsPMin = null;
+    let tsPMax = null;
+
+    tsCanvas.addEventListener("mousedown", function(e) {
+        if (tsPMin == null || tsPMax == null) return;
+        const rect = tsCanvas.getBoundingClientRect();
+        const scaleY = tsCanvas.height / rect.height;
+        const my = (e.clientY - rect.top) * scaleY;
+        const H = tsCanvas.height;
+        // Line is drawn at (triggerThresholdDb - 17) on the trace's axis.
+        const lineDb = triggerThresholdDb - IQ_STATS_OFFSET_DB;
+        const ty = H - ((lineDb - tsPMin) / (tsPMax - tsPMin)) * H;
+        if (Math.abs(my - ty) < 8) {
+            draggingTrigger = true;
+            e.preventDefault();
+        }
+    });
+
+    tsCanvas.addEventListener("mouseup", function() {
+        if (draggingTrigger) {
+            draggingTrigger = false;
+            const rounded = Math.round(triggerThresholdDb * 10) / 10;
+            triggerThresholdDb = rounded;
+            fetch("/config/apply", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({trigger_threshold_db: String(rounded)}),
+            });
+            tsCanvas.style.cursor = "";
+        }
+    });
+
     tsCanvas.addEventListener("mousemove", function(e) {
         const N = tsAvgPower.length;
         if (N < 2) return;
         const rect = tsCanvas.getBoundingClientRect();
         const scaleX = tsCanvas.width / rect.width;
+        const scaleY = tsCanvas.height / rect.height;
         const x = (e.clientX - rect.left) * scaleX;
+        const my = (e.clientY - rect.top) * scaleY;
+        const H = tsCanvas.height;
+
+        if (draggingTrigger && tsPMin != null && tsPMax != null) {
+            // Drag updates the trace-axis line position, then we add the
+            // 17 dB offset back when saving to TRIGGER_THRESHOLD_DB.
+            const lineDb = tsPMax - (my / H) * (tsPMax - tsPMin);
+            triggerThresholdDb = lineDb + IQ_STATS_OFFSET_DB;
+            tsCanvas.style.cursor = "ns-resize";
+            drawTimeSeries();
+            return;
+        }
+
+        if (tsPMin != null && tsPMax != null) {
+            const lineDb = triggerThresholdDb - IQ_STATS_OFFSET_DB;
+            const ty = H - ((lineDb - tsPMin) / (tsPMax - tsPMin)) * H;
+            tsCanvas.style.cursor = Math.abs(my - ty) < 8 ? "ns-resize" : "";
+        }
+
         tsCrosshairIdx = Math.min(N - 1, Math.max(0, Math.round((x / tsCanvas.width) * (TS_MAX_POINTS - 1))));
         if (tsCrosshairIdx >= N) tsCrosshairIdx = N - 1;
 
@@ -194,6 +248,10 @@
     });
 
     tsCanvas.addEventListener("mouseleave", function() {
+        if (draggingTrigger) {
+            draggingTrigger = false;
+            tsCanvas.style.cursor = "";
+        }
         tsCrosshairIdx = -1;
         tsTooltip.style.display = "none";
         drawTimeSeries();
@@ -217,14 +275,21 @@
             tsCtx.beginPath(); tsCtx.moveTo(0, y); tsCtx.lineTo(W, y); tsCtx.stroke();
         }
 
-        // Power range (needed for crosshair even if trace hidden)
+        // Power range (needed for crosshair even if trace hidden).
+        // Also factor the trigger line's position into the range so it
+        // always stays on-screen when the user drags it.
         let pMin = Infinity, pMax = -Infinity;
         for (let i = 0; i < N; i++) {
             if (tsAvgPower[i] < pMin) pMin = tsAvgPower[i];
             if (tsAvgPower[i] > pMax) pMax = tsAvgPower[i];
         }
+        const triggerLineDb = triggerThresholdDb - IQ_STATS_OFFSET_DB;
+        if (triggerLineDb < pMin) pMin = triggerLineDb;
+        if (triggerLineDb > pMax) pMax = triggerLineDb;
         const pPad = Math.max((pMax - pMin) * 0.1, 2);
         pMin -= pPad; pMax += pPad;
+        tsPMin = pMin;
+        tsPMax = pMax;
 
         // Power trace
         if (traceVisible.power) {
@@ -247,6 +312,28 @@
             tsCtx.textAlign = "right";
             tsCtx.fillText(pMax.toFixed(0) + " dBFS", W - 4, 12);
             tsCtx.fillText(pMin.toFixed(0) + " dBFS", W - 4, H - 4);
+        }
+
+        // IQ-recording trigger line (broadband). Drawn at trigger - 17 to
+        // sit on the trace's axis (iq_stats has the 50-ohm offset applied).
+        // Label shows the underlying TRIGGER_THRESHOLD_DB so the user sees
+        // the value they're configuring.
+        const triggerY = H - ((triggerLineDb - pMin) / (pMax - pMin)) * H;
+        if (triggerY >= 0 && triggerY <= H) {
+            tsCtx.strokeStyle = "rgba(255, 60, 60, 0.7)";
+            tsCtx.lineWidth = 1;
+            tsCtx.setLineDash([6, 4]);
+            tsCtx.beginPath();
+            tsCtx.moveTo(0, triggerY);
+            tsCtx.lineTo(W, triggerY);
+            tsCtx.stroke();
+            tsCtx.setLineDash([]);
+            tsCtx.fillStyle = "rgba(255, 60, 60, 0.9)";
+            tsCtx.textAlign = "right";
+            tsCtx.fillText(
+                "Trigger " + triggerThresholdDb.toFixed(1) + " dBFS",
+                W - 4, triggerY - 4,
+            );
         }
 
         // Kurtosis trace
@@ -304,37 +391,51 @@
     let lastFrequencies = [];
     let psdCrosshairBin = -1;  // persists across redraws
 
-    // Trigger line — initial value from server-rendered TRIGGER_THRESHOLD_DB,
-    // re-synced from each broadcast's `trigger_threshold_db` field unless the
-    // user is currently dragging it. POSTing on drag-release feeds back into
-    // the same setting, so the next message confirms the new value.
-    let triggerLevel = {{ settings.TRIGGER_THRESHOLD_DB }};
+    // --- Threshold lines on two distinct charts ---
+    //
+    // PSD chart  → burst-detection high threshold.
+    //   Drawn at (noise_floor_db + burst_threshold_high_db). Per-bin PSD units.
+    //   Drag → save burst_threshold_high_db as (line_y - noise_floor_db).
+    //
+    // Time-series → IQ-recording trigger threshold.
+    //   Drawn at (trigger_threshold_db - 17). The -17 compensates for the
+    //   50-ohm normalization in iq_utils.calculate_iq_statistics; the trigger
+    //   itself is checked against broadband mean power without that offset
+    //   (streaming.py:_check_power_above_threshold). We keep the offset in
+    //   iq_stats so OpenZMS observation values stay on the historical scale.
+    //   Drag → save trigger_threshold_db as (line_y + 17).
+    const IQ_STATS_OFFSET_DB = 17.0;
+
+    let burstThresholdHighDb = {{ settings.BURST_THRESHOLD_HIGH_DB }};
+    let noiseFloorDb = null;  // populated from each broadcast
+    let burstAbsLevel = null;  // = noiseFloorDb + burstThresholdHighDb (PSD line position)
+    let draggingBurst = false;
+
+    let triggerThresholdDb = {{ settings.TRIGGER_THRESHOLD_DB }};
     let draggingTrigger = false;
 
-    // Trigger line drag interaction
+    // PSD chart: drag the burst-threshold line.
     psdCanvas.addEventListener("mousedown", function(e) {
+        if (burstAbsLevel == null) return;
         const rect = psdCanvas.getBoundingClientRect();
         const scaleY = psdCanvas.height / rect.height;
         const my = (e.clientY - rect.top) * scaleY;
         const H = psdCanvas.height;
-        const ty = H - ((triggerLevel - dynamicMin) / (dynamicMax - dynamicMin)) * H;
+        const ty = H - ((burstAbsLevel - dynamicMin) / (dynamicMax - dynamicMin)) * H;
         if (Math.abs(my - ty) < 8) {
-            draggingTrigger = true;
+            draggingBurst = true;
             e.preventDefault();
         }
     });
 
     psdCanvas.addEventListener("mouseup", function() {
-        if (draggingTrigger) {
-            draggingTrigger = false;
-            // Save new threshold
-            // Save the absolute trigger level directly
-            const rounded = Math.round(triggerLevel * 10) / 10;
-            triggerLevel = rounded;
+        if (draggingBurst && noiseFloorDb != null) {
+            draggingBurst = false;
+            burstThresholdHighDb = Math.round((burstAbsLevel - noiseFloorDb) * 10) / 10;
             fetch("/config/apply", {
                 method: "POST",
                 headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({trigger_threshold_db: String(rounded)}),
+                body: JSON.stringify({burst_threshold_high_db: String(burstThresholdHighDb)}),
             });
             psdCanvas.style.cursor = "";
         }
@@ -349,17 +450,17 @@
         const my = (e.clientY - rect.top) * scaleY;
         const H = psdCanvas.height;
 
-        // Handle trigger line dragging
-        if (draggingTrigger) {
-            triggerLevel = dynamicMax - (my / H) * (dynamicMax - dynamicMin);
+        if (draggingBurst) {
+            burstAbsLevel = dynamicMax - (my / H) * (dynamicMax - dynamicMin);
             psdCanvas.style.cursor = "ns-resize";
             redrawPSD();
             return;
         }
 
-        // Show resize cursor near trigger line
-        const ty = H - ((triggerLevel - dynamicMin) / (dynamicMax - dynamicMin)) * H;
-        psdCanvas.style.cursor = Math.abs(my - ty) < 8 ? "ns-resize" : "";
+        if (burstAbsLevel != null) {
+            const ty = H - ((burstAbsLevel - dynamicMin) / (dynamicMax - dynamicMin)) * H;
+            psdCanvas.style.cursor = Math.abs(my - ty) < 8 ? "ns-resize" : "";
+        }
 
         const N = lastPowers.length;
         psdCrosshairBin = Math.min(N - 1, Math.max(0, Math.floor((x / psdCanvas.width) * N)));
@@ -368,7 +469,7 @@
         const power = lastPowers[psdCrosshairBin] || 0;
 
         psdTooltip.style.display = "block";
-        psdTooltip.textContent = (freq / 1e6).toFixed(2) + " MHz  " + power.toFixed(1) + " dBFS";
+        psdTooltip.textContent = (freq / 1e6).toFixed(2) + " MHz  " + power.toFixed(1) + " dB/bin";
         const tipX = e.clientX - rect.left;
         psdTooltip.style.left = Math.min(tipX + 10, rect.width - 160) + "px";
         psdTooltip.style.top = "4px";
@@ -377,8 +478,8 @@
     });
 
     psdCanvas.addEventListener("mouseleave", function() {
-        if (draggingTrigger) {
-            draggingTrigger = false;
+        if (draggingBurst) {
+            draggingBurst = false;
             psdCanvas.style.cursor = "";
         }
         psdCrosshairBin = -1;
@@ -389,7 +490,7 @@
     function redrawPSD() {
         drawPSD(psdCtx, psdCanvas.width, psdCanvas.height,
             lastPowers, lastFrequencies, dynamicMin, dynamicMax,
-            psdCrosshairBin, triggerLevel);
+            psdCrosshairBin, burstAbsLevel);
     }
 
     // --- Waterfall ---
@@ -618,10 +719,19 @@
                     lastFreqHighHz = data.frequencies[data.frequencies.length - 1];
                 }
                 updateDynamicRange(data.powers);
-                // Sync trigger line to server-side setting (skip while dragging
-                // so the user's interaction isn't snapped back).
+                // Sync threshold-line state from server (skip the field
+                // currently being dragged so the user isn't snapped back).
                 if (!draggingTrigger && typeof data.trigger_threshold_db === "number") {
-                    triggerLevel = data.trigger_threshold_db;
+                    triggerThresholdDb = data.trigger_threshold_db;
+                }
+                if (!draggingBurst && typeof data.burst_threshold_high_db === "number") {
+                    burstThresholdHighDb = data.burst_threshold_high_db;
+                }
+                if (typeof data.noise_floor_db === "number") {
+                    noiseFloorDb = data.noise_floor_db;
+                }
+                if (noiseFloorDb != null && !draggingBurst) {
+                    burstAbsLevel = noiseFloorDb + burstThresholdHighDb;
                 }
                 redrawPSD();
                 const chunkTimeMs = typeof data.chunk_time_ms === "number"

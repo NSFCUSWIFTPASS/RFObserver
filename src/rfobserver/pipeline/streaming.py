@@ -1048,7 +1048,14 @@ class StreamingProcessor:
         result: _StreamResult,
         chunk_count: int,
     ) -> None:
-        """Broadcast a DURATION_SEC-averaged PSD to the UI."""
+        """Broadcast a DURATION_SEC-averaged PSD to the UI.
+
+        Burst rectangles are intentionally omitted from the averaged broadcast:
+        bursts are detected at PSD-grid resolution (~0.5 ms rows) but each
+        averaged-mode waterfall row covers DURATION_SEC, so any rectangle
+        timing would be off by 25-1000x. The high-res broadcast (sent only
+        when a subscriber opts in) carries them.
+        """
         if self._broadcast is None:
             return
         await self._broadcast.publish(
@@ -1063,7 +1070,7 @@ class StreamingProcessor:
                 "max_power_db": result.iq_stats.max,
                 "kurtosis": result.iq_stats.kurtosis,
                 "burst_count": len(self._active_bursts),
-                "bursts": self._active_bursts,
+                "bursts": [],
                 "capture_num": result.capture_num,
                 "process_ms": result.process_ms,
                 "excess_ms": result.latency_ms,
@@ -1113,7 +1120,13 @@ class StreamingProcessor:
         )
 
     async def _publish_processed(self, avg_powers: list[float], result: _StreamResult) -> None:
-        """Build the per-window envelope once, fan out to ZMS + NATS."""
+        """Build the per-window envelope once, fan out to ZMS + NATS.
+
+        Both fanouts run as background tasks so the consumer loop returns
+        immediately. ZMS POSTs and NATS publishes can take 10-25 ms each;
+        awaiting them inline previously blocked the next high-res FFT
+        broadcast every DURATION_SEC, which the user saw as a stutter.
+        """
         if self._zms_monitor is None and self._nats_producer is None:
             return
         try:
@@ -1123,27 +1136,30 @@ class StreamingProcessor:
             return
 
         if self._zms_monitor is not None:
-            timeout = max(15.0, 5.0 * self._settings.DURATION_SEC)
-            try:
-                ok = await asyncio.wait_for(
-                    self._zms_monitor.submit_observation(envelope), timeout=timeout
-                )
-                if ok:
-                    logger.debug("ZMS observation submitted (chunk #%d)", result.capture_num)
-            except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
-                logger.warning(
-                    "ZMS submit timed out (chunk #%d) after %.1fs",
-                    result.capture_num,
-                    timeout,
-                )
-            except Exception:
-                logger.exception("ZMS observation submission failed")
+            asyncio.create_task(self._zms_submit_async(envelope, result.capture_num))
 
         if self._nats_producer is not None:
-            try:
-                await self._nats_producer.publish_stats(envelope, self._settings.HOSTNAME)
-            except Exception:
-                logger.exception("NATS stats publish failed")
+            asyncio.create_task(self._nats_publish_async(envelope))
+
+    async def _zms_submit_async(self, envelope: ProcessedDataEnvelope, chunk_num: int) -> None:
+        timeout = max(15.0, 5.0 * self._settings.DURATION_SEC)
+        try:
+            ok = await asyncio.wait_for(
+                self._zms_monitor.submit_observation(envelope),  # type: ignore[union-attr]
+                timeout=timeout,
+            )
+            if ok:
+                logger.debug("ZMS observation submitted (chunk #%d)", chunk_num)
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
+            logger.warning("ZMS submit timed out (chunk #%d) after %.1fs", chunk_num, timeout)
+        except Exception:
+            logger.exception("ZMS observation submission failed")
+
+    async def _nats_publish_async(self, envelope: ProcessedDataEnvelope) -> None:
+        try:
+            await self._nats_producer.publish_stats(envelope, self._settings.HOSTNAME)  # type: ignore[union-attr]
+        except Exception:
+            logger.exception("NATS stats publish failed")
 
     async def _drain_burst_results(self) -> None:
         """Process all pending burst results from the burst detection thread."""

@@ -15,7 +15,7 @@
                 <input type="checkbox" id="highres-toggle">
                 <span class="toggle-text">High Res</span>
             </label>
-            <label class="toggle-label" title="Show detected bursts on waterfall">
+            <label class="toggle-label" title="Show detected bursts on waterfall" id="burst-toggle-label" style="display:none;">
                 <input type="checkbox" id="burst-toggle" checked>
                 <span style="display:inline-block;width:15px;height:13px;border:1.5px solid #ff3b30;border-radius:2px;vertical-align:middle;"></span>
             </label>
@@ -99,6 +99,7 @@
     let ws = null;
 
     const burstToggle = document.getElementById("burst-toggle");
+    const burstToggleLabel = document.getElementById("burst-toggle-label");
     burstToggle.addEventListener("change", function() {
         showBursts = this.checked;
         if (!showBursts) {
@@ -111,6 +112,15 @@
         highRes = this.checked;
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({type: "set_mode", high_res: highRes}));
+        }
+        // Burst rectangles only make sense in high-res mode (averaged-mode
+        // rows span DURATION_SEC, far longer than any burst).
+        if (highRes) {
+            burstToggleLabel.style.display = "";
+        } else {
+            burstToggleLabel.style.display = "none";
+            showBursts = false;
+            burstCtx.clearRect(0, 0, wfWidth, wfHeight);
         }
         // Clear waterfall — time scale changes between modes
         clearWaterfall();

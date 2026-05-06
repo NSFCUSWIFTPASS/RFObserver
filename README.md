@@ -1,6 +1,6 @@
 # RFObserver
 
-RFObserver is a python application to monitor, visualize and process RF spectrum using SDRs. It is been developed for continuous RFI detection and monitoring at the Hat Creek Radio Observatory using [OpenZMS](https://openzms.net/). The instantaneous bandwidth is configurable and depends on the SDR and compute available. The current version deployed and tested uses the B205mini SDR and the Jetson Nano Super for compute.
+RFObserver (or RFObs) is a python application to monitor, visualize and process RF spectrum using SDRs with a live Web UI. It is been developed for continuous RFI detection, monitoring and enforcement at the Hat Creek Radio Observatory using [OpenZMS](https://openzms.net/). The instantaneous bandwidth is configurable and depends on the SDR and compute available. The current version deployed and being tested uses the B205mini SDR and the Jetson Nano Super for compute.
 
 ![RFObserver](assets/rfobs.png)
 
@@ -11,6 +11,7 @@ RFObserver supports configurable add-ons to the post processing pipeline for dem
 - Rolling burst detector with dual-threshold hysteresis on per-bin noise floor.
 - Trigger-based IQ recording (manual or power-threshold) with a pre-trigger circular buffer; streaming-to-disk or RAM-buffered modes.
 - Pluggable post-processing add-ons; FM audio demodulation included.
+- Configurable via API
 - Local WebUI (FastAPI + HTMX): live spectrogram, detection history, capture browser, runtime reconfiguration of every pipeline knob.
 - Local SQLite store of detections + capture metadata; long-running with WAL.
 - Outbound integrations: OpenZMS DST (SigMF observations) and NATS JetStream (`rfobs.stats.<hostname>` per-window envelopes).

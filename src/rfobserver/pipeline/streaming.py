@@ -37,7 +37,6 @@ from rfobserver.processing.iq_utils import calculate_iq_statistics, convert_sc16
 from rfobserver.processing.rolling_burst import RollingBurstDetector
 from rfobserver.processing.spectral import (
     PSDGridConfig,
-    compute_noise_floor,
     compute_psd_grid,
     compute_summary_psd,
 )
@@ -908,25 +907,18 @@ class StreamingProcessor:
                         time_resolution_s=time_res_s,
                     )
 
+                # Snapshot the rolling-window per-bin noise floor only on
+                # evaluation boundaries. detect_bursts already computes the
+                # array; we just read it from _last_detection. Recomputing on
+                # every chunk wedged the burst-detection thread (see fix in
+                # this commit), so we piggy-back on the detector's existing
+                # work and only refresh when it actually evaluates.
+                prev_rows_since_eval = rolling_detector._rows_since_eval
                 completed_bursts = rolling_detector.feed(psd_grid)
-
-                # Snapshot the rolling-window per-bin noise floor for the UI
-                # broadcast. Same compute_noise_floor() the detector uses on
-                # eval, so the threshold curve drawn on the PSD chart matches
-                # what the detector actually compared against (not a scalar
-                # 10th-percentile-across-frequency of the averaged trace).
-                rows_filled = rolling_detector._rows_filled
-                if rows_filled > 0:
-                    if rows_filled < rolling_detector._window_rows:
-                        win = rolling_detector._window[:rows_filled]
-                    else:
-                        win = np.concatenate(
-                            [
-                                rolling_detector._window[rolling_detector._write_pos :],
-                                rolling_detector._window[: rolling_detector._write_pos],
-                            ]
-                        )
-                    self._noise_floor_per_bin = compute_noise_floor(win).tolist()
+                if rolling_detector._rows_since_eval < prev_rows_since_eval:
+                    last_det = rolling_detector._last_detection
+                    if last_det is not None and last_det.noise_floor_per_bin is not None:
+                        self._noise_floor_per_bin = last_det.noise_floor_per_bin.tolist()
 
                 if completed_bursts and self._loop is not None:
                     self._loop.call_soon_threadsafe(

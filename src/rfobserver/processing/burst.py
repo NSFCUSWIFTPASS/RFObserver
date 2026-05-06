@@ -36,6 +36,7 @@ class BurstDetectionConfig:
 class BurstDetectionResult:
     bursts: list[BurstFingerprint] = field(default_factory=list)
     noise_floor_db: float = 0.0
+    noise_floor_per_bin: np.ndarray | None = None
     num_raw_detections: int = 0
     num_merged: int = 0
 
@@ -82,7 +83,7 @@ def detect_bursts(
     valid_labels = valid_labels[valid_labels > 0]
 
     if len(valid_labels) == 0:
-        return BurstDetectionResult(noise_floor_db=avg_noise)
+        return BurstDetectionResult(noise_floor_db=avg_noise, noise_floor_per_bin=noise_floor)
 
     raw_bursts = _extract_fingerprints(
         labeled,
@@ -106,6 +107,7 @@ def detect_bursts(
     return BurstDetectionResult(
         bursts=raw_bursts,
         noise_floor_db=avg_noise,
+        noise_floor_per_bin=noise_floor,
         num_raw_detections=num_raw,
         num_merged=num_raw - len(raw_bursts),
     )

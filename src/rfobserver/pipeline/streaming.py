@@ -35,7 +35,12 @@ from rfobserver.capture.buffer import CircularBuffer
 from rfobserver.processing.burst import BurstDetectionConfig
 from rfobserver.processing.iq_utils import calculate_iq_statistics, convert_sc16_to_complex
 from rfobserver.processing.rolling_burst import RollingBurstDetector
-from rfobserver.processing.spectral import PSDGridConfig, compute_psd_grid, compute_summary_psd
+from rfobserver.processing.spectral import (
+    PSDGridConfig,
+    compute_noise_floor,
+    compute_psd_grid,
+    compute_summary_psd,
+)
 
 if TYPE_CHECKING:
     from rfobserver.capture.receiver import IReceiver
@@ -193,6 +198,11 @@ class StreamingProcessor:
 
         # Active bursts for WebSocket overlay (written by burst thread, read by consumer)
         self._active_bursts: list[dict[str, object]] = []
+        # Per-bin noise floor that the rolling detector currently sees, in dB.
+        # Updated by the burst thread after each feed(); read by the consumer
+        # for the broadcast payload so the UI can draw the *actual* threshold
+        # the detector uses (a per-bin curve, not a horizontal line).
+        self._noise_floor_per_bin: list[float] | None = None
 
         # Burst results from burst thread -> event loop
         self._burst_result_queue: asyncio.Queue[list[BurstFingerprint] | None] = asyncio.Queue(
@@ -900,6 +910,24 @@ class StreamingProcessor:
 
                 completed_bursts = rolling_detector.feed(psd_grid)
 
+                # Snapshot the rolling-window per-bin noise floor for the UI
+                # broadcast. Same compute_noise_floor() the detector uses on
+                # eval, so the threshold curve drawn on the PSD chart matches
+                # what the detector actually compared against (not a scalar
+                # 10th-percentile-across-frequency of the averaged trace).
+                rows_filled = rolling_detector._rows_filled
+                if rows_filled > 0:
+                    if rows_filled < rolling_detector._window_rows:
+                        win = rolling_detector._window[:rows_filled]
+                    else:
+                        win = np.concatenate(
+                            [
+                                rolling_detector._window[rolling_detector._write_pos :],
+                                rolling_detector._window[: rolling_detector._write_pos],
+                            ]
+                        )
+                    self._noise_floor_per_bin = compute_noise_floor(win).tolist()
+
                 if completed_bursts and self._loop is not None:
                     self._loop.call_soon_threadsafe(
                         _put_nowait_drop_full, self._burst_result_queue, completed_bursts
@@ -1024,12 +1052,19 @@ class StreamingProcessor:
             # --- High-res UI broadcast (every chunk) ---
             if self._broadcast is not None and self._broadcast.has_high_res_subscribers():
                 noise_floor_db = float(np.percentile(result.summary_psd.powers, 10))
+                # Per-bin chunk max — peak across the high-resolution PSD rows
+                # in this chunk. This is what the detector actually compared
+                # against; the UI plots it as a "max-hold" trace so transient
+                # bursts that get smoothed out of the time-averaged summary
+                # are still visible against the per-bin threshold curve.
+                max_powers = result.psd_grid.grid.max(axis=0).astype(float).tolist()
                 await self._broadcast.publish(
                     {
                         "type": "psd",
                         "center_freq_hz": result.center_freq_hz,
                         "bandwidth_hz": self._settings.BANDWIDTH,
                         "powers": result.summary_psd.powers,
+                        "max_powers": max_powers,
                         "frequencies": result.summary_psd.frequencies,
                         "num_bins": result.summary_psd.num_bins,
                         "avg_power_db": result.iq_stats.average,
@@ -1044,6 +1079,7 @@ class StreamingProcessor:
                         "burst_threshold_high_db": self._settings.BURST_THRESHOLD_HIGH_DB,
                         "burst_threshold_low_ratio": self._settings.BURST_THRESHOLD_LOW_RATIO,
                         "noise_floor_db": noise_floor_db,
+                        "noise_floor_per_bin": self._noise_floor_per_bin,
                         "chunk_time_ms": datetime.now(timezone.utc).timestamp() * 1000.0,
                     }
                 )
@@ -1065,12 +1101,14 @@ class StreamingProcessor:
         if self._broadcast is None:
             return
         noise_floor_db = float(np.percentile(avg_powers, 10)) if avg_powers else -200.0
+        max_powers = result.psd_grid.grid.max(axis=0).astype(float).tolist()
         await self._broadcast.publish(
             {
                 "type": "psd",
                 "center_freq_hz": result.center_freq_hz,
                 "bandwidth_hz": self._settings.BANDWIDTH,
                 "powers": avg_powers,
+                "max_powers": max_powers,
                 "frequencies": result.summary_psd.frequencies,
                 "num_bins": result.summary_psd.num_bins,
                 "avg_power_db": result.iq_stats.average,
@@ -1084,7 +1122,9 @@ class StreamingProcessor:
                 "chunks_averaged": chunk_count,
                 "trigger_threshold_db": self._settings.TRIGGER_THRESHOLD_DB,
                 "burst_threshold_high_db": self._settings.BURST_THRESHOLD_HIGH_DB,
+                "burst_threshold_low_ratio": self._settings.BURST_THRESHOLD_LOW_RATIO,
                 "noise_floor_db": noise_floor_db,
+                "noise_floor_per_bin": self._noise_floor_per_bin,
                 "chunk_time_ms": datetime.now(timezone.utc).timestamp() * 1000.0,
             }
         )

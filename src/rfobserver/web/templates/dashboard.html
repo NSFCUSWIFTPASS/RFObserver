@@ -388,6 +388,8 @@
     const psdTooltip = document.getElementById("psd-tooltip");
 
     let lastPowers = [];
+    let lastMaxPowers = [];        // per-bin max across the chunk's PSD rows
+    let lastNoiseFloorPerBin = []; // per-bin 10th percentile from rolling window
     let lastFrequencies = [];
     let psdCrosshairBin = -1;  // persists across redraws
 
@@ -409,31 +411,41 @@
     let burstThresholdHighDb = {{ settings.BURST_THRESHOLD_HIGH_DB }};
     let burstThresholdLowRatio = {{ settings.BURST_THRESHOLD_LOW_RATIO }};
     let noiseFloorDb = null;  // populated from each broadcast
-    let burstAbsLevel = null;  // = noiseFloorDb + burstThresholdHighDb
-    let burstLowAbsLevel = null;  // = noiseFloorDb + burstThresholdHighDb * ratio
     let draggingBurst = false;
     let draggingBurstLow = false;
 
     let triggerThresholdDb = {{ settings.TRIGGER_THRESHOLD_DB }};
     let draggingTrigger = false;
 
-    // PSD chart: two draggable threshold lines.
-    //   High line (red)  → BURST_THRESHOLD_HIGH_DB         — burst ignition
-    //   Low line (orange)→ BURST_THRESHOLD_HIGH_DB * ratio — burst extent
-    // Each line is "near" the cursor within 8 px to grab. The low line's drag
-    // updates the *ratio* (line - floor) / high; clamped into (0, 1].
+    // PSD chart: two draggable threshold *curves*. Each curve sits at
+    // (per-bin noise floor) + scalar offset. The user drags the curve
+    // vertically; we record the offset and re-render the whole curve.
+    //
+    //   High curve (red)  → offset = BURST_THRESHOLD_HIGH_DB
+    //   Low curve (orange)→ offset = BURST_THRESHOLD_HIGH_DB * ratio
+    //
+    // Hit-test compares the cursor's y to the curve's y *at the cursor's
+    // bin*, since the curve isn't horizontal anymore.
+    function _binAtX(canvasX) {
+        const N = lastNoiseFloorPerBin.length;
+        if (N === 0) return -1;
+        return Math.min(N - 1, Math.max(0, Math.floor((canvasX / psdCanvas.width) * N)));
+    }
+
     psdCanvas.addEventListener("mousedown", function(e) {
-        if (burstAbsLevel == null) return;
+        if (lastNoiseFloorPerBin.length === 0) return;
         const rect = psdCanvas.getBoundingClientRect();
+        const scaleX = psdCanvas.width / rect.width;
         const scaleY = psdCanvas.height / rect.height;
+        const mx = (e.clientX - rect.left) * scaleX;
         const my = (e.clientY - rect.top) * scaleY;
-        const H = psdCanvas.height;
-        const tyHi = H - ((burstAbsLevel - dynamicMin) / (dynamicMax - dynamicMin)) * H;
-        const tyLo = burstLowAbsLevel == null
-            ? -1
-            : H - ((burstLowAbsLevel - dynamicMin) / (dynamicMax - dynamicMin)) * H;
+        const bin = _binAtX(mx);
+        if (bin < 0) return;
+        const nfHere = lastNoiseFloorPerBin[bin];
+        const tyHi = _dbToY(nfHere + burstThresholdHighDb);
+        const tyLo = _dbToY(nfHere + burstThresholdHighDb * burstThresholdLowRatio);
         const dHi = Math.abs(my - tyHi);
-        const dLo = tyLo < 0 ? Infinity : Math.abs(my - tyLo);
+        const dLo = Math.abs(my - tyLo);
         if (dHi < 8 && dHi <= dLo) {
             draggingBurst = true;
             e.preventDefault();
@@ -444,9 +456,9 @@
     });
 
     psdCanvas.addEventListener("mouseup", function() {
-        if (draggingBurst && noiseFloorDb != null) {
+        if (draggingBurst) {
             draggingBurst = false;
-            burstThresholdHighDb = Math.round((burstAbsLevel - noiseFloorDb) * 10) / 10;
+            burstThresholdHighDb = Math.round(burstThresholdHighDb * 10) / 10;
             fetch("/config/apply", {
                 method: "POST",
                 headers: {"Content-Type": "application/json"},
@@ -454,11 +466,9 @@
             });
             psdCanvas.style.cursor = "";
         }
-        if (draggingBurstLow && noiseFloorDb != null && burstThresholdHighDb > 0) {
+        if (draggingBurstLow) {
             draggingBurstLow = false;
-            const lowDb = Math.max(0.01, burstLowAbsLevel - noiseFloorDb);
-            const ratio = Math.min(1.0, lowDb / burstThresholdHighDb);
-            burstThresholdLowRatio = Math.round(ratio * 1000) / 1000;
+            burstThresholdLowRatio = Math.round(burstThresholdLowRatio * 1000) / 1000;
             fetch("/config/apply", {
                 method: "POST",
                 headers: {"Content-Type": "application/json"},
@@ -476,40 +486,36 @@
         const x = (e.clientX - rect.left) * scaleX;
         const my = (e.clientY - rect.top) * scaleY;
         const H = psdCanvas.height;
+        const span = dynamicMax - dynamicMin;
+        const myDb = dynamicMax - (my / H) * span;
+        const bin = _binAtX(x);
+        const nfHere = bin >= 0 && lastNoiseFloorPerBin.length > 0
+            ? lastNoiseFloorPerBin[bin] : null;
 
-        if (draggingBurst) {
-            burstAbsLevel = dynamicMax - (my / H) * (dynamicMax - dynamicMin);
-            // Keep low line proportional during a high-line drag.
-            if (noiseFloorDb != null) {
-                burstLowAbsLevel = noiseFloorDb
-                    + (burstAbsLevel - noiseFloorDb) * burstThresholdLowRatio;
-            }
+        if (draggingBurst && nfHere != null) {
+            // The user dragged the high curve; new offset at this bin is
+            // (myDb - nfHere). The whole curve translates because every bin
+            // sees the same offset shift.
+            burstThresholdHighDb = Math.max(0.1, myDb - nfHere);
             psdCanvas.style.cursor = "ns-resize";
             redrawPSD();
             return;
         }
-        if (draggingBurstLow) {
-            const newLow = dynamicMax - (my / H) * (dynamicMax - dynamicMin);
-            // Clamp: low must stay between noise floor and high threshold.
-            if (noiseFloorDb != null && burstAbsLevel != null) {
-                burstLowAbsLevel = Math.min(burstAbsLevel - 0.1,
-                    Math.max(noiseFloorDb + 0.1, newLow));
-            } else {
-                burstLowAbsLevel = newLow;
-            }
+        if (draggingBurstLow && nfHere != null && burstThresholdHighDb > 0) {
+            // Drag low curve → recompute ratio so its at-cursor y = myDb.
+            const newLowDb = Math.max(0.05, myDb - nfHere);
+            const ratio = Math.min(0.99, newLowDb / burstThresholdHighDb);
+            burstThresholdLowRatio = Math.max(0.01, ratio);
             psdCanvas.style.cursor = "ns-resize";
             redrawPSD();
             return;
         }
 
         let nearLine = false;
-        if (burstAbsLevel != null) {
-            const tyHi = H - ((burstAbsLevel - dynamicMin) / (dynamicMax - dynamicMin)) * H;
-            if (Math.abs(my - tyHi) < 8) nearLine = true;
-        }
-        if (!nearLine && burstLowAbsLevel != null) {
-            const tyLo = H - ((burstLowAbsLevel - dynamicMin) / (dynamicMax - dynamicMin)) * H;
-            if (Math.abs(my - tyLo) < 8) nearLine = true;
+        if (nfHere != null) {
+            const tyHi = _dbToY(nfHere + burstThresholdHighDb);
+            const tyLo = _dbToY(nfHere + burstThresholdHighDb * burstThresholdLowRatio);
+            if (Math.abs(my - tyHi) < 8 || Math.abs(my - tyLo) < 8) nearLine = true;
         }
         psdCanvas.style.cursor = nearLine ? "ns-resize" : "";
 
@@ -518,11 +524,14 @@
 
         const freq = lastFrequencies[psdCrosshairBin] || 0;
         const power = lastPowers[psdCrosshairBin] || 0;
+        const peak = lastMaxPowers[psdCrosshairBin];
+        let tip = (freq / 1e6).toFixed(2) + " MHz  " + power.toFixed(1) + " dB/bin";
+        if (typeof peak === "number") tip += "  pk " + peak.toFixed(1);
 
         psdTooltip.style.display = "block";
-        psdTooltip.textContent = (freq / 1e6).toFixed(2) + " MHz  " + power.toFixed(1) + " dB/bin";
+        psdTooltip.textContent = tip;
         const tipX = e.clientX - rect.left;
-        psdTooltip.style.left = Math.min(tipX + 10, rect.width - 160) + "px";
+        psdTooltip.style.left = Math.min(tipX + 10, rect.width - 200) + "px";
         psdTooltip.style.top = "4px";
 
         redrawPSD();
@@ -537,35 +546,98 @@
         redrawPSD();
     });
 
-    function _drawBurstLowLine() {
-        if (burstLowAbsLevel == null) return;
-        const W = psdCanvas.width;
+    // Map a bin index to the PSD canvas's internal x coordinate.
+    function _binToX(binIdx, n) {
+        return n > 0 ? (binIdx / n) * psdCanvas.width : 0;
+    }
+
+    // y for an absolute dB value on the PSD canvas.
+    function _dbToY(db) {
         const H = psdCanvas.height;
-        const ty = H - ((burstLowAbsLevel - dynamicMin) / (dynamicMax - dynamicMin)) * H;
-        if (ty < 0 || ty > H) return;
+        return H - ((db - dynamicMin) / (dynamicMax - dynamicMin)) * H;
+    }
+
+    // Per-bin threshold *curve*, not a horizontal line. The detector compares
+    // each high-resolution PSD cell against (per-bin noise floor) + threshold.
+    // Drawing a horizontal scalar misled — the curve here matches what the
+    // detector actually compares against.
+    function _drawBurstThresholdCurves() {
+        const nf = lastNoiseFloorPerBin;
+        if (!nf || nf.length === 0) return;
+        const N = nf.length;
+        const W = psdCanvas.width;
+        const ratio = burstThresholdLowRatio;
+
+        // High threshold curve (red dashed)
+        psdCtx.strokeStyle = "rgba(255, 60, 60, 0.7)";
+        psdCtx.lineWidth = 1;
+        psdCtx.setLineDash([6, 4]);
+        psdCtx.beginPath();
+        for (let i = 0; i < N; i++) {
+            const x = _binToX(i, N);
+            const y = _dbToY(nf[i] + burstThresholdHighDb);
+            if (i === 0) psdCtx.moveTo(x, y); else psdCtx.lineTo(x, y);
+        }
+        psdCtx.stroke();
+        psdCtx.setLineDash([]);
+
+        // Low threshold curve (orange dashed)
         psdCtx.strokeStyle = "rgba(255, 159, 10, 0.6)";
         psdCtx.lineWidth = 1;
         psdCtx.setLineDash([3, 4]);
         psdCtx.beginPath();
-        psdCtx.moveTo(0, ty);
-        psdCtx.lineTo(W, ty);
+        for (let i = 0; i < N; i++) {
+            const x = _binToX(i, N);
+            const y = _dbToY(nf[i] + burstThresholdHighDb * ratio);
+            if (i === 0) psdCtx.moveTo(x, y); else psdCtx.lineTo(x, y);
+        }
         psdCtx.stroke();
         psdCtx.setLineDash([]);
-        psdCtx.fillStyle = "rgba(255, 159, 10, 0.85)";
+
+        // Right-edge labels at the curve endpoints.
+        const yHiEnd = _dbToY(nf[N - 1] + burstThresholdHighDb);
+        const yLoEnd = _dbToY(nf[N - 1] + burstThresholdHighDb * ratio);
         psdCtx.font = "10px -apple-system, sans-serif";
         psdCtx.textAlign = "right";
-        psdCtx.fillText(
-            "Burst Lo " + burstLowAbsLevel.toFixed(1) + " dB/bin (×"
-                + burstThresholdLowRatio.toFixed(2) + ")",
-            W - 4, ty + 12,
-        );
+        if (yHiEnd >= 0 && yHiEnd <= psdCanvas.height) {
+            psdCtx.fillStyle = "rgba(255, 60, 60, 0.9)";
+            psdCtx.fillText("Burst Hi +" + burstThresholdHighDb.toFixed(1) + " dB",
+                W - 4, yHiEnd - 4);
+        }
+        if (yLoEnd >= 0 && yLoEnd <= psdCanvas.height) {
+            psdCtx.fillStyle = "rgba(255, 159, 10, 0.85)";
+            psdCtx.fillText(
+                "Burst Lo ×" + ratio.toFixed(2),
+                W - 4, yLoEnd + 12,
+            );
+        }
+    }
+
+    // Faint per-bin max-hold trace. Transient peaks the detector saw — even
+    // if the time-averaged "powers" trace smoothed them out — show up here.
+    function _drawMaxHoldTrace() {
+        const M = lastMaxPowers;
+        if (!M || M.length < 2) return;
+        const N = M.length;
+        psdCtx.strokeStyle = "rgba(255, 159, 10, 0.45)";
+        psdCtx.lineWidth = 1;
+        psdCtx.beginPath();
+        for (let i = 0; i < N; i++) {
+            const x = (i / (N - 1)) * psdCanvas.width;
+            const y = _dbToY(M[i]);
+            if (i === 0) psdCtx.moveTo(x, y); else psdCtx.lineTo(x, y);
+        }
+        psdCtx.stroke();
     }
 
     function redrawPSD() {
+        // Pass null so drawPSD skips its single-line draw — we do per-bin
+        // threshold curves below.
         drawPSD(psdCtx, psdCanvas.width, psdCanvas.height,
             lastPowers, lastFrequencies, dynamicMin, dynamicMax,
-            psdCrosshairBin, burstAbsLevel);
-        _drawBurstLowLine();
+            psdCrosshairBin, null);
+        _drawMaxHoldTrace();
+        _drawBurstThresholdCurves();
     }
 
     // --- Waterfall ---
@@ -788,6 +860,10 @@
 
                 // PSD + waterfall
                 lastPowers = data.powers;
+                lastMaxPowers = Array.isArray(data.max_powers) ? data.max_powers : [];
+                lastNoiseFloorPerBin = Array.isArray(data.noise_floor_per_bin)
+                    ? data.noise_floor_per_bin
+                    : [];
                 lastFrequencies = data.frequencies;
                 if (data.frequencies && data.frequencies.length >= 2) {
                     lastFreqLowHz = data.frequencies[0];
@@ -807,14 +883,6 @@
                 }
                 if (typeof data.noise_floor_db === "number") {
                     noiseFloorDb = data.noise_floor_db;
-                }
-                if (noiseFloorDb != null) {
-                    if (!draggingBurst) {
-                        burstAbsLevel = noiseFloorDb + burstThresholdHighDb;
-                    }
-                    if (!draggingBurstLow) {
-                        burstLowAbsLevel = noiseFloorDb + burstThresholdHighDb * burstThresholdLowRatio;
-                    }
                 }
                 redrawPSD();
                 const chunkTimeMs = typeof data.chunk_time_ms === "number"

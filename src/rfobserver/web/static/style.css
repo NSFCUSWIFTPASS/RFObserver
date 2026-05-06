@@ -70,6 +70,21 @@ body {
     max-width: 960px;
     margin: 0 auto;
     padding: 16px 24px;
+    min-height: calc(100vh - 48px - 56px);
+}
+
+/* Site footer */
+.site-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+    padding: 16px 24px;
+    border-top: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 12px;
+    background: var(--nav-bg);
+    backdrop-filter: saturate(180%) blur(20px);
 }
 
 .page-header {

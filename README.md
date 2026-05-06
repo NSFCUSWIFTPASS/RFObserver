@@ -80,3 +80,11 @@ src/rfobserver/
 ## License
 
 BSD 3-Clause. See [LICENSE](LICENSE).
+
+## Acknowledgement
+
+This work is supported by NSF Cooperative Agreement #2431961.
+
+## Copyright
+
+&copy; 2026 University of Colorado Boulder &mdash; Wireless Interdisciplinary Research Group (WIRG).

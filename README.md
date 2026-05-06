@@ -10,12 +10,13 @@ RFObserver supports configurable add-ons to the post processing pipeline for dem
 - Real-time PSD grid + summary PSD computation, IQ statistics (mean/max/median/std/kurtosis).
 - Rolling burst detector with dual-threshold hysteresis on per-bin noise floor.
 - Trigger-based IQ recording (manual or power-threshold) with a pre-trigger circular buffer; streaming-to-disk or RAM-buffered modes.
+- Capture view with waterfall and spectrogram in the Web UI for post analysis
 - Pluggable post-processing add-ons; FM audio demodulation included.
 - Configurable via API
 - Local WebUI (FastAPI + HTMX): live spectrogram, detection history, capture browser, runtime reconfiguration of every pipeline knob.
 - Local SQLite store of detections + capture metadata; long-running with WAL.
 - Outbound integrations: OpenZMS DST (SigMF observations) and NATS JetStream (`rfobs.stats.<hostname>` per-window envelopes).
-- Mock receiver for development without hardware; integration tests cover the full pipeline against synthetic IQ.
+- Mock receiver for development without hardware; integration tests cover the most of the pipeline against synthetic IQ.
 
 ## Quick Start
 

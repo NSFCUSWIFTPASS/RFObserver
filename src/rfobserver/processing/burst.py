@@ -144,13 +144,16 @@ def _extract_fingerprints(
         f_max = float(freq_axis[max_col])
         bandwidth = f_max - f_min
 
-        # Peak power and center frequency
+        # Peak power; center frequency = geometric middle of (f_min, f_max).
+        # The peak's exact bin location is intentionally NOT used for
+        # center_freq_hz — visualizations and span queries assume it sits
+        # at the geometric center so that center +/- bandwidth/2 reproduces
+        # the actual occupied range.
         region_powers = grid[rows, cols]
         peak_idx = int(np.argmax(region_powers))
         peak_power = float(region_powers[peak_idx])
-        peak_freq = float(freq_axis[cols[peak_idx]])
 
-        burst_center_freq = center_freq_hz + peak_freq
+        burst_center_freq = center_freq_hz + (f_min + f_max) / 2
 
         bursts.append(
             BurstFingerprint(

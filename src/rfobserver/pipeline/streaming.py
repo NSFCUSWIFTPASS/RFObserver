@@ -1039,6 +1039,7 @@ class StreamingProcessor:
                         "capture_num": result.capture_num,
                         "process_ms": result.process_ms,
                         "excess_ms": result.latency_ms,
+                        "trigger_threshold_db": self._settings.TRIGGER_THRESHOLD_DB,
                     }
                 )
 
@@ -1075,6 +1076,7 @@ class StreamingProcessor:
                 "process_ms": result.process_ms,
                 "excess_ms": result.latency_ms,
                 "chunks_averaged": chunk_count,
+                "trigger_threshold_db": self._settings.TRIGGER_THRESHOLD_DB,
             }
         )
 

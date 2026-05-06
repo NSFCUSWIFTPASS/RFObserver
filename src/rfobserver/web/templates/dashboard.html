@@ -304,9 +304,11 @@
     let lastFrequencies = [];
     let psdCrosshairBin = -1;  // persists across redraws
 
-    // Trigger line — auto-computed from first data, then fixed until dragged
-    // or config changes (freq/BW/duration edit clears waterfall + resets this)
-    let triggerLevel = null;  // null = auto-compute from next PSD update
+    // Trigger line — initial value from server-rendered TRIGGER_THRESHOLD_DB,
+    // re-synced from each broadcast's `trigger_threshold_db` field unless the
+    // user is currently dragging it. POSTing on drag-release feeds back into
+    // the same setting, so the next message confirms the new value.
+    let triggerLevel = {{ settings.TRIGGER_THRESHOLD_DB }};
     let draggingTrigger = false;
 
     // Trigger line drag interaction
@@ -415,8 +417,7 @@
         wfMessageCount = 0;
         activeBursts = [];
         burstCtx.clearRect(0, 0, wfWidth, wfHeight);
-        // Recalculate trigger level from next PSD data
-        triggerLevel = null;
+        // Trigger level is synced from server on every PSD message, so no reset needed.
     }
     clearWaterfall();
 
@@ -573,11 +574,10 @@
                 lastPowers = data.powers;
                 lastFrequencies = data.frequencies;
                 updateDynamicRange(data.powers);
-                // Auto-compute trigger level from first data
-                if (triggerLevel === null && data.powers.length > 0) {
-                    const sorted = [...data.powers].sort((a, b) => a - b);
-                    const nf = sorted[Math.floor(sorted.length * 0.1)];
-                    triggerLevel = nf + {{ settings.BURST_THRESHOLD_HIGH_DB }};
+                // Sync trigger line to server-side setting (skip while dragging
+                // so the user's interaction isn't snapped back).
+                if (!draggingTrigger && typeof data.trigger_threshold_db === "number") {
+                    triggerLevel = data.trigger_threshold_db;
                 }
                 redrawPSD();
                 addWaterfallLine(data.powers);

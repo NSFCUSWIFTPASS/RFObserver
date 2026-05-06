@@ -17,12 +17,16 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from rfobserver.processing.burst import BurstDetectionConfig
-from rfobserver.processing.iq_utils import convert_sc16_to_complex
-from rfobserver.processing.rolling_burst import RollingBurstDetector
-from rfobserver.processing.spectral import PSDGridConfig, compute_psd_grid
+# Pillow is only used to save the eyeball PNG; CI runners may not have it.
+# Skip the whole module rather than tank an unrelated test job.
+pytest.importorskip("PIL")
 
-from ._synth import Burst, iq_to_sc16_int32, make_iq_with_bursts
+from rfobserver.processing.burst import BurstDetectionConfig  # noqa: E402
+from rfobserver.processing.iq_utils import convert_sc16_to_complex  # noqa: E402
+from rfobserver.processing.rolling_burst import RollingBurstDetector  # noqa: E402
+from rfobserver.processing.spectral import PSDGridConfig, compute_psd_grid  # noqa: E402
+
+from ._synth import Burst, iq_to_sc16_int32, make_iq_with_bursts  # noqa: E402
 
 # Same canvas dimensions as the dashboard <canvas> elements.
 WF_WIDTH = 920

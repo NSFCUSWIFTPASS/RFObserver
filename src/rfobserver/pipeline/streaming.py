@@ -1042,6 +1042,7 @@ class StreamingProcessor:
                         "excess_ms": result.latency_ms,
                         "trigger_threshold_db": self._settings.TRIGGER_THRESHOLD_DB,
                         "burst_threshold_high_db": self._settings.BURST_THRESHOLD_HIGH_DB,
+                        "burst_threshold_low_ratio": self._settings.BURST_THRESHOLD_LOW_RATIO,
                         "noise_floor_db": noise_floor_db,
                         "chunk_time_ms": datetime.now(timezone.utc).timestamp() * 1000.0,
                     }

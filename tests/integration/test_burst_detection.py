@@ -127,6 +127,10 @@ async def test_detects_known_bursts_at_multiple_bandwidths(
                 duration_sec=settings.DURATION_SEC,
             ),
             iq_int32=sc16,
+            # Slower pacing so dispatch keeps up on under-resourced CI runners
+            # (4x realtime drops chunks at 25 MHz BW on shared CI; 2x is
+            # reliable while still finishing in <2 s wall time).
+            pacing_factor=2.0,
         )
         receiver.initialize()
         processor = _make_processor(settings, receiver, db)
@@ -192,6 +196,7 @@ async def _run_threshold_test(
                 duration_sec=settings.DURATION_SEC,
             ),
             iq_int32=sc16,
+            pacing_factor=2.0,
         )
         receiver.initialize()
         processor = _make_processor(settings, receiver, db)

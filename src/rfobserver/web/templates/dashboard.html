@@ -464,14 +464,23 @@
                     if (existing.key === key) { isDup = true; break; }
                 }
                 if (!isDup) {
-                    const x = b.freq_start * wfWidth;
-                    const w = Math.max(3, (b.freq_end - b.freq_start) * wfWidth);
                     const ups = upsTimestamps.length > 1
                         ? (upsTimestamps.length - 1) / ((upsTimestamps[upsTimestamps.length - 1] - upsTimestamps[0]) / 1000)
                         : 2;
-                    const h = Math.max(3, (b.duration_ms / 1000) * ups);
-                    // Position using age_sec — how far back in time
-                    const y = Math.round((b.age_sec || 0) * ups);
+                    // Center the rectangle on the burst's geometric (freq, time)
+                    // center. For narrow/short bursts the natural width and
+                    // height are sub-pixel; the 3 px clamp keeps them visible.
+                    // Anchoring to top-left used to push the box down-and-right
+                    // of the actual streak — center-anchoring keeps the streak
+                    // inside the rectangle.
+                    const naturalW = (b.freq_end - b.freq_start) * wfWidth;
+                    const naturalH = (b.duration_ms / 1000) * ups;
+                    const w = Math.max(3, naturalW);
+                    const h = Math.max(3, naturalH);
+                    const xCenter = ((b.freq_start + b.freq_end) / 2) * wfWidth;
+                    const yCenter = ((b.age_sec || 0) + (b.duration_ms / 1000) / 2) * ups;
+                    const x = Math.round(xCenter - w / 2);
+                    const y = Math.max(0, Math.round(yCenter - h / 2));
                     activeBursts.push({x, y, w, h, key, meta: b});
                 }
             }

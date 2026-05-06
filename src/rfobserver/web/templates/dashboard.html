@@ -406,7 +406,21 @@
     const burstCtx = burstOverlayCanvas.getContext("2d");
     const burstTooltip = document.getElementById("burst-tooltip");
     const wfWrapper = document.getElementById("wf-wrapper");
-    let activeBursts = [];
+
+    // Per-spectrum-line timestamps: wfRowTimes[i] is the chunk_time_ms of
+    // the line currently displayed at row i (0 = top = newest). The
+    // backend stamps every broadcast; the frontend uses that + each
+    // burst's start/stop_time_ms to place rectangles by absolute time.
+    let wfRowTimes = [];
+    // Bursts the backend has reported recently. Keyed by burst id (uuid)
+    // so re-detection of the same physical burst in subsequent rolling
+    // evaluations keeps refining its anchor instead of stacking.
+    const seenBursts = new Map();
+    // Last broadcast's frequency span — used to map burst freq to x.
+    let lastFreqLowHz = null;
+    let lastFreqHighHz = null;
+    // Last frame's drawn rectangles, used by the hover tooltip.
+    let lastDrawnRects = [];
 
     function clearWaterfall() {
         for (let i = 0; i < wfImageData.data.length; i += 4) {
@@ -415,7 +429,8 @@
         }
         wfCtx.putImageData(wfImageData, 0, 0);
         wfMessageCount = 0;
-        activeBursts = [];
+        wfRowTimes = [];
+        seenBursts.clear();
         burstCtx.clearRect(0, 0, wfWidth, wfHeight);
         // Trigger level is synced from server on every PSD message, so no reset needed.
     }
@@ -436,53 +451,43 @@
         if (el) el.textContent = ups.toFixed(1) + " ups";
     }
 
-    function addWaterfallLine(powers) {
+    function addWaterfallLine(powers, chunkTimeMs) {
         const rowBytes = wfWidth * 4;
         wfImageData.data.copyWithin(rowBytes, 0, (wfHeight - 1) * rowBytes);
         renderWaterfallRow(wfImageData, wfWidth, 0, powers, dynamicMin, dynamicMax);
         wfCtx.putImageData(wfImageData, 0, 0);
+        // Record this row's timestamp at index 0 (top, newest).
+        wfRowTimes.unshift(chunkTimeMs);
+        if (wfRowTimes.length > wfHeight) wfRowTimes.length = wfHeight;
+    }
+
+    // Find the row index (0 = newest) whose stored time is closest to
+    // *targetMs*. Returns -1 if targetMs is newer than the newest row,
+    // wfHeight if older than the oldest. Linear scan — wfHeight is small.
+    function rowForTime(targetMs) {
+        if (wfRowTimes.length === 0) return -1;
+        if (targetMs > wfRowTimes[0]) return -1;
+        for (let i = 0; i < wfRowTimes.length; i++) {
+            if (wfRowTimes[i] <= targetMs) return i;
+        }
+        return wfRowTimes.length;
     }
 
     function updateBurstOverlay(newBursts) {
-        // 1. Shift all existing bursts down 1 pixel (waterfall scrolled 1 row)
-        for (let i = activeBursts.length - 1; i >= 0; i--) {
-            activeBursts[i].y += 1;
-            if (activeBursts[i].y > wfHeight) {
-                activeBursts.splice(i, 1);
+        // Add / refresh each reported burst by id; the backend re-emits
+        // pending bursts across detector evaluations, so the latest payload
+        // for an id is the most accurate (the burst may have grown).
+        if (newBursts && newBursts.length > 0) {
+            for (const b of newBursts) {
+                if (b.id != null) seenBursts.set(b.id, b);
             }
         }
 
-        // 2. Add new bursts that aren't already tracked.
-        //    Use a key of freq_start + duration_ms to deduplicate across
-        //    consecutive messages (the rolling detector reports the same
-        //    burst in multiple evaluations).
-        if (newBursts && newBursts.length > 0) {
-            for (const b of newBursts) {
-                const key = b.center_freq_hz.toFixed(0) + "_" + b.duration_ms.toFixed(1);
-                let isDup = false;
-                for (const existing of activeBursts) {
-                    if (existing.key === key) { isDup = true; break; }
-                }
-                if (!isDup) {
-                    const ups = upsTimestamps.length > 1
-                        ? (upsTimestamps.length - 1) / ((upsTimestamps[upsTimestamps.length - 1] - upsTimestamps[0]) / 1000)
-                        : 2;
-                    // Center the rectangle on the burst's geometric (freq, time)
-                    // center. For narrow/short bursts the natural width and
-                    // height are sub-pixel; the 3 px clamp keeps them visible.
-                    // Anchoring to top-left used to push the box down-and-right
-                    // of the actual streak — center-anchoring keeps the streak
-                    // inside the rectangle.
-                    const naturalW = (b.freq_end - b.freq_start) * wfWidth;
-                    const naturalH = (b.duration_ms / 1000) * ups;
-                    const w = Math.max(3, naturalW);
-                    const h = Math.max(3, naturalH);
-                    const xCenter = ((b.freq_start + b.freq_end) / 2) * wfWidth;
-                    const yCenter = ((b.age_sec || 0) + (b.duration_ms / 1000) / 2) * ups;
-                    const x = Math.round(xCenter - w / 2);
-                    const y = Math.max(0, Math.round(yCenter - h / 2));
-                    activeBursts.push({x, y, w, h, key, meta: b});
-                }
+        // Drop bursts whose stop time is older than the oldest visible row.
+        if (wfRowTimes.length > 0) {
+            const oldest = wfRowTimes[wfRowTimes.length - 1];
+            for (const [id, b] of seenBursts) {
+                if (b.stop_time_ms < oldest) seenBursts.delete(id);
             }
         }
 
@@ -491,13 +496,39 @@
 
     function drawBurstOverlay() {
         burstCtx.clearRect(0, 0, wfWidth, wfHeight);
+        lastDrawnRects = [];
         if (!showBursts) return;
-        for (const b of activeBursts) {
+        if (lastFreqLowHz == null || lastFreqHighHz == null) return;
+        const fSpan = lastFreqHighHz - lastFreqLowHz;
+        if (fSpan <= 0) return;
+
+        for (const b of seenBursts.values()) {
+            // Vertical: rows for stop (top of rect, more recent) and start.
+            const yTopRow = rowForTime(b.stop_time_ms);
+            const yBotRow = rowForTime(b.start_time_ms);
+            const yTop = yTopRow < 0 ? 0 : yTopRow;
+            const yBot = yBotRow >= wfHeight ? wfHeight : yBotRow;
+            if (yBot <= 0 || yTop >= wfHeight) continue;
+            const naturalH = yBot - yTop;
+            const h = Math.max(3, naturalH);
+            const yCenter = (yTop + yBot) / 2;
+            const y = Math.max(0, Math.round(yCenter - h / 2));
+
+            // Horizontal: map freq bounds onto canvas using the latest
+            // broadcast's freq span.
+            const xLoF = (b.freq_low_hz - lastFreqLowHz) / fSpan;
+            const xHiF = (b.freq_high_hz - lastFreqLowHz) / fSpan;
+            const naturalW = (xHiF - xLoF) * wfWidth;
+            const w = Math.max(3, naturalW);
+            const xCenter = ((xLoF + xHiF) / 2) * wfWidth;
+            const x = Math.round(xCenter - w / 2);
+
             burstCtx.strokeStyle = "rgba(255, 60, 60, 0.9)";
             burstCtx.lineWidth = 1.5;
-            burstCtx.strokeRect(b.x, b.y, b.w, b.h);
+            burstCtx.strokeRect(x, y, w, h);
             burstCtx.fillStyle = "rgba(255, 60, 60, 0.08)";
-            burstCtx.fillRect(b.x, b.y, b.w, b.h);
+            burstCtx.fillRect(x, y, w, h);
+            lastDrawnRects.push({x, y, w, h, meta: b});
         }
     }
 
@@ -510,7 +541,7 @@
         const my = (e.clientY - rect.top) * scaleY;
 
         let hit = null;
-        for (const b of activeBursts) {
+        for (const b of lastDrawnRects) {
             if (mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h) {
                 hit = b;
                 break;
@@ -582,6 +613,10 @@
                 // PSD + waterfall
                 lastPowers = data.powers;
                 lastFrequencies = data.frequencies;
+                if (data.frequencies && data.frequencies.length >= 2) {
+                    lastFreqLowHz = data.frequencies[0];
+                    lastFreqHighHz = data.frequencies[data.frequencies.length - 1];
+                }
                 updateDynamicRange(data.powers);
                 // Sync trigger line to server-side setting (skip while dragging
                 // so the user's interaction isn't snapped back).
@@ -589,7 +624,9 @@
                     triggerLevel = data.trigger_threshold_db;
                 }
                 redrawPSD();
-                addWaterfallLine(data.powers);
+                const chunkTimeMs = typeof data.chunk_time_ms === "number"
+                    ? data.chunk_time_ms : Date.now();
+                addWaterfallLine(data.powers, chunkTimeMs);
                 updateBurstOverlay(data.bursts);
                 drawLegendBar();
             }

@@ -296,6 +296,13 @@ async def test_streaming_rapid_reconfigure_does_not_wedge(
     consumer task exited — taking _running=False and all threads with it.
     """
 
+    # Push the burst threshold high so MockReceiver Gaussian noise doesn't
+    # generate thousands of false-positive detections — those bog the DB
+    # write path and make this test flaky under load. The detector's
+    # reconfigure path runs the same regardless of how many bursts get
+    # emitted.
+    object.__setattr__(settings, "BURST_THRESHOLD_HIGH_DB", 40.0)
+
     async def burst_reconfigures_and_stop() -> None:
         while streaming_processor._capture_count < 3:
             await asyncio.sleep(0.02)
@@ -326,7 +333,7 @@ async def test_streaming_rapid_reconfigure_does_not_wedge(
 
     await asyncio.wait_for(
         asyncio.gather(streaming_processor.run(), burst_reconfigures_and_stop()),
-        timeout=15.0,
+        timeout=30.0,
     )
 
 

@@ -26,7 +26,7 @@ import queue
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -906,33 +906,33 @@ class StreamingProcessor:
                     )
 
                 # Build active burst overlay data for WebSocket.
-                # Send freq as fractional position [0,1] and time as
-                # seconds so the frontend can map to any canvas size
-                # and update rate.
+                # Each burst carries absolute frequency bounds plus real
+                # start/stop UTC timestamps (epoch ms). The frontend
+                # correlates these with per-spectrum-line timestamps to
+                # place rectangles — no pixel math here.
+                #
+                # BurstFingerprint stores timestamps as
+                # ``capture_time + offset_within_window`` (legacy encoding),
+                # so the real wall-clock time is ``stored - window_dur``.
                 detection = rolling_detector.last_detection
                 if detection and detection.bursts:
-                    freq_axis = psd_grid.freq_axis
-                    num_bins = len(freq_axis)
                     time_res = rolling_detector._time_resolution_s
                     window_dur = rolling_detector._rows_filled * time_res
                     active: list[dict[str, object]] = []
                     for b in detection.bursts:
-                        f_lo = b.center_freq_hz - b.bandwidth_hz / 2 - center_freq
-                        f_hi = b.center_freq_hz + b.bandwidth_hz / 2 - center_freq
-                        bin_start = int(np.searchsorted(freq_axis, f_lo))
-                        bin_end = int(np.searchsorted(freq_axis, f_hi))
-                        # Time: how many seconds ago the burst ended
-                        t_end = (b.stop_time - b.detection_timestamp).total_seconds()
-                        age_sec = max(0.0, window_dur - t_end)
+                        real_start = b.start_time - timedelta(seconds=window_dur)
+                        real_stop = b.stop_time - timedelta(seconds=window_dur)
                         active.append(
                             {
+                                "id": b.burst_id,
                                 "center_freq_hz": b.center_freq_hz,
                                 "bandwidth_hz": b.bandwidth_hz,
+                                "freq_low_hz": b.center_freq_hz - b.bandwidth_hz / 2,
+                                "freq_high_hz": b.center_freq_hz + b.bandwidth_hz / 2,
                                 "peak_power_db": round(b.peak_power_db, 1),
                                 "duration_ms": round(b.duration_ms, 2),
-                                "freq_start": bin_start / num_bins,
-                                "freq_end": min(1.0, bin_end / num_bins),
-                                "age_sec": round(age_sec, 4),
+                                "start_time_ms": real_start.timestamp() * 1000.0,
+                                "stop_time_ms": real_stop.timestamp() * 1000.0,
                             }
                         )
                     self._active_bursts = active
@@ -1040,6 +1040,7 @@ class StreamingProcessor:
                         "process_ms": result.process_ms,
                         "excess_ms": result.latency_ms,
                         "trigger_threshold_db": self._settings.TRIGGER_THRESHOLD_DB,
+                        "chunk_time_ms": datetime.now(timezone.utc).timestamp() * 1000.0,
                     }
                 )
 
@@ -1077,6 +1078,7 @@ class StreamingProcessor:
                 "excess_ms": result.latency_ms,
                 "chunks_averaged": chunk_count,
                 "trigger_threshold_db": self._settings.TRIGGER_THRESHOLD_DB,
+                "chunk_time_ms": datetime.now(timezone.utc).timestamp() * 1000.0,
             }
         )
 

@@ -1,12 +1,20 @@
 # RFObserver
 
-Unified RF monitoring sensor for NVIDIA Jetson Orin Nano 8GB Super. Consolidates rf-survey, rf-processor, zms-monitor, and iq2ram into a single package with continuous full-duty-cycle capture at 26 Msps.
+RFObserver is a python application to monitor, visualize and process RF spectrum using SDRs. It is been developed for continuous RFI detection and monitoring at the Hat Creek Radio Observatory using [OpenZMS](https://openzms.net/). The instantaneous bandwidth is configurable and depends on the SDR and compute available. The current version deployed and tested uses the B205mini SDR and the Jetson Nano Super for compute.
 
-## Architecture
+![RFObserver](assets/rfobs.png)
 
-RFObserver runs entirely on the Jetson. It captures IQ samples from a USRP SDR, processes them in real-time (PSD, spectral kurtosis, burst detection), stores results locally in SQLite, and publishes summaries to a remote server via NATS JetStream.
+RFObserver supports configurable add-ons to the post processing pipeline for demodulation. Currently, FM demoulation is supported. It has following features:
 
-A local WebUI (FastAPI + HTMX) provides field operators with live spectrogram, detection history, and sensor reconfiguration -- no remote server required.
+- Continuous full-duty-cycle IQ capture from USRP SDRs (B200/B205mini tested), with frequency sweep support.
+- Real-time PSD grid + summary PSD computation, IQ statistics (mean/max/median/std/kurtosis).
+- Rolling burst detector with dual-threshold hysteresis on per-bin noise floor.
+- Trigger-based IQ recording (manual or power-threshold) with a pre-trigger circular buffer; streaming-to-disk or RAM-buffered modes.
+- Pluggable post-processing add-ons; FM audio demodulation included.
+- Local WebUI (FastAPI + HTMX): live spectrogram, detection history, capture browser, runtime reconfiguration of every pipeline knob.
+- Local SQLite store of detections + capture metadata; long-running with WAL.
+- Outbound integrations: OpenZMS DST (SigMF observations) and NATS JetStream (`rfobs.stats.<hostname>` per-window envelopes).
+- Mock receiver for development without hardware; integration tests cover the full pipeline against synthetic IQ.
 
 ## Quick Start
 
@@ -41,40 +49,6 @@ hatch run test:integration
 ruff check src/rfobserver/
 ruff format --check src/rfobserver/
 mypy src/rfobserver/
-```
-
-## Docker
-
-```bash
-# Dev stack (mock mode + NATS)
-docker compose -f docker/docker-compose.yml up
-
-# Production Jetson image
-docker build -f docker/Dockerfile.jetson -t rfobserver:jetson .
-```
-
-## Deployment
-
-See `deploy/` for systemd unit and Jetson setup script.
-
-```bash
-sudo ./deploy/install.sh
-sudo systemctl start rfobserver
-```
-
-## Project Structure
-
-```
-src/rfobserver/
-  capture/       # USRP acquisition, trigger, buffer
-  processing/    # IQ stats, PSD, burst detection, waterfall
-  storage/       # Local file archiver, SQLite DB
-  transport/     # NATS JetStream publisher
-  web/           # FastAPI + HTMX local WebUI
-  zms/           # OpenZMS integration
-  pipeline/      # Async orchestrator
-  metrics/       # Prometheus metrics
-  utils/         # Hardware, scheduler, watchdog
 ```
 
 ## License

@@ -77,6 +77,41 @@
 </div>
 
 <div class="card" style="margin-bottom: 16px;">
+    <div class="card-header">Location</div>
+    <div class="card-body">
+        <div class="config-form">
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="latitude">Latitude</label>
+                    <input type="number" id="latitude" name="latitude" step="0.000001" min="-90" max="90"
+                           value="{{ settings.LATITUDE if settings.LATITUDE is not none else '' }}"
+                           placeholder="e.g. 40.8170">
+                </div>
+                <div class="form-group">
+                    <label for="longitude">Longitude</label>
+                    <input type="number" id="longitude" name="longitude" step="0.000001" min="-180" max="180"
+                           value="{{ settings.LONGITUDE if settings.LONGITUDE is not none else '' }}"
+                           placeholder="e.g. -121.4720">
+                </div>
+                <div class="form-group" style="flex: 0 0 auto; justify-content: flex-end;">
+                    <label>&nbsp;</label>
+                    <button type="button" id="open-map-btn" class="btn-apply"
+                            title="Pick location on map"
+                            style="padding: 4px 10px; font-size: 12px; display: inline-flex; align-items: center; gap: 6px;">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                             stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path>
+                            <circle cx="12" cy="10" r="3"></circle>
+                        </svg>
+                        Map
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card" style="margin-bottom: 16px;">
     <div class="card-header">Storage</div>
     <div class="card-body">
         <div class="config-form">
@@ -189,6 +224,32 @@
     </button>
 </div>
 </form>
+
+<!-- Map picker modal. Lazy-loads Leaflet from CDN on first open so the
+     rest of the page doesn't carry the asset cost when the user never
+     touches the map. Geocoding uses OpenStreetMap Nominatim — no API
+     key, light-touch rate limit (1 req/s, enforced by debounce). -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<div id="map-modal" class="map-modal" style="display: none;">
+    <div class="map-modal-overlay"></div>
+    <div class="map-modal-panel">
+        <div class="map-modal-header">
+            <input id="map-search" type="search" placeholder="Search for a place…" autocomplete="off">
+            <span class="map-modal-coords">
+                <span id="map-coords-lat">--</span>, <span id="map-coords-lon">--</span>
+            </span>
+            <button type="button" class="map-modal-close" title="Close" aria-label="Close">&times;</button>
+        </div>
+        <div id="map" class="map-modal-map"></div>
+        <div class="map-modal-footer">
+            <div id="map-search-results" class="map-search-results"></div>
+            <span style="flex:1;"></span>
+            <button type="button" class="btn-cancel map-modal-cancel">Cancel</button>
+            <button type="button" class="btn-apply map-modal-apply">Use this location</button>
+        </div>
+    </div>
+</div>
 
 <script>
 (function() {
@@ -414,6 +475,181 @@
         }
         pollStatus();
     });
+
+    // --- Map picker modal ---------------------------------------------------
+    //
+    // First open: dynamically inject the Leaflet <script>, then init the map.
+    // Subsequent opens just refresh the marker + view from the form inputs.
+    // The modal mutates the lat/long inputs only on "Use this location";
+    // Cancel/Escape/overlay click leaves them untouched.
+    const latInput = document.getElementById('latitude');
+    const lonInput = document.getElementById('longitude');
+    const mapBtn = document.getElementById('open-map-btn');
+    const modal = document.getElementById('map-modal');
+    const searchInput = document.getElementById('map-search');
+    const searchResults = document.getElementById('map-search-results');
+    const coordLatEl = document.getElementById('map-coords-lat');
+    const coordLonEl = document.getElementById('map-coords-lon');
+    const closeBtn = modal.querySelector('.map-modal-close');
+    const cancelBtn = modal.querySelector('.map-modal-cancel');
+    const applyBtn = modal.querySelector('.map-modal-apply');
+    const overlay = modal.querySelector('.map-modal-overlay');
+
+    let map = null;
+    let marker = null;
+    let stagedLat = null;
+    let stagedLon = null;
+    let leafletPromise = null;
+
+    function loadLeaflet() {
+        if (window.L) return Promise.resolve(window.L);
+        if (leafletPromise) return leafletPromise;
+        leafletPromise = new Promise((resolve, reject) => {
+            const s = document.createElement('script');
+            s.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+            s.integrity = 'sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=';
+            s.crossOrigin = '';
+            s.onload = () => resolve(window.L);
+            s.onerror = () => reject(new Error('Failed to load Leaflet'));
+            document.head.appendChild(s);
+        });
+        return leafletPromise;
+    }
+
+    function updateCoordsReadout(lat, lon) {
+        stagedLat = lat;
+        stagedLon = lon;
+        coordLatEl.textContent = lat.toFixed(6);
+        coordLonEl.textContent = lon.toFixed(6);
+    }
+
+    function initMap(L, lat, lon, zoom) {
+        map = L.map('map').setView([lat, lon], zoom);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://openstreetmap.org/copyright">OpenStreetMap</a>',
+        }).addTo(map);
+        marker = L.marker([lat, lon], {draggable: true}).addTo(map);
+        marker.on('drag', e => {
+            const ll = e.target.getLatLng();
+            updateCoordsReadout(ll.lat, ll.lng);
+        });
+        map.on('click', e => {
+            marker.setLatLng(e.latlng);
+            updateCoordsReadout(e.latlng.lat, e.latlng.lng);
+        });
+        updateCoordsReadout(lat, lon);
+    }
+
+    function openModal() {
+        const havePos = latInput.value && lonInput.value;
+        const lat = havePos ? parseFloat(latInput.value) : 20;
+        const lon = havePos ? parseFloat(lonInput.value) : 0;
+        const zoom = havePos ? 12 : 2;
+
+        modal.style.display = '';
+        document.body.style.overflow = 'hidden';
+        searchInput.value = '';
+        searchResults.innerHTML = '';
+
+        loadLeaflet().then(L => {
+            if (map === null) {
+                initMap(L, lat, lon, zoom);
+            } else {
+                marker.setLatLng([lat, lon]);
+                map.setView([lat, lon], zoom);
+                updateCoordsReadout(lat, lon);
+            }
+            // Leaflet calculates pane sizes on init; opening from display:none
+            // means it sees zero, so kick it to recompute on next paint.
+            setTimeout(() => map.invalidateSize(), 50);
+        }).catch(err => {
+            alert('Failed to load map: ' + err.message);
+            closeModal();
+        });
+    }
+
+    function closeModal() {
+        modal.style.display = 'none';
+        document.body.style.overflow = '';
+    }
+
+    function applySelection() {
+        if (stagedLat == null || stagedLon == null) return;
+        latInput.value = stagedLat.toFixed(6);
+        lonInput.value = stagedLon.toFixed(6);
+        // Trigger 'input' so the form's dirty-tracking (which enables the
+        // Apply button) notices the change.
+        latInput.dispatchEvent(new Event('input', {bubbles: true}));
+        lonInput.dispatchEvent(new Event('input', {bubbles: true}));
+        closeModal();
+    }
+
+    mapBtn.addEventListener('click', openModal);
+    closeBtn.addEventListener('click', closeModal);
+    cancelBtn.addEventListener('click', closeModal);
+    overlay.addEventListener('click', closeModal);
+    applyBtn.addEventListener('click', applySelection);
+    document.addEventListener('keydown', e => {
+        if (e.key === 'Escape' && modal.style.display !== 'none') closeModal();
+    });
+
+    // --- Nominatim geocoder (debounced 500ms; max ~1 req/s per their TOS) --
+    let searchTimer = null;
+    searchInput.addEventListener('input', () => {
+        clearTimeout(searchTimer);
+        const q = searchInput.value.trim();
+        if (q.length < 3) {
+            searchResults.innerHTML = '';
+            return;
+        }
+        searchTimer = setTimeout(() => runGeocode(q), 500);
+    });
+    searchInput.addEventListener('keydown', e => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            clearTimeout(searchTimer);
+            const q = searchInput.value.trim();
+            if (q.length >= 1) runGeocode(q);
+        }
+    });
+
+    async function runGeocode(q) {
+        searchResults.innerHTML = '<span class="map-search-pending">Searching…</span>';
+        try {
+            const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=5&q='
+                + encodeURIComponent(q);
+            const r = await fetch(url, {headers: {'Accept': 'application/json'}});
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const items = await r.json();
+            renderSearchResults(items);
+        } catch (e) {
+            searchResults.innerHTML = '<span class="map-search-pending">Search failed</span>';
+        }
+    }
+
+    function renderSearchResults(items) {
+        if (!items || items.length === 0) {
+            searchResults.innerHTML = '<span class="map-search-pending">No matches</span>';
+            return;
+        }
+        searchResults.innerHTML = '';
+        for (const it of items) {
+            const lat = parseFloat(it.lat);
+            const lon = parseFloat(it.lon);
+            const div = document.createElement('div');
+            div.className = 'map-search-result';
+            div.textContent = it.display_name;
+            div.title = it.display_name;
+            div.addEventListener('click', () => {
+                marker.setLatLng([lat, lon]);
+                map.setView([lat, lon], 13);
+                updateCoordsReadout(lat, lon);
+                searchResults.innerHTML = '';
+            });
+            searchResults.appendChild(div);
+        }
+    }
 })();
 </script>
 {% endblock %}

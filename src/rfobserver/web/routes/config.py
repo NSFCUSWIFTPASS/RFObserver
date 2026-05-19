@@ -91,6 +91,9 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "num_fft_bins": ("NUM_FFT_BINS", int),
         "archive_max_gb": ("ARCHIVE_MAX_GB", float),
         "history_days": ("HISTORY_DAYS", int),
+        # Sensor location (optional — empty input clears the value)
+        "latitude": ("LATITUDE", float),
+        "longitude": ("LONGITUDE", float),
         # NATS
         "nats_host": ("NATS_HOST", str),
         "nats_port": ("NATS_PORT", int),
@@ -109,17 +112,26 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "zms_token": "ZMS_TOKEN",
     }
 
+    # Settings that legitimately accept None — submitting an empty input on
+    # the config form clears them. Keep this list tight; for required fields
+    # we want the cast to raise so the user notices.
+    nullable_attrs = {"LATITUDE", "LONGITUDE"}
+
     changed = []
     for form_key, (attr, cast) in field_map.items():
         if form_key not in body:
             continue
-        try:
-            new_val = cast(body[form_key])
-        except (ValueError, TypeError) as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid value for {form_key}",
-            ) from exc
+        raw = body[form_key]
+        if attr in nullable_attrs and (raw is None or raw == ""):
+            new_val = None
+        else:
+            try:
+                new_val = cast(raw)
+            except (ValueError, TypeError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid value for {form_key}",
+                ) from exc
 
         # Validate FFT bins: must be a power of 2 in [256, 8192]
         if attr == "NUM_FFT_BINS":

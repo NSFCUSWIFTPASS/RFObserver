@@ -118,13 +118,16 @@ def build_status_bar_html(settings: Any) -> str:
     Shared between the HTMX page-load fetch (``GET /api/status-bar``) and
     the WebSocket heartbeat that keeps the bar fresh while live (no polling).
     """
-    hostname = settings.HOSTNAME
+    # SENSOR_NAME is a user-facing display label; HOSTNAME is the machine
+    # identifier used elsewhere (NATS subjects, capture filenames, ZMS
+    # metadata). The dashboard only ever shows the friendly label.
+    display_name = settings.SENSOR_NAME or settings.HOSTNAME
     freq = settings.FREQUENCY_START / 1e6
     bw = settings.BANDWIDTH / 1e6
     dur = settings.DURATION_SEC
 
     return (
-        f"{hostname} "
+        f"{display_name} "
         f'<span class="status-sep">&middot;</span> '
         f'<span class="editable-val" data-field="frequency_start" '
         f'data-raw="{settings.FREQUENCY_START}" data-suffix=" MHz">'

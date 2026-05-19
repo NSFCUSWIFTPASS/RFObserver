@@ -175,7 +175,7 @@
                 </div>
                 <div class="form-group">
                     <label for="zms-name">Monitor Name</label>
-                    <input type="text" id="zms-name" name="zms_monitor_name" value="{{ settings.ZMS_MONITOR_NAME }}">
+                    <input type="text" id="zms-name" name="zms_monitor_name" value="{{ settings.ZMS_MONITOR_NAME or '' }}" placeholder="RFObs - {{ settings.HOSTNAME }}">
                 </div>
             </div>
         </div>

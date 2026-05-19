@@ -20,6 +20,7 @@ async def dashboard(request: Request) -> Any:
         {
             "settings": settings,
             "hostname": settings.HOSTNAME,
+            "display_name": settings.SENSOR_NAME or settings.HOSTNAME,
             "frequency_start": settings.FREQUENCY_START,
             "frequency_end": settings.FREQUENCY_END,
             "bandwidth": settings.BANDWIDTH,

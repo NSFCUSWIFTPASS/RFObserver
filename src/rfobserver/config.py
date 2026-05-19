@@ -62,7 +62,18 @@ class AppSettings(BaseSettings):
     BURST_MERGE_TIME_MS: float = 3.0
 
     # Identity
+    #
+    # HOSTNAME is the canonical machine identifier — used in NATS subjects,
+    # capture filenames, the envelope MetadataRecord, and the rf-processor
+    # hostname lookup. Don't change at runtime.
+    #
+    # SENSOR_NAME is a human-facing display label. When set, the dashboard
+    # status bar shows it instead of the hostname; everything else (NATS,
+    # filenames, OpenZMS observations) keeps using HOSTNAME as identity.
     HOSTNAME: str = Field(default_factory=socket.gethostname)
+    SENSOR_NAME: str | None = None
+    LATITUDE: float | None = None
+    LONGITUDE: float | None = None
     ORGANIZATION: str = "DefaultOrg"
     COORDINATES: str = "0.0N,0.0W"
 
@@ -115,7 +126,9 @@ class AppSettings(BaseSettings):
     ZMS_IDENTITY_HTTP: str | None = None
     ZMS_TOKEN: SecretStr | None = None
     ZMS_MONITOR_ID: str | None = None
-    ZMS_MONITOR_NAME: str = "RFObserver"
+    # When unset, falls back to ``f"RFObs - {HOSTNAME}"`` (see `zms` property
+    # below). This shows up as the monitor's display name in OpenZMS.
+    ZMS_MONITOR_NAME: str | None = None
     ZMS_MONITOR_SCHEMA_PATH: str | None = None
     ZMS_METRIC_ID: str | None = None
 
@@ -135,7 +148,7 @@ class AppSettings(BaseSettings):
                 identity_http=self.ZMS_IDENTITY_HTTP,
                 token=self.ZMS_TOKEN.get_secret_value(),
                 monitor_id=self.ZMS_MONITOR_ID,
-                monitor_name=self.ZMS_MONITOR_NAME,
+                monitor_name=self.ZMS_MONITOR_NAME or f"RFObs - {self.HOSTNAME}",
                 monitor_schema_path=self.ZMS_MONITOR_SCHEMA_PATH,
                 metric_id=self.ZMS_METRIC_ID,
             )

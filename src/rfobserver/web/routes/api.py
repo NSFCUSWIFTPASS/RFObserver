@@ -281,18 +281,24 @@ async def set_storage_path(request: Request) -> dict[str, Any]:
 
 
 def build_zms_status_payload(settings: Any, proc: Any) -> dict[str, Any]:
-    """Same shape as ``GET /api/zms/status`` — reused by the WS heartbeat."""
+    """Same shape as ``GET /api/zms/status`` — reused by the WS heartbeat.
+
+    ``enabled`` reflects user intent (``settings.ZMS_ENABLED`` persisted via
+    .env, AND ``settings.zms`` valid). ``connected`` reflects runtime state —
+    whether a ZmsMonitor is currently attached to the processor.
+    """
     zms = getattr(proc, "_zms_monitor", None) if proc else None
+    enabled = bool(settings.ZMS_ENABLED and settings.zms)
     if zms is None:
         return {
-            "enabled": False,
+            "enabled": enabled,
             "connected": False,
             "message_count": 0,
             "last_sent": None,
             "monitor_id": settings.ZMS_MONITOR_ID,
         }
     return {
-        "enabled": True,
+        "enabled": enabled,
         "connected": True,
         "message_count": zms.message_count,
         "last_sent": f"{zms.message_count} observations sent",
@@ -309,7 +315,9 @@ async def zms_status(request: Request) -> dict[str, Any]:
 
 @router.post("/zms/enable")
 async def zms_enable(request: Request) -> dict[str, Any]:
-    """Enable ZMS monitor (requires ZMS settings to be configured)."""
+    """Enable ZMS monitor + persist the intent to .env."""
+    from rfobserver.web.routes.config import _persist_settings
+
     settings = request.app.state.settings
     proc = _get_processor(request)
 
@@ -319,21 +327,25 @@ async def zms_enable(request: Request) -> dict[str, Any]:
     if settings.zms is None:
         return {"status": "error", "detail": "ZMS settings incomplete"}
 
-    if getattr(proc, "_zms_monitor", None) is not None:
-        return {"status": "already_enabled"}
+    if getattr(proc, "_zms_monitor", None) is None:
+        from rfobserver.zms.monitor import ZmsMonitor
 
-    from rfobserver.zms.monitor import ZmsMonitor
+        zms = ZmsMonitor(settings.zms)
+        await zms.start()
+        proc._zms_monitor = zms
 
-    zms = ZmsMonitor(settings.zms)
-    await zms.start()
-    proc._zms_monitor = zms
-    logger.info("ZMS monitor enabled via API")
+    object.__setattr__(settings, "ZMS_ENABLED", True)
+    _persist_settings(settings)
+    logger.info("ZMS monitor enabled via API (persisted)")
     return {"status": "enabled"}
 
 
 @router.post("/zms/disable")
 async def zms_disable(request: Request) -> dict[str, Any]:
-    """Disable ZMS monitor."""
+    """Disable ZMS monitor + persist the intent to .env."""
+    from rfobserver.web.routes.config import _persist_settings
+
+    settings = request.app.state.settings
     proc = _get_processor(request)
     if proc is None:
         return {"status": "error", "detail": "Pipeline not running"}
@@ -342,7 +354,10 @@ async def zms_disable(request: Request) -> dict[str, Any]:
     if zms is not None:
         await zms.stop()
         proc._zms_monitor = None
-        logger.info("ZMS monitor disabled via API")
+
+    object.__setattr__(settings, "ZMS_ENABLED", False)
+    _persist_settings(settings)
+    logger.info("ZMS monitor disabled via API (persisted)")
     return {"status": "disabled"}
 
 
@@ -376,35 +391,38 @@ async def nats_status(request: Request) -> dict[str, Any]:
 
 @router.post("/nats/enable")
 async def nats_enable(request: Request) -> dict[str, Any]:
-    """Enable NATS producer at runtime (connect + attach to processor)."""
+    """Enable NATS producer at runtime + persist the intent to .env."""
+    from rfobserver.web.routes.config import _persist_settings
+
     settings = request.app.state.settings
     proc = _get_processor(request)
 
     if proc is None:
         return {"status": "error", "detail": "Pipeline not running"}
 
-    if getattr(proc, "_nats_producer", None) is not None:
-        return {"status": "already_enabled"}
+    if getattr(proc, "_nats_producer", None) is None:
+        from rfobserver.transport.nats_producer import NatsProducer
 
-    from rfobserver.transport.nats_producer import NatsProducer
+        token = settings.NATS_TOKEN.get_secret_value() if settings.NATS_TOKEN else None
+        producer = NatsProducer(url=settings.NATS_URL, token=token)
+        try:
+            await producer.connect()
+        except Exception as e:
+            logger.exception("NATS enable failed")
+            return {"status": "error", "detail": f"connect failed: {e}"}
+        proc._nats_producer = producer
 
-    token = settings.NATS_TOKEN.get_secret_value() if settings.NATS_TOKEN else None
-    producer = NatsProducer(url=settings.NATS_URL, token=token)
-    try:
-        await producer.connect()
-    except Exception as e:
-        logger.exception("NATS enable failed")
-        return {"status": "error", "detail": f"connect failed: {e}"}
-
-    proc._nats_producer = producer
     settings.NATS_ENABLED = True
-    logger.info("NATS producer enabled via API (%s)", settings.NATS_URL)
+    _persist_settings(settings)
+    logger.info("NATS producer enabled via API (%s, persisted)", settings.NATS_URL)
     return {"status": "enabled"}
 
 
 @router.post("/nats/disable")
 async def nats_disable(request: Request) -> dict[str, Any]:
-    """Disable NATS producer (close + detach from processor)."""
+    """Disable NATS producer (close + detach) + persist the intent to .env."""
+    from rfobserver.web.routes.config import _persist_settings
+
     settings = request.app.state.settings
     proc = _get_processor(request)
     if proc is None:
@@ -417,8 +435,10 @@ async def nats_disable(request: Request) -> dict[str, Any]:
         except Exception:
             logger.exception("NATS close raised; detaching anyway")
         proc._nats_producer = None
-        logger.info("NATS producer disabled via API")
+
     settings.NATS_ENABLED = False
+    _persist_settings(settings)
+    logger.info("NATS producer disabled via API (persisted)")
     return {"status": "disabled"}
 
 

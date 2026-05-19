@@ -104,6 +104,12 @@ class AppSettings(BaseSettings):
     LOG_LEVEL: str = "INFO"
 
     # ZMS (optional)
+    #
+    # ZMS_ENABLED is the user-intent flag — True means "start the monitor at
+    # boot if settings.zms is also valid". Default True so existing deployments
+    # with the four required URLs/tokens populated keep behaving as before.
+    # The /api/zms/{enable,disable} endpoints persist this through .env.
+    ZMS_ENABLED: bool = True
     ZMS_ZMC_HTTP: str | None = None
     ZMS_DST_HTTP: str | None = None
     ZMS_IDENTITY_HTTP: str | None = None

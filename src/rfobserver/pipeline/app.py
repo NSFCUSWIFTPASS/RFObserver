@@ -51,9 +51,11 @@ async def run(settings: AppSettings) -> None:
     local_storage = LocalStorage(settings.STORAGE_PATH, max_gb=settings.ARCHIVE_MAX_GB)
     broadcast = LiveBroadcast()
 
-    # ZMS monitor (optional)
+    # ZMS monitor (optional). Two conditions both required:
+    #   settings.zms       — all four URLs/tokens populated (settings valid)
+    #   settings.ZMS_ENABLED — user has it toggled on (persisted in .env)
     zms_monitor = None
-    if settings.zms:
+    if settings.zms and settings.ZMS_ENABLED:
         from rfobserver.zms.monitor import ZmsMonitor
 
         zms_monitor = ZmsMonitor(settings.zms)

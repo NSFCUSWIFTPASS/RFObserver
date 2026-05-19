@@ -5,7 +5,7 @@
 <div class="graph-stack">
     <div class="card">
         <div class="card-header">
-            <span class="card-header-label" hx-get="/api/status-bar" hx-trigger="load, every 2s" hx-swap="innerHTML">Loading...</span>
+            <span id="status-bar-label" class="card-header-label" hx-get="/api/status-bar" hx-trigger="load" hx-swap="innerHTML">Loading...</span>
             <span class="status-sep">&middot;</span>
             <span id="ups-counter" class="card-header-label" style="opacity: 0.5;">-- ups</span>
             <span id="timing-sep" class="status-sep" style="display: none;">&middot;</span>
@@ -72,7 +72,7 @@
                         <th>Peak</th>
                     </tr>
                 </thead>
-                <tbody hx-get="/api/detections" hx-trigger="load, every 5s" hx-swap="innerHTML">
+                <tbody id="detections-tbody" hx-get="/api/detections" hx-trigger="load, refreshDetections from:body" hx-swap="innerHTML">
                     <tr><td colspan="5" class="placeholder-text">Loading...</td></tr>
                 </tbody>
             </table>
@@ -866,6 +866,10 @@
 
         ws.onmessage = function(evt) {
             const data = JSON.parse(evt.data);
+            if (data.type === "heartbeat") {
+                handleHeartbeat(data);
+                return;
+            }
             if (data.type === "psd") {
                 recordUpdate();
 
@@ -919,6 +923,17 @@
                 addWaterfallLine(data.powers, chunkTimeMs);
                 updateBurstOverlay(data.bursts);
                 drawLegendBar();
+
+                // When new bursts arrive, ask the detections table to refetch
+                // (event-driven; replaces the old every-5s HTMX poll).
+                if (Array.isArray(data.bursts) && data.bursts.length > 0) {
+                    const maxStop = data.bursts.reduce(
+                        (m, b) => Math.max(m, b.stop_time_ms || 0), 0);
+                    if (maxStop > lastBurstSeqSeen) {
+                        lastBurstSeqSeen = maxStop;
+                        document.body.dispatchEvent(new Event("refreshDetections"));
+                    }
+                }
             }
         };
 
@@ -967,16 +982,25 @@
         }
     }
 
-    // Poll recording status
-    setInterval(async function() {
-        try {
-            const r = await fetch("/api/recording/status");
-            if (r.ok) {
-                const d = await r.json();
-                updateRecUI(d.state, d.file, d.bytes, d.duration_sec, d.dropped_chunks || 0);
-            }
-        } catch (_) { /* ignore */ }
-    }, 1000);
+    // Recording state + status bar arrive over /ws/live as a "heartbeat"
+    // message (see ws.onmessage). No HTTP polling needed.
+    let lastBurstSeqSeen = -1;
+    const statusBarEl = document.getElementById("status-bar-label");
+    function handleHeartbeat(d) {
+        if (typeof d.status_bar_html === "string" && statusBarEl
+                && statusBarEl.innerHTML !== d.status_bar_html) {
+            statusBarEl.innerHTML = d.status_bar_html;
+        }
+        if (d.recording) {
+            updateRecUI(
+                d.recording.state,
+                d.recording.file,
+                d.recording.bytes || 0,
+                d.recording.duration_sec || 0,
+                d.recording.dropped_chunks || 0,
+            );
+        }
+    }
 
     recBtn.addEventListener("click", async function() {
         await fetch("/api/recording/start", {method: "POST"});

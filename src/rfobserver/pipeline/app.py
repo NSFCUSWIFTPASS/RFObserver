@@ -117,6 +117,7 @@ async def run(settings: AppSettings) -> None:
         tasks.append(zms_monitor.run())
     if settings.WEB_PORT > 0:
         tasks.append(_run_web_server(settings, processor, db, broadcast))
+        tasks.append(_heartbeat_loop(settings, processor, broadcast))
 
     try:
         await asyncio.gather(*tasks)
@@ -126,6 +127,42 @@ async def run(settings: AppSettings) -> None:
         if nats_producer is not None:
             await nats_producer.close()
         await db.close()
+
+
+async def _heartbeat_loop(
+    settings: AppSettings,
+    processor: object,
+    broadcast: LiveBroadcast,
+    interval_sec: float = 1.0,
+) -> None:
+    """Push slow-changing state to /ws/live so the dashboard can stop polling.
+
+    Sends one ``type: "heartbeat"`` message per ``interval_sec`` to every
+    WebSocket subscriber. Carries the rendered status-bar HTML and the
+    recording-status dict — the two things the dashboard used to fetch
+    on a 2 s + 1 s polling cadence.
+    """
+    from rfobserver.web.routes.api import build_status_bar_html
+
+    while True:
+        try:
+            rec_status: dict[str, object]
+            if hasattr(processor, "recording_status"):
+                rec_status = processor.recording_status()
+            else:
+                rec_status = {"state": "idle", "file": None, "bytes": 0, "duration_sec": 0}
+
+            await broadcast.publish(
+                {
+                    "type": "heartbeat",
+                    "status_bar_html": build_status_bar_html(settings),
+                    "recording": rec_status,
+                }
+            )
+        except Exception:
+            logger.exception("Heartbeat publish failed; continuing")
+
+        await asyncio.sleep(interval_sec)
 
 
 async def _run_web_server(

@@ -112,11 +112,12 @@ async def status_fragment(request: Request) -> str:
 """
 
 
-@router.get("/status-bar", response_class=HTMLResponse)
-async def status_bar(request: Request) -> str:
-    """Compact inline status bar for graph header."""
-    settings = request.app.state.settings
+def build_status_bar_html(settings: Any) -> str:
+    """Render the dashboard status bar.
 
+    Shared between the HTMX page-load fetch (``GET /api/status-bar``) and
+    the WebSocket heartbeat that keeps the bar fresh while live (no polling).
+    """
     hostname = settings.HOSTNAME
     freq = settings.FREQUENCY_START / 1e6
     bw = settings.BANDWIDTH / 1e6
@@ -137,6 +138,12 @@ async def status_bar(request: Request) -> str:
         f'data-raw="{dur}" data-suffix="s">'
         f"{dur}s</span> capture"
     )
+
+
+@router.get("/status-bar", response_class=HTMLResponse)
+async def status_bar(request: Request) -> str:
+    """Compact inline status bar for graph header (HTML, one-shot)."""
+    return build_status_bar_html(request.app.state.settings)
 
 
 @router.post("/trigger")

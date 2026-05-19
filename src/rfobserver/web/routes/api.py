@@ -280,13 +280,9 @@ async def set_storage_path(request: Request) -> dict[str, Any]:
 # -- ZMS status/toggle --
 
 
-@router.get("/zms/status")
-async def zms_status(request: Request) -> dict[str, Any]:
-    """Get ZMS connection status."""
-    settings = request.app.state.settings
-    proc = _get_processor(request)
+def build_zms_status_payload(settings: Any, proc: Any) -> dict[str, Any]:
+    """Same shape as ``GET /api/zms/status`` — reused by the WS heartbeat."""
     zms = getattr(proc, "_zms_monitor", None) if proc else None
-
     if zms is None:
         return {
             "enabled": False,
@@ -295,7 +291,6 @@ async def zms_status(request: Request) -> dict[str, Any]:
             "last_sent": None,
             "monitor_id": settings.ZMS_MONITOR_ID,
         }
-
     return {
         "enabled": True,
         "connected": True,
@@ -304,6 +299,12 @@ async def zms_status(request: Request) -> dict[str, Any]:
         "monitor_id": settings.ZMS_MONITOR_ID,
         "op_status": getattr(zms, "_op_status", "unknown"),
     }
+
+
+@router.get("/zms/status")
+async def zms_status(request: Request) -> dict[str, Any]:
+    """Get ZMS connection status."""
+    return build_zms_status_payload(request.app.state.settings, _get_processor(request))
 
 
 @router.post("/zms/enable")
@@ -348,13 +349,9 @@ async def zms_disable(request: Request) -> dict[str, Any]:
 # -- NATS status --
 
 
-@router.get("/nats/status")
-async def nats_status(request: Request) -> dict[str, Any]:
-    """Get NATS connection status (reads live producer attached to processor)."""
-    settings = request.app.state.settings
-    proc = _get_processor(request)
+def build_nats_status_payload(settings: Any, proc: Any) -> dict[str, Any]:
+    """Same shape as ``GET /api/nats/status`` — reused by the WS heartbeat."""
     producer = getattr(proc, "_nats_producer", None) if proc else None
-
     base = {
         "host": settings.NATS_HOST,
         "port": settings.NATS_PORT,
@@ -363,13 +360,18 @@ async def nats_status(request: Request) -> dict[str, Any]:
     }
     if producer is None:
         return {**base, "connected": False, "stats_count": 0, "dropped": 0}
-
     return {
         **base,
         "connected": producer.connected,
         "stats_count": producer.stats_count,
         "dropped": producer.dropped,
     }
+
+
+@router.get("/nats/status")
+async def nats_status(request: Request) -> dict[str, Any]:
+    """Get NATS connection status (reads live producer attached to processor)."""
+    return build_nats_status_payload(request.app.state.settings, _get_processor(request))
 
 
 @router.post("/nats/enable")

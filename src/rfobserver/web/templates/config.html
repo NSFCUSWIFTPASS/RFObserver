@@ -326,44 +326,69 @@
         setPathBtn.disabled = false;
     });
 
-    // --- ZMS/NATS status polling ---
+    // --- ZMS / NATS status: pushed over /ws/live as a 1 Hz heartbeat ---
+    function renderZmsStatus(d) {
+        const el = document.getElementById('zms-status');
+        if (!el || !d) return;
+        if (d.enabled) {
+            el.textContent = d.last_sent || 'enabled';
+            el.style.color = d.connected ? '#34c759' : '#ff9f0a';
+        } else {
+            el.textContent = 'disabled';
+            el.style.color = '';
+        }
+    }
+    function renderNatsStatus(d) {
+        const el = document.getElementById('nats-status');
+        if (!el || !d) return;
+        if (d.enabled) {
+            if (d.connected) {
+                el.textContent = (d.stats_count || 0) + ' stats sent';
+                el.style.color = '#34c759';
+            } else {
+                el.textContent = 'disconnected';
+                el.style.color = '#ff9f0a';
+            }
+        } else {
+            el.textContent = 'disabled';
+            el.style.color = '';
+        }
+    }
+
+    // Open a websocket purely to receive heartbeat state. Reconnect on close.
+    let statusWs = null;
+    function connectStatusWs() {
+        statusWs = new WebSocket("ws://" + location.host + "/ws/live");
+        statusWs.onmessage = function(evt) {
+            try {
+                const data = JSON.parse(evt.data);
+                if (data.type !== "heartbeat") return;
+                renderZmsStatus(data.zms);
+                renderNatsStatus(data.nats);
+            } catch (_) {}
+        };
+        statusWs.onclose = function() {
+            statusWs = null;
+            setTimeout(connectStatusWs, 2000);
+        };
+        statusWs.onerror = function() { try { statusWs.close(); } catch (_) {} };
+    }
+    connectStatusWs();
+
+    // pollStatus() is used by the toggle handlers (below) to refresh the UI
+    // immediately after a mutation — heartbeat would catch up in ~1 s, but
+    // mutation-feedback should be instant.
     async function pollStatus() {
         try {
             const r = await fetch('/api/zms/status');
-            if (r.ok) {
-                const d = await r.json();
-                const el = document.getElementById('zms-status');
-                if (d.enabled) {
-                    el.textContent = d.last_sent || 'enabled';
-                    el.style.color = d.connected ? '#34c759' : '#ff9f0a';
-                } else {
-                    el.textContent = 'disabled';
-                    el.style.color = '';
-                }
-            }
+            if (r.ok) renderZmsStatus(await r.json());
         } catch (_) {}
         try {
             const r = await fetch('/api/nats/status');
-            if (r.ok) {
-                const d = await r.json();
-                const el = document.getElementById('nats-status');
-                if (d.enabled) {
-                    if (d.connected) {
-                        el.textContent = (d.stats_count || 0) + ' stats sent';
-                        el.style.color = '#34c759';
-                    } else {
-                        el.textContent = 'disconnected';
-                        el.style.color = '#ff9f0a';
-                    }
-                } else {
-                    el.textContent = 'disabled';
-                    el.style.color = '';
-                }
-            }
+            if (r.ok) renderNatsStatus(await r.json());
         } catch (_) {}
     }
     pollStatus();
-    setInterval(pollStatus, 5000);
 
     // --- ZMS toggle ---
     const zmsToggle = document.getElementById('zms-toggle');

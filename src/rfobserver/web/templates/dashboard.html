@@ -985,6 +985,7 @@
     // Recording state + status bar arrive over /ws/live as a "heartbeat"
     // message (see ws.onmessage). No HTTP polling needed.
     let lastBurstSeqSeen = -1;
+    let lastDetectionCount = -1;
     const statusBarEl = document.getElementById("status-bar-label");
     function handleHeartbeat(d) {
         if (typeof d.status_bar_html === "string" && statusBarEl
@@ -999,6 +1000,17 @@
                 d.recording.duration_sec || 0,
                 d.recording.dropped_chunks || 0,
             );
+        }
+        if (d.modules) {
+            _renderModulesFrom(d.modules);
+        }
+        if (typeof d.detection_count === "number" && d.detection_count !== lastDetectionCount) {
+            // Either first heartbeat (lastDetectionCount === -1) or new
+            // detections landed since the last tick — ask HTMX to refetch.
+            if (lastDetectionCount >= 0) {
+                document.body.dispatchEvent(new Event("refreshDetections"));
+            }
+            lastDetectionCount = d.detection_count;
         }
     }
 
@@ -1127,11 +1139,11 @@
         }).catch(e => alert("Error: " + e.message));
     });
 
-    function refreshModules() {
-        // Skip refresh when an input is focused (prevents input destruction)
+    function _renderModulesFrom(d) {
+        // Skip render when an input is focused (prevents input destruction)
         if (modulesContainer.querySelector("input:focus, select:focus")) return;
 
-        fetch("/api/modules").then(r => r.json()).then(d => {
+        Promise.resolve(d).then(d => {
             const mods = d.modules || [];
             moduleTypes = d.available_types || {};
 
@@ -1239,6 +1251,12 @@
         }).catch(() => {});
     }
 
+    function refreshModules() {
+        // Used by mutation handlers (add / remove / start-audio etc.) that
+        // can't wait for the next heartbeat. Also called once on page load.
+        fetch("/api/modules").then(r => r.json()).then(d => _renderModulesFrom(d));
+    }
+
     // Expose to onclick handlers
     window.toggleAudio = function(moduleId) {
         if (audioContexts[moduleId]) {
@@ -1318,8 +1336,10 @@
         fetch("/api/modules/" + moduleId, {method: "DELETE"}).then(() => refreshModules());
     };
 
-    // Poll module status
-    setInterval(refreshModules, 3000);
+    // Module list is also delivered via heartbeat (see ws.onmessage) — we
+    // skip refreshes whenever any module input/select has focus to avoid
+    // clobbering in-progress edits. Initial fetch on page load so the UI
+    // isn't blank for the first 1 s.
     refreshModules();
 })();
 </script>

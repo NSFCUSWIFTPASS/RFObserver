@@ -130,6 +130,18 @@ class SensorDatabase:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
+    async def count_detections(self) -> int:
+        """Return the total number of rows in the detections table.
+
+        Used by the WebSocket heartbeat as a monotonic counter — clients
+        refresh the detections table when this increments instead of polling
+        the HTML endpoint on a fixed interval.
+        """
+        assert self._db is not None
+        async with self._db.execute("SELECT COUNT(*) FROM detections") as cursor:
+            row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+
     async def set_config(self, key: str, value: str) -> None:
         assert self._db is not None
         await self._db.execute(

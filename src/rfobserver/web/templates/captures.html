@@ -304,7 +304,29 @@
     });
 
     loadList();
-    setInterval(loadList, 10000);
+
+    // Re-list when capture_count ticks up on the /ws/live heartbeat — that's
+    // the signal a recording finished and dropped a new file in storage.
+    (function() {
+        let lastCount = -1;
+        let ws = null;
+        function connect() {
+            ws = new WebSocket("ws://" + location.host + "/ws/live");
+            ws.onmessage = function(evt) {
+                try {
+                    const d = JSON.parse(evt.data);
+                    if (d.type !== "heartbeat") return;
+                    if (typeof d.capture_count === "number" && d.capture_count !== lastCount) {
+                        if (lastCount >= 0) loadList();
+                        lastCount = d.capture_count;
+                    }
+                } catch (_) {}
+            };
+            ws.onclose = function() { ws = null; setTimeout(connect, 2000); };
+            ws.onerror = function() { try { ws.close(); } catch (_) {} };
+        }
+        connect();
+    })();
 })();
 </script>
 {% endblock %}

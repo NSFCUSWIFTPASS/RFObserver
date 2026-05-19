@@ -20,13 +20,11 @@ def _get_manager(request: Request) -> Any:
     return getattr(proc, "_module_manager", None)
 
 
-@router.get("/modules")
-async def list_modules(request: Request) -> dict[str, Any]:
-    mgr = _get_manager(request)
+def build_modules_payload(mgr: Any) -> dict[str, Any]:
+    """Same shape as ``GET /api/modules`` — reused by the WS heartbeat."""
     if mgr is None:
         return {"modules": [], "available_types": {}}
     modules = mgr.list_modules()
-    # Add has_audio to each module status
     for m_status in modules:
         mid = m_status.get("module_id")
         mod = mgr.get_module(mid) if mid else None
@@ -36,6 +34,11 @@ async def list_modules(request: Request) -> dict[str, Any]:
         "modules": modules,
         "available_types": mgr.registry_info(),
     }
+
+
+@router.get("/modules")
+async def list_modules(request: Request) -> dict[str, Any]:
+    return build_modules_payload(_get_manager(request))
 
 
 @router.post("/modules")

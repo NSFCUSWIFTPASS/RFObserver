@@ -18,10 +18,38 @@
                     <th>Peak Power</th>
                 </tr>
             </thead>
-            <tbody hx-get="/api/detections" hx-trigger="load, every 10s" hx-swap="innerHTML">
+            <tbody hx-get="/api/detections" hx-trigger="load, refreshDetections from:body" hx-swap="innerHTML">
                 <tr><td colspan="5" class="placeholder-text">Loading...</td></tr>
             </tbody>
         </table>
     </div>
 </div>
+<script>
+// Listen to the live websocket purely for the detection_count counter. When
+// it ticks up, dispatch refreshDetections — HTMX picks that up and re-renders
+// the table fragment via /api/detections (REST endpoint stays intact for
+// non-WS automations).
+(function() {
+    let lastCount = -1;
+    let ws = null;
+    function connect() {
+        ws = new WebSocket("ws://" + location.host + "/ws/live");
+        ws.onmessage = function(evt) {
+            try {
+                const d = JSON.parse(evt.data);
+                if (d.type !== "heartbeat") return;
+                if (typeof d.detection_count === "number" && d.detection_count !== lastCount) {
+                    if (lastCount >= 0) {
+                        document.body.dispatchEvent(new Event("refreshDetections"));
+                    }
+                    lastCount = d.detection_count;
+                }
+            } catch (_) {}
+        };
+        ws.onclose = function() { ws = null; setTimeout(connect, 2000); };
+        ws.onerror = function() { try { ws.close(); } catch (_) {} };
+    }
+    connect();
+})();
+</script>
 {% endblock %}

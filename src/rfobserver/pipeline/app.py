@@ -117,7 +117,7 @@ async def run(settings: AppSettings) -> None:
         tasks.append(zms_monitor.run())
     if settings.WEB_PORT > 0:
         tasks.append(_run_web_server(settings, processor, db, broadcast))
-        tasks.append(_heartbeat_loop(settings, processor, broadcast))
+        tasks.append(_heartbeat_loop(settings, processor, db, local_storage, broadcast))
 
     try:
         await asyncio.gather(*tasks)
@@ -132,31 +132,63 @@ async def run(settings: AppSettings) -> None:
 async def _heartbeat_loop(
     settings: AppSettings,
     processor: object,
+    db: object,
+    local_storage: object,
     broadcast: LiveBroadcast,
     interval_sec: float = 1.0,
 ) -> None:
-    """Push slow-changing state to /ws/live so the dashboard can stop polling.
+    """Push slow-changing state to /ws/live so each page can stop polling.
 
-    Sends one ``type: "heartbeat"`` message per ``interval_sec`` to every
-    WebSocket subscriber. Carries the rendered status-bar HTML and the
-    recording-status dict — the two things the dashboard used to fetch
-    on a 2 s + 1 s polling cadence.
+    Carries one ``type: "heartbeat"`` message per ``interval_sec`` containing
+    everything dashboard / config / captures / history used to fetch on a
+    periodic timer. Two monotonic counters (``detection_count``,
+    ``capture_count``) let clients trigger HTML-fragment refreshes only when
+    the underlying state actually changes — REST endpoints stay intact for
+    automations that aren't on a websocket.
     """
-    from rfobserver.web.routes.api import build_status_bar_html
+    from pathlib import Path
+
+    from rfobserver.web.routes.api import (
+        build_nats_status_payload,
+        build_status_bar_html,
+        build_zms_status_payload,
+    )
+    from rfobserver.web.routes.modules import build_modules_payload
+
+    storage_path = Path(getattr(local_storage, "storage_path", "."))
+    module_manager = getattr(processor, "_module_manager", None)
 
     while True:
         try:
-            rec_status: dict[str, object]
             if hasattr(processor, "recording_status"):
-                rec_status = processor.recording_status()
+                rec_status: dict[str, object] = processor.recording_status()
             else:
                 rec_status = {"state": "idle", "file": None, "bytes": 0, "duration_sec": 0}
+
+            try:
+                detection_count = (
+                    await db.count_detections() if hasattr(db, "count_detections") else 0
+                )
+            except Exception:
+                detection_count = 0
+
+            try:
+                capture_count = (
+                    sum(1 for _ in storage_path.glob("*.sc16")) if storage_path.exists() else 0
+                )
+            except Exception:
+                capture_count = 0
 
             await broadcast.publish(
                 {
                     "type": "heartbeat",
                     "status_bar_html": build_status_bar_html(settings),
                     "recording": rec_status,
+                    "zms": build_zms_status_payload(settings, processor),
+                    "nats": build_nats_status_payload(settings, processor),
+                    "modules": build_modules_payload(module_manager),
+                    "detection_count": detection_count,
+                    "capture_count": capture_count,
                 }
             )
         except Exception:

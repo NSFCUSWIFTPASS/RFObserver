@@ -237,7 +237,8 @@
         <div class="map-modal-header">
             <input id="map-search" type="search" placeholder="Search for a place…" autocomplete="off">
             <span class="map-modal-coords">
-                <span id="map-coords-lat">--</span>, <span id="map-coords-lon">--</span>
+                <input id="map-coords-lat" type="number" step="0.000001" min="-90" max="90" placeholder="lat">
+                <input id="map-coords-lon" type="number" step="0.000001" min="-180" max="180" placeholder="lon">
             </span>
             <button type="button" class="map-modal-close" title="Close" aria-label="Close">&times;</button>
         </div>
@@ -495,6 +496,10 @@
     const applyBtn = modal.querySelector('.map-modal-apply');
     const overlay = modal.querySelector('.map-modal-overlay');
 
+    // Hat Creek Radio Observatory — sensible default for an empty config.
+    const DEFAULT_LAT = 40.8258;
+    const DEFAULT_LON = -121.4702;
+
     let map = null;
     let marker = null;
     let stagedLat = null;
@@ -516,12 +521,39 @@
         return leafletPromise;
     }
 
-    function updateCoordsReadout(lat, lon) {
+    // Single source of truth for the staged coordinates. Called from every
+    // input path (marker drag, map click, search result, header inputs) so
+    // they all stay in sync. ``skipInputs`` avoids feedback when the user
+    // is mid-edit in the number boxes.
+    function setStaged(lat, lon, opts) {
+        opts = opts || {};
         stagedLat = lat;
         stagedLon = lon;
-        coordLatEl.textContent = lat.toFixed(6);
-        coordLonEl.textContent = lon.toFixed(6);
+        if (!opts.skipInputs) {
+            coordLatEl.value = lat.toFixed(6);
+            coordLonEl.value = lon.toFixed(6);
+        }
     }
+
+    function _commitFromInputs() {
+        const lat = parseFloat(coordLatEl.value);
+        const lon = parseFloat(coordLonEl.value);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+        if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return;
+        setStaged(lat, lon, {skipInputs: true});
+        if (marker && map) {
+            marker.setLatLng([lat, lon]);
+            map.setView([lat, lon]);
+        }
+    }
+    coordLatEl.addEventListener('change', _commitFromInputs);
+    coordLonEl.addEventListener('change', _commitFromInputs);
+    coordLatEl.addEventListener('keydown', e => {
+        if (e.key === 'Enter') { e.preventDefault(); _commitFromInputs(); }
+    });
+    coordLonEl.addEventListener('keydown', e => {
+        if (e.key === 'Enter') { e.preventDefault(); _commitFromInputs(); }
+    });
 
     function initMap(L, lat, lon, zoom) {
         map = L.map('map').setView([lat, lon], zoom);
@@ -532,20 +564,20 @@
         marker = L.marker([lat, lon], {draggable: true}).addTo(map);
         marker.on('drag', e => {
             const ll = e.target.getLatLng();
-            updateCoordsReadout(ll.lat, ll.lng);
+            setStaged(ll.lat, ll.lng);
         });
         map.on('click', e => {
             marker.setLatLng(e.latlng);
-            updateCoordsReadout(e.latlng.lat, e.latlng.lng);
+            setStaged(e.latlng.lat, e.latlng.lng);
         });
-        updateCoordsReadout(lat, lon);
+        setStaged(lat, lon);
     }
 
     function openModal() {
         const havePos = latInput.value && lonInput.value;
-        const lat = havePos ? parseFloat(latInput.value) : 20;
-        const lon = havePos ? parseFloat(lonInput.value) : 0;
-        const zoom = havePos ? 12 : 2;
+        const lat = havePos ? parseFloat(latInput.value) : DEFAULT_LAT;
+        const lon = havePos ? parseFloat(lonInput.value) : DEFAULT_LON;
+        const zoom = 11;
 
         modal.style.display = '';
         document.body.style.overflow = 'hidden';
@@ -558,7 +590,7 @@
             } else {
                 marker.setLatLng([lat, lon]);
                 map.setView([lat, lon], zoom);
-                updateCoordsReadout(lat, lon);
+                setStaged(lat, lon);
             }
             // Leaflet calculates pane sizes on init; opening from display:none
             // means it sees zero, so kick it to recompute on next paint.
@@ -644,7 +676,7 @@
             div.addEventListener('click', () => {
                 marker.setLatLng([lat, lon]);
                 map.setView([lat, lon], 13);
-                updateCoordsReadout(lat, lon);
+                setStaged(lat, lon);
                 searchResults.innerHTML = '';
             });
             searchResults.appendChild(div);

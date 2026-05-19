@@ -347,17 +347,41 @@ class StreamingProcessor:
     # -- Receiver thread --
 
     def _receiver_loop(self) -> None:
-        """Runs on a dedicated thread.  Calls recv_chunk() and feeds queues."""
+        """Runs on a dedicated thread.  Calls recv_chunk() and feeds queues.
+
+        Streaming state is kept across dwell iterations: we only call
+        ``start_streaming`` / ``stop_streaming`` when the target frequency
+        actually changes (or on reconfig / shutdown). In single-frequency
+        mode the radio streams continuously instead of cycling stop→start
+        every ``DURATION_SEC``.
+        """
         s = self._settings
         recv_count = 0
         my_gen = self._config_generation
+        current_streaming_freq: int | None = None
+
+        def _ensure_streaming(target_freq: int) -> None:
+            nonlocal current_streaming_freq
+            if current_streaming_freq == target_freq:
+                return
+            if current_streaming_freq is not None:
+                self._receiver.stop_streaming()
+            self._receiver.start_streaming(target_freq)
+            current_streaming_freq = target_freq
+
+        def _ensure_stopped() -> None:
+            nonlocal current_streaming_freq
+            if current_streaming_freq is not None:
+                self._receiver.stop_streaming()
+                current_streaming_freq = None
 
         try:
             while self._running:
-                # Check for reconfiguration before each frequency sweep.
-                # Hardware reconfigure + chunk param rebuild happens here,
-                # safely between stream stop/start.
+                # Reconfig tears down and re-initializes the streamer, so we
+                # must stop_streaming() first to issue stop_cont before the
+                # streamer object is replaced.
                 if self._config_generation != my_gen:
+                    _ensure_stopped()
                     my_gen = self._config_generation
                     self._reconfigure_receiver()
                     self._recompute_chunk_params()
@@ -378,7 +402,9 @@ class StreamingProcessor:
                         logger.info("Receiver loop: breaking for reconfig")
                         break
 
-                    self._receiver.start_streaming(center_freq)
+                    # Only retune+restart when the frequency actually changes.
+                    # Single-freq deployments stay continuously streaming.
+                    _ensure_streaming(center_freq)
 
                     # Dwell at this frequency for DURATION_SEC
                     chunks_per_dwell = max(1, int(s.DURATION_SEC / self._chunk_duration))
@@ -429,11 +455,10 @@ class StreamingProcessor:
                                 self._chunk_duration * 1000,
                             )
 
-                    self._receiver.stop_streaming()
-
         except Exception:
             logger.exception("Receiver loop crashed")
         finally:
+            _ensure_stopped()
             logger.info("Receiver loop exiting (running=%s)", self._running)
             self._chunk_queue.put(_STOP)
 

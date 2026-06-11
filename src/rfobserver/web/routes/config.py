@@ -95,6 +95,10 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "sensor_name": ("SENSOR_NAME", str),
         "latitude": ("LATITUDE", float),
         "longitude": ("LONGITUDE", float),
+        # Display (all optional — empty input reverts to uncalibrated/auto)
+        "cal_offset_db": ("CAL_OFFSET_DB", float),
+        "psd_scale_min_db": ("PSD_SCALE_MIN_DB", float),
+        "psd_scale_max_db": ("PSD_SCALE_MAX_DB", float),
         # NATS
         "nats_host": ("NATS_HOST", str),
         "nats_port": ("NATS_PORT", int),
@@ -116,7 +120,14 @@ async def apply_config(request: Request) -> dict[str, Any]:
     # Settings that legitimately accept None — submitting an empty input on
     # the config form clears them. Keep this list tight; for required fields
     # we want the cast to raise so the user notices.
-    nullable_attrs = {"SENSOR_NAME", "LATITUDE", "LONGITUDE"}
+    nullable_attrs = {
+        "SENSOR_NAME",
+        "LATITUDE",
+        "LONGITUDE",
+        "CAL_OFFSET_DB",
+        "PSD_SCALE_MIN_DB",
+        "PSD_SCALE_MAX_DB",
+    }
 
     changed = []
     for form_key, (attr, cast) in field_map.items():

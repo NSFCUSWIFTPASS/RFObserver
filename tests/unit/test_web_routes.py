@@ -275,6 +275,50 @@ class TestConfigApply:
         for n in [256, 512, 1024, 2048, 4096, 8192]:
             assert f'value="{n}"' in resp.text
 
+    def test_apply_display_settings(self, client_with_processor):
+        client, settings, processor = client_with_processor
+        resp = client.post(
+            "/config/apply",
+            json={
+                "cal_offset_db": "-107.5",
+                "psd_scale_min_db": "-160",
+                "psd_scale_max_db": "-80",
+            },
+        )
+        assert resp.status_code == 200
+        assert settings.CAL_OFFSET_DB == -107.5
+        assert settings.PSD_SCALE_MIN_DB == -160.0
+        assert settings.PSD_SCALE_MAX_DB == -80.0
+        # Display-only settings must not bounce the pipeline
+        processor.reconfigure.assert_not_called()
+
+    def test_apply_display_settings_clear(self, client_with_processor):
+        client, settings, _ = client_with_processor
+        object.__setattr__(settings, "CAL_OFFSET_DB", -100.0)
+        object.__setattr__(settings, "PSD_SCALE_MIN_DB", -150.0)
+        resp = client.post(
+            "/config/apply",
+            json={"cal_offset_db": "", "psd_scale_min_db": ""},
+        )
+        assert resp.status_code == 200
+        assert settings.CAL_OFFSET_DB is None
+        assert settings.PSD_SCALE_MIN_DB is None
+
+    def test_apply_cal_offset_zero_is_kept(self, client_with_processor):
+        # 0.0 is a meaningful calibration value (display switches to dBm/Hz),
+        # distinct from None (uncalibrated dBFS).
+        client, settings, _ = client_with_processor
+        resp = client.post("/config/apply", json={"cal_offset_db": "0"})
+        assert resp.status_code == 200
+        assert settings.CAL_OFFSET_DB == 0.0
+
+    def test_config_page_shows_display_card(self, client):
+        resp = client.get("/config")
+        assert resp.status_code == 200
+        assert "cal_offset_db" in resp.text
+        assert "psd_scale_min_db" in resp.text
+        assert "psd_scale_max_db" in resp.text
+
 
 # -- Recording API tests --
 

@@ -53,7 +53,7 @@
             <span class="legend-label" id="legend-min">--</span>
             <canvas id="legend-canvas" width="200" height="12" style="width: 200px; height: 12px; border-radius: 3px;"></canvas>
             <span class="legend-label" id="legend-max">--</span>
-            <span class="legend-label" style="margin-left: 2px;">dBFS</span>
+            <span class="legend-label" id="legend-unit" style="margin-left: 2px;">dBFS</span>
         </div>
     </div>
 
@@ -156,9 +156,21 @@
 
     // powerToColor() and drawPSD() are in shared-charts.js
 
-    // Dynamic range (must be declared before drawLegendBar)
+    // Dynamic range (must be declared before drawLegendBar).
+    // dynamicMin/Max are the effective display range; emaMin/Max track the
+    // auto-scale state so a pinned bound can be cleared without a cold start.
     let dynamicMin = -120;
     let dynamicMax = -40;
+    let emaMin = -120;
+    let emaMax = -40;
+
+    // Display calibration/scale, synced from each psd message.
+    // When the server sends a cal_offset_db, all absolute per-bin values are
+    // shifted on receipt (raw dBFS/Hz + offset = dBm/Hz) — display only,
+    // nothing is written back. scaleMin/MaxDb pin the corresponding bound.
+    let displayUnit = "dBFS";
+    let scaleMinDb = null;
+    let scaleMaxDb = null;
 
     // Draw color legend
     const legendCanvas = document.getElementById("legend-canvas");
@@ -171,6 +183,7 @@
         }
         document.getElementById("legend-min").textContent = dynamicMin.toFixed(0);
         document.getElementById("legend-max").textContent = dynamicMax.toFixed(0);
+        document.getElementById("legend-unit").textContent = displayUnit;
     }
     drawLegendBar();
 
@@ -463,7 +476,7 @@
         // is enabled).
         drawPSD(psdCtx, psdCanvas.width, psdCanvas.height,
             lastPowers, lastFrequencies, dynamicMin, dynamicMax,
-            psdCrosshairBin, null);
+            psdCrosshairBin, null, displayUnit);
     }
 
     // ---- Burst-tuning panel ----
@@ -850,8 +863,15 @@
             if (powers[i] < pMin) pMin = powers[i];
             if (powers[i] > pMax) pMax = powers[i];
         }
-        dynamicMin = dynamicMin * 0.95 + (pMin - 5) * 0.05;
-        dynamicMax = dynamicMax * 0.95 + (pMax + 5) * 0.05;
+        emaMin = emaMin * 0.95 + (pMin - 5) * 0.05;
+        emaMax = emaMax * 0.95 + (pMax + 5) * 0.05;
+        dynamicMin = (scaleMinDb != null) ? scaleMinDb : emaMin;
+        dynamicMax = (scaleMaxDb != null) ? scaleMaxDb : emaMax;
+        if (dynamicMin >= dynamicMax) {
+            // Degenerate pinned range — ignore the pins rather than divide by zero
+            dynamicMin = emaMin;
+            dynamicMax = emaMax;
+        }
     }
 
     // --- WebSocket ---
@@ -889,6 +909,29 @@
                     tsAvgPower.shift(); tsKurtosis.shift();
                 }
                 drawTimeSeries();
+
+                // Display calibration: shift all absolute per-bin dB values
+                // by the user's cal offset so spectrum/waterfall show dBm/Hz.
+                // The burst-tuning panel plots powers minus noise floor, so
+                // the offset cancels there. Time-series and detection powers
+                // stay raw dBFS (the trigger drag writes back to settings).
+                const calSet = typeof data.cal_offset_db === "number";
+                displayUnit = calSet ? "dBm/Hz" : "dBFS";
+                scaleMinDb = (typeof data.scale_min_db === "number") ? data.scale_min_db : null;
+                scaleMaxDb = (typeof data.scale_max_db === "number") ? data.scale_max_db : null;
+                if (calSet && data.cal_offset_db !== 0) {
+                    const off = data.cal_offset_db;
+                    for (let i = 0; i < data.powers.length; i++) data.powers[i] += off;
+                    if (Array.isArray(data.max_powers)) {
+                        for (let i = 0; i < data.max_powers.length; i++) data.max_powers[i] += off;
+                    }
+                    if (Array.isArray(data.noise_floor_per_bin)) {
+                        for (let i = 0; i < data.noise_floor_per_bin.length; i++) {
+                            data.noise_floor_per_bin[i] += off;
+                        }
+                    }
+                    if (typeof data.noise_floor_db === "number") data.noise_floor_db += off;
+                }
 
                 // PSD + waterfall
                 lastPowers = data.powers;

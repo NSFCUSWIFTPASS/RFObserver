@@ -1097,6 +1097,9 @@ class StreamingProcessor:
                         "burst_threshold_low_ratio": self._settings.BURST_THRESHOLD_LOW_RATIO,
                         "noise_floor_db": noise_floor_db,
                         "noise_floor_per_bin": self._noise_floor_per_bin,
+                        "cal_offset_db": self._settings.CAL_OFFSET_DB,
+                        "scale_min_db": self._settings.PSD_SCALE_MIN_DB,
+                        "scale_max_db": self._settings.PSD_SCALE_MAX_DB,
                         "chunk_time_ms": datetime.now(timezone.utc).timestamp() * 1000.0,
                     }
                 )
@@ -1142,6 +1145,9 @@ class StreamingProcessor:
                 "burst_threshold_low_ratio": self._settings.BURST_THRESHOLD_LOW_RATIO,
                 "noise_floor_db": noise_floor_db,
                 "noise_floor_per_bin": self._noise_floor_per_bin,
+                "cal_offset_db": self._settings.CAL_OFFSET_DB,
+                "scale_min_db": self._settings.PSD_SCALE_MIN_DB,
+                "scale_max_db": self._settings.PSD_SCALE_MAX_DB,
                 "chunk_time_ms": datetime.now(timezone.utc).timestamp() * 1000.0,
             }
         )

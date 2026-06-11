@@ -93,6 +93,39 @@
 </div>
 
 <div class="card" style="margin-bottom: 16px;">
+    <div class="card-header">Display</div>
+    <div class="card-body">
+        <div class="config-form">
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="cal-offset">Calibration Offset (dB)</label>
+                    <input type="number" id="cal-offset" name="cal_offset_db" step="0.1"
+                           value="{{ settings.CAL_OFFSET_DB if settings.CAL_OFFSET_DB is not none else '' }}"
+                           placeholder="none (dBFS)">
+                </div>
+                <div class="form-group">
+                    <label for="scale-min">Scale Min (dB)</label>
+                    <input type="number" id="scale-min" name="psd_scale_min_db" step="1"
+                           value="{{ settings.PSD_SCALE_MIN_DB if settings.PSD_SCALE_MIN_DB is not none else '' }}"
+                           placeholder="auto">
+                </div>
+                <div class="form-group">
+                    <label for="scale-max">Scale Max (dB)</label>
+                    <input type="number" id="scale-max" name="psd_scale_max_db" step="1"
+                           value="{{ settings.PSD_SCALE_MAX_DB if settings.PSD_SCALE_MAX_DB is not none else '' }}"
+                           placeholder="auto">
+                </div>
+            </div>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px;">
+                Offset is added to raw dBFS/Hz so the spectrum and waterfall show absolute dBm/Hz.
+                Leave empty for uncalibrated dBFS display. Scale bounds pin the display range;
+                empty bounds auto-scale. Display only — published and stored data stay raw.
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card" style="margin-bottom: 16px;">
     <div class="card-header">Location</div>
     <div class="card-body">
         <div class="config-form">

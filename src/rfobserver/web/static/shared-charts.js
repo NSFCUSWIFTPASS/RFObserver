@@ -24,8 +24,9 @@ function powerToColor(val, min, max) {
  * @param {number} max - dynamic range maximum (dBFS)
  * @param {number} crosshairBin - bin index for crosshair (-1 = none)
  * @param {number|null} triggerLevel - absolute dBFS level for trigger line (null = hidden)
+ * @param {string} [unit] - Y-axis unit label (default "dBFS"; "dBm/Hz" when calibrated)
  */
-function drawPSD(ctx, W, H, powers, frequencies, min, max, crosshairBin, triggerLevel) {
+function drawPSD(ctx, W, H, powers, frequencies, min, max, crosshairBin, triggerLevel, unit) {
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = "#1a1a2e";
     ctx.fillRect(0, 0, W, H);
@@ -110,8 +111,9 @@ function drawPSD(ctx, W, H, powers, frequencies, min, max, crosshairBin, trigger
     ctx.fillStyle = "rgba(255,255,255,0.5)";
     ctx.font = "10px -apple-system, sans-serif";
     ctx.textAlign = "left";
-    ctx.fillText(max.toFixed(0) + " dBFS", 4, 12);
-    ctx.fillText(min.toFixed(0) + " dBFS", 4, H - 4);
+    const unitLabel = unit || "dBFS";
+    ctx.fillText(max.toFixed(0) + " " + unitLabel, 4, 12);
+    ctx.fillText(min.toFixed(0) + " " + unitLabel, 4, H - 4);
 
     if (frequencies.length > 0) {
         const fMin = (frequencies[0] / 1e6).toFixed(1);

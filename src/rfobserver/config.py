@@ -93,6 +93,16 @@ class AppSettings(BaseSettings):
     WEB_HOST: str = "0.0.0.0"
     WEB_PORT: int = 8080
 
+    # Display (UI only — never applied to published or stored data)
+    #
+    # CAL_OFFSET_DB: added to raw dBFS/Hz values in the dashboard so the
+    # spectrum/waterfall show absolute dBm/Hz. Unset = uncalibrated dBFS.
+    # PSD_SCALE_MIN_DB / PSD_SCALE_MAX_DB: pin the display range (in the
+    # displayed unit); unset bounds auto-scale as before.
+    CAL_OFFSET_DB: float | None = None
+    PSD_SCALE_MIN_DB: float | None = None
+    PSD_SCALE_MAX_DB: float | None = None
+
     # Processing
     NUM_FFT_BINS: int = 1024
     PSD_TIME_RESOLUTION_MS: float = 0.2  # internal PSD grid time resolution

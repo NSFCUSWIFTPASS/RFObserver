@@ -105,6 +105,10 @@ class TestCapturesPSD:
         assert len(data["grid"]) == 50
         assert len(data["freq_axis"]) > 0
         assert data["center_freq_hz"] == 915000000
+        # Global colour range spans the whole grid (not just the returned page),
+        # so the lazy-loading client keeps stable colours across pages.
+        assert data["grid_min"] == pytest.approx(float(grid.min()), abs=1e-3)
+        assert data["grid_max"] == pytest.approx(float(grid.max()), abs=1e-3)
 
         # Cleanup
         npz_path.unlink(missing_ok=True)

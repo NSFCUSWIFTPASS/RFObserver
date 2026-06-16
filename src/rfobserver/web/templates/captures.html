@@ -87,13 +87,23 @@
     }
 
     // --- Viewer state ---
-    let viewerGrid = null;     // loaded PSD rows (2D array)
+    // The waterfall is virtualized: rows are fetched in pages on demand as the
+    // user scrolls, cached (with a bounded LRU so very long captures don't
+    // exhaust memory), and only the visible window is ever drawn. The slider is
+    // scoped to whatever rows are currently on screen.
     let viewerFreqs = null;    // freq axis
     let viewerTimeRes = 0;     // seconds per row
     let viewerTotalRows = 0;
     let viewerMin = -120;
     let viewerMax = -40;
     let viewerCrosshairBin = -1;
+    let viewerFilename = null;
+
+    const VIEW_ROWS = 400;     // waterfall viewport height in rows (1px/row)
+    const PAGE = 500;          // rows fetched per request
+    const MAX_PAGES = 48;      // LRU cap (~24k rows cached)
+    let pageCache = new Map(); // pageIdx -> rows[][] (Map order = LRU)
+    let pageLoading = new Set();
 
     async function showDetail(filename, hasPsd) {
         document.querySelectorAll(".capture-item").forEach(function(el) {
@@ -146,43 +156,49 @@
         }
     }
 
+    async function fetchPageRaw(start) {
+        try {
+            const r = await fetch("/captures/psd/" + encodeURIComponent(viewerFilename)
+                + "?start=" + start + "&count=" + PAGE + "&max_bins=512");
+            if (!r.ok) return null;
+            return await r.json();
+        } catch (_) {
+            return null;
+        }
+    }
+
     async function loadPsdViewer(filename) {
+        viewerFilename = filename;
+        pageCache = new Map();
+        pageLoading = new Set();
+        viewerCrosshairBin = -1;
 
         try {
-            const r = await fetch("/captures/psd/" + encodeURIComponent(filename) + "?start=0&count=2000&max_bins=512");
-            if (!r.ok) { viewerEl.innerHTML = '<div class="placeholder-text">PSD data unavailable</div>'; return; }
-            const d = await r.json();
+            // The first page doubles as the metadata probe (total rows, time
+            // resolution, freq axis, global colour range).
+            const first = await fetchPageRaw(0);
+            if (!first) { viewerEl.innerHTML = '<div class="placeholder-text">PSD data unavailable</div>'; return; }
 
-            viewerGrid = d.grid;
-            viewerFreqs = d.freq_axis;
-            viewerTimeRes = d.time_resolution_s;
-            viewerTotalRows = d.total_rows;
-            viewerCrosshairBin = -1;
+            viewerFreqs = first.freq_axis;
+            viewerTimeRes = first.time_resolution_s;
+            viewerTotalRows = first.total_rows;
+            viewerMin = first.grid_min - 3;
+            viewerMax = first.grid_max + 3;
+            pageCache.set(0, first.grid);
 
-            // Compute dynamic range from data
-            let gMin = Infinity, gMax = -Infinity;
-            for (let r = 0; r < viewerGrid.length; r++) {
-                for (let c = 0; c < viewerGrid[r].length; c++) {
-                    const v = viewerGrid[r][c];
-                    if (v < gMin) gMin = v;
-                    if (v > gMax) gMax = v;
-                }
-            }
-            viewerMin = gMin - 3;
-            viewerMax = gMax + 3;
-
-            const totalDuration = (viewerTotalRows * viewerTimeRes).toFixed(3);
-            const loadedRows = viewerGrid.length;
-            const wfRows = Math.min(loadedRows, 400);
+            const totalRows = viewerTotalRows;
+            const viewH = Math.max(1, Math.min(VIEW_ROWS, totalRows));  // viewport rows (1px each)
+            const totalDuration = (totalRows * viewerTimeRes).toFixed(3);
 
             let html = '';
-            html += '<div class="viewer-label">Waterfall (' + loadedRows + ' / ' + viewerTotalRows + ' rows, '
-                + totalDuration + 's total)</div>';
-            html += '<div style="position:relative;">';
-            html += '<canvas id="viewer-wf" width="920" height="' + wfRows + '" class="viewer-canvas"></canvas>';
-            html += '</div>';
+            html += '<div class="viewer-label" id="viewer-wf-label"></div>';
+            html += '<div class="viewer-wf-scroll" id="viewer-wf-scroll" style="height:' + viewH + 'px;">';
+            html += '<div class="viewer-wf-spacer" style="height:' + totalRows + 'px;">';
+            html += '<canvas id="viewer-wf" class="viewer-wf-canvas" width="920" height="' + viewH
+                + '" style="height:' + viewH + 'px;"></canvas>';
+            html += '</div></div>';
             html += '<div class="viewer-slider-row">';
-            html += '<input type="range" id="viewer-slider" min="0" max="' + (loadedRows - 1)
+            html += '<input type="range" id="viewer-slider" min="0" max="' + (viewH - 1)
                 + '" value="0" class="viewer-slider">';
             html += '<span id="viewer-time" class="viewer-time">0.000s</span>';
             html += '</div>';
@@ -197,19 +213,19 @@
             html += '<span class="legend-label">' + viewerMax.toFixed(0) + '</span>';
             html += '<span class="legend-label" style="margin-left:2px;">dBFS</span>';
             html += '</div>';
-
             viewerEl.innerHTML = html;
 
-            // Render waterfall
+            const scrollEl = document.getElementById("viewer-wf-scroll");
+            const wfLabel = document.getElementById("viewer-wf-label");
             const wfCanvas = document.getElementById("viewer-wf");
             const wfCtx = wfCanvas.getContext("2d");
-            const wfImgData = wfCtx.createImageData(920, wfRows);
-            for (let r = 0; r < wfRows; r++) {
-                renderWaterfallRow(wfImgData, 920, r, viewerGrid[r], viewerMin, viewerMax);
-            }
-            wfCtx.putImageData(wfImgData, 0, 0);
+            const psdCanvas = document.getElementById("viewer-psd");
+            const psdCtx = psdCanvas.getContext("2d");
+            const psdTooltip = document.getElementById("viewer-psd-tooltip");
+            const slider = document.getElementById("viewer-slider");
+            const timeLabel = document.getElementById("viewer-time");
 
-            // Draw legend bar
+            // Legend bar
             const legCanvas = document.getElementById("viewer-legend");
             const legCtx = legCanvas.getContext("2d");
             for (let x = 0; x < 200; x++) {
@@ -218,43 +234,140 @@
                 legCtx.fillRect(x, 0, 1, 12);
             }
 
-            // PSD view
-            const psdCanvas = document.getElementById("viewer-psd");
-            const psdCtx = psdCanvas.getContext("2d");
-            const psdTooltip = document.getElementById("viewer-psd-tooltip");
+            let firstVisibleRow = 0;
 
-            function drawViewerPSD(rowIdx) {
-                if (rowIdx < 0 || rowIdx >= viewerGrid.length) return;
-                const powers = viewerGrid[rowIdx];
-                drawPSD(psdCtx, 920, 160, powers, viewerFreqs, viewerMin, viewerMax, viewerCrosshairBin, null);
+            const pageIndexFor = function(absRow) { return Math.floor(absRow / PAGE); };
+
+            function getRow(absRow) {
+                const idx = pageIndexFor(absRow);
+                const p = pageCache.get(idx);
+                return p ? (p[absRow - idx * PAGE] || null) : null;
             }
 
-            // Slider
-            const slider = document.getElementById("viewer-slider");
-            const timeLabel = document.getElementById("viewer-time");
-            slider.addEventListener("input", function() {
-                const idx = parseInt(this.value);
-                timeLabel.textContent = (idx * viewerTimeRes).toFixed(3) + "s";
-                drawViewerPSD(idx);
-                // Highlight row on waterfall
-                wfCtx.putImageData(wfImgData, 0, 0);
-                if (idx < wfRows) {
+            // Bound the cache: drop the oldest-loaded pages that aren't part of
+            // the current visible window. Scrolling back re-fetches them.
+            function evict(neededSet) {
+                while (pageCache.size > MAX_PAGES) {
+                    let removed = false;
+                    for (const key of pageCache.keys()) {
+                        if (!neededSet.has(key)) { pageCache.delete(key); removed = true; break; }
+                    }
+                    if (!removed) break;
+                }
+            }
+
+            async function ensureVisible(firstRow) {
+                const lastRow = Math.min(totalRows - 1, firstRow + viewH - 1);
+                const firstPage = pageIndexFor(firstRow);
+                const lastPage = pageIndexFor(lastRow);
+                const needed = new Set();
+                const toFetch = [];
+                for (let p = firstPage; p <= lastPage; p++) {
+                    needed.add(p);
+                    if (!pageCache.has(p) && !pageLoading.has(p)) toFetch.push(p);
+                }
+                if (toFetch.length === 0) return false;
+                await Promise.all(toFetch.map(async function(p) {
+                    pageLoading.add(p);
+                    const resp = await fetchPageRaw(p * PAGE);
+                    pageLoading.delete(p);
+                    if (resp) pageCache.set(p, resp.grid);
+                }));
+                evict(needed);
+                return true;
+            }
+
+            function drawHighlight() {
+                const y = parseInt(slider.value) - firstVisibleRow;
+                if (y >= 0 && y < viewH) {
                     wfCtx.strokeStyle = "rgba(255,255,255,0.6)";
                     wfCtx.lineWidth = 1;
                     wfCtx.beginPath();
-                    wfCtx.moveTo(0, idx + 0.5);
-                    wfCtx.lineTo(920, idx + 0.5);
+                    wfCtx.moveTo(0, y + 0.5);
+                    wfCtx.lineTo(920, y + 0.5);
                     wfCtx.stroke();
                 }
+            }
+
+            function renderWaterfall() {
+                const img = wfCtx.createImageData(920, viewH);
+                for (let y = 0; y < viewH; y++) {
+                    const absRow = firstVisibleRow + y;
+                    const rowData = (absRow < totalRows) ? getRow(absRow) : null;
+                    if (rowData) {
+                        renderWaterfallRow(img, 920, y, rowData, viewerMin, viewerMax);
+                    } else {
+                        // Not-yet-loaded rows render as a dark placeholder.
+                        const base = y * 920 * 4;
+                        for (let x = 0; x < 920; x++) {
+                            const i = base + x * 4;
+                            img.data[i] = 18; img.data[i + 1] = 18; img.data[i + 2] = 30; img.data[i + 3] = 255;
+                        }
+                    }
+                }
+                wfCtx.putImageData(img, 0, 0);
+                drawHighlight();
+            }
+
+            function drawViewerPSD(absRow) {
+                const powers = getRow(absRow);
+                if (!powers) return;
+                drawPSD(psdCtx, 920, 160, powers, viewerFreqs, viewerMin, viewerMax, viewerCrosshairBin, null);
+            }
+
+            function updateLabel() {
+                const lastRow = Math.min(totalRows, firstVisibleRow + viewH);
+                wfLabel.textContent = 'Waterfall (rows ' + firstVisibleRow + '–' + (lastRow - 1)
+                    + ' of ' + totalRows + ', ' + totalDuration + 's total)';
+            }
+
+            // Re-scope the slider to the visible window, keeping the selected
+            // absolute row when it stays on screen, else clamping to an edge.
+            function rescopeSlider() {
+                const lastVisible = Math.min(totalRows - 1, firstVisibleRow + viewH - 1);
+                let v = parseInt(slider.value);
+                slider.min = firstVisibleRow;
+                slider.max = lastVisible;
+                if (v < firstVisibleRow) v = firstVisibleRow;
+                if (v > lastVisible) v = lastVisible;
+                slider.value = v;
+                timeLabel.textContent = (v * viewerTimeRes).toFixed(3) + "s";
+            }
+
+            let rafPending = false;
+            async function onScroll() {
+                firstVisibleRow = Math.max(0, Math.min(
+                    totalRows - viewH, Math.round(scrollEl.scrollTop)));
+                rescopeSlider();
+                updateLabel();
+                renderWaterfall();              // paint what's already cached
+                drawViewerPSD(parseInt(slider.value));
+                if (await ensureVisible(firstVisibleRow)) {
+                    renderWaterfall();          // repaint once fetched pages land
+                    drawViewerPSD(parseInt(slider.value));
+                }
+            }
+
+            scrollEl.addEventListener("scroll", function() {
+                if (rafPending) return;
+                rafPending = true;
+                requestAnimationFrame(function() { rafPending = false; onScroll(); });
             });
 
-            // Waterfall click → set slider
+            slider.addEventListener("input", function() {
+                const idx = parseInt(this.value);
+                timeLabel.textContent = (idx * viewerTimeRes).toFixed(3) + "s";
+                renderWaterfall();
+                drawViewerPSD(idx);
+            });
+
+            // Click a waterfall row → select it on the slider.
             wfCanvas.addEventListener("click", function(e) {
                 const rect = wfCanvas.getBoundingClientRect();
                 const scaleY = wfCanvas.height / rect.height;
-                const row = Math.floor((e.clientY - rect.top) * scaleY);
-                if (row >= 0 && row < loadedRows) {
-                    slider.value = row;
+                const absRow = firstVisibleRow + Math.floor((e.clientY - rect.top) * scaleY);
+                if (absRow >= firstVisibleRow && absRow <= parseInt(slider.max)) {
+                    slider.value = absRow;
                     slider.dispatchEvent(new Event("input"));
                 }
             });
@@ -269,7 +382,8 @@
 
                 const freq = viewerFreqs[viewerCrosshairBin] || 0;
                 const idx = parseInt(slider.value);
-                const power = viewerGrid[idx] ? viewerGrid[idx][viewerCrosshairBin] || 0 : 0;
+                const rowData = getRow(idx);
+                const power = rowData ? (rowData[viewerCrosshairBin] || 0) : 0;
 
                 psdTooltip.style.display = "block";
                 psdTooltip.textContent = (freq / 1e6).toFixed(2) + " MHz  " + power.toFixed(1) + " dBFS";
@@ -286,7 +400,10 @@
                 drawViewerPSD(parseInt(slider.value));
             });
 
-            // Initial draw
+            // Initial paint
+            rescopeSlider();
+            updateLabel();
+            renderWaterfall();
             drawViewerPSD(0);
 
         } catch (_) {

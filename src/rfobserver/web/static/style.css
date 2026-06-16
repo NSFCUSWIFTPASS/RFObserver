@@ -621,6 +621,28 @@ body {
     display: block;
 }
 
+/* Virtualized waterfall: a fixed-height scroll viewport whose inner spacer
+   is as tall as the whole capture (1px per row), with the canvas pinned to
+   the top so only the visible window is ever drawn. */
+.viewer-wf-scroll {
+    overflow-y: auto;
+    overflow-x: hidden;
+    position: relative;
+    border-radius: 6px;
+}
+
+.viewer-wf-spacer {
+    position: relative;
+    width: 100%;
+}
+
+.viewer-wf-canvas {
+    position: sticky;
+    top: 0;
+    width: 100%;
+    display: block;
+}
+
 .viewer-slider-row {
     display: flex;
     align-items: center;

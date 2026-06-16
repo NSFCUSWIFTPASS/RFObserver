@@ -122,6 +122,12 @@ async def capture_psd(
 
     total_rows, num_bins = grid.shape
 
+    # Global range over the whole grid so the waterfall/PSD colour mapping
+    # stays stable while the client lazy-loads pages on scroll (a per-page
+    # min/max would make colours jump between pages).
+    grid_min = float(grid.min()) if total_rows else -120.0
+    grid_max = float(grid.max()) if total_rows else -40.0
+
     # Slice rows
     start = max(0, min(start, total_rows))
     end = min(start + count, total_rows)
@@ -141,6 +147,8 @@ async def capture_psd(
         "time_resolution_s": time_res,
         "total_rows": total_rows,
         "num_bins": num_bins,
+        "grid_min": grid_min,
+        "grid_max": grid_max,
         "start": start,
         "count": end - start,
         "center_freq_hz": center_freq,

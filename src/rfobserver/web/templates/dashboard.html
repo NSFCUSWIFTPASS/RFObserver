@@ -1031,7 +1031,11 @@
     let lastDetectionCount = -1;
     const statusBarEl = document.getElementById("status-bar-label");
     function handleHeartbeat(d) {
-        if (typeof d.status_bar_html === "string" && statusBarEl
+        // Don't clobber the status bar while the user is inline-editing one of
+        // its values — the rebuild would destroy the open <input>. The edit
+        // commit refreshes the bar itself, and the next heartbeat re-syncs once
+        // editing ends.
+        if (!editing && typeof d.status_bar_html === "string" && statusBarEl
                 && statusBarEl.innerHTML !== d.status_bar_html) {
             statusBarEl.innerHTML = d.status_bar_html;
         }

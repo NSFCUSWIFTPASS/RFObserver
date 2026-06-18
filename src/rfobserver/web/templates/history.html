@@ -8,6 +8,35 @@
 <div class="card full-width">
     <div class="card-header">Recent Bursts</div>
     <div class="card-body">
+        <form id="detection-filters" class="detection-filters" onsubmit="return false;">
+            <label class="filter-field">
+                <span>SDR Center</span>
+                <select name="sdr_center">
+                    <option value="">All</option>
+                    {% for c in centers %}
+                    <option value="{{ c }}">{{ "%.1f"|format(c / 1e6) }} MHz</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label class="filter-field">
+                <span>Sample Rate</span>
+                <select name="sample_rate">
+                    <option value="">All</option>
+                    {% for sr in sample_rates %}
+                    <option value="{{ sr }}">{{ "%.0f"|format(sr / 1e6) }} MHz</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label class="filter-field">
+                <span>Gain</span>
+                <select name="gain">
+                    <option value="">All</option>
+                    {% for g in gains %}
+                    <option value="{{ g }}">{{ "%.0f"|format(g) }} dB</option>
+                    {% endfor %}
+                </select>
+            </label>
+        </form>
         <table class="data-table">
             <thead>
                 <tr>
@@ -16,10 +45,13 @@
                     <th>Bandwidth</th>
                     <th>Duration</th>
                     <th>Peak Power</th>
+                    <th>Capture</th>
                 </tr>
             </thead>
-            <tbody hx-get="/api/detections" hx-trigger="load, refreshDetections from:body" hx-swap="innerHTML">
-                <tr><td colspan="5" class="placeholder-text">Loading...</td></tr>
+            <tbody hx-get="/api/detections" hx-include="#detection-filters"
+                   hx-trigger="load, change from:#detection-filters, refreshDetections from:body"
+                   hx-swap="innerHTML">
+                <tr><td colspan="6" class="placeholder-text">Loading...</td></tr>
             </tbody>
         </table>
     </div>

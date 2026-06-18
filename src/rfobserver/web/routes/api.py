@@ -445,20 +445,64 @@ async def nats_disable(request: Request) -> dict[str, Any]:
     return {"status": "disabled"}
 
 
+def _format_capture(r: dict[str, Any]) -> str:
+    """Compact SDR capture-context label, e.g. '915.0 MHz / 56 MHz / 40 dB'.
+
+    Renders '--' when a capture has no SDR context (pre-migration detections).
+    """
+    center = r.get("sdr_center_freq_hz")
+    if center is None:
+        return "--"
+    parts = [f"{center / 1e6:.1f} MHz"]
+    sr = r.get("sample_rate_hz")
+    if sr is not None:
+        parts.append(f"{sr / 1e6:.0f} MHz")
+    gain = r.get("gain_db")
+    if gain is not None:
+        parts.append(f"{gain:.0f} dB")
+    return " / ".join(parts)
+
+
+def _opt_float(raw: str | None) -> float | None:
+    """Parse an optional numeric query param; '' (the 'All' filter) → None."""
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
 @router.get("/detections", response_class=HTMLResponse)
-async def detections_fragment(request: Request) -> str:
-    """Return HTML table rows for HTMX detection history."""
+async def detections_fragment(
+    request: Request,
+    sdr_center: str | None = None,
+    sample_rate: str | None = None,
+    gain: str | None = None,
+) -> str:
+    """Return HTML table rows for HTMX detection history.
+
+    Optional query params filter by SDR capture context so detections can be
+    categorized by tuning config; with none supplied the table is unfiltered
+    (the dashboard's Recent Detections table relies on that). Params are strings
+    so the filter form's empty 'All' option round-trips cleanly.
+    """
     db = _get_db(request)
     if db is None:
-        return '<tr><td colspan="5" class="placeholder-text">Database not connected</td></tr>'
+        return '<tr><td colspan="6" class="placeholder-text">Database not connected</td></tr>'
 
     try:
-        rows = await db.query_detections(limit=50)
+        rows = await db.query_detections(
+            limit=50,
+            sdr_center_freq=_opt_float(sdr_center),
+            sample_rate=_opt_float(sample_rate),
+            gain=_opt_float(gain),
+        )
     except Exception:
-        return '<tr><td colspan="5" class="placeholder-text">Error loading detections</td></tr>'
+        return '<tr><td colspan="6" class="placeholder-text">Error loading detections</td></tr>'
 
     if not rows:
-        return '<tr><td colspan="5" class="placeholder-text">No detections yet</td></tr>'
+        return '<tr><td colspan="6" class="placeholder-text">No detections yet</td></tr>'
 
     html_rows = []
     for r in rows:
@@ -474,6 +518,7 @@ async def detections_fragment(request: Request) -> str:
             f"<td>{bw_mhz:.2f} MHz</td>"
             f"<td>{dur:.2f} ms</td>"
             f"<td>{peak:.1f} dB</td>"
+            f"<td>{_format_capture(r)}</td>"
             f"</tr>"
         )
 

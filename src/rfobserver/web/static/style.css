@@ -211,6 +211,43 @@ body {
     box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.15);
 }
 
+/* Detection history filter bar */
+.detection-filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    padding: 0 16px 16px;
+}
+
+.filter-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.filter-field span {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+
+.filter-field select {
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 13px;
+    font-family: inherit;
+    background: var(--bg);
+    color: var(--text-primary);
+    min-width: 120px;
+}
+
+.filter-field select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.15);
+}
+
 /* Form layout */
 .form-row {
     display: grid;

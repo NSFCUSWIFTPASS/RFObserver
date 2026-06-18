@@ -70,10 +70,11 @@
                         <th>BW</th>
                         <th>Duration</th>
                         <th>Peak</th>
+                        <th>Capture</th>
                     </tr>
                 </thead>
                 <tbody id="detections-tbody" hx-get="/api/detections" hx-trigger="load, refreshDetections from:body" hx-swap="innerHTML">
-                    <tr><td colspan="5" class="placeholder-text">Loading...</td></tr>
+                    <tr><td colspan="6" class="placeholder-text">Loading...</td></tr>
                 </tbody>
             </table>
         </div>

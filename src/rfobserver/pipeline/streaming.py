@@ -206,9 +206,11 @@ class StreamingProcessor:
         # the detector uses (a per-bin curve, not a horizontal line).
         self._noise_floor_per_bin: list[float] | None = None
 
-        # Burst results from burst thread -> event loop
-        self._burst_result_queue: asyncio.Queue[list[BurstFingerprint] | None] = asyncio.Queue(
-            maxsize=32
+        # Burst results from burst thread -> event loop. Payload is
+        # (completed_bursts, sdr_center_freq_hz) so each detection can be
+        # stamped with the actual tuned center, correct even mid-sweep.
+        self._burst_result_queue: asyncio.Queue[tuple[list[BurstFingerprint], int] | None] = (
+            asyncio.Queue(maxsize=32)
         )
 
         # Module manager — attached externally by pipeline/app.py (optional)
@@ -955,7 +957,9 @@ class StreamingProcessor:
 
                 if completed_bursts and self._loop is not None:
                     self._loop.call_soon_threadsafe(
-                        _put_nowait_drop_full, self._burst_result_queue, completed_bursts
+                        _put_nowait_drop_full,
+                        self._burst_result_queue,
+                        (completed_bursts, int(freq_hz)),
                     )
 
                 # Build active burst overlay data for WebSocket.
@@ -1247,11 +1251,25 @@ class StreamingProcessor:
         """Process all pending burst results from the burst detection thread."""
         while True:
             try:
-                bursts = self._burst_result_queue.get_nowait()
+                item = self._burst_result_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            if bursts is None:
+            if item is None:
                 break
+
+            bursts, sdr_center_freq_hz = item
+
+            # SDR capture context, recorded on every detection so they can be
+            # categorized by tuning (center / sample rate / gain). Center comes
+            # from the dwell that produced these bursts; the rest only change on
+            # reconfigure, so reading them here is accurate. LO offset and
+            # analog BW aren't configured in the receiver yet (always 0 / None).
+            rx_config = getattr(self._receiver, "config", None)
+            sample_rate_hz = float(
+                getattr(rx_config, "bandwidth_hz", None) or self._settings.BANDWIDTH
+            )
+            gain_db = float(getattr(rx_config, "gain_db", None) or self._settings.GAIN)
+            device_serial = getattr(self._receiver, "serial", None)
 
             for burst in bursts:
                 await self._db.insert_detection(
@@ -1263,6 +1281,13 @@ class StreamingProcessor:
                     peak_power_db=burst.peak_power_db,
                     duration_ms=burst.duration_ms,
                     detection_timestamp=burst.detection_timestamp,
+                    sdr_center_freq_hz=float(sdr_center_freq_hz),
+                    sample_rate_hz=sample_rate_hz,
+                    lo_offset_hz=0.0,
+                    analog_bw_hz=None,
+                    gain_db=gain_db,
+                    antenna="RX2",
+                    device_serial=device_serial,
                 )
 
             if bursts:

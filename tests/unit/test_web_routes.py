@@ -661,3 +661,81 @@ class TestZmsNatsAPI:
         changed = resp.json()["changed"]
         assert "ZMS_ZMC_HTTP" in changed
         assert "ZMS_MONITOR_ID" in changed
+
+
+# -- Detections fragment (SDR capture-context filtering) --
+
+
+async def _detections_app_with_rows(settings, db_path):
+    """Build an app with a connected DB holding two distinct-config detections."""
+    from datetime import datetime
+
+    from rfobserver.storage.database import SensorDatabase
+
+    app = create_app(settings)
+    database = SensorDatabase(db_path)
+    await database.connect()
+    app.state.database = database
+
+    common = dict(
+        start_time=datetime(2026, 1, 1),
+        stop_time=datetime(2026, 1, 1, 0, 0, 1),
+        center_freq_hz=915e6,
+        bandwidth_hz=1e6,
+        peak_power_db=-30.0,
+        duration_ms=10.0,
+        detection_timestamp=datetime(2026, 1, 1),
+        sample_rate_hz=56e6,
+        gain_db=40.0,
+    )
+    await database.insert_detection(burst_id="at915", sdr_center_freq_hz=915e6, **common)
+    await database.insert_detection(burst_id="at2437", sdr_center_freq_hz=2437e6, **common)
+    return app, database
+
+
+async def test_detections_fragment_has_capture_column(settings, tmp_path):
+    import httpx
+
+    app, database = await _detections_app_with_rows(settings, str(tmp_path / "d.db"))
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.get("/api/detections")
+        assert resp.status_code == 200
+        # Compact capture-context label rendered for each detection.
+        assert "915.0 MHz / 56 MHz / 40 dB" in resp.text
+        assert "2437.0 MHz / 56 MHz / 40 dB" in resp.text
+    finally:
+        await database.close()
+
+
+async def test_detections_fragment_filters_by_sdr_center(settings, tmp_path):
+    import httpx
+
+    app, database = await _detections_app_with_rows(settings, str(tmp_path / "d.db"))
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.get("/api/detections?sdr_center=915000000")
+        assert resp.status_code == 200
+        assert "915.0 MHz" in resp.text
+        # The 2437 MHz capture is filtered out.
+        assert "2437.0 MHz" not in resp.text
+    finally:
+        await database.close()
+
+
+async def test_detections_fragment_empty_filter_is_unfiltered(settings, tmp_path):
+    # The 'All' option submits an empty string; it must not 422 or filter.
+    import httpx
+
+    app, database = await _detections_app_with_rows(settings, str(tmp_path / "d.db"))
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.get("/api/detections?sdr_center=&sample_rate=&gain=")
+        assert resp.status_code == 200
+        assert "915.0 MHz" in resp.text
+        assert "2437.0 MHz" in resp.text
+    finally:
+        await database.close()

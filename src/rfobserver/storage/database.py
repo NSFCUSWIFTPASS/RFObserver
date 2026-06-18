@@ -27,6 +27,16 @@ CREATE TABLE IF NOT EXISTS detections (
     peak_power_db REAL NOT NULL,
     duration_ms REAL NOT NULL,
     detection_timestamp TEXT NOT NULL,
+    -- SDR capture context (how the radio was tuned when the burst was found).
+    -- Distinct from center_freq_hz/bandwidth_hz above, which describe the burst
+    -- signal itself. Nullable so pre-migration rows and uncalibrated paths work.
+    sdr_center_freq_hz REAL,
+    sample_rate_hz REAL,
+    lo_offset_hz REAL,
+    analog_bw_hz REAL,
+    gain_db REAL,
+    antenna TEXT,
+    device_serial TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -48,6 +58,19 @@ CREATE INDEX IF NOT EXISTS idx_detections_freq ON detections(center_freq_hz);
 CREATE INDEX IF NOT EXISTS idx_stats_time ON stats(timestamp);
 """
 
+# SDR capture-context columns added after the original detections schema.
+# Existing databases predate them, so connect() adds any that are missing via
+# ALTER TABLE (SQLite has no "ADD COLUMN IF NOT EXISTS").
+_DETECTION_SDR_COLUMNS: dict[str, str] = {
+    "sdr_center_freq_hz": "REAL",
+    "sample_rate_hz": "REAL",
+    "lo_offset_hz": "REAL",
+    "analog_bw_hz": "REAL",
+    "gain_db": "REAL",
+    "antenna": "TEXT",
+    "device_serial": "TEXT",
+}
+
 
 class SensorDatabase:
     """Async SQLite database for local sensor state."""
@@ -62,8 +85,28 @@ class SensorDatabase:
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")
         await self._db.executescript(SCHEMA)
+        await self._migrate_detection_columns()
+        # Created after migration: on a pre-existing DB the indexed column is
+        # added by the migration above, so this can't run inside SCHEMA.
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_detections_sdr_center ON detections(sdr_center_freq_hz)"
+        )
         await self._db.commit()
         logger.info("Database connected: %s", self._db_path)
+
+    async def _migrate_detection_columns(self) -> None:
+        """Add SDR capture-context columns to an existing detections table.
+
+        Fresh databases get these from SCHEMA; older ones are upgraded in place
+        so their pre-existing rows keep working (the new columns read as NULL).
+        """
+        assert self._db is not None
+        async with self._db.execute("PRAGMA table_info(detections)") as cursor:
+            existing = {row[1] for row in await cursor.fetchall()}
+        for column, col_type in _DETECTION_SDR_COLUMNS.items():
+            if column not in existing:
+                await self._db.execute(f"ALTER TABLE detections ADD COLUMN {column} {col_type}")
+                logger.info("Migrated detections: added column %s", column)
 
     async def close(self) -> None:
         if self._db:
@@ -79,13 +122,22 @@ class SensorDatabase:
         peak_power_db: float,
         duration_ms: float,
         detection_timestamp: datetime,
+        sdr_center_freq_hz: float | None = None,
+        sample_rate_hz: float | None = None,
+        lo_offset_hz: float | None = None,
+        analog_bw_hz: float | None = None,
+        gain_db: float | None = None,
+        antenna: str | None = None,
+        device_serial: str | None = None,
     ) -> None:
         assert self._db is not None
         await self._db.execute(
             """INSERT OR IGNORE INTO detections
                (burst_id, start_time, stop_time, center_freq_hz, bandwidth_hz,
-                peak_power_db, duration_ms, detection_timestamp)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                peak_power_db, duration_ms, detection_timestamp,
+                sdr_center_freq_hz, sample_rate_hz, lo_offset_hz, analog_bw_hz,
+                gain_db, antenna, device_serial)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 burst_id,
                 start_time.isoformat(),
@@ -95,6 +147,13 @@ class SensorDatabase:
                 peak_power_db,
                 duration_ms,
                 detection_timestamp.isoformat(),
+                sdr_center_freq_hz,
+                sample_rate_hz,
+                lo_offset_hz,
+                analog_bw_hz,
+                gain_db,
+                antenna,
+                device_serial,
             ),
         )
         await self._db.commit()
@@ -106,6 +165,9 @@ class SensorDatabase:
         min_freq: float | None = None,
         max_freq: float | None = None,
         since: datetime | None = None,
+        sdr_center_freq: float | None = None,
+        sample_rate: float | None = None,
+        gain: float | None = None,
     ) -> list[dict[str, Any]]:
         assert self._db is not None
         conditions = []
@@ -120,6 +182,16 @@ class SensorDatabase:
         if since is not None:
             conditions.append("start_time >= ?")
             params.append(since.isoformat())
+        # Exact-match SDR capture-context filters (categorize by tuning config).
+        if sdr_center_freq is not None:
+            conditions.append("sdr_center_freq_hz = ?")
+            params.append(sdr_center_freq)
+        if sample_rate is not None:
+            conditions.append("sample_rate_hz = ?")
+            params.append(sample_rate)
+        if gain is not None:
+            conditions.append("gain_db = ?")
+            params.append(gain)
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         query = f"SELECT * FROM detections {where} ORDER BY start_time DESC LIMIT ? OFFSET ?"
@@ -127,6 +199,23 @@ class SensorDatabase:
 
         self._db.row_factory = aiosqlite.Row
         async with self._db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def capture_configs(self) -> list[dict[str, Any]]:
+        """Return the distinct SDR capture configs present in the detections.
+
+        Feeds the History page filter dropdowns so they only offer tuning
+        configurations that actually appear in the stored data.
+        """
+        assert self._db is not None
+        self._db.row_factory = aiosqlite.Row
+        async with self._db.execute(
+            """SELECT DISTINCT sdr_center_freq_hz, sample_rate_hz, gain_db
+               FROM detections
+               WHERE sdr_center_freq_hz IS NOT NULL
+               ORDER BY sdr_center_freq_hz, sample_rate_hz, gain_db"""
+        ) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 

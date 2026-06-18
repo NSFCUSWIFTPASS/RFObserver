@@ -128,6 +128,10 @@ async def capture_psd(
     grid_min = float(grid.min()) if total_rows else -120.0
     grid_max = float(grid.max()) if total_rows else -40.0
 
+    # Display calibration baked in at record time (absent on uncalibrated or
+    # pre-existing captures → client falls back to dBFS).
+    cal_offset_db = float(data["cal_offset_db"]) if "cal_offset_db" in data.files else None
+
     # Slice rows
     start = max(0, min(start, total_rows))
     end = min(start + count, total_rows)
@@ -149,6 +153,7 @@ async def capture_psd(
         "num_bins": num_bins,
         "grid_min": grid_min,
         "grid_max": grid_max,
+        "cal_offset_db": cal_offset_db,
         "start": start,
         "count": end - start,
         "center_freq_hz": center_freq,

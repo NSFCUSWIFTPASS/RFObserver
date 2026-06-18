@@ -21,10 +21,12 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     if settings is None:
         settings = AppSettings()
 
+    # API docs page removed from the UI; the /api/* data routes stay available
+    # for external automations.
     app = FastAPI(
         title="RFObserver",
         version=__version__,
-        docs_url="/api/docs",
+        docs_url=None,
         redoc_url=None,
     )
 

@@ -192,6 +192,9 @@ class StreamingProcessor:
         self._recording_grids: list[np.ndarray[Any, np.dtype[Any]]] = []
         self._recording_freq_axis: np.ndarray[Any, np.dtype[Any]] | None = None
         self._recording_time_res: float = 0.0
+        # Display calibration snapshotted when recording begins, baked into the
+        # .npz so the capture viewer can show the same dBm/Hz the live view did.
+        self._recording_cal_offset: float | None = None
 
         self._capture_count = 0
 
@@ -536,6 +539,7 @@ class StreamingProcessor:
         self._recording_grids = []
         self._recording_freq_axis = None
         self._recording_time_res = 0.0
+        self._recording_cal_offset = self._settings.CAL_OFFSET_DB
 
         s = self._settings
         pre_data = self._pre_trigger_buf.read()
@@ -626,14 +630,18 @@ class StreamingProcessor:
         if grids and self._recording_freq_axis is not None:
             full_grid = np.concatenate(grids, axis=0)
             npz_path = self._storage.storage_path / base_name.replace(".sc16", ".npz")
-            np.savez_compressed(
-                npz_path,
-                grid=full_grid,
-                freq_axis=self._recording_freq_axis,
-                time_resolution_s=np.float64(self._recording_time_res),
-                center_freq_hz=np.int64(self._settings.FREQUENCY_START),
-                bandwidth_hz=np.int64(self._settings.BANDWIDTH),
-            )
+            npz_fields: dict[str, Any] = {
+                "grid": full_grid,
+                "freq_axis": self._recording_freq_axis,
+                "time_resolution_s": np.float64(self._recording_time_res),
+                "center_freq_hz": np.int64(self._settings.FREQUENCY_START),
+                "bandwidth_hz": np.int64(self._settings.BANDWIDTH),
+            }
+            # Bake the display calibration so the viewer renders dBm/Hz like the
+            # live view did; omitted entirely when uncalibrated (viewer → dBFS).
+            if self._recording_cal_offset is not None:
+                npz_fields["cal_offset_db"] = np.float64(self._recording_cal_offset)
+            np.savez_compressed(npz_path, **npz_fields)
             logger.info("PSD data saved: %s (%d rows)", npz_path.name, full_grid.shape[0])
 
         # Write companion metadata JSON

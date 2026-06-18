@@ -109,10 +109,42 @@ class TestCapturesPSD:
         # so the lazy-loading client keeps stable colours across pages.
         assert data["grid_min"] == pytest.approx(float(grid.min()), abs=1e-3)
         assert data["grid_max"] == pytest.approx(float(grid.max()), abs=1e-3)
+        # No calibration baked into this capture → null (viewer falls back to dBFS)
+        assert data["cal_offset_db"] is None
 
         # Cleanup
         npz_path.unlink(missing_ok=True)
         (storage / "test-capture.sc16").unlink(missing_ok=True)
+
+    def test_psd_returns_baked_cal_offset(self, client, settings):
+        # A capture recorded under calibration bakes cal_offset_db into the
+        # .npz; the endpoint surfaces it so the viewer can render dBm/Hz.
+        from pathlib import Path
+
+        import numpy as np
+
+        storage = Path(settings.STORAGE_PATH)
+        storage.mkdir(parents=True, exist_ok=True)
+
+        grid = np.random.uniform(-100, -60, (20, 32)).astype(np.float32)
+        npz_path = storage / "cal-capture.npz"
+        np.savez_compressed(
+            npz_path,
+            grid=grid,
+            freq_axis=np.linspace(-500000, 500000, 32),
+            time_resolution_s=np.float64(0.001),
+            center_freq_hz=np.int64(915000000),
+            bandwidth_hz=np.int64(1000000),
+            cal_offset_db=np.float64(-107.5),
+        )
+        (storage / "cal-capture.sc16").write_bytes(b"\x00" * 100)
+
+        resp = client.get("/captures/psd/cal-capture.sc16?start=0&count=20")
+        assert resp.status_code == 200
+        assert resp.json()["cal_offset_db"] == pytest.approx(-107.5)
+
+        npz_path.unlink(missing_ok=True)
+        (storage / "cal-capture.sc16").unlink(missing_ok=True)
 
     def test_psd_pagination(self, client, settings):
         from pathlib import Path

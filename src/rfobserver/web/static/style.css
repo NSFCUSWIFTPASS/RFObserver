@@ -248,6 +248,107 @@ body {
     box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.15);
 }
 
+/* --- Pulse-length histogram --- */
+.histogram-section {
+    padding: 0 16px 16px;
+}
+
+.histogram-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+
+.histogram-wrap {
+    min-height: 150px;
+}
+
+.hist-chart {
+    display: flex;
+    align-items: stretch;
+}
+
+.hist-yaxis {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    height: 120px;
+    width: 44px;
+    padding-right: 6px;
+    text-align: right;
+    font-size: 10px;
+    color: var(--text-secondary);
+    box-sizing: border-box;
+}
+
+.hist-main {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.histogram {
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 120px;
+    box-sizing: border-box;
+    border-bottom: 1px solid var(--border);
+    /* Horizontal gridlines every 25% to read off the y-axis ticks. */
+    background-image: repeating-linear-gradient(
+        to top, var(--border) 0 1px, transparent 1px 25%);
+}
+
+.hist-bar {
+    flex: 1 1 0;
+    min-width: 3px;
+    background: var(--accent);
+    border-radius: 3px 3px 0 0;
+    cursor: pointer;
+    transition: background 0.12s ease, opacity 0.12s ease;
+    opacity: 0.85;
+}
+
+.hist-bar:hover {
+    opacity: 1;
+}
+
+.hist-bar.is-selected {
+    background: #ff9f0a;
+    opacity: 1;
+}
+
+.hist-axis {
+    display: flex;
+    gap: 2px;
+    margin-top: 4px;
+}
+
+.hist-axis span {
+    flex: 1 1 0;
+    min-width: 3px;
+    font-size: 10px;
+    color: var(--text-secondary);
+    text-align: center;
+    overflow: visible;
+    white-space: nowrap;
+}
+
+.duration-chip {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--accent);
+    background: rgba(0, 113, 227, 0.1);
+    border-radius: 999px;
+    padding: 3px 10px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.duration-chip:hover {
+    background: rgba(0, 113, 227, 0.18);
+}
+
 /* Form layout */
 .form-row {
     display: grid;

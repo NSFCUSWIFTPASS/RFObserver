@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,28 @@ _DETECTION_SDR_COLUMNS: dict[str, str] = {
     "antenna": "TEXT",
     "device_serial": "TEXT",
 }
+
+
+def _nice_bin_width(span: float) -> float:
+    """Pick a human-friendly bin width (1/2/5 x 10^k ms) targeting ~20 bins.
+
+    Floored at 0.5 ms so a tiny or zero range still yields a usable width.
+    """
+    raw = span / 20.0
+    if raw <= 0:
+        return 0.5
+    exp = math.floor(math.log10(raw))
+    base = 10.0**exp
+    frac = raw / base
+    if frac <= 1:
+        nice = 1.0
+    elif frac <= 2:
+        nice = 2.0
+    elif frac <= 5:
+        nice = 5.0
+    else:
+        nice = 10.0
+    return max(0.5, nice * base)
 
 
 class SensorDatabase:
@@ -158,6 +181,30 @@ class SensorDatabase:
         )
         await self._db.commit()
 
+    @staticmethod
+    def _sdr_conditions(
+        sdr_center_freq: float | None,
+        sample_rate: float | None,
+        gain: float | None,
+    ) -> tuple[list[str], list[Any]]:
+        """Build the exact-match SDR capture-context WHERE fragments.
+
+        Shared by query_detections and duration_histogram so the two always
+        scope detections by the same tuning-config filters.
+        """
+        conditions: list[str] = []
+        params: list[Any] = []
+        if sdr_center_freq is not None:
+            conditions.append("sdr_center_freq_hz = ?")
+            params.append(sdr_center_freq)
+        if sample_rate is not None:
+            conditions.append("sample_rate_hz = ?")
+            params.append(sample_rate)
+        if gain is not None:
+            conditions.append("gain_db = ?")
+            params.append(gain)
+        return conditions, params
+
     async def query_detections(
         self,
         limit: int = 100,
@@ -168,6 +215,8 @@ class SensorDatabase:
         sdr_center_freq: float | None = None,
         sample_rate: float | None = None,
         gain: float | None = None,
+        min_duration_ms: float | None = None,
+        max_duration_ms: float | None = None,
     ) -> list[dict[str, Any]]:
         assert self._db is not None
         conditions = []
@@ -183,15 +232,17 @@ class SensorDatabase:
             conditions.append("start_time >= ?")
             params.append(since.isoformat())
         # Exact-match SDR capture-context filters (categorize by tuning config).
-        if sdr_center_freq is not None:
-            conditions.append("sdr_center_freq_hz = ?")
-            params.append(sdr_center_freq)
-        if sample_rate is not None:
-            conditions.append("sample_rate_hz = ?")
-            params.append(sample_rate)
-        if gain is not None:
-            conditions.append("gain_db = ?")
-            params.append(gain)
+        sdr_conditions, sdr_params = self._sdr_conditions(sdr_center_freq, sample_rate, gain)
+        conditions.extend(sdr_conditions)
+        params.extend(sdr_params)
+        # Half-open [min, max) duration range — matches the histogram buckets so a
+        # bar click drills the table to exactly that bucket.
+        if min_duration_ms is not None:
+            conditions.append("duration_ms >= ?")
+            params.append(min_duration_ms)
+        if max_duration_ms is not None:
+            conditions.append("duration_ms < ?")
+            params.append(max_duration_ms)
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         query = f"SELECT * FROM detections {where} ORDER BY start_time DESC LIMIT ? OFFSET ?"
@@ -201,6 +252,59 @@ class SensorDatabase:
         async with self._db.execute(query, params) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+    async def duration_histogram(
+        self,
+        bin_width: float | None = None,
+        sdr_center_freq: float | None = None,
+        sample_rate: float | None = None,
+        gain: float | None = None,
+    ) -> dict[str, Any]:
+        """Bucket detection pulse lengths (duration_ms) into fixed-width bins.
+
+        Aggregates over the full set matching the SDR filters (not the table's
+        50-row page). bin_width None → an auto width derived from the data range.
+        Returns {min, max, count, bin_width, bins:[{lo, hi, count}, ...]} with each
+        bin half-open [lo, hi); the final bin includes an exact-max sample.
+        """
+        assert self._db is not None
+        conditions, params = self._sdr_conditions(sdr_center_freq, sample_rate, gain)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"SELECT duration_ms FROM detections {where}"
+        async with self._db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+
+        durations = [float(r[0]) for r in rows if r[0] is not None]
+        if not durations:
+            return {"min": None, "max": None, "count": 0, "bin_width": bin_width, "bins": []}
+
+        lo_d, hi_d = min(durations), max(durations)
+        if bin_width is not None and bin_width > 0:
+            width = bin_width
+        else:
+            width = _nice_bin_width(hi_d - lo_d)
+
+        start = math.floor(lo_d / width) * width
+        end = math.ceil(hi_d / width) * width
+        n_bins = max(1, int(round((end - start) / width)))
+
+        counts = [0] * n_bins
+        for d in durations:
+            idx = int((d - start) // width)
+            idx = max(0, min(idx, n_bins - 1))  # clamp the exact-max into the last bin
+            counts[idx] += 1
+
+        bins = [
+            {"lo": start + i * width, "hi": start + (i + 1) * width, "count": counts[i]}
+            for i in range(n_bins)
+        ]
+        return {
+            "min": lo_d,
+            "max": hi_d,
+            "count": len(durations),
+            "bin_width": width,
+            "bins": bins,
+        }
 
     async def capture_configs(self) -> list[dict[str, Any]]:
         """Return the distinct SDR capture configs present in the detections.

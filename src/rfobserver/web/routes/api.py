@@ -479,13 +479,16 @@ async def detections_fragment(
     sdr_center: str | None = None,
     sample_rate: str | None = None,
     gain: str | None = None,
+    duration_min: str | None = None,
+    duration_max: str | None = None,
 ) -> str:
     """Return HTML table rows for HTMX detection history.
 
     Optional query params filter by SDR capture context so detections can be
     categorized by tuning config; with none supplied the table is unfiltered
     (the dashboard's Recent Detections table relies on that). Params are strings
-    so the filter form's empty 'All' option round-trips cleanly.
+    so the filter form's empty 'All' option round-trips cleanly. duration_min/max
+    narrow the table to a histogram bucket (half-open [min, max)).
     """
     db = _get_db(request)
     if db is None:
@@ -497,6 +500,8 @@ async def detections_fragment(
             sdr_center_freq=_opt_float(sdr_center),
             sample_rate=_opt_float(sample_rate),
             gain=_opt_float(gain),
+            min_duration_ms=_opt_float(duration_min),
+            max_duration_ms=_opt_float(duration_max),
         )
     except Exception:
         return '<tr><td colspan="6" class="placeholder-text">Error loading detections</td></tr>'
@@ -523,3 +528,91 @@ async def detections_fragment(
         )
 
     return "\n".join(html_rows)
+
+
+def _fmt_ms(v: float, width: float) -> str:
+    """Compact ms label: integer when the value and bin width are whole."""
+    if width >= 1 and abs(v - round(v)) < 1e-9:
+        return str(int(round(v)))
+    return f"{v:.1f}"
+
+
+def _fmt_count(v: float) -> str:
+    """Compact count label for the histogram y-axis (e.g. 268002 -> '268k')."""
+    n = int(v)
+    if n >= 1_000_000:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1e3:.0f}k"
+    return str(n)
+
+
+@router.get("/detections/histogram", response_class=HTMLResponse)
+async def detections_histogram_fragment(
+    request: Request,
+    bin_width: str | None = None,
+    sdr_center: str | None = None,
+    sample_rate: str | None = None,
+    gain: str | None = None,
+) -> str:
+    """Return the pulse-length (duration_ms) distribution as clickable HTML bars.
+
+    Scoped by the same SDR capture-context filters as the detections table.
+    Ignores any duration_min/max params: the histogram always shows the full
+    distribution for the SDR scope while a bar click narrows only the table.
+    """
+    db = _get_db(request)
+    if db is None:
+        return '<div class="placeholder-text">Database not connected</div>'
+
+    try:
+        hist = await db.duration_histogram(
+            bin_width=_opt_float(bin_width),
+            sdr_center_freq=_opt_float(sdr_center),
+            sample_rate=_opt_float(sample_rate),
+            gain=_opt_float(gain),
+        )
+    except Exception:
+        return '<div class="placeholder-text">Error loading histogram</div>'
+
+    bins = hist["bins"]
+    if not bins or hist["count"] == 0:
+        return '<div class="placeholder-text">No detections yet</div>'
+
+    width = hist["bin_width"]
+    max_count = max(b["count"] for b in bins) or 1
+    n = len(bins)
+    # Label every bucket when they fit; thin with a uniform step only when there
+    # are too many to read. Uniform step keeps the spacing consistent (no
+    # odd-then-even mix). Labels are centered under their bar (see .hist-axis CSS).
+    label_step = 1 if n <= 40 else max(1, round(n / 30))
+
+    bars = []
+    axis = []
+    for i, b in enumerate(bins):
+        pct = (b["count"] / max_count) * 100.0 if b["count"] else 0.0
+        height = max(4.0, pct) if b["count"] else 0.0
+        lo_lbl = _fmt_ms(b["lo"], width)
+        hi_lbl = _fmt_ms(b["hi"], width)
+        title = f"{lo_lbl}–{hi_lbl} ms · {b['count']:,}"
+        bars.append(
+            f'<div class="hist-bar" style="height:{height:.1f}%" '
+            f'data-lo="{b["lo"]:.6g}" data-hi="{b["hi"]:.6g}" '
+            f'data-count="{b["count"]}" title="{title}"></div>'
+        )
+        axis.append(f"<span>{lo_lbl if i % label_step == 0 else ''}</span>")
+
+    # Vertical count scale: five ticks from max down to 0, aligned with the
+    # gridlines drawn behind the bars.
+    yticks = "".join(
+        f"<span>{_fmt_count(round(max_count * f))}</span>" for f in (1.0, 0.75, 0.5, 0.25, 0.0)
+    )
+
+    return (
+        f'<div class="hist-chart">'
+        f'<div class="hist-yaxis">{yticks}</div>'
+        f'<div class="hist-main">'
+        f'<div class="histogram" data-bin-width="{width:.6g}">{"".join(bars)}</div>'
+        f'<div class="hist-axis">{"".join(axis)}</div>'
+        f"</div></div>"
+    )

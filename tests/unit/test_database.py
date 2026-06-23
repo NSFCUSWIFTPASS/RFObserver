@@ -231,6 +231,70 @@ async def test_migration_adds_sdr_columns_to_old_db(tmp_path):
         await database.close()
 
 
+async def _insert_durations(db, durations, **overrides):
+    common = dict(
+        start_time=datetime(2026, 1, 1),
+        stop_time=datetime(2026, 1, 1, 0, 0, 1),
+        center_freq_hz=915e6,
+        bandwidth_hz=1e6,
+        peak_power_db=-30.0,
+        detection_timestamp=datetime(2026, 1, 1),
+    )
+    common.update(overrides)
+    for i, d in enumerate(durations):
+        await db.insert_detection(burst_id=f"d-{i}-{d}", duration_ms=d, **common)
+
+
+async def test_duration_histogram_buckets_with_fixed_width(db):
+    # Half-open [lo, hi) bins anchored at multiples of the width.
+    await _insert_durations(db, [82.0, 83.0, 84.0, 85.0, 91.0])
+    hist = await db.duration_histogram(bin_width=5.0)
+    assert hist["count"] == 5
+    assert hist["bin_width"] == 5.0
+    by_lo = {b["lo"]: b["count"] for b in hist["bins"]}
+    assert by_lo[80.0] == 3  # 82, 83, 84
+    assert by_lo[85.0] == 1  # 85 (lower bound inclusive)
+    assert by_lo[90.0] == 1  # 91
+
+
+async def test_duration_histogram_exact_max_on_boundary_in_last_bin(db):
+    # The single global max sitting exactly on a bin edge is clamped into the
+    # last bin rather than dropping off the end.
+    await _insert_durations(db, [81.0, 90.0])
+    hist = await db.duration_histogram(bin_width=5.0)
+    assert sum(b["count"] for b in hist["bins"]) == 2
+    assert hist["bins"][-1]["count"] == 1  # 90 lands in the final bin
+
+
+async def test_duration_histogram_auto_width_is_sane(db):
+    await _insert_durations(db, [float(x) for x in range(0, 200, 10)])
+    hist = await db.duration_histogram()  # auto width
+    assert hist["count"] == 20
+    assert hist["bin_width"] >= 0.5
+    assert sum(b["count"] for b in hist["bins"]) == 20
+
+
+async def test_duration_histogram_respects_sdr_filter(db):
+    await _insert_durations(db, [10.0, 11.0], sdr_center_freq_hz=915e6, sample_rate_hz=56e6)
+    await _insert_durations(db, [10.0], sdr_center_freq_hz=2437e6, sample_rate_hz=56e6)
+    hist = await db.duration_histogram(bin_width=5.0, sdr_center_freq=915e6)
+    assert hist["count"] == 2
+
+
+async def test_duration_histogram_empty(db):
+    hist = await db.duration_histogram(bin_width=5.0)
+    assert hist["count"] == 0
+    assert hist["bins"] == []
+    assert hist["min"] is None
+
+
+async def test_query_detections_duration_range_is_half_open(db):
+    await _insert_durations(db, [79.0, 80.0, 84.9, 85.0])
+    rows = await db.query_detections(min_duration_ms=80.0, max_duration_ms=85.0)
+    durs = sorted(r["duration_ms"] for r in rows)
+    assert durs == [80.0, 84.9]  # 79 excluded (< lo), 85 excluded (== hi, half-open)
+
+
 async def test_config_set_and_get(db):
     await db.set_config("gain", "35")
     value = await db.get_config("gain")

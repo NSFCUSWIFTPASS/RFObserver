@@ -36,7 +36,35 @@
                     {% endfor %}
                 </select>
             </label>
+            <label class="filter-field">
+                <span>Bin Width</span>
+                <select name="bin_width">
+                    <option value="">Auto</option>
+                    <option value="1">1 ms</option>
+                    <option value="2">2 ms</option>
+                    <option value="5">5 ms</option>
+                    <option value="10">10 ms</option>
+                    <option value="20">20 ms</option>
+                    <option value="50">50 ms</option>
+                </select>
+            </label>
+            <input type="hidden" name="duration_min" value="">
+            <input type="hidden" name="duration_max" value="">
         </form>
+
+        <div class="histogram-section">
+            <div class="histogram-head">
+                <span class="legend-label">Pulse Length Distribution</span>
+                <span id="duration-chip" class="duration-chip" hidden></span>
+            </div>
+            <div id="histogram" class="histogram-wrap"
+                 hx-get="/api/detections/histogram" hx-include="#detection-filters"
+                 hx-trigger="load, change from:#detection-filters, refreshDetections from:body"
+                 hx-swap="innerHTML">
+                <div class="placeholder-text">Loading...</div>
+            </div>
+        </div>
+
         <table class="data-table">
             <thead>
                 <tr>
@@ -49,7 +77,7 @@
                 </tr>
             </thead>
             <tbody hx-get="/api/detections" hx-include="#detection-filters"
-                   hx-trigger="load, change from:#detection-filters, refreshDetections from:body"
+                   hx-trigger="load, change from:#detection-filters, refreshDetections from:body, filterByDuration from:body"
                    hx-swap="innerHTML">
                 <tr><td colspan="6" class="placeholder-text">Loading...</td></tr>
             </tbody>
@@ -57,6 +85,65 @@
     </div>
 </div>
 <script>
+// --- Histogram drill-down: clicking a bar narrows ONLY the table to that
+// duration bucket (the histogram itself keeps showing the full distribution).
+(function() {
+    const form = document.getElementById("detection-filters");
+    const minInput = form.querySelector('input[name="duration_min"]');
+    const maxInput = form.querySelector('input[name="duration_max"]');
+    const chip = document.getElementById("duration-chip");
+    const histogram = document.getElementById("histogram");
+
+    function fmt(v) {
+        const n = parseFloat(v);
+        return Number.isInteger(n) ? String(n) : n.toFixed(1);
+    }
+
+    function clearSelection() {
+        minInput.value = "";
+        maxInput.value = "";
+        chip.hidden = true;
+        histogram.querySelectorAll(".hist-bar.is-selected")
+            .forEach(b => b.classList.remove("is-selected"));
+        document.body.dispatchEvent(new Event("filterByDuration"));
+    }
+
+    histogram.addEventListener("click", function(evt) {
+        const bar = evt.target.closest(".hist-bar");
+        if (!bar) return;
+        const lo = bar.dataset.lo, hi = bar.dataset.hi;
+        // Clicking the active bar again clears the filter.
+        if (minInput.value === lo && maxInput.value === hi) { clearSelection(); return; }
+        minInput.value = lo;
+        maxInput.value = hi;
+        histogram.querySelectorAll(".hist-bar.is-selected")
+            .forEach(b => b.classList.remove("is-selected"));
+        bar.classList.add("is-selected");
+        chip.textContent = "Durations: " + fmt(lo) + "–" + fmt(hi) + " ms  ✕";
+        chip.hidden = false;
+        document.body.dispatchEvent(new Event("filterByDuration"));
+    });
+
+    chip.addEventListener("click", clearSelection);
+
+    // The histogram re-renders on every live detection as well as on SDR/bin-width
+    // changes. Reconcile rather than wipe: re-mark the still-present selected
+    // bucket (live refresh keeps the same bins), and only drop the selection when
+    // that bucket no longer exists (bin width or SDR scope changed).
+    histogram.addEventListener("htmx:afterSwap", function() {
+        if (!minInput.value && !maxInput.value) return;
+        const sel = '.hist-bar[data-lo="' + minInput.value + '"][data-hi="' + maxInput.value + '"]';
+        const bar = histogram.querySelector(sel);
+        if (bar) {
+            bar.classList.add("is-selected");
+            chip.textContent = "Durations: " + fmt(minInput.value) + "–" + fmt(maxInput.value) + " ms  ✕";
+            chip.hidden = false;
+        } else {
+            clearSelection();
+        }
+    });
+})();
+
 // Listen to the live websocket purely for the detection_count counter. When
 // it ticks up, dispatch refreshDetections — HTMX picks that up and re-renders
 // the table fragment via /api/detections (REST endpoint stays intact for

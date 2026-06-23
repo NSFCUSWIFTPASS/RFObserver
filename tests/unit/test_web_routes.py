@@ -739,3 +739,73 @@ async def test_detections_fragment_empty_filter_is_unfiltered(settings, tmp_path
         assert "2437.0 MHz" in resp.text
     finally:
         await database.close()
+
+
+async def _histogram_app(settings, db_path, durations):
+    from datetime import datetime
+
+    from rfobserver.storage.database import SensorDatabase
+
+    app = create_app(settings)
+    database = SensorDatabase(db_path)
+    await database.connect()
+    app.state.database = database
+    common = dict(
+        start_time=datetime(2026, 1, 1),
+        stop_time=datetime(2026, 1, 1, 0, 0, 1),
+        center_freq_hz=915e6,
+        bandwidth_hz=1e6,
+        peak_power_db=-30.0,
+        detection_timestamp=datetime(2026, 1, 1),
+        sdr_center_freq_hz=915e6,
+        sample_rate_hz=56e6,
+        gain_db=40.0,
+    )
+    for i, d in enumerate(durations):
+        await database.insert_detection(burst_id=f"h{i}", duration_ms=d, **common)
+    return app, database
+
+
+async def test_histogram_fragment_renders_bars(settings, tmp_path):
+    import httpx
+
+    app, database = await _histogram_app(settings, str(tmp_path / "h.db"), [82.0, 83.0, 91.0])
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.get("/api/detections/histogram?bin_width=5")
+        assert resp.status_code == 200
+        assert 'class="hist-bar"' in resp.text
+        assert 'data-lo="80"' in resp.text  # bucket anchored at a multiple of width
+    finally:
+        await database.close()
+
+
+async def test_histogram_fragment_empty(settings, tmp_path):
+    import httpx
+
+    app, database = await _histogram_app(settings, str(tmp_path / "h.db"), [])
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.get("/api/detections/histogram")
+        assert resp.status_code == 200
+        assert "placeholder-text" in resp.text
+        assert "hist-bar" not in resp.text
+    finally:
+        await database.close()
+
+
+async def test_detections_fragment_duration_range_narrows(settings, tmp_path):
+    import httpx
+
+    app, database = await _histogram_app(settings, str(tmp_path / "h.db"), [82.0, 91.0])
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.get("/api/detections?duration_min=80&duration_max=85")
+        assert resp.status_code == 200
+        assert "82.00 ms" in resp.text
+        assert "91.00 ms" not in resp.text  # outside [80, 85)
+    finally:
+        await database.close()

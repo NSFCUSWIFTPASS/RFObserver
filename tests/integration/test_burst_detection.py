@@ -233,3 +233,73 @@ async def test_high_threshold_rejects_marginal_burst(
     assert near_planted == 0, (
         f"high threshold should reject the marginal burst, got {near_planted} matching"
     )
+
+
+@pytest.mark.asyncio
+async def test_lossless_shutdown_does_not_hang_on_full_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stopping a lossless processor must not wedge on a full chunk queue.
+
+    Regression: in lossless mode the receiver blocks until there is queue room,
+    and a slow single worker leaves the queue full. Shutdown must still unblock
+    the receiver and join all threads promptly (a blocking ``put(_STOP)`` after
+    the consumer had stopped used to deadlock, freezing the event loop).
+    """
+    import threading
+    import time
+
+    bw = 1_000_000
+    iq = make_iq_with_bursts(
+        duration_sec=1.0,
+        bandwidth_hz=bw,
+        bursts=[Burst(start_sec=0.3, duration_sec=0.05, freq_offset_hz=bw * 0.2, amplitude=0.2)],
+    )
+    sc16 = iq_to_sc16_int32(iq)
+
+    settings = _build_settings(tmp_path, bandwidth=bw, num_fft_bins=256)
+
+    # Slow the per-chunk work and cap to one worker so the bounded queue stays
+    # full behind the processor while the receiver keeps producing.
+    original = StreamingProcessor._process_one_chunk
+
+    def slow_process(self: StreamingProcessor, *args: object, **kwargs: object) -> object:
+        time.sleep(0.1)
+        return original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(StreamingProcessor, "_process_one_chunk", slow_process)
+
+    db = SensorDatabase(settings.DB_PATH)
+    await db.connect()
+    try:
+        receiver = SyntheticBurstReceiver(
+            receiver_config=ReceiverConfig(
+                gain_db=settings.GAIN,
+                bandwidth_hz=settings.BANDWIDTH,
+                duration_sec=settings.DURATION_SEC,
+            ),
+            iq_int32=sc16,
+            pacing_factor=1000.0,  # feed fast so the queue saturates immediately
+        )
+        receiver.initialize()
+        processor = _make_processor(settings, receiver, db)
+        processor._num_proc_workers = 1
+
+        task = asyncio.create_task(processor.run())
+        # Let the queue fill and stay full behind the slow worker.
+        while processor._chunk_queue.qsize() < processor._chunk_queue.maxsize:
+            await asyncio.sleep(0.02)
+
+        processor.stop()
+        # Must return well within the per-thread join timeout; a hang here means
+        # the deadlock is back.
+        await asyncio.wait_for(task, timeout=10.0)
+
+        lingering = [
+            t.name
+            for t in threading.enumerate()
+            if t.name in ("recv", "dispatch", "burst") and t.is_alive()
+        ]
+        assert not lingering, f"threads still alive after shutdown: {lingering}"
+    finally:
+        await db.close()

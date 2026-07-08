@@ -135,6 +135,27 @@ def _put_nowait_drop_full(q: asyncio.Queue[Any], item: Any) -> None:
         q.put_nowait(item)
 
 
+def _signal_stop(q: queue.Queue[Any]) -> None:
+    """Enqueue the ``_STOP`` sentinel without ever blocking.
+
+    On shutdown ``_running`` is already False, so the consumer thread has
+    stopped draining ``q``. In lossless mode a producer can leave ``q`` full,
+    which would make a plain blocking ``put(_STOP)`` wedge forever. Drop pending
+    items to make room, then signal — and freeing a slot also unblocks any
+    producer parked in a blocking ``put`` so it can observe ``_running`` and
+    exit.
+    """
+    while True:
+        try:
+            q.put_nowait(_STOP)
+            return
+        except queue.Full:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                return
+
+
 class StreamingProcessor:
     """Streaming pipeline: continuous recv → parallel PSD → rolling burst detection."""
 
@@ -293,9 +314,10 @@ class StreamingProcessor:
             if self._recording_state == "recording":
                 self._end_recording()
             self._recording_state = "idle"
-            # Unblock threads
-            self._chunk_queue.put(_STOP)
-            self._burst_queue.put(_STOP)
+            # Unblock threads (drain-safe: a full queue in lossless mode must not
+            # wedge shutdown now that the consumers have stopped).
+            _signal_stop(self._chunk_queue)
+            _signal_stop(self._burst_queue)
             recv_thread.join(timeout=5)
             dispatch_thread.join(timeout=5)
             burst_thread.join(timeout=5)
@@ -450,7 +472,9 @@ class StreamingProcessor:
 
                         # Enqueue for processing — best-effort, drop if behind.
                         # In lossless mode block until the dispatch loop drains a
-                        # slot so no chunk is ever dropped.
+                        # slot so no chunk is ever dropped, but poll ``_running``
+                        # on a short timeout so shutdown can't wedge the thread on
+                        # a full queue.
                         if self._drop_on_overflow:
                             try:
                                 self._chunk_queue.put_nowait((buf, recv_time))
@@ -459,7 +483,15 @@ class StreamingProcessor:
                                 with contextlib.suppress(queue.Full):
                                     self._buf_pool.put_nowait(buf)
                         else:
-                            self._chunk_queue.put((buf, recv_time))
+                            while self._running:
+                                try:
+                                    self._chunk_queue.put((buf, recv_time), timeout=0.1)
+                                    break
+                                except queue.Full:
+                                    continue
+                            else:
+                                with contextlib.suppress(queue.Full):
+                                    self._buf_pool.put_nowait(buf)
 
                         recv_count += 1
                         if recv_count % 50 == 0:
@@ -477,7 +509,7 @@ class StreamingProcessor:
         finally:
             _ensure_stopped()
             logger.info("Receiver loop exiting (running=%s)", self._running)
-            self._chunk_queue.put(_STOP)
+            _signal_stop(self._chunk_queue)
 
     def _check_trigger_and_record(self, sc16_buf: np.ndarray[Any, np.dtype[Any]]) -> None:
         """Handle recording and trigger logic for each chunk."""
@@ -814,7 +846,7 @@ class StreamingProcessor:
                 except Exception:
                     logger.exception("Processing worker failed during shutdown")
             executor.shutdown(wait=True, cancel_futures=True)
-            self._burst_queue.put(_STOP)
+            _signal_stop(self._burst_queue)
 
     def _make_grid_config(self) -> PSDGridConfig:
         """Build a PSDGridConfig from current settings."""

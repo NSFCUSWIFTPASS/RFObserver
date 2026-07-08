@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from rfobserver.web.websocket import LiveBroadcast
 
 if TYPE_CHECKING:
     from rfobserver.capture.receiver import IReceiver
     from rfobserver.config import AppSettings
+    from rfobserver.pipeline.supervisor import PipelineSupervisor
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ async def run(settings: AppSettings) -> None:
     """Start the full sensor pipeline."""
     from rfobserver.capture.mock_receiver import MockReceiver
     from rfobserver.capture.receiver import ReceiverConfig
+    from rfobserver.pipeline.supervisor import PipelineSupervisor
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.storage.local import LocalStorage
 
@@ -33,17 +35,6 @@ async def run(settings: AppSettings) -> None:
         bandwidth_hz=settings.BANDWIDTH,
         duration_sec=settings.DURATION_SEC,
     )
-
-    receiver: IReceiver
-    if settings.MOCK_RECEIVER:
-        receiver = MockReceiver(receiver_config)
-        logger.info("Using mock receiver")
-    else:
-        from rfobserver.capture.receiver import Receiver
-
-        receiver = Receiver(receiver_config)
-
-    receiver.initialize()
 
     db = SensorDatabase(settings.DB_PATH)
     await db.connect()
@@ -77,33 +68,41 @@ async def run(settings: AppSettings) -> None:
             logger.exception("NATS connect failed; continuing without NATS")
             nats_producer = None
 
-    # Choose pipeline mode: streaming for single-freq / trigger, batch for sweeps
-    is_sweep = settings.FREQUENCY_STEP > 0 and settings.FREQUENCY_END > settings.FREQUENCY_START
-    use_streaming = settings.TRIGGER_ENABLED or not is_sweep
+    # The receiver and processor are built lazily by the supervisor when the
+    # sensor is activated, so a Standby start never claims the SDR.
+    def build_receiver() -> IReceiver:
+        if settings.MOCK_RECEIVER:
+            logger.info("Using mock receiver")
+            return MockReceiver(receiver_config)
+        from rfobserver.capture.receiver import Receiver
 
-    if use_streaming:
-        from rfobserver.pipeline.streaming import StreamingProcessor
+        return Receiver(receiver_config)
 
-        processor = StreamingProcessor(
-            receiver=receiver,
-            database=db,
-            local_storage=local_storage,
-            settings=settings,
-            broadcast=broadcast,
-            zms_monitor=zms_monitor,
-            nats_producer=nats_producer,
-        )
+    def build_processor(receiver: IReceiver) -> Any:
+        # streaming for single-freq / trigger, batch for sweeps
+        is_sweep = settings.FREQUENCY_STEP > 0 and settings.FREQUENCY_END > settings.FREQUENCY_START
+        use_streaming = settings.TRIGGER_ENABLED or not is_sweep
+        if use_streaming:
+            from rfobserver.modules.manager import ModuleManager
+            from rfobserver.pipeline.streaming import StreamingProcessor
 
-        # Attach module manager for upstream signal processing
-        from rfobserver.modules.manager import ModuleManager
-
-        processor._module_manager = ModuleManager()
-
-        logger.info("Using streaming pipeline")
-    else:
+            proc: Any = StreamingProcessor(
+                receiver=receiver,
+                database=db,
+                local_storage=local_storage,
+                settings=settings,
+                broadcast=broadcast,
+                zms_monitor=zms_monitor,
+                nats_producer=nats_producer,
+            )
+            # Attach module manager for upstream signal processing
+            proc._module_manager = ModuleManager()
+            logger.info("Using streaming pipeline")
+            return proc
         from rfobserver.pipeline.continuous import ContinuousProcessor
 
-        processor = ContinuousProcessor(  # type: ignore[assignment]
+        logger.info("Using batch pipeline (sweep mode)")
+        return ContinuousProcessor(
             receiver=receiver,
             database=db,
             local_storage=local_storage,
@@ -112,18 +111,30 @@ async def run(settings: AppSettings) -> None:
             zms_monitor=zms_monitor,
             nats_producer=nats_producer,
         )
-        logger.info("Using batch pipeline (sweep mode)")
 
-    tasks = [processor.run()]
+    supervisor = PipelineSupervisor(
+        build_receiver=build_receiver,
+        build_processor=build_processor,
+    )
+    if settings.SENSOR_ACTIVE:
+        await supervisor.set_active(True)
+    else:
+        logger.info("Sensor starting in Standby (SENSOR_ACTIVE=false)")
+
+    tasks: list[Any] = []
     if zms_monitor is not None:
         tasks.append(zms_monitor.run())
     if settings.WEB_PORT > 0:
-        tasks.append(_run_web_server(settings, processor, db, broadcast))
-        tasks.append(_heartbeat_loop(settings, processor, db, local_storage, broadcast))
+        tasks.append(_run_web_server(settings, supervisor, db, broadcast))
+        tasks.append(_heartbeat_loop(settings, supervisor, db, local_storage, broadcast))
+    # Keep the process alive even in Standby / headless (no web) mode; the
+    # supervisor owns the processor task independently of this gather.
+    tasks.append(asyncio.Event().wait())
 
     try:
         await asyncio.gather(*tasks)
     finally:
+        await supervisor.set_active(False)
         if zms_monitor is not None:
             await zms_monitor.stop()
         if nats_producer is not None:
@@ -133,7 +144,7 @@ async def run(settings: AppSettings) -> None:
 
 async def _heartbeat_loop(
     settings: AppSettings,
-    processor: object,
+    supervisor: PipelineSupervisor,
     db: object,
     local_storage: object,
     broadcast: LiveBroadcast,
@@ -146,7 +157,8 @@ async def _heartbeat_loop(
     periodic timer. Two monotonic counters (``detection_count``,
     ``capture_count``) let clients trigger HTML-fragment refreshes only when
     the underlying state actually changes — REST endpoints stay intact for
-    automations that aren't on a websocket.
+    automations that aren't on a websocket. Reads the supervisor's current
+    processor each tick so the state reflects Standby (no processor) live.
     """
     from pathlib import Path
 
@@ -158,11 +170,12 @@ async def _heartbeat_loop(
     from rfobserver.web.routes.modules import build_modules_payload
 
     storage_path = Path(getattr(local_storage, "storage_path", "."))
-    module_manager = getattr(processor, "_module_manager", None)
 
     while True:
         try:
-            if hasattr(processor, "recording_status"):
+            processor = supervisor.processor
+            module_manager = getattr(processor, "_module_manager", None)
+            if processor is not None and hasattr(processor, "recording_status"):
                 rec_status: dict[str, object] = processor.recording_status()
             else:
                 rec_status = {"state": "idle", "file": None, "bytes": 0, "duration_sec": 0}
@@ -184,7 +197,7 @@ async def _heartbeat_loop(
             await broadcast.publish(
                 {
                     "type": "heartbeat",
-                    "status_bar_html": build_status_bar_html(settings),
+                    "status_bar_html": build_status_bar_html(settings, active=supervisor.active),
                     "recording": rec_status,
                     "zms": build_zms_status_payload(settings, processor),
                     "nats": build_nats_status_payload(settings, processor),
@@ -201,7 +214,7 @@ async def _heartbeat_loop(
 
 async def _run_web_server(
     settings: AppSettings,
-    processor: object,
+    supervisor: PipelineSupervisor,
     database: object,
     broadcast: LiveBroadcast,
 ) -> None:
@@ -211,9 +224,17 @@ async def _run_web_server(
     from rfobserver.web.app import create_app
 
     app = create_app(settings)
-    app.state.processor = processor
+    app.state.supervisor = supervisor
     app.state.database = database
     app.state.broadcast = broadcast
+    app.state.processor = supervisor.processor
+
+    # Keep app.state.processor pointed at the live processor (or None in
+    # Standby) as the supervisor starts/stops it.
+    def _sync_processor(processor: object | None) -> None:
+        app.state.processor = processor
+
+    supervisor._on_processor_change = _sync_processor
 
     config = uvicorn.Config(
         app,

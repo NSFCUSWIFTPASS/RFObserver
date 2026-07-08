@@ -112,11 +112,13 @@ async def status_fragment(request: Request) -> str:
 """
 
 
-def build_status_bar_html(settings: Any) -> str:
+def build_status_bar_html(settings: Any, active: bool = True) -> str:
     """Render the dashboard status bar.
 
     Shared between the HTMX page-load fetch (``GET /api/status-bar``) and
     the WebSocket heartbeat that keeps the bar fresh while live (no polling).
+    ``active`` reflects the Sensor Active state; when False the bar leads with a
+    "Standby" badge.
     """
     # SENSOR_NAME is a user-facing display label; HOSTNAME is the machine
     # identifier used elsewhere (NATS subjects, capture filenames, ZMS
@@ -126,8 +128,13 @@ def build_status_bar_html(settings: Any) -> str:
     bw = settings.BANDWIDTH / 1e6
     dur = settings.DURATION_SEC
 
+    prefix = (
+        ""
+        if active
+        else '<span class="status-standby">Standby</span> <span class="status-sep">&middot;</span> '
+    )
     return (
-        f"{display_name} "
+        prefix + f"{display_name} "
         f'<span class="status-sep">&middot;</span> '
         f'<span class="editable-val" data-field="frequency_start" '
         f'data-raw="{settings.FREQUENCY_START}" data-suffix=" MHz">'
@@ -146,7 +153,9 @@ def build_status_bar_html(settings: Any) -> str:
 @router.get("/status-bar", response_class=HTMLResponse)
 async def status_bar(request: Request) -> str:
     """Compact inline status bar for graph header (HTML, one-shot)."""
-    return build_status_bar_html(request.app.state.settings)
+    supervisor = getattr(request.app.state, "supervisor", None)
+    active = bool(getattr(supervisor, "active", True))
+    return build_status_bar_html(request.app.state.settings, active=active)
 
 
 @router.post("/trigger")

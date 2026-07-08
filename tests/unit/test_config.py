@@ -32,15 +32,16 @@ def test_env_prefix(monkeypatch):
     assert settings.LOG_LEVEL == "DEBUG"
 
 
-def test_sensor_active_defaults_true():
+def test_sensor_active_defaults_false():
+    # Fresh install starts in Standby so it does not claim the SDR until enabled.
     settings = AppSettings(_env_file=None)
-    assert settings.SENSOR_ACTIVE is True
+    assert settings.SENSOR_ACTIVE is False
 
 
 def test_sensor_active_env_override(monkeypatch):
-    monkeypatch.setenv("RFOBS_SENSOR_ACTIVE", "false")
+    monkeypatch.setenv("RFOBS_SENSOR_ACTIVE", "true")
     settings = AppSettings(_env_file=None)
-    assert settings.SENSOR_ACTIVE is False
+    assert settings.SENSOR_ACTIVE is True
 
 
 def test_zms_none_when_incomplete():

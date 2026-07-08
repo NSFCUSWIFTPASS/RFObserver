@@ -10,9 +10,14 @@
         Sensor
         <span style="flex:1;"></span>
         <label class="toggle-label" title="Enable/disable capture and streaming; releases the SDR when off">
-            <input type="checkbox" id="sensor-toggle" {% if settings.SENSOR_ACTIVE %}checked{% endif %}>
+            <input type="checkbox" id="sensor-toggle"
+                   {% if sensor_active %}checked{% endif %}
+                   {% if not sensor_available %}disabled{% endif %}>
             <span class="toggle-text">Sensor Active</span>
         </label>
+        <span id="sensor-hint" style="font-size:10px;opacity:0.6;margin-left:8px;{% if sensor_available %}display:none;{% endif %}">
+            No pipeline running
+        </span>
     </div>
     <div class="card-body">
         <p style="font-size:12px;opacity:0.7;margin:0;">
@@ -548,9 +553,13 @@
     // The switch settles only on the backend-confirmed state; capture stops and
     // the SDR is released when off.
     const sensorToggle = document.getElementById('sensor-toggle');
+    const sensorHint = document.getElementById('sensor-hint');
     if (sensorToggle) {
         fetch('/api/sensor').then(r => r.json()).then(d => {
             sensorToggle.checked = !!d.active;
+            // No pipeline attached (web-only mode): the toggle can't act.
+            sensorToggle.disabled = !d.available;
+            if (sensorHint) sensorHint.style.display = d.available ? 'none' : '';
         }).catch(() => {});
 
         sensorToggle.addEventListener('change', async function() {

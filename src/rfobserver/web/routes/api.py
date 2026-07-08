@@ -160,11 +160,15 @@ async def status_bar(request: Request) -> str:
 
 @router.get("/sensor")
 async def sensor_state(request: Request) -> dict[str, Any]:
-    """Current sensor-active state for initial UI render."""
+    """Current sensor-active state for initial UI render.
+
+    ``available`` is False in web-only mode (no pipeline attached), where the
+    toggle cannot act and the UI should disable it.
+    """
     supervisor = getattr(request.app.state, "supervisor", None)
     if supervisor is not None:
-        return {"active": bool(supervisor.active)}
-    return {"active": bool(request.app.state.settings.SENSOR_ACTIVE)}
+        return {"active": bool(supervisor.active), "available": True}
+    return {"active": bool(request.app.state.settings.SENSOR_ACTIVE), "available": False}
 
 
 @router.post("/sensor")

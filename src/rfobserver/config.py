@@ -44,10 +44,11 @@ class AppSettings(BaseSettings):
     GAIN: int = 40
 
     # SENSOR_ACTIVE is the user-intent flag for capture. False means the sensor
-    # is in Standby: no streaming/processing and the SDR is released. Persisted
-    # to .env so a disabled sensor stays disabled across restarts. The
-    # /api/sensor endpoint drives and persists this.
-    SENSOR_ACTIVE: bool = True
+    # is in Standby: no streaming/processing and the SDR is released. Defaults
+    # to False so a fresh install starts in Standby and does not claim the SDR
+    # until explicitly enabled. Persisted to .env so the choice survives
+    # restarts; the /api/sensor endpoint drives and persists this.
+    SENSOR_ACTIVE: bool = False
 
     # Sweep
     CYCLES: int = 0  # 0 = infinite

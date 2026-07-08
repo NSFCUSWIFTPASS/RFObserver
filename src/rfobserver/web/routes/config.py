@@ -19,11 +19,19 @@ router = APIRouter()
 async def config_page(request: Request) -> Any:
     templates = request.app.state.templates
     settings = request.app.state.settings
+    # A supervisor is only attached when the full pipeline is running. In
+    # web-only mode the Sensor Active toggle can't act, so render it disabled and
+    # reflect the live state when a supervisor is present.
+    supervisor = getattr(request.app.state, "supervisor", None)
+    sensor_available = supervisor is not None
+    sensor_active = supervisor.active if supervisor is not None else settings.SENSOR_ACTIVE
     return templates.TemplateResponse(
         request,
         "config.html",
         {
             "settings": settings,
+            "sensor_available": sensor_available,
+            "sensor_active": sensor_active,
         },
     )
 

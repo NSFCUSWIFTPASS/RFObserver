@@ -834,7 +834,7 @@ def test_get_sensor_reflects_supervisor(settings):
     client = TestClient(app)
     resp = client.get("/api/sensor")
     assert resp.status_code == 200
-    assert resp.json() == {"active": False}
+    assert resp.json() == {"active": False, "available": True}
 
 
 def test_get_sensor_without_supervisor_uses_settings(settings):
@@ -842,7 +842,7 @@ def test_get_sensor_without_supervisor_uses_settings(settings):
     client = TestClient(create_app(settings))
     resp = client.get("/api/sensor")
     assert resp.status_code == 200
-    assert resp.json() == {"active": True}
+    assert resp.json() == {"active": True, "available": False}
 
 
 def test_post_sensor_toggles_and_confirms(settings, monkeypatch):

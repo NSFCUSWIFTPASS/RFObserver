@@ -1,6 +1,8 @@
 # RFObserver
 
-RFObserver (or RFObs) is a python application to monitor, visualize and process RF spectrum using SDRs with a live Web UI. It is been developed for continuous RFI detection, monitoring and enforcement at the Hat Creek Radio Observatory using [OpenZMS](https://openzms.net/). The instantaneous bandwidth is configurable and depends on the SDR and compute available. The current version deployed and being tested uses the B205mini SDR and the Jetson Nano Super for compute.
+RFObserver (or RFObs) is a python application to monitor, visualize and process RF (Radio Frequency) spectrum using SDRs with a live Web UI. It is been developed for continuous RFI detection, monitoring and enforcement at the Hat Creek Radio Observatory using [OpenZMS](https://openzms.net/). Radio Observatories are very sensitive to local RF transmissions since they overpower weak RF signals that are inherently emitted due to physical processes by bodies in space such as the Sun. This makes observatories require stringent control over RF transmission. RFObserver in tandem with OpenZMS opens up a  possibility to use the RF spectrum dynamically when the observatory is not observing or observing only in a certain spectrum. 
+
+The instantaneous bandwidth for RFObs is configurable and depends on the SDR and compute available. The current version deployed and being tested uses the B205mini SDR and the Jetson Nano Super for compute.
 
 ![RFObserver](assets/rfobs.png)
 
@@ -33,6 +35,20 @@ RFOBS_MOCK_RECEIVER=true rfobserver run
 # Run web UI only
 rfobserver web
 ```
+
+> **`rfobserver: command not found`?** A user install (`pip install .` without a
+> virtualenv or `sudo`) places the `rfobserver` script in `~/.local/bin`, which
+> is often not on `PATH` — pip prints a `WARNING: The script rfobserver is
+> installed in '.../.local/bin' which is not on PATH` when this happens. Add it
+> to your `PATH` and reload the shell:
+>
+> ```bash
+> echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+> source ~/.bashrc
+> ```
+>
+> Or invoke it without touching `PATH`, via the full path
+> (`~/.local/bin/rfobserver config`) or as a module (`python3 -m rfobserver config`).
 
 ## Development
 

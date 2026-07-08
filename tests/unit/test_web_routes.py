@@ -809,3 +809,59 @@ async def test_detections_fragment_duration_range_narrows(settings, tmp_path):
         assert "91.00 ms" not in resp.text  # outside [80, 85)
     finally:
         await database.close()
+
+
+class _FakeSupervisor:
+    """Minimal supervisor stand-in for the /api/sensor endpoints."""
+
+    def __init__(self, active: bool = True) -> None:
+        self._active = active
+        self.calls: list[bool] = []
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    async def set_active(self, active: bool) -> bool:
+        self.calls.append(active)
+        self._active = active
+        return self._active
+
+
+def test_get_sensor_reflects_supervisor(settings):
+    app = create_app(settings)
+    app.state.supervisor = _FakeSupervisor(active=False)
+    client = TestClient(app)
+    resp = client.get("/api/sensor")
+    assert resp.status_code == 200
+    assert resp.json() == {"active": False}
+
+
+def test_get_sensor_without_supervisor_uses_settings(settings):
+    settings.SENSOR_ACTIVE = True
+    client = TestClient(create_app(settings))
+    resp = client.get("/api/sensor")
+    assert resp.status_code == 200
+    assert resp.json() == {"active": True}
+
+
+def test_post_sensor_toggles_and_confirms(settings, monkeypatch):
+    import rfobserver.web.routes.config as config_mod
+
+    monkeypatch.setattr(config_mod, "_persist_settings", lambda s: None)
+    app = create_app(settings)
+    sup = _FakeSupervisor(active=True)
+    app.state.supervisor = sup
+    client = TestClient(app)
+
+    resp = client.post("/api/sensor", json={"active": False})
+    assert resp.status_code == 200
+    assert resp.json()["active"] is False
+    assert sup.calls == [False]
+    assert settings.SENSOR_ACTIVE is False
+
+
+def test_post_sensor_without_supervisor_is_409(settings):
+    client = TestClient(create_app(settings))  # web-only: no supervisor
+    resp = client.post("/api/sensor", json={"active": False})
+    assert resp.status_code == 409

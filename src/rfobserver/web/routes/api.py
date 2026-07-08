@@ -158,6 +158,49 @@ async def status_bar(request: Request) -> str:
     return build_status_bar_html(request.app.state.settings, active=active)
 
 
+@router.get("/sensor")
+async def sensor_state(request: Request) -> dict[str, Any]:
+    """Current sensor-active state for initial UI render."""
+    supervisor = getattr(request.app.state, "supervisor", None)
+    if supervisor is not None:
+        return {"active": bool(supervisor.active)}
+    return {"active": bool(request.app.state.settings.SENSOR_ACTIVE)}
+
+
+@router.post("/sensor")
+async def sensor_set(request: Request) -> dict[str, Any]:
+    """Enable/disable capture + streaming; returns the confirmed state.
+
+    Persists the intent to .env so a disabled sensor stays disabled across
+    restarts. Returns 409 when no pipeline is running (web-only mode).
+    """
+    from rfobserver.web.routes.config import _persist_settings
+
+    supervisor = getattr(request.app.state, "supervisor", None)
+    if supervisor is None:
+        raise HTTPException(status_code=409, detail="Pipeline not running")
+
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+    if not isinstance(body, dict) or "active" not in body:
+        raise HTTPException(status_code=400, detail="Missing 'active'")
+    want = bool(body["active"])
+
+    try:
+        confirmed = await supervisor.set_active(want)
+    except Exception as exc:
+        logger.exception("Sensor toggle failed")
+        raise HTTPException(status_code=500, detail=f"toggle failed: {exc}") from exc
+
+    settings = request.app.state.settings
+    settings.SENSOR_ACTIVE = confirmed
+    _persist_settings(settings)
+    logger.info("Sensor set active=%s via API (persisted)", confirmed)
+    return {"active": confirmed, "detail": "active" if confirmed else "standby"}
+
+
 @router.post("/trigger")
 async def trigger_capture(request: Request) -> dict[str, str]:
     """Activate manual IQ capture trigger (backward compat)."""

@@ -147,6 +147,7 @@ class StreamingProcessor:
         broadcast: LiveBroadcast | None = None,
         zms_monitor: ZmsMonitor | None = None,
         nats_producer: NatsProducer | None = None,
+        drop_on_overflow: bool = True,
     ) -> None:
         self._receiver = receiver
         self._db = database
@@ -156,6 +157,12 @@ class StreamingProcessor:
         self._zms_monitor = zms_monitor
         self._nats_producer = nats_producer
         self._running = False
+        # Live capture must never block the receiver thread, so chunks are
+        # dropped when processing falls behind (the default). Offline replay of
+        # a bounded buffer (e.g. integration tests, file playback) can opt into
+        # lossless mode, where the producer and dispatch loop instead block
+        # until there is room — every chunk is processed, deterministically.
+        self._drop_on_overflow = drop_on_overflow
 
         total_cores = os.cpu_count() or 4
         self._num_proc_workers = max(1, total_cores - 3)
@@ -441,13 +448,18 @@ class StreamingProcessor:
                         # Handle recording / trigger
                         self._check_trigger_and_record(buf[:n])
 
-                        # Enqueue for processing — best-effort, drop if behind
-                        try:
-                            self._chunk_queue.put_nowait((buf, recv_time))
-                        except queue.Full:
-                            self._dropped_chunks += 1
-                            with contextlib.suppress(queue.Full):
-                                self._buf_pool.put_nowait(buf)
+                        # Enqueue for processing — best-effort, drop if behind.
+                        # In lossless mode block until the dispatch loop drains a
+                        # slot so no chunk is ever dropped.
+                        if self._drop_on_overflow:
+                            try:
+                                self._chunk_queue.put_nowait((buf, recv_time))
+                            except queue.Full:
+                                self._dropped_chunks += 1
+                                with contextlib.suppress(queue.Full):
+                                    self._buf_pool.put_nowait(buf)
+                        else:
+                            self._chunk_queue.put((buf, recv_time))
 
                         recv_count += 1
                         if recv_count % 50 == 0:
@@ -769,12 +781,19 @@ class StreamingProcessor:
                 sc16_buf, recv_time = item
                 capture_num += 1
 
-                # Drop chunk if too many in flight (backpressure)
+                # Too many in flight: drop (live) or, in lossless mode, block on
+                # the oldest future so this chunk still gets processed.
                 if len(pending_futures) >= max_inflight:
-                    self._dropped_chunks += 1
-                    with contextlib.suppress(queue.Full):
-                        self._buf_pool.put_nowait(sc16_buf)
-                    continue
+                    if self._drop_on_overflow:
+                        self._dropped_chunks += 1
+                        with contextlib.suppress(queue.Full):
+                            self._buf_pool.put_nowait(sc16_buf)
+                        continue
+                    f = pending_futures.pop(0)
+                    try:
+                        self._handle_chunk_result(f.result())
+                    except Exception:
+                        logger.exception("Processing worker failed")
 
                 future = executor.submit(
                     self._process_one_chunk,

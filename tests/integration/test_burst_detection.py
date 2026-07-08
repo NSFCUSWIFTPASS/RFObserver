@@ -85,6 +85,11 @@ def _make_processor(
         database=db,
         local_storage=storage,
         settings=settings,
+        # Lossless replay: the pipeline blocks instead of dropping chunks when
+        # processing falls behind, so every burst-carrying chunk is processed.
+        # This makes detection deterministic on slow/shared CI runners (a single
+        # processing worker there used to overrun the queue and drop bursts).
+        drop_on_overflow=False,
     )
 
 
@@ -127,9 +132,9 @@ async def test_detects_known_bursts_at_multiple_bandwidths(
                 duration_sec=settings.DURATION_SEC,
             ),
             iq_int32=sc16,
-            # Slower pacing so dispatch keeps up on under-resourced CI runners
-            # (4x realtime drops chunks at 25 MHz BW on shared CI; 2x is
-            # reliable while still finishing in <2 s wall time).
+            # Pacing only bounds the wall-clock feed rate; correctness no longer
+            # depends on it because the processor runs lossless (see
+            # _make_processor). 2x realtime keeps the test brief.
             pacing_factor=2.0,
         )
         receiver.initialize()

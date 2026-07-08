@@ -5,6 +5,24 @@
     <h1>Sensor Configuration</h1>
 </div>
 
+<div class="card" style="margin-bottom: 16px;">
+    <div class="card-header">
+        Sensor
+        <span style="flex:1;"></span>
+        <label class="toggle-label" title="Enable/disable capture and streaming; releases the SDR when off">
+            <input type="checkbox" id="sensor-toggle" {% if settings.SENSOR_ACTIVE %}checked{% endif %}>
+            <span class="toggle-text">Sensor Active</span>
+        </label>
+    </div>
+    <div class="card-body">
+        <p style="font-size:12px;opacity:0.7;margin:0;">
+            When off, the sensor goes to Standby: capture and processing stop and the SDR is
+            released so another process can use it. The switch updates only after the backend
+            confirms the change.
+        </p>
+    </div>
+</div>
+
 <form id="config-form" method="post">
 <div class="card" style="margin-bottom: 16px;">
     <div class="card-header">Identity</div>
@@ -525,6 +543,40 @@
         }
         pollStatus();
     });
+
+    // --- Sensor Active toggle ---
+    // The switch settles only on the backend-confirmed state; capture stops and
+    // the SDR is released when off.
+    const sensorToggle = document.getElementById('sensor-toggle');
+    if (sensorToggle) {
+        fetch('/api/sensor').then(r => r.json()).then(d => {
+            sensorToggle.checked = !!d.active;
+        }).catch(() => {});
+
+        sensorToggle.addEventListener('change', async function() {
+            const want = this.checked;
+            sensorToggle.disabled = true;
+            try {
+                const r = await fetch('/api/sensor', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({active: want}),
+                });
+                if (!r.ok) {
+                    this.checked = !want;  // revert; transition not confirmed
+                    const e = await r.json().catch(() => ({}));
+                    alert(e.detail || 'Sensor toggle failed');
+                } else {
+                    const d = await r.json();
+                    this.checked = !!d.active;  // settle on confirmed state
+                }
+            } catch (_) {
+                this.checked = !want;
+            } finally {
+                sensorToggle.disabled = false;
+            }
+        });
+    }
 
     // --- Map picker modal ---------------------------------------------------
     //

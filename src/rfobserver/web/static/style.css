@@ -470,6 +470,11 @@ body {
     margin: 0 4px;
 }
 
+.status-standby {
+    color: #ff9f0a;
+    font-weight: 600;
+}
+
 /* Spectrogram legend */
 .spectrogram-legend {
     display: flex;

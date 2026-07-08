@@ -32,6 +32,17 @@ def test_env_prefix(monkeypatch):
     assert settings.LOG_LEVEL == "DEBUG"
 
 
+def test_sensor_active_defaults_true():
+    settings = AppSettings(_env_file=None)
+    assert settings.SENSOR_ACTIVE is True
+
+
+def test_sensor_active_env_override(monkeypatch):
+    monkeypatch.setenv("RFOBS_SENSOR_ACTIVE", "false")
+    settings = AppSettings(_env_file=None)
+    assert settings.SENSOR_ACTIVE is False
+
+
 def test_zms_none_when_incomplete():
     settings = AppSettings(_env_file=None)
     assert settings.zms is None

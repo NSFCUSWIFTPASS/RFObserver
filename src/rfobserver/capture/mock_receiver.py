@@ -25,6 +25,7 @@ class MockReceiver:
         self._capture_count = 0
         self._streaming = False
         self._stream_center_freq: int = 0
+        self._closed = False
 
     @property
     def serial(self) -> str:
@@ -119,6 +120,12 @@ class MockReceiver:
     def stop_streaming(self) -> None:
         self._streaming = False
         logger.info("MockReceiver stopped streaming")
+
+    def close(self) -> None:
+        """Release the (mock) device. No hardware to free; records state."""
+        self._streaming = False
+        self._closed = True
+        logger.info("MockReceiver closed")
 
     async def get_temperature(self) -> float | None:
         return float(45.0 + self._rng.uniform(-2, 2))

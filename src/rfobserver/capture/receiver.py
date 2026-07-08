@@ -16,7 +16,7 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -60,6 +60,10 @@ class IReceiver(Protocol):
     def recv_chunk(self, out_buf: np.ndarray) -> int: ...
     def stop_streaming(self) -> None: ...
 
+    # Lifecycle
+    def initialize(self) -> None: ...
+    def close(self) -> None: ...
+
     @property
     def serial(self) -> str: ...
 
@@ -81,6 +85,9 @@ class Receiver:
         self._active_buf: int = 0  # index into _buffers: 0 or 1
         self._serial = ""
         self._streaming = False
+        # UHD handles — created in initialize(), dropped in close().
+        self.usrp: Any = None
+        self.rx_streamer: Any = None
 
     @property
     def serial(self) -> str:
@@ -253,6 +260,20 @@ class Receiver:
         self.rx_streamer.issue_stream_cmd(stream_cmd)
         self._streaming = False
         logger.info("Stopped continuous streaming")
+
+    def close(self) -> None:
+        """Release the SDR so another process can claim it.
+
+        Drops the UHD streamer and device handles; Python/UHD frees the USB
+        device when the last reference goes away. ``initialize()`` recreates
+        them, so a closed receiver can be brought back. Safe to call twice or
+        before ``initialize()``.
+        """
+        with self._hardware_lock:
+            self.rx_streamer = None
+            self.usrp = None
+            self._streaming = False
+        logger.info("Receiver closed (SDR released)")
 
     async def get_temperature(self) -> float | None:
         loop = asyncio.get_running_loop()

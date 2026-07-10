@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -271,7 +272,9 @@ async def recording_stop(request: Request) -> dict[str, Any]:
     """Stop recording or disarm trigger."""
     proc = _get_processor(request)
     if proc is not None and hasattr(proc, "stop_recording"):
-        proc.stop_recording()
+        # Finalizing a recording does blocking file I/O; keep it off the event
+        # loop so the WebSocket/heartbeat stay responsive.
+        await asyncio.to_thread(proc.stop_recording)
         return _rec_status(proc)
     return _idle_status()
 

@@ -865,3 +865,30 @@ def test_post_sensor_without_supervisor_is_409(settings):
     client = TestClient(create_app(settings))  # web-only: no supervisor
     resp = client.post("/api/sensor", json={"active": False})
     assert resp.status_code == 409
+
+
+def test_recording_stop_runs_off_event_loop(monkeypatch, settings):
+    """stop_recording (blocking) must be dispatched via asyncio.to_thread."""
+    import asyncio as _asyncio
+
+    calls = {"to_thread": 0}
+    real_to_thread = _asyncio.to_thread
+
+    async def spy(fn, *a, **k):
+        calls["to_thread"] += 1
+        return await real_to_thread(fn, *a, **k)
+
+    monkeypatch.setattr(_asyncio, "to_thread", spy)
+
+    class Proc:
+        def stop_recording(self):
+            pass
+
+        def recording_status(self):
+            return {"state": "idle", "file": None, "bytes": 0, "duration_sec": 0}
+
+    app = create_app(settings)
+    app.state.processor = Proc()
+    r = TestClient(app).post("/api/recording/stop")
+    assert r.status_code == 200
+    assert calls["to_thread"] == 1

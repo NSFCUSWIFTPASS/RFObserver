@@ -709,10 +709,12 @@ class StreamingProcessor:
             self._recording_file = base_name
 
         if self._recording_buf is not None:
-            # RAM mode: flush buffer to disk
+            # RAM mode: flush buffer to disk. tofile() streams the array straight
+            # to the file — avoids the transient full-size copy that .tobytes()
+            # makes, which would double IQ RAM right at the memory-cap boundary.
             filepath = self._storage.storage_path / base_name
             used = self._recording_buf[: self._recording_buf_pos]
-            filepath.write_bytes(used.tobytes())
+            used.tofile(str(filepath))
             self._recording_bytes = self._recording_buf_pos * 4
             self._recording_buf = None
             self._recording_buf_pos = 0

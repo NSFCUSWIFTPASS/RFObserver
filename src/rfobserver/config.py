@@ -122,6 +122,7 @@ class AppSettings(BaseSettings):
     # Recording
     RECORDING_MAX_SEC: float = 30.0  # auto-stop after this duration (0 = no limit)
     RECORDING_RAM_BUFFER: bool = False  # buffer entire capture in RAM, flush on stop
+    RECORDING_MEM_FRACTION: float = 0.5  # RAM-mode: max fraction of avail RAM per recording
 
     # Metrics
     METRICS_ENABLED: bool = False

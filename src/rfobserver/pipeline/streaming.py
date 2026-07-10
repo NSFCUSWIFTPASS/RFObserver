@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import queue
 import threading
@@ -154,6 +155,38 @@ def _signal_stop(q: queue.Queue[Any]) -> None:
                 q.get_nowait()
             except queue.Empty:
                 return
+
+
+def _mem_available_bytes() -> int | None:
+    """Available RAM in bytes from /proc/meminfo, or None if unreadable."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _effective_max_recording_sec(settings: Any, mem_available_bytes: int | None) -> float:
+    """Auto-stop duration for a recording.
+
+    Disk mode streams IQ+grids to disk, so RAM is not the limit — only the
+    configured RECORDING_MAX_SEC (or unlimited). RAM mode holds IQ+grids in RAM,
+    so cap the duration to a fraction of available RAM. Returns math.inf for
+    "no limit". Falls back to 30 s (or the configured max) if RAM is unknown.
+    """
+    configured = float(settings.RECORDING_MAX_SEC) if settings.RECORDING_MAX_SEC > 0 else math.inf
+    if not settings.RECORDING_RAM_BUFFER:
+        return configured
+    if mem_available_bytes is None:
+        return min(configured, 30.0)
+    grid_bps = (1000.0 / settings.PSD_TIME_RESOLUTION_MS) * settings.NUM_FFT_BINS * 4
+    iq_bps = settings.BANDWIDTH * 4
+    ram_bps = grid_bps + iq_bps
+    ram_max = (mem_available_bytes * settings.RECORDING_MEM_FRACTION) / ram_bps
+    return min(configured, float(ram_max))
 
 
 class StreamingProcessor:

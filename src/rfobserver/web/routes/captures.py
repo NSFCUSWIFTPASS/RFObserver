@@ -10,11 +10,19 @@ import numpy as np
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
+from rfobserver.storage import psd_grid
+
 router = APIRouter()
 
 
 def _get_storage(request: Request) -> Path:
     return Path(request.app.state.settings.STORAGE_PATH)
+
+
+def _has_psd(sc16_path: Path) -> bool:
+    """True if a PSD companion exists (new raw+sidecar, or legacy .npz)."""
+    raw, meta = psd_grid.grid_paths(sc16_path)
+    return (raw.exists() and meta.exists()) or sc16_path.with_suffix(".npz").exists()
 
 
 def _validate_filename(filename: str, storage: Path) -> Path:
@@ -45,7 +53,7 @@ async def captures_list(request: Request) -> list[dict[str, Any]]:
         entry: dict[str, Any] = {
             "filename": sc16.name,
             "size_bytes": sc16.stat().st_size,
-            "has_psd": sc16.with_suffix(".npz").exists(),
+            "has_psd": _has_psd(sc16),
         }
 
         json_path = sc16.with_suffix(".json")
@@ -74,7 +82,7 @@ async def capture_detail(request: Request, filename: str) -> dict[str, Any]:
     result: dict[str, Any] = {
         "filename": filename,
         "size_bytes": sc16_path.stat().st_size,
-        "has_psd": sc16_path.with_suffix(".npz").exists(),
+        "has_psd": _has_psd(sc16_path),
     }
 
     json_path = sc16_path.with_suffix(".json")
@@ -106,31 +114,38 @@ async def capture_psd(
     """
     storage = _get_storage(request)
 
-    # Resolve .npz path from filename (accept both .sc16 and .npz names)
+    # New format (raw .psd + .psd.json, memmap) first, then legacy .npz.
     base = filename.replace(".sc16", "").replace(".npz", "")
-    npz_path = _validate_filename(base + ".npz", storage)
-
-    if not npz_path.exists():
-        raise HTTPException(status_code=404, detail="PSD data not found")
-
-    data = np.load(npz_path)
-    grid = data["grid"]  # shape: (total_rows, num_bins)
-    freq_axis = data["freq_axis"]
-    time_res = float(data["time_resolution_s"])
-    center_freq = int(data["center_freq_hz"])
-    bandwidth = int(data["bandwidth_hz"])
-
-    total_rows, num_bins = grid.shape
-
-    # Global range over the whole grid so the waterfall/PSD colour mapping
-    # stays stable while the client lazy-loads pages on scroll (a per-page
-    # min/max would make colours jump between pages).
-    grid_min = float(grid.min()) if total_rows else -120.0
-    grid_max = float(grid.max()) if total_rows else -40.0
-
-    # Display calibration baked in at record time (absent on uncalibrated or
-    # pre-existing captures → client falls back to dBFS).
-    cal_offset_db = float(data["cal_offset_db"]) if "cal_offset_db" in data.files else None
+    sc16_path = _validate_filename(base + ".sc16", storage)
+    loaded = psd_grid.load_grid(sc16_path)
+    if loaded is not None:
+        grid, meta = loaded  # grid is a read-only memmap; only the window is materialized
+        freq_axis = np.asarray(meta["freq_axis"])
+        time_res = float(meta["time_resolution_s"])
+        center_freq = int(meta["center_freq_hz"])
+        bandwidth = int(meta["bandwidth_hz"])
+        total_rows = int(meta["rows"])
+        num_bins = int(meta["num_bins"])
+        grid_min = float(meta["grid_min"])
+        grid_max = float(meta["grid_max"])
+        cal_offset_db = float(meta["cal_offset_db"]) if "cal_offset_db" in meta else None
+    else:
+        npz_path = _validate_filename(base + ".npz", storage)
+        if not npz_path.exists():
+            raise HTTPException(status_code=404, detail="PSD data not found")
+        data = np.load(npz_path)
+        grid = data["grid"]  # shape: (total_rows, num_bins)
+        freq_axis = data["freq_axis"]
+        time_res = float(data["time_resolution_s"])
+        center_freq = int(data["center_freq_hz"])
+        bandwidth = int(data["bandwidth_hz"])
+        total_rows, num_bins = grid.shape
+        # Global range over the whole grid so the waterfall colour mapping stays
+        # stable while the client lazy-loads pages (a per-page min/max would jump).
+        grid_min = float(grid.min()) if total_rows else -120.0
+        grid_max = float(grid.max()) if total_rows else -40.0
+        # Display calibration baked in at record time (absent → client uses dBFS).
+        cal_offset_db = float(data["cal_offset_db"]) if "cal_offset_db" in data.files else None
 
     # Slice rows
     start = max(0, min(start, total_rows))

@@ -892,3 +892,45 @@ def test_recording_stop_runs_off_event_loop(monkeypatch, settings):
     r = TestClient(app).post("/api/recording/stop")
     assert r.status_code == 200
     assert calls["to_thread"] == 1
+
+
+def test_psd_reads_new_raw_format(client, settings):
+    """The viewer serves a window from the new raw .psd + .psd.json companion."""
+    from pathlib import Path
+
+    import numpy as np
+
+    from rfobserver.storage import psd_grid
+
+    storage = Path(settings.STORAGE_PATH)
+    storage.mkdir(parents=True, exist_ok=True)
+    sc16 = storage / "newfmt.sc16"
+    sc16.write_bytes(b"\x00" * 16)
+    raw, meta = psd_grid.grid_paths(sc16)
+    grid = np.linspace(-120, -40, 8 * 4, dtype=np.float32).reshape(8, 4)
+    raw.write_bytes(grid.tobytes())
+    psd_grid.write_meta(
+        meta,
+        rows=8,
+        num_bins=4,
+        time_resolution_s=0.001,
+        center_freq_hz=915_000_000,
+        bandwidth_hz=26_000_000,
+        freq_axis=np.arange(4, dtype=np.float64),
+        grid_min=float(grid.min()),
+        grid_max=float(grid.max()),
+        cal_offset_db=None,
+    )
+
+    resp = client.get("/captures/psd/newfmt.sc16?start=0&count=4")
+    assert resp.status_code == 200
+    d = resp.json()
+    assert d["total_rows"] == 8
+    assert d["num_bins"] == 4
+    assert len(d["grid"]) == 4  # windowed
+    assert d["grid_min"] == pytest.approx(float(grid.min()))
+    assert d["cal_offset_db"] is None
+
+    raw.unlink(missing_ok=True)
+    meta.unlink(missing_ok=True)
+    sc16.unlink(missing_ok=True)

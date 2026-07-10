@@ -9,7 +9,12 @@ Wants=network-online.target
 Type=simple
 User=rfobserver
 Group=rfobserver
-EnvironmentFile=/etc/rfobserver/rfobserver.env
+# Config lives in a writable .env in the state dir (not an EnvironmentFile under
+# read-only /etc). WorkingDirectory makes that .env the one both the app reads on
+# startup and the UI writes on toggle/apply, so runtime changes persist across
+# restarts. Do NOT add an EnvironmentFile: its env vars would outrank the .env
+# and silently override UI-persisted changes.
+WorkingDirectory=/var/lib/rfobserver
 ExecStart=/usr/local/bin/rfobserver run
 Restart=on-failure
 RestartSec=5

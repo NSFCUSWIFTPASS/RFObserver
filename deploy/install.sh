@@ -23,16 +23,20 @@ if ! id rfobserver &>/dev/null; then
 fi
 
 # Create directories
-mkdir -p /var/lib/rfobserver /etc/rfobserver
+mkdir -p /var/lib/rfobserver
 chown rfobserver:rfobserver /var/lib/rfobserver
 
 # Install package
 pip3 install --break-system-packages .
 
-# Install config if not present
-if [ ! -f /etc/rfobserver/rfobserver.env ]; then
-    cp deploy/rfobserver.env.example /etc/rfobserver/rfobserver.env
-    echo "Edit /etc/rfobserver/rfobserver.env with your sensor settings"
+# Install config if not present. It lives as a writable .env in the state dir
+# (the service's WorkingDirectory) so that UI toggles / config-apply persist
+# across restarts. May contain tokens, so lock it down to the service user.
+if [ ! -f /var/lib/rfobserver/.env ]; then
+    cp deploy/rfobserver.env.example /var/lib/rfobserver/.env
+    chown rfobserver:rfobserver /var/lib/rfobserver/.env
+    chmod 600 /var/lib/rfobserver/.env
+    echo "Edit /var/lib/rfobserver/.env with your sensor settings"
 fi
 
 # Install systemd service

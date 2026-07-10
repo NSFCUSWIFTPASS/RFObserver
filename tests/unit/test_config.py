@@ -1,6 +1,7 @@
 """Tests for rfobserver.config."""
 
 from rfobserver.config import AppSettings
+from rfobserver.web.routes.config import _persist_settings
 
 
 def test_default_settings():
@@ -42,6 +43,35 @@ def test_sensor_active_env_override(monkeypatch):
     monkeypatch.setenv("RFOBS_SENSOR_ACTIVE", "true")
     settings = AppSettings(_env_file=None)
     assert settings.SENSOR_ACTIVE is True
+
+
+def test_toggle_persists_to_env_and_reloads(monkeypatch, tmp_path):
+    """A UI toggle (persist to .env in cwd) must survive a restart.
+
+    This is what makes runtime toggles durable for the systemd service, whose
+    WorkingDirectory is the writable state dir holding this .env.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    # Enable non-default toggles, as a UI toggle would, then persist.
+    settings = AppSettings(_env_file=None)
+    settings.SENSOR_ACTIVE = True
+    settings.NATS_ENABLED = True
+    settings.ZMS_ENABLED = True
+    _persist_settings(settings)
+
+    assert (tmp_path / ".env").exists()
+
+    # A fresh process reads the same .env from cwd and sees the enabled state.
+    reloaded = AppSettings()
+    assert reloaded.SENSOR_ACTIVE is True
+    assert reloaded.NATS_ENABLED is True
+    assert reloaded.ZMS_ENABLED is True
+
+    # Toggling back to the default is likewise durable.
+    reloaded.SENSOR_ACTIVE = False
+    _persist_settings(reloaded)
+    assert AppSettings().SENSOR_ACTIVE is False
 
 
 def test_zms_none_when_incomplete():

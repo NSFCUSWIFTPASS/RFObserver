@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 from rfobserver.capture.mock_receiver import MockReceiver
@@ -387,15 +386,17 @@ async def test_streaming_manual_recording(
     assert "dropped_chunks" in meta
     assert "center_freq_hz" in meta
 
-    # Verify companion .npz PSD data
-    npz_files = list(Path(settings.STORAGE_PATH).glob("*.npz"))
-    assert len(npz_files) >= 1
-    data = np.load(npz_files[0])
-    assert "grid" in data
-    assert "freq_axis" in data
-    assert "time_resolution_s" in data
-    assert data["grid"].shape[0] > 0  # has rows
-    assert data["grid"].shape[1] > 0  # has bins
+    # Verify companion PSD grid (new raw .psd + .psd.json format, memmap-backed)
+    from rfobserver.storage import psd_grid
+
+    assert not list(Path(settings.STORAGE_PATH).glob("*.npz"))  # legacy format retired
+    loaded = psd_grid.load_grid(sc16_files[0])
+    assert loaded is not None
+    grid, grid_meta = loaded
+    assert grid_meta["time_resolution_s"] >= 0
+    assert grid.shape[0] > 0  # has rows
+    assert grid.shape[1] > 0  # has bins
+    assert len(grid_meta["freq_axis"]) == grid.shape[1]
 
 
 @pytest.mark.asyncio

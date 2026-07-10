@@ -23,9 +23,10 @@ if ! id rfobserver &>/dev/null; then
     useradd --system --shell /usr/sbin/nologin --create-home rfobserver
 fi
 
-# Create directories
+# Create directories. chown -R so a DB/.env left root-owned by an earlier root
+# run becomes writable by the service user (else SQLite hits "readonly database").
 mkdir -p /var/lib/rfobserver
-chown rfobserver:rfobserver /var/lib/rfobserver
+chown -R rfobserver:rfobserver /var/lib/rfobserver
 
 # Install the package system-wide. A plain system install (not a virtualenv) is
 # required so the app can import the system UHD Python bindings (/usr/lib/

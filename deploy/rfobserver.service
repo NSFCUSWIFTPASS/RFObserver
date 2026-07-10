@@ -14,6 +14,9 @@ Group=rfobserver
 # startup and the UI writes on toggle/apply, so runtime changes persist across
 # restarts. Do NOT add an EnvironmentFile: its env vars would outrank the .env
 # and silently override UI-persisted changes.
+# systemd creates/owns /var/lib/rfobserver as the service user on every start,
+# so the SQLite DB and .env there are always writable (no "readonly database").
+StateDirectory=rfobserver
 WorkingDirectory=/var/lib/rfobserver
 ExecStart=/usr/local/bin/rfobserver run
 Restart=on-failure

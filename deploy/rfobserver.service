@@ -1,6 +1,8 @@
 [Unit]
 Description=RFObserver Sensor Pipeline
-After=network-online.target nats-server.service
+# The sensor is a NATS client to a remote RFS broker, so no local
+# nats-server.service ordering is needed.
+After=network-online.target
 Wants=network-online.target
 
 [Service]

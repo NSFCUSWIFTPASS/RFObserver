@@ -375,7 +375,9 @@ async def test_streaming_manual_recording(
     assert sc16_files[0].stat().st_size > 0
 
     # Verify companion .json metadata file
-    json_files = list(Path(settings.STORAGE_PATH).glob("*.json"))
+    json_files = [
+        p for p in Path(settings.STORAGE_PATH).glob("*.json") if not p.name.endswith(".psd.json")
+    ]
     assert len(json_files) >= 1
     import json
 
@@ -642,7 +644,11 @@ async def test_ram_recording_creates_file(
     assert sc16_files[0].stat().st_size > 0
 
     # Verify companion JSON
-    json_files = list(Path(ram_settings.STORAGE_PATH).glob("*.json"))
+    json_files = [
+        p
+        for p in Path(ram_settings.STORAGE_PATH).glob("*.json")
+        if not p.name.endswith(".psd.json")
+    ]
     assert len(json_files) >= 1
     import json
 
@@ -723,7 +729,11 @@ async def test_ram_recording_arm_and_fire(
 
     import json
 
-    json_files = list(Path(ram_settings.STORAGE_PATH).glob("*.json"))
+    json_files = [
+        p
+        for p in Path(ram_settings.STORAGE_PATH).glob("*.json")
+        if not p.name.endswith(".psd.json")
+    ]
     meta = json.loads(json_files[0].read_text())
     assert meta["trigger_initiated"] is True
     assert meta["ram_buffered"] is True

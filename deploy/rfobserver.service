@@ -19,6 +19,12 @@ Group=rfobserver
 StateDirectory=rfobserver
 WorkingDirectory=/var/lib/rfobserver
 ExecStart=/usr/local/bin/rfobserver run
+
+# Memory backstop: if a bug blows past this, OOM-kill just this service (then
+# Restart=on-failure brings it back) instead of freezing the whole board. Tune
+# per box (sized for a ~7-8 GB sensor).
+MemoryHigh=3G
+MemoryMax=4G
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

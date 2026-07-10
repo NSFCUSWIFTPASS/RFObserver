@@ -256,6 +256,15 @@ class StreamingProcessor:
         # Display calibration snapshotted when recording begins, baked into the
         # .npz so the capture viewer can show the same dBm/Hz the live view did.
         self._recording_cal_offset: float | None = None
+        # New raw-grid streaming state. Disk mode writes rows to _grid_file
+        # (bounded RAM); RAM mode still uses _recording_grids but is bounded by
+        # the RAM-derived _effective_max_sec auto-stop.
+        self._grid_file: Any = None
+        self._grid_raw_path: Any = None
+        self._grid_rows: int = 0
+        self._grid_min: float = float("inf")
+        self._grid_max: float = float("-inf")
+        self._effective_max_sec: float = float("inf")
 
         self._capture_count = 0
 
@@ -551,9 +560,8 @@ class StreamingProcessor:
         if state == "recording":
             self._write_recording_chunk(sc16_buf)
 
-            # Auto-stop on max duration
-            max_sec = self._settings.RECORDING_MAX_SEC
-            if max_sec > 0 and (time.monotonic() - self._recording_start) >= max_sec:
+            # Auto-stop on the effective max duration (RAM-derived cap in RAM mode).
+            if (time.monotonic() - self._recording_start) >= self._effective_max_sec:
                 self.stop_recording()
                 return
 
@@ -619,13 +627,33 @@ class StreamingProcessor:
         self._recording_freq_axis = None
         self._recording_time_res = 0.0
         self._recording_cal_offset = self._settings.CAL_OFFSET_DB
+        self._grid_rows = 0
+        self._grid_min = float("inf")
+        self._grid_max = float("-inf")
+        self._effective_max_sec = _effective_max_recording_sec(
+            self._settings, _mem_available_bytes()
+        )
+        if self._effective_max_sec != float("inf"):
+            logger.info("Recording auto-stop cap: %.1fs", self._effective_max_sec)
+        # Disk mode streams grid rows to <base>.psd; RAM mode accumulates in list.
+        from rfobserver.storage import psd_grid
+
+        if not self._settings.RECORDING_RAM_BUFFER:
+            raw_path, _ = psd_grid.grid_paths(self._storage.storage_path / self._recording_file)
+            self._grid_raw_path = raw_path
+            # Long-lived handle: written per-chunk during recording, closed in
+            # _end_recording — a context manager doesn't fit this lifecycle.
+            self._grid_file = open(raw_path, "wb")  # noqa: SIM115
+        else:
+            self._grid_file = None
+            self._grid_raw_path = None
 
         s = self._settings
         pre_data = self._pre_trigger_buf.read()
 
         if s.RECORDING_RAM_BUFFER:
-            # Pre-allocate RAM for max recording duration
-            max_sec = s.RECORDING_MAX_SEC if s.RECORDING_MAX_SEC > 0 else 30.0
+            # Pre-allocate RAM for the (RAM-bounded) max recording duration.
+            max_sec = self._effective_max_sec if self._effective_max_sec != float("inf") else 30.0
             total_samples = int((s.TRIGGER_PRE_SEC + max_sec) * s.BANDWIDTH)
             self._recording_buf = np.zeros(total_samples, dtype=np.int32)
             self._recording_buf_pos = 0
@@ -703,25 +731,40 @@ class StreamingProcessor:
                 if orig.exists():
                     orig.rename(dest)
 
-        # Save PSD grid data as .npz companion
-        grids = self._recording_grids
-        self._recording_grids = []
-        if grids and self._recording_freq_axis is not None:
-            full_grid = np.concatenate(grids, axis=0)
-            npz_path = self._storage.storage_path / base_name.replace(".sc16", ".npz")
-            npz_fields: dict[str, Any] = {
-                "grid": full_grid,
-                "freq_axis": self._recording_freq_axis,
-                "time_resolution_s": np.float64(self._recording_time_res),
-                "center_freq_hz": np.int64(self._settings.FREQUENCY_START),
-                "bandwidth_hz": np.int64(self._settings.BANDWIDTH),
-            }
-            # Bake the display calibration so the viewer renders dBm/Hz like the
-            # live view did; omitted entirely when uncalibrated (viewer → dBFS).
-            if self._recording_cal_offset is not None:
-                npz_fields["cal_offset_db"] = np.float64(self._recording_cal_offset)
-            np.savez_compressed(npz_path, **npz_fields)
-            logger.info("PSD data saved: %s (%d rows)", npz_path.name, full_grid.shape[0])
+        # Finalize the PSD grid companion (<base>.psd + .psd.json). Disk mode has
+        # been streaming rows; RAM mode flushes its list here row-by-row (no
+        # np.concatenate). Either way, no whole-grid RAM copy.
+        from rfobserver.storage import psd_grid
+
+        raw_path, meta_path = psd_grid.grid_paths(self._storage.storage_path / base_name)
+        if self._grid_file is not None:
+            self._grid_file.close()
+            self._grid_file = None
+            # If the .sc16 was drop-renamed, move the streamed grid to match.
+            if self._grid_raw_path is not None and self._grid_raw_path != raw_path:
+                with contextlib.suppress(OSError):
+                    self._grid_raw_path.rename(raw_path)
+            self._grid_raw_path = None
+        elif self._recording_grids:
+            with open(raw_path, "wb") as fh:
+                for g in self._recording_grids:
+                    fh.write(np.ascontiguousarray(g, dtype=np.float32).tobytes())
+                    self._grid_rows += g.shape[0]
+            self._recording_grids = []
+        if self._grid_rows > 0 and self._recording_freq_axis is not None:
+            psd_grid.write_meta(
+                meta_path,
+                rows=self._grid_rows,
+                num_bins=int(self._recording_freq_axis.shape[0]),
+                time_resolution_s=self._recording_time_res,
+                center_freq_hz=self._settings.FREQUENCY_START,
+                bandwidth_hz=self._settings.BANDWIDTH,
+                freq_axis=self._recording_freq_axis,
+                grid_min=(0.0 if self._grid_min == float("inf") else self._grid_min),
+                grid_max=(0.0 if self._grid_max == float("-inf") else self._grid_max),
+                cal_offset_db=self._recording_cal_offset,
+            )
+            logger.info("PSD data saved: %s (%d rows)", meta_path.name, self._grid_rows)
 
         # Write companion metadata JSON
         self._write_recording_metadata(base_name, duration)
@@ -942,14 +985,24 @@ class StreamingProcessor:
         with contextlib.suppress(queue.Full):
             self._burst_queue.put_nowait((cr.psd_grid, cr.center_freq_hz, cr.capture_num))
 
-        # Accumulate PSD grids during recording (for .npz companion file)
+        # Persist PSD grids during recording. Disk mode streams rows straight to
+        # the raw .psd file (bounded RAM); RAM mode keeps them in the list, which
+        # is bounded by the RAM-derived _effective_max_sec auto-stop.
         if self._recording_state == "recording":
-            self._recording_grids.append(cr.psd_grid.grid.copy())
+            grid = cr.psd_grid.grid
             self._recording_freq_axis = cr.psd_grid.freq_axis
             if len(cr.psd_grid.time_axis) > 1:
                 self._recording_time_res = float(
                     cr.psd_grid.time_axis[1] - cr.psd_grid.time_axis[0]
                 )
+            if grid.size:
+                self._grid_min = min(self._grid_min, float(grid.min()))
+                self._grid_max = max(self._grid_max, float(grid.max()))
+            if self._grid_file is not None:
+                self._grid_file.write(np.ascontiguousarray(grid, dtype=np.float32).tobytes())
+                self._grid_rows += grid.shape[0]
+            else:
+                self._recording_grids.append(grid.copy())
 
         self._capture_count = cr.capture_num
         latency_ms = (time.monotonic() - cr.recv_time) * 1000.0

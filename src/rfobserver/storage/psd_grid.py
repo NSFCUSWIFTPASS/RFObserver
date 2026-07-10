@@ -9,10 +9,12 @@ compressed ``.npz`` which materialized the whole grid.
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def grid_paths(sc16_path: Path) -> tuple[Path, Path]:

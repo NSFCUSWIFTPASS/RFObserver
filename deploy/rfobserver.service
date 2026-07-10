@@ -15,7 +15,7 @@ Group=rfobserver
 # restarts. Do NOT add an EnvironmentFile: its env vars would outrank the .env
 # and silently override UI-persisted changes.
 WorkingDirectory=/var/lib/rfobserver
-ExecStart=/opt/rfobserver/venv/bin/rfobserver run
+ExecStart=/usr/local/bin/rfobserver run
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

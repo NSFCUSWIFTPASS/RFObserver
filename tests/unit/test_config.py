@@ -103,3 +103,11 @@ def test_zms_with_dst_http():
         _env_file=None,
     )
     assert settings.zms.dst_or_zmc == "http://dst.test"
+
+
+def test_burst_window_covers_long_bursts() -> None:
+    """Field default window must span ~400 ms bursts at 0.2 ms resolution."""
+    s = AppSettings(_env_file=None)
+    # 393.1 ms / 0.2 ms = ~1966 rows; window must exceed that.
+    assert s.BURST_WINDOW_ROWS >= 2000
+    assert s.BURST_EVAL_INTERVAL_ROWS == s.BURST_WINDOW_ROWS // 2

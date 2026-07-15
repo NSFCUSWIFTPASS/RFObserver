@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from ._synth import GridParams, derive_grid_params
+import numpy as np
+
+from ._synth import GridParams, derive_grid_params, make_iq_with_wideband_burst
 
 
 def test_grid_params_window_holds_long_burst() -> None:
@@ -34,3 +36,36 @@ def test_grid_params_slice_has_enough_samples_for_fft() -> None:
                 p: GridParams = derive_grid_params(fs_hz=fs, occupied_bw_hz=b, duration_ms=d)
                 slice_samples = fs * p.time_resolution_ms / 1000.0
                 assert slice_samples >= p.num_bins, (fs, b, d, slice_samples, p.num_bins)
+
+
+def test_wideband_burst_occupies_expected_band() -> None:
+    """The generated burst's PSD shows raised power across ~[offset +/- bw/2]."""
+    from rfobserver.processing.spectral import PSDGridConfig, compute_psd_grid
+
+    fs = 28_000_000
+    bw = 2_000_000
+    offset = 3_000_000
+    iq = make_iq_with_wideband_burst(
+        duration_sec=0.02,
+        sample_rate_hz=fs,
+        burst_start_sec=0.005,
+        burst_duration_sec=0.010,
+        burst_bw_hz=bw,
+        burst_offset_hz=offset,
+        burst_amplitude=0.5,
+    )
+    assert iq.dtype == np.complex64
+    assert iq.shape == (int(0.02 * fs),)
+
+    grid_res = compute_psd_grid(iq, fs, PSDGridConfig(num_bins=1024, time_resolution_ms=0.2))
+    # Average PSD over the burst time slices (middle of the buffer).
+    n = grid_res.grid.shape[0]
+    burst_psd = grid_res.grid[n // 3 : 2 * n // 3].mean(axis=0)
+    freqs = grid_res.freq_axis
+
+    in_band = (freqs >= offset - bw / 2) & (freqs <= offset + bw / 2)
+    # A guard band well away from the burst, used as the noise reference.
+    out_band = (freqs >= -fs / 2 + 1_000_000) & (freqs <= -fs / 2 + 3_000_000)
+    assert burst_psd[in_band].mean() - burst_psd[out_band].mean() > 15.0, (
+        "occupied band must sit >15 dB above the out-of-band noise"
+    )

@@ -142,6 +142,61 @@ def make_iq_with_bursts(
     return iq
 
 
+def make_iq_with_wideband_burst(
+    duration_sec: float,
+    sample_rate_hz: int,
+    *,
+    burst_start_sec: float,
+    burst_duration_sec: float,
+    burst_bw_hz: float,
+    burst_offset_hz: float,
+    burst_amplitude: float,
+    noise_stddev: float = 0.01,
+    seed: int = 42,
+) -> np.ndarray:
+    """complex64 IQ with a single band-limited-noise burst.
+
+    The burst is white complex noise band-limited (in the frequency domain) to
+    ``[burst_offset_hz - bw/2, burst_offset_hz + bw/2]``, normalized to unit RMS
+    then scaled to ``burst_amplitude``, and shaped by a 5% raised-cosine time
+    envelope. It presents a flat, fully-occupied ``bw`` in every time slice, so
+    the PSD grid shows a clean duration x bandwidth rectangle.
+    """
+    n_samples = int(duration_sec * sample_rate_hz)
+    rng = np.random.default_rng(seed)
+
+    iq = (rng.standard_normal(n_samples) + 1j * rng.standard_normal(n_samples)).astype(np.complex64)
+    iq *= np.float32(noise_stddev)
+
+    i0 = max(0, int(burst_start_sec * sample_rate_hz))
+    i1 = min(n_samples, int((burst_start_sec + burst_duration_sec) * sample_rate_hz))
+    seg = i1 - i0
+    if seg <= 1:
+        return iq
+
+    burst = (rng.standard_normal(seg) + 1j * rng.standard_normal(seg)).astype(np.complex64)
+    spec = np.fft.fft(burst)
+    freqs = np.fft.fftfreq(seg, d=1.0 / sample_rate_hz)
+    band = (freqs >= burst_offset_hz - burst_bw_hz / 2) & (
+        freqs <= burst_offset_hz + burst_bw_hz / 2
+    )
+    spec[~band] = 0.0
+    burst = np.fft.ifft(spec).astype(np.complex64)
+
+    rms = float(np.sqrt(np.mean(np.abs(burst) ** 2)))
+    if rms > 0.0:
+        burst = (burst / np.float32(rms)).astype(np.complex64)
+    burst *= np.float32(burst_amplitude)
+
+    env = np.ones(seg, dtype=np.float32)
+    ramp = max(1, seg // 20)
+    env[:ramp] = (0.5 * (1 - np.cos(np.pi * np.arange(ramp) / ramp))).astype(np.float32)
+    env[-ramp:] = env[:ramp][::-1]
+
+    iq[i0:i1] += (burst * env).astype(np.complex64)
+    return iq
+
+
 def iq_to_sc16_int32(iq: np.ndarray) -> np.ndarray:
     """Pack complex64 IQ in [-1, 1] into the int32 SC16 format the pipeline expects.
 

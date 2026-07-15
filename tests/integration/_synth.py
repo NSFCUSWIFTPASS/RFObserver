@@ -17,6 +17,7 @@ larger thanks to FFT processing gain — calibrate per test).
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -25,6 +26,65 @@ from typing import Any
 import numpy as np
 
 from rfobserver.capture.mock_receiver import MockReceiver
+
+
+@dataclass(frozen=True)
+class GridParams:
+    """Per-combo PSD-grid / rolling-detector settings.
+
+    Sample rate is pinned to a field value, so the grid must be sized so the
+    burst is resolvable: enough FFT bins across the occupied bandwidth, enough
+    time slices across the duration, and a rolling window that holds the whole
+    burst.
+    """
+
+    num_bins: int
+    time_resolution_ms: float
+    window_rows: int
+    eval_interval_rows: int
+    chunk_slices: int
+
+
+def _clamp_pow2(x: float, lo: int, hi: int) -> int:
+    """Nearest power of two to *x*, clamped to [lo, hi] (both powers of two)."""
+    if x <= lo:
+        return lo
+    if x >= hi:
+        return hi
+    exp = round(math.log2(x))
+    return int(max(lo, min(hi, 2**exp)))
+
+
+def derive_grid_params(fs_hz: int, occupied_bw_hz: float, duration_ms: float) -> GridParams:
+    """Size the PSD grid + rolling window for one (Fs, BW, duration) combo.
+
+    - num_bins: aim for ~64 bins across the occupied BW, clamped to [256, 8192]
+      and snapped to a power of two. Narrow-in-wide corners land near the
+      frequency-resolution floor by physics.
+    - time_resolution_ms: aim for ~40 slices across the burst, but floored so a
+      slice holds >= num_bins samples (an FFT needs that many).
+    - window_rows: hold the whole burst plus 50% margin, floored sensibly.
+    """
+    target_occupied_bins = 64
+    ideal_n = target_occupied_bins * fs_hz / occupied_bw_hz
+    num_bins = _clamp_pow2(ideal_n, lo=256, hi=8192)
+
+    min_time_res_ms = num_bins * 1000.0 / fs_hz
+    target_slices = 40
+    time_res_ms = max(duration_ms / target_slices, min_time_res_ms)
+
+    burst_rows = duration_ms / time_res_ms
+    window_rows = max(int(math.ceil(burst_rows * 1.5)) + 40, 100)
+    eval_interval_rows = max(window_rows // 2, 20)
+    chunk_slices = max(min(window_rows // 2, 200), 10)
+
+    return GridParams(
+        num_bins=num_bins,
+        time_resolution_ms=time_res_ms,
+        window_rows=window_rows,
+        eval_interval_rows=eval_interval_rows,
+        chunk_slices=chunk_slices,
+    )
 
 
 @dataclass(frozen=True)

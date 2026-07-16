@@ -1,5 +1,16 @@
 # Burst-Waveform Detection Matrix Implementation Plan
 
+> **SUPERSEDED IN PART (2026-07-15):** execution diverged from this plan after
+> the pipeline revealed real issues. The matrix now runs the **fixed field
+> config** (not per-combo `derive_grid_params`, which was removed) so it
+> validates deployment; the burst is a **multitone comb** (not band-limited
+> noise, which fragmented duration and over-read bandwidth); and a genuine bug
+> in the production `RollingBurstDetector` was fixed (it dropped pending→complete
+> bursts and re-emitted interior ones). `BURST_WINDOW_ROWS` is 4096 (not 2048),
+> needed to measure ~400 ms bursts. The git history (commits 6f0612b..c0f6494)
+> and the final test files are the source of truth; this document is a design
+> record of the original approach.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a parametrized integration-test matrix that drives the real `StreamingProcessor` with generated wideband bursts across a grid of pulse lengths, occupied bandwidths, and frequency offsets at the two field sample rates, asserting detection presence, duration, center frequency, and bandwidth within per-combo derived tolerances.

@@ -17,7 +17,6 @@ larger thanks to FFT processing gain — calibrate per test).
 
 from __future__ import annotations
 
-import math
 import threading
 import time
 from dataclasses import dataclass
@@ -26,65 +25,6 @@ from typing import Any
 import numpy as np
 
 from rfobserver.capture.mock_receiver import MockReceiver
-
-
-@dataclass(frozen=True)
-class GridParams:
-    """Per-combo PSD-grid / rolling-detector settings.
-
-    Sample rate is pinned to a field value, so the grid must be sized so the
-    burst is resolvable: enough FFT bins across the occupied bandwidth, enough
-    time slices across the duration, and a rolling window that holds the whole
-    burst.
-    """
-
-    num_bins: int
-    time_resolution_ms: float
-    window_rows: int
-    eval_interval_rows: int
-    chunk_slices: int
-
-
-def _clamp_pow2(x: float, lo: int, hi: int) -> int:
-    """Nearest power of two to *x*, clamped to [lo, hi] (both powers of two)."""
-    if x <= lo:
-        return lo
-    if x >= hi:
-        return hi
-    exp = round(math.log2(x))
-    return int(max(lo, min(hi, 2**exp)))
-
-
-def derive_grid_params(fs_hz: int, occupied_bw_hz: float, duration_ms: float) -> GridParams:
-    """Size the PSD grid + rolling window for one (Fs, BW, duration) combo.
-
-    - num_bins: aim for ~64 bins across the occupied BW, clamped to [256, 8192]
-      and snapped to a power of two. Narrow-in-wide corners land near the
-      frequency-resolution floor by physics.
-    - time_resolution_ms: aim for ~40 slices across the burst, but floored so a
-      slice holds >= num_bins samples (an FFT needs that many).
-    - window_rows: hold the whole burst plus 50% margin, floored sensibly.
-    """
-    target_occupied_bins = 64
-    ideal_n = target_occupied_bins * fs_hz / occupied_bw_hz
-    num_bins = _clamp_pow2(ideal_n, lo=256, hi=8192)
-
-    min_time_res_ms = num_bins * 1000.0 / fs_hz
-    target_slices = 40
-    time_res_ms = max(duration_ms / target_slices, min_time_res_ms)
-
-    burst_rows = duration_ms / time_res_ms
-    window_rows = max(int(math.ceil(burst_rows * 1.5)) + 40, 100)
-    eval_interval_rows = max(window_rows // 2, 20)
-    chunk_slices = max(min(window_rows // 2, 200), 10)
-
-    return GridParams(
-        num_bins=num_bins,
-        time_resolution_ms=time_res_ms,
-        window_rows=window_rows,
-        eval_interval_rows=eval_interval_rows,
-        chunk_slices=chunk_slices,
-    )
 
 
 @dataclass(frozen=True)
@@ -150,17 +90,32 @@ def make_iq_with_wideband_burst(
     burst_duration_sec: float,
     burst_bw_hz: float,
     burst_offset_hz: float,
-    burst_amplitude: float,
+    num_bins: int,
+    per_tone_amp: float = 0.02,
     noise_stddev: float = 0.01,
     seed: int = 42,
 ) -> np.ndarray:
-    """complex64 IQ with a single band-limited-noise burst.
+    """complex64 IQ with a single constant-envelope multitone-comb burst.
 
-    The burst is white complex noise band-limited (in the frequency domain) to
-    ``[burst_offset_hz - bw/2, burst_offset_hz + bw/2]``, normalized to unit RMS
-    then scaled to ``burst_amplitude``, and shaped by a 5% raised-cosine time
-    envelope. It presents a flat, fully-occupied ``bw`` in every time slice, so
-    the PSD grid shows a clean duration x bandwidth rectangle.
+    The burst is a dense comb of equal-amplitude CW tones evenly filling
+    ``[burst_offset_hz - bw/2, burst_offset_hz + bw/2]`` (~1.2 tones per FFT
+    bin, hence the ``num_bins`` argument), shaped by a 5% raised-cosine time
+    envelope. Two properties make it a clean measurement target where
+    band-limited noise fails:
+
+    - **Constant per-bin power over time** (CW tones, not noise) -> the PSD grid
+      is a crisp duration x bandwidth rectangle, so the connected-component
+      detector doesn't fragment it in time (accurate duration) and doesn't
+      over-read the edges (accurate bandwidth).
+    - **Constant per-tone amplitude** (``per_tone_amp``, NOT normalized to a
+      fixed total power) -> per-bin SNR is roughly constant across occupied
+      bandwidths, so a single detection threshold both finds a wide burst
+      (power spread over many bins) and avoids inflating a narrow burst's
+      measured bandwidth via an oversized leakage skirt.
+
+    Schroeder phases give the multitone a low crest factor, so a strong per-bin
+    SNR stays well within the [-1, 1] range the SC16 packing expects (no
+    clipping, which would splatter the spectrum).
     """
     n_samples = int(duration_sec * sample_rate_hz)
     rng = np.random.default_rng(seed)
@@ -174,19 +129,33 @@ def make_iq_with_wideband_burst(
     if seg <= 1:
         return iq
 
-    burst = (rng.standard_normal(seg) + 1j * rng.standard_normal(seg)).astype(np.complex64)
-    spec = np.fft.fft(burst)
-    freqs = np.fft.fftfreq(seg, d=1.0 / sample_rate_hz)
-    band = (freqs >= burst_offset_hz - burst_bw_hz / 2) & (
-        freqs <= burst_offset_hz + burst_bw_hz / 2
+    bin_spacing = sample_rate_hz / num_bins
+    occupied_bins = max(2, int(round(burst_bw_hz / bin_spacing)))
+    # ~1.2 tones per FFT bin: dense enough to fill the band flatly, sparse
+    # enough that a very wide burst (hundreds of bins) doesn't sum to a crest
+    # factor that clips the SC16 range.
+    num_tones = max(8, int(occupied_bins * 1.2))
+    tone_freqs = (
+        burst_offset_hz - burst_bw_hz / 2 + np.arange(num_tones) * (burst_bw_hz / (num_tones - 1))
     )
-    spec[~band] = 0.0
-    burst = np.fft.ifft(spec).astype(np.complex64)
+    # Schroeder phases: phi_k = -pi k^2 / N gives a near-constant-envelope
+    # multitone (low peak-to-average power ratio).
+    k = np.arange(num_tones)
+    phases = -np.pi * k * k / num_tones
 
-    rms = float(np.sqrt(np.mean(np.abs(burst) ** 2)))
-    if rms > 0.0:
-        burst = (burst / np.float32(rms)).astype(np.complex64)
-    burst *= np.float32(burst_amplitude)
+    t = np.arange(seg, dtype=np.float64) / sample_rate_hz
+    burst = np.zeros(seg, dtype=np.complex128)
+    for freq, phase in zip(tone_freqs, phases, strict=True):
+        burst += np.exp(1j * (2 * np.pi * freq * t + phase))
+    burst *= per_tone_amp
+    # Safety cap: a very wide comb (many tones) can still sum past the SC16
+    # range at high FFT-bin counts. Clamp the peak so packing never clips
+    # (which would splatter the spectrum); this only bites the widest combos and
+    # leaves their per-bin SNR comfortably above the detection threshold.
+    peak = float(np.max(np.abs(burst))) if seg else 0.0
+    if peak > 0.8:
+        burst *= 0.8 / peak
+    burst = burst.astype(np.complex64)
 
     env = np.ones(seg, dtype=np.float32)
     ramp = max(1, seg // 20)
@@ -242,12 +211,21 @@ class SyntheticBurstReceiver(MockReceiver):
         return self._exhausted.is_set()
 
     def _fill_drain_noise(self, out_buf: np.ndarray, start: int = 0) -> None:
-        """Fill ``out_buf[start:]`` with low-amplitude SC16 noise."""
+        """Fill ``out_buf[start:]`` with noise MATCHING the planted buffer's level.
+
+        The drain noise must sit at the same power as the buffer's background
+        noise (Gaussian, stddev ~0.01 in complex units -> ~328 in SC16 counts).
+        If it were much quieter, drain rows entering the rolling window would
+        pull the per-bin 10th-percentile noise floor down, and the ordinary
+        background noise would then exceed the burst detector's low threshold --
+        producing a spurious full-span "burst" spanning the whole band.
+        """
         n = len(out_buf) - start
         if n <= 0:
             return
-        noise_i = self._drain_rng.integers(-50, 50, size=n, dtype=np.int16)
-        noise_q = self._drain_rng.integers(-50, 50, size=n, dtype=np.int16)
+        sd = 0.01 * 32767.0  # match make_iq_with_wideband_burst's default noise_stddev
+        noise_i = (self._drain_rng.standard_normal(n) * sd).astype(np.int16)
+        noise_q = (self._drain_rng.standard_normal(n) * sd).astype(np.int16)
         packed = np.empty(n * 2, dtype=np.int16)
         packed[0::2] = noise_i
         packed[1::2] = noise_q

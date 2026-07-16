@@ -162,7 +162,8 @@ class TestRollingBurstDetector:
         det.reset()
         assert det._rows_filled == 0
         assert det._write_pos == 0
-        assert len(det._pending_bursts) == 0
+        assert len(det._tracked) == 0
+        assert det._total_rows_written == 0
 
     def test_detects_injected_burst(self, _make_detector):
         """A strong signal injected into a noise grid should be detected."""

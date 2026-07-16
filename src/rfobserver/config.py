@@ -116,14 +116,16 @@ class AppSettings(BaseSettings):
 
     # Streaming pipeline
     STREAMING_CHUNK_SLICES: int = 200  # PSD time slices per recv chunk
-    # Rolling burst-detection window. At PSD_TIME_RESOLUTION_MS=0.2, 2048 rows =
-    # ~410 ms, so bursts up to ~400 ms are measured without the circular window
-    # truncating their start. Cost vs the old 500-row window: the window buffer
-    # is 2048 * NUM_FFT_BINS * 4 B (~8.4 MB at 1024 bins) and each eval runs
-    # connected-component labeling over ~2.1 M cells; at the ~205 ms eval cadence
-    # this is an acceptable duty cycle on the field Jetson.
-    BURST_WINDOW_ROWS: int = 2048
-    BURST_EVAL_INTERVAL_ROWS: int = 1024  # ~half the window (matches prior ratio)
+    # Rolling burst-detection window. At PSD_TIME_RESOLUTION_MS=0.2, 4096 rows =
+    # ~819 ms, so a burst must sit comfortably inside the window to be measured
+    # at its true duration -- a ~400 ms burst needs a window well over 400 ms, so
+    # 4096 (not 2048) is required to measure the long modes to ~1% instead of
+    # truncating them ~60%. Cost: the window buffer is 4096 * NUM_FFT_BINS * 4 B
+    # (~16.8 MB at 1024 bins) and each eval runs connected-component labeling over
+    # ~4.2 M cells; at the ~410 ms eval cadence this is an accepted duty cycle on
+    # the field Jetson (the price of measuring ~400 ms bursts).
+    BURST_WINDOW_ROWS: int = 4096
+    BURST_EVAL_INTERVAL_ROWS: int = 2048  # ~half the window (matches prior ratio)
 
     # Recording
     RECORDING_MAX_SEC: float = 30.0  # auto-stop after this duration (0 = no limit)

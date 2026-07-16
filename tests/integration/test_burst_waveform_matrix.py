@@ -91,8 +91,13 @@ def field_settings(tmp_path: Path, fs: int, threshold_high_db: float) -> AppSett
 
 
 def select_burst(detections: list[dict], *, center_hz: float, occupied_bw_hz: float) -> dict | None:
-    """Pick the detection best matching the planted burst (freq overlap, then power)."""
-    tol = max(occupied_bw_hz, 100_000.0)
+    """Pick the detection best matching the planted burst (freq overlap, then power).
+
+    The floor exceeds assert_burst_measured's center tolerance (4 * bin spacing,
+    up to ~219 kHz at 56 MHz / 1024 bins) so a detection the center assertion
+    would accept is never filtered out here and misreported as "no detection".
+    """
+    tol = max(occupied_bw_hz, 250_000.0)
     candidates = [d for d in detections if abs(d["center_freq_hz"] - center_hz) <= tol]
     if not candidates:
         return None

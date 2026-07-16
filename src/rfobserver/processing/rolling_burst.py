@@ -17,7 +17,7 @@ chunk/evaluation, without being dropped or re-emitted every pass.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -44,7 +44,6 @@ class _TrackedBurst:
     last_eval: int
     still_growing: bool
     emitted: bool = False
-    detection_timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class RollingBurstDetector:
@@ -237,7 +236,10 @@ class RollingBurstDetector:
         return finished
 
     def _to_fingerprint(self, t: _TrackedBurst) -> BurstFingerprint:
-        n_rows = t.abs_end - t.abs_start + 1
+        # abs_end is derived from detect_bursts' exclusive t_end (time_axis of
+        # end_row + 1), so the span is abs_end - abs_start (no +1) -- matching
+        # the duration detect_bursts itself reports, with no one-row over-count.
+        n_rows = t.abs_end - t.abs_start
         duration_sec = n_rows * self._time_resolution_s
         now = datetime.now(timezone.utc)
         return BurstFingerprint(

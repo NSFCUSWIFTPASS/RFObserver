@@ -68,7 +68,7 @@ def test_burst_pending_then_complete_emitted_once_full_duration() -> None:
     durations_ms = sorted(b.duration_ms for b in emitted)
     assert len(emitted) == 1, f"expected exactly one emission, got {durations_ms}"
     # 40 rows * 1 ms = 40 ms; allow a couple rows of slack for edge handling.
-    assert abs(emitted[0].duration_ms - 40.0) <= 3.0, (
+    assert abs(emitted[0].duration_ms - 40.0) <= 2.0, (
         f"burst truncated: got {emitted[0].duration_ms:.1f} ms, expected ~40 ms"
     )
 
@@ -87,4 +87,4 @@ def test_interior_burst_not_re_emitted_each_eval() -> None:
         f"burst should be emitted once, got {len(emitted)}: "
         f"{sorted(round(b.duration_ms, 1) for b in emitted)}"
     )
-    assert abs(emitted[0].duration_ms - 40.0) <= 3.0
+    assert abs(emitted[0].duration_ms - 40.0) <= 2.0

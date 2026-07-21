@@ -74,6 +74,27 @@ class ProcessedDataEnvelope(BaseModel):
     message_id: str = Field(default_factory=lambda: str(uuid4()))
 
 
+class StatsEnvelope(BaseModel):
+    """Stats-only projection of a capture for RFS NATS.
+
+    RFS only needs the IQ statistics + capture metadata, not the full PSD
+    powers array (which is large -- num_bins floats per window -- and would
+    dominate the NATS payload). This is the wire contract for ``rfobs.stats``.
+    """
+
+    metadata: MetadataRecord
+    statistics: IQStatistics
+    message_id: str = Field(default_factory=lambda: str(uuid4()))
+
+    @classmethod
+    def from_envelope(cls, envelope: ProcessedDataEnvelope) -> StatsEnvelope:
+        return cls(
+            metadata=envelope.metadata,
+            statistics=envelope.statistics,
+            message_id=envelope.message_id,
+        )
+
+
 # ---------------------------------------------------------------------------
 # New models for RFObserver burst detection
 # ---------------------------------------------------------------------------

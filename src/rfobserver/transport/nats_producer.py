@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any
 
 import nats
 
+from rfobserver.models import StatsEnvelope
+
 if TYPE_CHECKING:
     from nats.aio.client import Client as NatsClient
     from nats.js import JetStreamContext
@@ -63,7 +65,21 @@ class NatsProducer:
         return self._url
 
     async def connect(self) -> None:
-        opts: dict[str, Any] = {"servers": [self._url]}
+        opts: dict[str, Any] = {
+            "servers": [self._url],
+            # Reconnect forever: a server-side broker outage must not
+            # permanently disable publishing (nats.py's default of 60 attempts
+            # gives up after ~2 min and never recovers even if the broker
+            # returns). The callbacks keep ``connected`` accurate so publishes
+            # drop immediately during an outage instead of hanging.
+            "allow_reconnect": True,
+            "max_reconnect_attempts": -1,
+            "reconnect_time_wait": 2,
+            "disconnected_cb": self._on_disconnected,
+            "reconnected_cb": self._on_reconnected,
+            "error_cb": self._on_error,
+            "closed_cb": self._on_closed,
+        }
         if self._token:
             opts["token"] = self._token
 
@@ -94,15 +110,33 @@ class NatsProducer:
             self._js = None
             logger.info("NATS connection closed")
 
+    # -- connection lifecycle callbacks --------------------------------------
+
+    async def _on_disconnected(self) -> None:
+        self._connected = False
+        logger.warning("NATS disconnected from %s; publishes drop until reconnect", self._url)
+
+    async def _on_reconnected(self) -> None:
+        self._connected = True
+        logger.info("NATS reconnected to %s", self._url)
+
+    async def _on_error(self, err: Exception) -> None:
+        logger.warning("NATS error: %s", err)
+
+    async def _on_closed(self) -> None:
+        self._connected = False
+
     # -- typed publishers ----------------------------------------------------
 
     async def publish_stats(self, envelope: ProcessedDataEnvelope, hostname: str) -> bool:
-        """Publish a per-capture ProcessedDataEnvelope on ``rfobs.stats.<hostname>``.
+        """Publish the stats-only projection on ``rfobs.stats.<hostname>``.
 
-        Returns True on success, False on failure (counted as dropped).
+        Only IQ statistics + metadata are sent (``StatsEnvelope``), not the PSD
+        powers array -- RFS doesn't need the PSD, and it would dominate the
+        payload. Returns True on success, False on failure (counted as dropped).
         """
         subject = f"{STREAM_STATS}.{hostname}"
-        payload = envelope.model_dump_json().encode()
+        payload = StatsEnvelope.from_envelope(envelope).model_dump_json().encode()
         return await self._publish(subject, payload)
 
     async def publish_champion(
@@ -135,7 +169,9 @@ class NatsProducer:
             logger.debug("NATS publish dropped (not connected): %s", subject)
             return False
         try:
-            ack = await self._js.publish(subject, payload)
+            # Bounded so a publish issued just as the broker drops can't hang
+            # the fire-and-forget task indefinitely.
+            ack = await self._js.publish(subject, payload, timeout=5.0)
             if subject.startswith(f"{STREAM_STATS}."):
                 self._stats_count += 1
             logger.debug("Published to %s (seq=%d)", subject, ack.seq)

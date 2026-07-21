@@ -118,7 +118,8 @@ async def test_publish_stats_routes_to_correct_subject_and_payload():
     assert parsed["metadata"]["length"] == 0.5
     assert parsed["metadata"]["interval"] == 10
     assert parsed["statistics"]["average"] == -78.0
-    assert parsed["psd_data"]["num_bins"] == 3
+    # Stats-only wire contract: the PSD powers array is NOT sent to RFS NATS.
+    assert "psd_data" not in parsed
 
 
 @pytest.mark.asyncio
@@ -166,3 +167,48 @@ def test_subject_constants_match_documented_layout():
     assert STREAM_STATS == "rfobs.stats"
     assert STREAM_CHAMPIONS == "rfobs.champions"
     assert STREAM_BURSTS == "rfobs.bursts"
+
+
+def test_stats_envelope_excludes_psd_data():
+    """The stats projection carries metadata + statistics but not the PSD array."""
+    from rfobserver.models import StatsEnvelope
+
+    env = _make_envelope()
+    stats = StatsEnvelope.from_envelope(env)
+    parsed = json.loads(stats.model_dump_json())
+
+    assert parsed["metadata"]["hostname"] == env.metadata.hostname
+    assert parsed["statistics"]["average"] == env.statistics.average
+    assert parsed["message_id"] == env.message_id
+    assert "psd_data" not in parsed
+
+
+@pytest.mark.asyncio
+async def test_connection_callbacks_track_connected_state():
+    """Disconnect/reconnect callbacks keep the connected flag accurate."""
+    p = NatsProducer(url="nats://localhost:4222")
+    p._connected = True
+
+    await p._on_disconnected()
+    assert p.connected is False  # publishes drop instead of hanging during outage
+
+    await p._on_reconnected()
+    assert p.connected is True
+
+    await p._on_closed()
+    assert p.connected is False
+
+
+@pytest.mark.asyncio
+async def test_publish_stats_disconnected_does_not_call_publish():
+    """While disconnected, no js.publish is attempted (no pileup/hang)."""
+    p = NatsProducer(url="nats://localhost:4222")
+    p._connected = False
+    fake_js = AsyncMock()
+    p._js = fake_js
+
+    ok = await p.publish_stats(_make_envelope(), "rfobs-test")
+
+    assert ok is False
+    fake_js.publish.assert_not_awaited()
+    assert p.dropped == 1

@@ -111,7 +111,10 @@ class AppSettings(BaseSettings):
     PSD_SCALE_MAX_DB: float | None = None
 
     # Processing
-    NUM_FFT_BINS: int = 1024
+    # 2048 bins (vs 1024) doubles frequency resolution -- halves the measured-
+    # bandwidth error on narrow bursts (a 50 kHz burst is ~4 bins instead of ~2
+    # in a 28-56 MHz span) -- at the cost of a larger per-eval FFT/CCL grid.
+    NUM_FFT_BINS: int = 2048
     PSD_TIME_RESOLUTION_MS: float = 0.2  # internal PSD grid time resolution
 
     # Streaming pipeline

@@ -265,7 +265,8 @@ class TestConfigApply:
 
     def test_apply_fft_bins_triggers_reconfigure(self, client_with_processor):
         client, settings, processor = client_with_processor
-        resp = client.post("/config/apply", json={"num_fft_bins": "2048"})
+        # Post a value different from the default (2048) so it's a real change.
+        resp = client.post("/config/apply", json={"num_fft_bins": "1024"})
         assert resp.status_code == 200
         processor.reconfigure.assert_called_once()
 

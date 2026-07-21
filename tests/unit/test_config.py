@@ -12,7 +12,7 @@ def test_default_settings():
     assert settings.BANDWIDTH == 56_000_000
     assert settings.GAIN == 40
     assert settings.MOCK_RECEIVER is False
-    assert settings.NUM_FFT_BINS == 1024
+    assert settings.NUM_FFT_BINS == 2048
     assert settings.PSD_TIME_RESOLUTION_MS == 0.2
 
 

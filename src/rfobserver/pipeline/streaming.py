@@ -363,6 +363,15 @@ class StreamingProcessor:
             recv_thread.join(timeout=5)
             dispatch_thread.join(timeout=5)
             burst_thread.join(timeout=5)
+            # Final drain: the burst thread may have enqueued completed bursts
+            # (via call_soon_threadsafe) after the consumer loop's last drain --
+            # i.e. a burst finishing right at shutdown. Let those scheduled
+            # enqueues run, then persist them so they aren't silently dropped.
+            try:
+                await asyncio.sleep(0)
+                await self._drain_burst_results()
+            except Exception:
+                logger.exception("Final burst-result drain failed during shutdown")
 
     def stop(self) -> None:
         self._running = False

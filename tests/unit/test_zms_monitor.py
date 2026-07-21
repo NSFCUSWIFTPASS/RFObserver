@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -41,7 +41,7 @@ def envelope():
         hostname="jetson",
         organization="test",
         frequency=915_000_000,
-        timestamp=datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC),
+        timestamp=datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
         source_path=Path("/tmp/test.sc16"),
         gain=35,
         sampling_rate=26_000_000,

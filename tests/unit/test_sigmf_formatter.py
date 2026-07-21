@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import json
 import tarfile
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 import numpy as np
 import pytest
@@ -31,7 +31,7 @@ def psd_kwargs():
         center_freq=915e6,
         sample_rate=26_000_000,
         gain=35,
-        timestamp=datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC),
+        timestamp=datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
         serial="TEST123",
         hostname="jetson-test",
         monitor_id="mon-1",

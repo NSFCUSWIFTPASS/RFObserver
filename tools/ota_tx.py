@@ -94,6 +94,74 @@ def transmit_cw(
     print("CW done")
 
 
+def run_lowrate_bursts(
+    tx_gain: float,
+    gap: float,
+    burst_rate: float,
+    max_bw: float,
+    dry_run: bool,
+    schedule_path: str,
+) -> None:
+    """Transmit each burst at its barcode center, retuning the TX per burst.
+
+    A USB-2.0-attached B200mini can't sustain 28 MS/s, so instead of one wide
+    capture we retune the TX to each burst's barcode center and synthesize just
+    that burst's occupied bandwidth at a low ``burst_rate`` (a few MS/s, which
+    USB 2.0 handles). Only bursts with occupied BW <= ``max_bw`` are sent (the
+    20 MHz burst genuinely needs >= ~25 MS/s and is skipped). The receiver still
+    captures at 28 MHz and the barcode schedule is unchanged, so validation is
+    identical.
+    """
+    combos = [(bw, dur) for bw in oc.BURST_BWS if bw <= max_bw for dur in oc.BURST_DURATIONS_MS]
+    usrp = None
+    streamer = None
+    if not dry_run:
+        import uhd
+
+        usrp = uhd.usrp.MultiUSRP()
+        usrp.set_tx_rate(burst_rate, 0)
+        usrp.set_tx_gain(tx_gain, 0)
+        usrp.set_tx_antenna("TX/RX", 0)
+        streamer = usrp.get_tx_stream(uhd.usrp.StreamArgs("fc32", "fc32"))
+
+    schedule = []
+    for i, (bw, dur) in enumerate(combos):
+        off = oc.barcode_offset(bw, dur)
+        center = oc.CENTER_HZ + off
+        # offset 0 -> the comb sits at the tuned center == the barcode center.
+        burst = oc.make_comb_burst(bw, dur, 0.0, burst_rate, peak=0.7)
+        schedule.append(
+            {
+                "index": i,
+                "tx_wallclock": time.time(),
+                "bw_hz": bw,
+                "duration_ms": dur,
+                "offset_hz": off,
+                "center_hz": center,
+                "tx_gain": tx_gain,
+                "burst_rate": burst_rate,
+                "n_samples": int(burst.size),
+            }
+        )
+        print(
+            f"[{i}] bw={bw / 1e3:.0f}kHz dur={dur}ms center={center / 1e6:.3f}MHz "
+            f"rate={burst_rate / 1e6:.0f}MS/s"
+        )
+        if not dry_run:
+            import uhd
+
+            usrp.set_tx_freq(uhd.libpyuhd.types.tune_request(center), 0)
+            md = uhd.types.TXMetadata()
+            md.start_of_burst = True
+            md.end_of_burst = True
+            streamer.send(burst, md)
+            time.sleep(gap)
+
+    with open(schedule_path, "w") as f:
+        json.dump(schedule, f, indent=2)
+    print(f"wrote {schedule_path} ({len(schedule)} bursts)")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tx-gain", type=float, default=60.0)
@@ -106,10 +174,23 @@ def main() -> None:
     ap.add_argument("--tone", type=float, default=915_500_000, help="tone freq for --cw")
     ap.add_argument("--seconds", type=float, default=12.0, help="--cw transmit duration")
     ap.add_argument("--cw-rate", type=float, default=2_000_000, help="--cw TX sample rate")
+    ap.add_argument(
+        "--low-rate",
+        action="store_true",
+        help="retune per burst + low sample rate (USB-2.0 TX; skips the 20 MHz burst)",
+    )
+    ap.add_argument("--burst-rate", type=float, default=4_000_000, help="--low-rate TX sample rate")
+    ap.add_argument("--max-bw", type=float, default=2_000_000, help="--low-rate max occupied BW")
     args = ap.parse_args()
 
     if args.cw:
         transmit_cw(args.center, args.tone, args.tx_gain, args.seconds, rate=args.cw_rate)
+        return
+
+    if args.low_rate:
+        run_lowrate_bursts(
+            args.tx_gain, args.gap, args.burst_rate, args.max_bw, args.dry_run, args.schedule
+        )
         return
 
     combos = _combos(args.subset)

@@ -30,7 +30,9 @@ path, and the deployed config end-to-end -- not just the DSP.
 - Subset first, then the full 5x5, at the **28 MHz** field sample rate.
 - Read detections via a **JSON web endpoint** (see the readout note -- the
   existing `/api/detections` returns HTML, so a small JSON endpoint is added).
-- Correlation without a shared clock: frequency + time-window + strongest-in-window.
+- **Frequency barcode** for ground truth (timing-independent): each combo is
+  transmitted at a distinct assigned center offset, so a detection's
+  `(center, bandwidth)` pair identifies exactly which combo it was.
 
 ## Sensor config for the test (all env-driven)
 
@@ -68,11 +70,21 @@ NOT part of the installed package:
   test synth, or factor a tiny shared copy) so TX waveforms are identical to the
   simulated ones.
 - For each burst in the (subset -> full) matrix: build the IQ at the TX sample
-  rate (28 MHz), transmit at 915 MHz center with the burst's freq offset, then
-  idle for a fixed **inter-burst gap (~3 s)** so detections don't overlap.
+  rate (28 MHz), transmit at 915 MHz center with the burst's **assigned barcode
+  offset**, then idle for a fixed **inter-burst gap (~3 s)** so detections don't
+  overlap (gap is for cleanliness, NOT identity).
 - Writes a **ground-truth schedule** JSON: per burst `{index, tx_wallclock,
   duration_ms, occupied_bw_hz, offset_hz, tx_gain}`.
-- Offsets chosen so every burst stays inside 902-928 (20 MHz burst -> offset 0).
+
+**Frequency-barcode offset assignment.** Usable band ~903-927 MHz (±12 MHz of
+915). For each occupied BW `b`, the max offset is `±(12 MHz - b/2)`; the 5
+durations of that BW are placed at 5 distinct offsets evenly spread across
+`[-max, +max]`. Examples: 50 kHz -> ~{-11, -5.5, 0, +5.5, +11} MHz; 20 MHz ->
+{-2, -1, 0, +1, +2} MHz (20 MHz still fits since bursts are sent one at a time).
+Result: within a BW the 5 durations have distinct centers; across BWs the
+occupied bandwidth differs. So the `(center, bandwidth)` pair is unique for every
+combo -- the barcode. A helper `barcode_offset(bw, duration)` computes it; both
+TX and the validator import it so they agree by construction.
 
 ## Phase C -- Link calibration
 
@@ -95,13 +107,14 @@ reusable for any external tooling and keeps validation clean. Small, testable
 addition (unit test mirrors the existing detections-fragment tests).
 
 **Validation script** (workstation): after a TX run, pull detections from
-`http://192.168.97.153:8888/api/detections.json` for the test window and match
-each scheduled TX burst to a detection by: frequency near `915e6 + offset`
-(within a few FFT bins), within a time window around the scheduled TX (allowing
-for clock offset + drift), taking the strongest in-window candidate. Report per
-burst: matched? measured duration / center / bandwidth vs transmitted, pass/fail
-against OTA-realistic tolerances. Summarize a matrix (detected / duration err /
-bw err per combo).
+`http://192.168.97.153:8888/api/detections.json` for the test window. For each
+scheduled combo, its identity is its barcode `(center = 915e6 + barcode_offset,
+bandwidth)`. Match a detection by **nearest center (within a few FFT bins) AND
+compatible bandwidth**, taking the strongest such candidate; this needs no
+timing. Report per combo: matched? measured duration / center / bandwidth vs
+transmitted, pass/fail against OTA-realistic tolerances. Summarize a matrix
+(detected / duration err / bw err per combo). The TX wall-clock in the schedule
+is kept only as a secondary sanity signal, not for identity.
 
 ## Phase E -- Run
 
@@ -109,14 +122,18 @@ bw err per combo).
    to close the loop; iterate on gain/placement.
 2. Full 5x5 once the loop is solid. Save the schedule + detections + report.
 
-## Correlation without a shared clock
+## Ground truth via frequency barcode (no shared clock)
 
 TX (workstation) and RX (Jetson) clocks are independent, and **915 ISM is
 crowded** (LoRa, cordless phones, telemetry) -- the sensor logs ambient bursts
-too. Matching therefore uses **frequency proximity to the TX offset + a time
-window around the scheduled TX + strongest-in-window**, never time-order alone.
-Transmitting each burst well above ambient (Phase C) makes the intended burst
-the strongest in its window. Bursts are spaced ~3 s so windows don't overlap.
+too. Rather than correlate by time, each combo is transmitted at a **distinct
+assigned center frequency** (the barcode, see Phase B), so identity is purely
+spectral: a detection is matched to the combo whose `(center, bandwidth)` it
+fits, independent of when it arrived or clock drift. Transmitting each burst
+well above ambient (Phase C) keeps the intended burst the strongest at its
+assigned center. Ambient RFI at *other* frequencies is simply ignored; ambient
+energy that happens to land on an assigned center is rejected by the bandwidth
+check and (secondarily) by not matching the expected duration.
 
 ## Tolerances (OTA-realistic, looser than the sim matrix)
 
@@ -133,14 +150,17 @@ Exact constants calibrated during Phase E against observed spread.
 
 ## Risks
 
-- **Ambient 915 ISM RFI:** mitigated by the freq+window+power matching; a quiet
-  moment / a lightly-used offset helps.
+- **Ambient 915 ISM RFI:** the barcode ignores energy at non-assigned centers;
+  a quiet moment / assigning barcodes to lightly-used offsets further helps.
 - **OTA transmit legality:** 915 ISM is license-free at low power (US Part 15);
   keep TX gain low and range short. Wideband (20 MHz) emissions must stay within
   902-928.
-- **No time sync / clock drift:** handled by matching windows sized for the
-  short test (minutes); if drift is an issue, re-sync the window per burst from
-  the first confident match.
+- **No time sync / clock drift:** irrelevant to identity now -- the barcode
+  matches by frequency, not time.
+- **Barcode collision with a same-BW ambient signal:** two combos of the same BW
+  sit at distinct assigned centers; if ambient traffic squats exactly on one
+  assigned center with a similar bandwidth, that combo's match is ambiguous ->
+  reassign that offset or run in a quieter window.
 - **Gain/SNR:** Phase C is explicitly a calibration loop; the widest bursts have
   the lowest per-bin SNR and are the hardest OTA.
 - **Jetson UHD/firmware:** apt UHD may lag the B200mini firmware; source build is

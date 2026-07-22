@@ -28,6 +28,18 @@ def test_combo_identity_is_unique_by_center_and_bw():
     assert len(keys) == len(oc.BURST_BWS) * len(oc.BURST_DURATIONS_MS)
 
 
+def test_all_centers_globally_distinct():
+    """Every combo has a distinct center, spaced >= MIN_CENTER_SPACING_HZ apart.
+
+    Distinct centers make identity robust to over-measured bandwidth (a narrow
+    burst can't be confused with a wider combo sharing a center).
+    """
+    offs = sorted(off for _bw, _d, off in oc.all_combos())
+    assert len(offs) == len(oc.BURST_BWS) * len(oc.BURST_DURATIONS_MS)
+    gaps = [b - a for a, b in zip(offs, offs[1:], strict=False)]
+    assert min(gaps) >= oc.MIN_CENTER_SPACING_HZ - 1.0, min(gaps)
+
+
 def test_widest_burst_offsets_are_small_but_distinct():
     """20 MHz burst can only shift a little, but its 5 durations still differ."""
     offs = [oc.barcode_offset(20_000_000, d) for d in oc.BURST_DURATIONS_MS]

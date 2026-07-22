@@ -2,6 +2,8 @@
 
 import sys
 
+import numpy as np
+
 sys.path.insert(0, "tools")
 
 import ota_common as oc  # noqa: E402
@@ -45,3 +47,28 @@ def test_widest_burst_offsets_are_small_but_distinct():
     offs = [oc.barcode_offset(20_000_000, d) for d in oc.BURST_DURATIONS_MS]
     assert max(abs(o) for o in offs) <= oc.USABLE_HALF_HZ - 20_000_000 / 2 + 1.0
     assert len({round(o) for o in offs}) == len(offs)
+
+
+def test_comb_burst_shape_and_occupied_band():
+    """The fast comb has the right length, no clipping, and fills its band."""
+    fs = 28_000_000
+    bw = 2_000_000
+    offset = 5_000_000
+    burst = oc.make_comb_burst(bw, 2.7, offset, fs)
+    assert burst.dtype == np.complex64
+    assert burst.shape == (int(2.7 / 1000.0 * fs),)
+    assert float(np.max(np.abs(burst))) <= 0.75  # peak-normalized, no clip
+
+    # Spectrum: power should sit in [offset-bw/2, offset+bw/2], not far outside.
+    spec = np.abs(np.fft.fft(burst.astype(np.complex128))) ** 2
+    freqs = np.fft.fftfreq(burst.size, d=1.0 / fs)
+    in_band = (freqs >= offset - bw / 2) & (freqs <= offset + bw / 2)
+    guard = (freqs >= offset - 4 * bw) & (freqs <= offset - 2 * bw)
+    assert spec[in_band].mean() > 100 * spec[guard].mean()
+
+
+def test_comb_burst_narrow_is_fast_and_nonzero():
+    """A 20 MHz / 83.2 ms comb (the slow-by-tone-sum case) builds quickly."""
+    burst = oc.make_comb_burst(20_000_000, 83.2, 0.0, 28_000_000)
+    assert burst.size == int(83.2 / 1000.0 * 28_000_000)
+    assert float(np.max(np.abs(burst))) > 0.0

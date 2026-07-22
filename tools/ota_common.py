@@ -9,6 +9,8 @@ and the validator both import ``barcode_offset`` so they agree by construction.
 
 from __future__ import annotations
 
+import numpy as np
+
 BURST_BWS = [50_000, 150_000, 500_000, 2_000_000, 20_000_000]
 BURST_DURATIONS_MS = [1.3, 2.7, 10.24, 83.2, 393.1]
 CENTER_HZ = 915_000_000
@@ -56,3 +58,41 @@ def barcode_offset(bw_hz: float, duration_ms: float) -> float:
 def all_combos() -> list[tuple[int, float, float]]:
     """``[(bw_hz, duration_ms, offset_hz), ...]`` for the full 5x5 matrix."""
     return [(bw, dur, barcode_offset(bw, dur)) for bw in BURST_BWS for dur in BURST_DURATIONS_MS]
+
+
+def make_comb_burst(
+    bw_hz: float,
+    duration_ms: float,
+    offset_hz: float,
+    sample_rate_hz: int,
+    *,
+    peak: float = 0.7,
+) -> np.ndarray:
+    """A flat-band multitone comb burst, built in the frequency domain (fast).
+
+    Fills the occupied band ``[offset - bw/2, offset + bw/2]`` with unit-magnitude
+    Schroeder-phased tones (one per FFT bin), IFFTs to the time domain, peak-
+    normalizes to ``peak``, and applies a 5% raised-cosine envelope. Equivalent
+    to the simulated comb (same occupied bandwidth + duration + low crest factor)
+    but O(N log N) instead of an O(tones x samples) tone-sum -- the wide/long
+    combos would otherwise take minutes to synthesize for transmit.
+
+    Returns complex64 in [-1, 1]; drive the SDR DAC with it directly.
+    """
+    n = max(4, int(duration_ms / 1000.0 * sample_rate_hz))
+    freqs = np.fft.fftfreq(n, d=1.0 / sample_rate_hz)
+    idx = np.where(np.abs(freqs - offset_hz) <= bw_hz / 2.0)[0]
+    if idx.size == 0:  # bw narrower than one bin -> nearest bin to the offset
+        idx = np.array([int(np.argmin(np.abs(freqs - offset_hz)))])
+    spec = np.zeros(n, dtype=np.complex128)
+    j = np.arange(idx.size)
+    spec[idx] = np.exp(1j * (-np.pi * j * j / idx.size))  # Schroeder -> low crest factor
+    burst = np.fft.ifft(spec)
+    burst = burst / (np.max(np.abs(burst)) or 1.0) * peak
+
+    env = np.ones(n)
+    r = max(1, n // 20)
+    ramp = 0.5 * (1 - np.cos(np.pi * np.arange(r) / r))
+    env[:r] = ramp
+    env[-r:] = ramp[::-1]
+    return (burst * env).astype(np.complex64)

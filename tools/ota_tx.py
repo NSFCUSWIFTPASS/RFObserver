@@ -22,13 +22,10 @@ import time
 import numpy as np
 
 sys.path.insert(0, "tools")
-sys.path.insert(0, ".")  # so `tests.integration._synth` resolves from repo root
 
 import ota_common as oc  # noqa: E402
-from tests.integration._synth import make_iq_with_wideband_burst  # noqa: E402
 
 TX_RATE = 28_000_000
-NUM_BINS = 2048
 # Representative subset to close the loop before the full 5x5.
 SUBSET = [
     (150_000, 2.7),
@@ -41,20 +38,8 @@ SUBSET = [
 
 
 def make_tx_burst(bw_hz: float, dur_ms: float, offset_hz: float) -> np.ndarray:
-    """A clean comb burst (no synthetic noise) normalized to ~0.7 peak for the DAC."""
-    iq = make_iq_with_wideband_burst(
-        duration_sec=dur_ms / 1000.0,
-        sample_rate_hz=TX_RATE,
-        burst_start_sec=0.0,
-        burst_duration_sec=dur_ms / 1000.0,
-        burst_bw_hz=bw_hz,
-        burst_offset_hz=offset_hz,
-        num_bins=NUM_BINS,
-        per_tone_amp=0.05,  # high enough to hit the generator's 0.8 peak cap
-        noise_stddev=0.0,  # clean carrier; the OTA channel + RX add noise
-    )
-    peak = float(np.max(np.abs(iq))) or 1.0
-    return (iq * (0.7 / peak)).astype(np.complex64)
+    """Fast flat-band comb burst (~0.7 peak) at the TX sample rate."""
+    return oc.make_comb_burst(bw_hz, dur_ms, offset_hz, TX_RATE, peak=0.7)
 
 
 def _combos(subset: bool) -> list[tuple[int, float]]:

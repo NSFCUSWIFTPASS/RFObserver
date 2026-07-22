@@ -48,6 +48,44 @@ def _combos(subset: bool) -> list[tuple[int, float]]:
     return [(bw, dur) for bw in oc.BURST_BWS for dur in oc.BURST_DURATIONS_MS]
 
 
+def transmit_cw(center_hz: float, tone_hz: float, tx_gain: float, seconds: float) -> None:
+    """Transmit a continuous CW tone at ``tone_hz`` for ``seconds`` (antenna test).
+
+    The radio tunes to ``center_hz`` and emits a phase-continuous complex
+    sinusoid at ``tone_hz - center_hz`` offset (kept off the LO to avoid DC
+    leakage). Used with the sensor's tone check to confirm the antenna band.
+    """
+    import uhd
+
+    off = tone_hz - center_hz
+    usrp = uhd.usrp.MultiUSRP()
+    usrp.set_tx_rate(TX_RATE, 0)
+    usrp.set_tx_freq(uhd.libpyuhd.types.tune_request(center_hz), 0)
+    usrp.set_tx_gain(tx_gain, 0)
+    usrp.set_tx_antenna("TX/RX", 0)
+    streamer = usrp.get_tx_stream(uhd.usrp.StreamArgs("fc32", "fc32"))
+
+    n = 1 << 16
+    t = np.arange(n, dtype=np.float64) / TX_RATE
+    phase = 0.0
+    md = uhd.types.TXMetadata()
+    md.start_of_burst = True
+    md.end_of_burst = False
+    print(
+        f"CW: center={center_hz / 1e6:.4f}MHz tone={tone_hz / 1e6:.4f}MHz "
+        f"(off={off / 1e3:.0f}kHz) gain={tx_gain} for {seconds}s"
+    )
+    end = time.time() + seconds
+    while time.time() < end:
+        chunk = (0.5 * np.exp(1j * (2 * np.pi * off * t + phase))).astype(np.complex64)
+        phase = (phase + 2 * np.pi * off * n / TX_RATE) % (2 * np.pi)
+        streamer.send(chunk, md)
+        md.start_of_burst = False
+    md.end_of_burst = True
+    streamer.send(np.zeros(1, dtype=np.complex64), md)
+    print("CW done")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tx-gain", type=float, default=60.0)
@@ -55,7 +93,15 @@ def main() -> None:
     ap.add_argument("--subset", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="no radio; generate + write schedule")
     ap.add_argument("--schedule", default="ota_schedule.json")
+    ap.add_argument("--cw", action="store_true", help="transmit a continuous tone (antenna test)")
+    ap.add_argument("--center", type=float, default=915_000_000, help="TX center for --cw")
+    ap.add_argument("--tone", type=float, default=915_500_000, help="tone freq for --cw")
+    ap.add_argument("--seconds", type=float, default=12.0, help="--cw transmit duration")
     args = ap.parse_args()
+
+    if args.cw:
+        transmit_cw(args.center, args.tone, args.tx_gain, args.seconds)
+        return
 
     combos = _combos(args.subset)
 

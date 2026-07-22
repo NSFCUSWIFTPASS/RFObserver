@@ -345,3 +345,34 @@ async def test_cleanup_old_data(db):
     results = await db.query_detections()
     assert len(results) == 1
     assert results[0]["burst_id"] == "new"
+
+
+async def test_tone_check_roundtrips(db):
+    await db.insert_tone_check(
+        timestamp=datetime(2026, 1, 1, 12, 0, 0),
+        tone_freq_hz=915.5e6,
+        sdr_center_freq_hz=915e6,
+        in_band=True,
+        tone_power_db=-40.0,
+        noise_floor_db=-90.0,
+        snr_db=50.0,
+        detected=True,
+    )
+    await db.insert_tone_check(
+        timestamp=datetime(2026, 1, 1, 12, 0, 1),
+        tone_freq_hz=2.4e9,
+        sdr_center_freq_hz=915e6,
+        in_band=False,
+        tone_power_db=None,
+        noise_floor_db=None,
+        snr_db=None,
+        detected=False,
+    )
+    rows = await db.query_tone_checks(limit=10)
+    assert len(rows) == 2
+    newest = rows[0]  # newest first
+    assert newest["in_band"] in (0, False)
+    assert newest["detected"] in (0, False)
+    detected_row = next(r for r in rows if r["detected"])
+    assert detected_row["tone_freq_hz"] == 915.5e6
+    assert abs(detected_row["snr_db"] - 50.0) < 1e-6

@@ -303,3 +303,51 @@ async def test_lossless_shutdown_does_not_hang_on_full_queue(
         assert not lingering, f"threads still alive after shutdown: {lingering}"
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_tone_check_persists_detection(tmp_path: Path) -> None:
+    """With TONE_CHECK enabled, a planted continuous tone yields detected rows."""
+    bandwidth = 1_000_000
+    center = 915_000_000
+    offset = 200_000  # +200 kHz from center
+    # A continuous strong tone spanning the whole buffer (not a short burst).
+    iq = make_iq_with_bursts(
+        duration_sec=2.0,
+        bandwidth_hz=bandwidth,
+        bursts=[Burst(start_sec=0.0, duration_sec=2.0, freq_offset_hz=offset, amplitude=0.3)],
+    )
+    sc16 = iq_to_sc16_int32(iq)
+
+    settings = _build_settings(tmp_path, bandwidth=bandwidth, num_fft_bins=256)
+    object.__setattr__(settings, "DURATION_SEC", 0.1)  # flush often
+    object.__setattr__(settings, "TONE_CHECK_ENABLED", True)
+    object.__setattr__(settings, "TONE_CHECK_FREQ_HZ", float(center + offset))
+    object.__setattr__(settings, "TONE_CHECK_THRESHOLD_DB", 10.0)
+
+    db = SensorDatabase(settings.DB_PATH)
+    await db.connect()
+    try:
+        receiver = SyntheticBurstReceiver(
+            receiver_config=ReceiverConfig(
+                gain_db=settings.GAIN,
+                bandwidth_hz=settings.BANDWIDTH,
+                duration_sec=settings.DURATION_SEC,
+            ),
+            iq_int32=sc16,
+            pacing_factor=4.0,
+        )
+        receiver.initialize()
+        processor = _make_processor(settings, receiver, db)
+        await _run_until_exhausted_then_drain(processor, receiver)
+
+        rows = await db.query_tone_checks(limit=100)
+        assert rows, "tone check produced no rows"
+        detected = [r for r in rows if r["detected"]]
+        assert detected, f"tone not detected in any interval; rows={rows[:3]}"
+        r = detected[0]
+        assert r["in_band"]
+        assert abs(r["tone_freq_hz"] - (center + offset)) < 1e-6
+        assert r["snr_db"] >= 10.0
+    finally:
+        await db.close()

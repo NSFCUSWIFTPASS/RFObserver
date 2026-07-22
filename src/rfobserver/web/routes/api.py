@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from rfobserver.__about__ import __version__
+from rfobserver.web.routes.config import _persist_settings
 
 logger = logging.getLogger(__name__)
 
@@ -615,6 +616,43 @@ async def detections_json(
         logger.exception("detections.json query failed")
         return {"detections": []}
     return {"detections": [dict(r) for r in rows]}
+
+
+@router.get("/tone-check")
+async def tone_check_status(request: Request) -> dict[str, Any]:
+    """Tone-check config + recent results (newest first)."""
+    settings = request.app.state.settings
+    db = _get_db(request)
+    results = await db.query_tone_checks(limit=200) if db is not None else []
+    return {
+        "enabled": settings.TONE_CHECK_ENABLED,
+        "freq_hz": settings.TONE_CHECK_FREQ_HZ,
+        "threshold_db": settings.TONE_CHECK_THRESHOLD_DB,
+        "results": results,
+    }
+
+
+@router.post("/tone-check")
+async def tone_check_set(request: Request) -> dict[str, Any]:
+    """Enable/disable the tone check and set its frequency/threshold.
+
+    Applied live (the check only reads the PSD the pipeline already computes, so
+    no reconfigure) and persisted to .env for restart survival.
+    """
+    settings = request.app.state.settings
+    body = await request.json()
+    if "enabled" in body:
+        object.__setattr__(settings, "TONE_CHECK_ENABLED", bool(body["enabled"]))
+    if "freq_hz" in body:
+        object.__setattr__(settings, "TONE_CHECK_FREQ_HZ", float(body["freq_hz"]))
+    if "threshold_db" in body:
+        object.__setattr__(settings, "TONE_CHECK_THRESHOLD_DB", float(body["threshold_db"]))
+    _persist_settings(settings)
+    return {
+        "enabled": settings.TONE_CHECK_ENABLED,
+        "freq_hz": settings.TONE_CHECK_FREQ_HZ,
+        "threshold_db": settings.TONE_CHECK_THRESHOLD_DB,
+    }
 
 
 def _fmt_ms(v: float, width: float) -> str:

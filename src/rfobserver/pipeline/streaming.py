@@ -1215,6 +1215,9 @@ class StreamingProcessor:
             if elapsed >= self._settings.DURATION_SEC:
                 avg = _np.mean(accum_powers, axis=0).tolist()
 
+                if self._settings.TONE_CHECK_ENABLED:
+                    await self._run_tone_check(avg, result)
+
                 # Normal-mode UI broadcast (only if no high-res subscribers)
                 if self._broadcast is not None and not self._broadcast.has_high_res_subscribers():
                     await self._broadcast_averaged(avg, result, len(accum_powers))
@@ -1351,6 +1354,39 @@ class StreamingProcessor:
             metadata=meta,
             statistics=result.iq_stats,
             psd_data=averaged_psd,
+        )
+
+    async def _run_tone_check(self, avg_powers: list[float], result: _StreamResult) -> None:
+        """Evaluate the tone check on the averaged PSD and persist + log it."""
+        from rfobserver.processing.tone_check import evaluate_tone_check
+
+        tc = evaluate_tone_check(
+            avg_powers,
+            result.summary_psd.frequencies,
+            tone_freq_hz=self._settings.TONE_CHECK_FREQ_HZ,
+            threshold_db=self._settings.TONE_CHECK_THRESHOLD_DB,
+        )
+        try:
+            await self._db.insert_tone_check(
+                timestamp=datetime.now(timezone.utc),
+                tone_freq_hz=tc["tone_freq_hz"],
+                sdr_center_freq_hz=result.center_freq_hz,
+                in_band=tc["in_band"],
+                tone_power_db=tc["tone_power_db"],
+                noise_floor_db=tc["noise_floor_db"],
+                snr_db=tc["snr_db"],
+                detected=tc["detected"],
+            )
+        except Exception:
+            logger.exception("tone-check insert failed")
+        state = "DETECTED" if tc["detected"] else ("out-of-band" if not tc["in_band"] else "absent")
+        snr = tc["snr_db"]
+        logger.info(
+            "TONE CHECK %.4f MHz: %s (snr=%s dB, floor=%s dB)",
+            tc["tone_freq_hz"] / 1e6,
+            state,
+            f"{snr:.1f}" if snr is not None else "n/a",
+            f"{tc['noise_floor_db']:.1f}" if tc["noise_floor_db"] is not None else "n/a",
         )
 
     async def _publish_processed(self, avg_powers: list[float], result: _StreamResult) -> None:

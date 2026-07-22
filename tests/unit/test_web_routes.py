@@ -958,3 +958,27 @@ def test_psd_reads_new_raw_format(client, settings):
     raw.unlink(missing_ok=True)
     meta.unlink(missing_ok=True)
     sc16.unlink(missing_ok=True)
+
+
+def test_tone_check_post_updates_and_get_echoes(client, monkeypatch):
+    import rfobserver.web.routes.api as api_mod
+
+    # Don't write .env during the test.
+    monkeypatch.setattr(api_mod, "_persist_settings", lambda s: None)
+
+    resp = client.post(
+        "/api/tone-check",
+        json={"enabled": True, "freq_hz": 915_500_000, "threshold_db": 12.0},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["enabled"] is True
+    assert body["freq_hz"] == 915_500_000
+    assert body["threshold_db"] == 12.0
+
+    got = client.get("/api/tone-check")
+    assert got.status_code == 200
+    g = got.json()
+    assert g["enabled"] is True
+    assert g["freq_hz"] == 915_500_000
+    assert isinstance(g["results"], list)

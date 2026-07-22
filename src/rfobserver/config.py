@@ -130,6 +130,14 @@ class AppSettings(BaseSettings):
     BURST_WINDOW_ROWS: int = 4096
     BURST_EVAL_INTERVAL_ROWS: int = 2048  # ~half the window (matches prior ratio)
 
+    # Tone check (antenna / environment diagnostic). When enabled, each
+    # averaging interval RFObserver looks for a CW tone at TONE_CHECK_FREQ_HZ
+    # (absolute Hz) and records whether it is >= TONE_CHECK_THRESHOLD_DB above
+    # the noise floor. Persisted to the tone_checks DB table + logged.
+    TONE_CHECK_ENABLED: bool = False
+    TONE_CHECK_FREQ_HZ: float = 0.0
+    TONE_CHECK_THRESHOLD_DB: float = 10.0
+
     # Recording
     RECORDING_MAX_SEC: float = 30.0  # auto-stop after this duration (0 = no limit)
     RECORDING_RAM_BUFFER: bool = False  # buffer entire capture in RAM, flush on stop

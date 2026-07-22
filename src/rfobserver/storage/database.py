@@ -54,9 +54,23 @@ CREATE TABLE IF NOT EXISTS stats (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS tone_checks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    tone_freq_hz REAL NOT NULL,
+    sdr_center_freq_hz REAL NOT NULL,
+    in_band INTEGER NOT NULL,
+    tone_power_db REAL,
+    noise_floor_db REAL,
+    snr_db REAL,
+    detected INTEGER NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_detections_time ON detections(start_time);
 CREATE INDEX IF NOT EXISTS idx_detections_freq ON detections(center_freq_hz);
 CREATE INDEX IF NOT EXISTS idx_stats_time ON stats(timestamp);
+CREATE INDEX IF NOT EXISTS idx_tone_checks_time ON tone_checks(timestamp);
 """
 
 # SDR capture-context columns added after the original detections schema.
@@ -180,6 +194,51 @@ class SensorDatabase:
             ),
         )
         await self._db.commit()
+
+    async def insert_tone_check(
+        self,
+        *,
+        timestamp: datetime,
+        tone_freq_hz: float,
+        sdr_center_freq_hz: float,
+        in_band: bool,
+        tone_power_db: float | None,
+        noise_floor_db: float | None,
+        snr_db: float | None,
+        detected: bool,
+    ) -> None:
+        """Record one tone-check result (one averaging interval)."""
+        assert self._db is not None
+        await self._db.execute(
+            """INSERT INTO tone_checks
+               (timestamp, tone_freq_hz, sdr_center_freq_hz, in_band,
+                tone_power_db, noise_floor_db, snr_db, detected)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                timestamp.isoformat(),
+                tone_freq_hz,
+                sdr_center_freq_hz,
+                int(in_band),
+                tone_power_db,
+                noise_floor_db,
+                snr_db,
+                int(detected),
+            ),
+        )
+        await self._db.commit()
+
+    async def query_tone_checks(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Recent tone-check results, newest first."""
+        assert self._db is not None
+        self._db.row_factory = aiosqlite.Row
+        async with self._db.execute(
+            """SELECT timestamp, tone_freq_hz, sdr_center_freq_hz, in_band,
+                      tone_power_db, noise_floor_db, snr_db, detected
+               FROM tone_checks ORDER BY id DESC LIMIT ?""",
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
 
     @staticmethod
     def _sdr_conditions(

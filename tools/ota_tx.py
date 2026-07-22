@@ -48,26 +48,36 @@ def _combos(subset: bool) -> list[tuple[int, float]]:
     return [(bw, dur) for bw in oc.BURST_BWS for dur in oc.BURST_DURATIONS_MS]
 
 
-def transmit_cw(center_hz: float, tone_hz: float, tx_gain: float, seconds: float) -> None:
+def transmit_cw(
+    center_hz: float, tone_hz: float, tx_gain: float, seconds: float, rate: float = 2_000_000
+) -> None:
     """Transmit a continuous CW tone at ``tone_hz`` for ``seconds`` (antenna test).
 
     The radio tunes to ``center_hz`` and emits a phase-continuous complex
     sinusoid at ``tone_hz - center_hz`` offset (kept off the LO to avoid DC
-    leakage). Used with the sensor's tone check to confirm the antenna band.
+    leakage). A CW needs almost no bandwidth, so it runs at a low ``rate`` (2 MS/s
+    default) that a USB-2.0-attached B200mini can sustain without underflow --
+    28 MS/s starves the DAC on USB 2.0 and radiates almost nothing.
     """
     import uhd
 
     off = tone_hz - center_hz
+    if abs(off) >= rate / 2:
+        raise SystemExit(
+            f"tone offset {off / 1e3:.0f} kHz exceeds +/- rate/2 ({rate / 2e3:.0f} kHz)"
+        )
     usrp = uhd.usrp.MultiUSRP()
-    usrp.set_tx_rate(TX_RATE, 0)
+    usrp.set_tx_rate(rate, 0)
     usrp.set_tx_freq(uhd.libpyuhd.types.tune_request(center_hz), 0)
     usrp.set_tx_gain(tx_gain, 0)
     usrp.set_tx_antenna("TX/RX", 0)
     streamer = usrp.get_tx_stream(uhd.usrp.StreamArgs("fc32", "fc32"))
 
-    n = 1 << 16
-    t = np.arange(n, dtype=np.float64) / TX_RATE
-    phase = 0.0
+    # Pre-generate one contiguous buffer and loop-send it (per-call host
+    # overhead can't starve the DAC). One tiny phase wrap per loop is negligible.
+    n = 1 << 20
+    t = np.arange(n, dtype=np.float64) / rate
+    buf = (0.5 * np.exp(1j * 2 * np.pi * off * t)).astype(np.complex64)
     md = uhd.types.TXMetadata()
     md.start_of_burst = True
     md.end_of_burst = False
@@ -77,9 +87,7 @@ def transmit_cw(center_hz: float, tone_hz: float, tx_gain: float, seconds: float
     )
     end = time.time() + seconds
     while time.time() < end:
-        chunk = (0.5 * np.exp(1j * (2 * np.pi * off * t + phase))).astype(np.complex64)
-        phase = (phase + 2 * np.pi * off * n / TX_RATE) % (2 * np.pi)
-        streamer.send(chunk, md)
+        streamer.send(buf, md)
         md.start_of_burst = False
     md.end_of_burst = True
     streamer.send(np.zeros(1, dtype=np.complex64), md)
@@ -97,10 +105,11 @@ def main() -> None:
     ap.add_argument("--center", type=float, default=915_000_000, help="TX center for --cw")
     ap.add_argument("--tone", type=float, default=915_500_000, help="tone freq for --cw")
     ap.add_argument("--seconds", type=float, default=12.0, help="--cw transmit duration")
+    ap.add_argument("--cw-rate", type=float, default=2_000_000, help="--cw TX sample rate")
     args = ap.parse_args()
 
     if args.cw:
-        transmit_cw(args.center, args.tone, args.tx_gain, args.seconds)
+        transmit_cw(args.center, args.tone, args.tx_gain, args.seconds, rate=args.cw_rate)
         return
 
     combos = _combos(args.subset)

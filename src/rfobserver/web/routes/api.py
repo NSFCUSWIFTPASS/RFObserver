@@ -589,6 +589,34 @@ async def detections_fragment(
     return "\n".join(html_rows)
 
 
+@router.get("/detections.json")
+async def detections_json(
+    request: Request,
+    limit: int = 200,
+    sdr_center: str | None = None,
+    sample_rate: str | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """JSON detections for external tooling (e.g. the OTA burst validator).
+
+    Sibling of the HTML ``/detections`` fragment so non-browser clients don't
+    scrape HTML. Rows are ``query_detections`` dicts (center_freq_hz,
+    bandwidth_hz, duration_ms, peak_power_db, start/stop_time, sdr context).
+    """
+    db = _get_db(request)
+    if db is None:
+        return {"detections": []}
+    try:
+        rows = await db.query_detections(
+            limit=limit,
+            sdr_center_freq=_opt_float(sdr_center),
+            sample_rate=_opt_float(sample_rate),
+        )
+    except Exception:
+        logger.exception("detections.json query failed")
+        return {"detections": []}
+    return {"detections": [dict(r) for r in rows]}
+
+
 def _fmt_ms(v: float, width: float) -> str:
     """Compact ms label: integer when the value and bin width are whole."""
     if width >= 1 and abs(v - round(v)) < 1e-9:

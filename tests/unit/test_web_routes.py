@@ -710,6 +710,29 @@ async def test_detections_fragment_has_capture_column(settings, tmp_path):
         await database.close()
 
 
+async def test_detections_json_returns_rows(settings, tmp_path):
+    import httpx
+
+    app, database = await _detections_app_with_rows(settings, str(tmp_path / "d.db"))
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.get("/api/detections.json")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "detections" in body
+        assert isinstance(body["detections"], list)
+        assert len(body["detections"]) == 2
+        d = body["detections"][0]
+        # Fields the OTA validator matches on must be present.
+        for key in ("center_freq_hz", "bandwidth_hz", "duration_ms", "peak_power_db"):
+            assert key in d, key
+        centers = {round(row["center_freq_hz"]) for row in body["detections"]}
+        assert centers == {round(915e6)}  # both seeded rows are at 915 MHz burst center
+    finally:
+        await database.close()
+
+
 async def test_detections_fragment_filters_by_sdr_center(settings, tmp_path):
     import httpx
 

@@ -177,6 +177,7 @@ class ContinuousProcessor:
                 peak_power_db=burst.peak_power_db,
                 duration_ms=burst.duration_ms,
                 detection_timestamp=burst.detection_timestamp,
+                peak_freq_hz=burst.peak_freq_hz,
             )
 
         if pr.bursts:

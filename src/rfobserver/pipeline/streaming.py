@@ -1466,6 +1466,7 @@ class StreamingProcessor:
                     peak_power_db=burst.peak_power_db,
                     duration_ms=burst.duration_ms,
                     detection_timestamp=burst.detection_timestamp,
+                    peak_freq_hz=burst.peak_freq_hz,
                     sdr_center_freq_hz=float(sdr_center_freq_hz),
                     sample_rate_hz=sample_rate_hz,
                     lo_offset_hz=0.0,

@@ -158,6 +158,10 @@ def compute_summary_psd(
 
 
 def compute_noise_floor(grid: np.ndarray, percentile: float = 10.0) -> np.ndarray:
-    """Estimate per-bin noise floor as the given percentile across time slices."""
+    """Estimate per-bin noise floor as the given percentile across time slices.
+
+    The default 10.0 is the historical value; burst detection passes its own
+    configured percentile (median by default, see BurstDetectionConfig).
+    """
     result: np.ndarray = np.percentile(grid, percentile, axis=0).astype(np.float32)
     return result

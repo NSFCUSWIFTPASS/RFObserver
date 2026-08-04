@@ -51,7 +51,10 @@ def detect_bursts(
     """Detect RF bursts in a PSD grid using dual-threshold hysteresis + CCL.
 
     Algorithm:
-    1. Estimate noise floor as 10th percentile per frequency bin.
+    1. Estimate noise floor per frequency bin at config.noise_floor_percentile
+       (default median; a lower percentile like 10 sits below the true floor and
+       fragments detections, a strong signal on a broadband pedestal needs the
+       median to keep the pedestal sub-threshold).
     2. Create high-threshold mask: cells > noise_floor + T_H.
     3. Create low-threshold mask: cells > noise_floor + T_L.
     4. Label connected components in the low-threshold mask (8-connectivity).

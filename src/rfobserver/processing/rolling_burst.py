@@ -41,6 +41,7 @@ class _TrackedBurst:
     f_hi_hz: float
     center_freq_hz: float
     peak_power_db: float
+    peak_freq_hz: float
     last_eval: int
     still_growing: bool
     emitted: bool = False
@@ -193,6 +194,8 @@ class RollingBurstDetector:
                 t.f_lo_hz = min(t.f_lo_hz, f_lo)
                 t.f_hi_hz = max(t.f_hi_hz, f_hi)
                 t.center_freq_hz = (t.f_lo_hz + t.f_hi_hz) / 2
+                if burst.peak_power_db > t.peak_power_db:
+                    t.peak_freq_hz = burst.peak_freq_hz
                 t.peak_power_db = max(t.peak_power_db, burst.peak_power_db)
                 t.last_eval = self._eval_count
                 t.still_growing = still_growing
@@ -206,6 +209,7 @@ class RollingBurstDetector:
                 f_hi_hz=f_hi,
                 center_freq_hz=burst.center_freq_hz,
                 peak_power_db=burst.peak_power_db,
+                peak_freq_hz=burst.peak_freq_hz,
                 last_eval=self._eval_count,
                 still_growing=still_growing,
             )
@@ -246,6 +250,7 @@ class RollingBurstDetector:
             start_time=now - timedelta(seconds=duration_sec),
             stop_time=now,
             center_freq_hz=t.center_freq_hz,
+            peak_freq_hz=t.peak_freq_hz,
             bandwidth_hz=max(t.f_hi_hz - t.f_lo_hz, 0.0),
             peak_power_db=t.peak_power_db,
             duration_ms=duration_sec * 1000.0,

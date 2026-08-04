@@ -88,3 +88,32 @@ def test_interior_burst_not_re_emitted_each_eval() -> None:
         f"{sorted(round(b.duration_ms, 1) for b in emitted)}"
     )
     assert abs(emitted[0].duration_ms - 40.0) <= 2.0
+
+
+def test_emitted_burst_carries_peak_freq_hz_of_strongest_constituent() -> None:
+    """peak_freq_hz must track the peak-power bin, not the band midpoint.
+
+    The occupied band spans cols 25..39 (midpoint ~col 32), but the strongest
+    power is at col 25 (asymmetric, off-center). The emitted fingerprint's
+    peak_freq_hz must land at the peak bin's frequency, not the midpoint.
+    """
+    tres = 0.001
+    num_bins = 64
+    grid = np.full((250, num_bins), -120.0, dtype=np.float32)
+    grid[78:118, 25:40] = -50.0  # occupied plateau -> midpoint around col 32
+    grid[78:118, 25] = 0.0  # strong peak at col 25 (off-center)
+
+    det = _detector(window=100, eval_iv=50, num_bins=num_bins, tres_s=tres)
+    freq = det._freq_axis
+    emitted = _feed_grid(det, grid, chunk=50, tres_s=tres)
+
+    assert len(emitted) == 1
+    b = emitted[0]
+    peak_bin_freq = det._center_freq_hz + float(freq[25])
+    midpoint_freq = b.center_freq_hz
+    assert abs(b.peak_freq_hz - peak_bin_freq) < abs(b.peak_freq_hz - midpoint_freq), (
+        f"peak_freq_hz={b.peak_freq_hz} should be nearer the peak bin "
+        f"({peak_bin_freq}) than the midpoint ({midpoint_freq})"
+    )
+    assert abs(b.peak_freq_hz - peak_bin_freq) < 1.0
+    assert abs(midpoint_freq - peak_bin_freq) > 1.0  # sanity: peak != midpoint

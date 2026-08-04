@@ -207,6 +207,12 @@ def _merge_bursts(
             new_bw = new_f_hi - new_f_lo
             new_center = (new_f_lo + new_f_hi) / 2
             new_peak = max(current.peak_power_db, next_burst.peak_power_db)
+            # Carry the peak frequency of the stronger constituent (matches the
+            # rolling tracker's rule), not the geometric midpoint.
+            if current.peak_power_db >= next_burst.peak_power_db:
+                new_peak_freq = current.peak_freq_hz
+            else:
+                new_peak_freq = next_burst.peak_freq_hz
             new_duration = (new_stop - current.start_time).total_seconds() * 1000.0
 
             current = BurstFingerprint(
@@ -214,6 +220,7 @@ def _merge_bursts(
                 start_time=current.start_time,
                 stop_time=new_stop,
                 center_freq_hz=new_center,
+                peak_freq_hz=new_peak_freq,
                 bandwidth_hz=new_bw,
                 peak_power_db=new_peak,
                 duration_ms=new_duration,

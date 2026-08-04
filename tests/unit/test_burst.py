@@ -4,8 +4,39 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-from rfobserver.processing.burst import BurstDetectionConfig, detect_bursts
+from rfobserver.models import BurstFingerprint
+from rfobserver.processing.burst import BurstDetectionConfig, _merge_bursts, detect_bursts
 from rfobserver.processing.spectral import PSDGridResult, compute_noise_floor
+
+
+def test_merge_bursts_carries_stronger_peak_freq_hz():
+    """A merged burst keeps the peak frequency of the stronger constituent, not 0.0."""
+    from datetime import timedelta
+
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    a = BurstFingerprint(
+        start_time=t0,
+        stop_time=t0 + timedelta(milliseconds=10),
+        center_freq_hz=915_000_000.0,
+        peak_freq_hz=915_020_000.0,
+        bandwidth_hz=200_000.0,
+        peak_power_db=-70.0,
+        duration_ms=10.0,
+        detection_timestamp=t0,
+    )
+    b = BurstFingerprint(
+        start_time=t0 + timedelta(milliseconds=11),
+        stop_time=t0 + timedelta(milliseconds=20),
+        center_freq_hz=915_050_000.0,
+        peak_freq_hz=915_070_000.0,
+        bandwidth_hz=200_000.0,
+        peak_power_db=-50.0,  # stronger
+        duration_ms=9.0,
+        detection_timestamp=t0,
+    )
+    merged = _merge_bursts([a, b], max_time_gap=0.005, freq_tolerance=500_000.0)
+    assert len(merged) == 1
+    assert merged[0].peak_freq_hz == 915_070_000.0  # stronger constituent's peak
 
 
 def _make_grid(

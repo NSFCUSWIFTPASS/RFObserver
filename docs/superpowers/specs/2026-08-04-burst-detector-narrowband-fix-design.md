@@ -65,33 +65,37 @@ detections; the median sits at true noise for an FHSS grid (no bin occupied >50%
 a window) and is what the reference uses. Empirically p10 produced hundreds of
 fragments where median produced clean per-hop components.
 
-### 2. Reported center: peak frequency, with the occupied range kept explicit
+### 2. Add a peak-frequency field (do NOT change `center_freq_hz` semantics)
 
 `_extract_fingerprints` sets `center_freq_hz = center + (f_min + f_max)/2` (midpoint)
 and the rolling tracker reconstructs `f_lo/f_hi = center ± bandwidth/2`
-(`rolling_burst.py:164-165`). For a narrowband tone midpoint ≈ peak, but for any
-asymmetric/partially-bridged component the midpoint is wrong (this is the 915.0 MHz
-artifact). The reference uses the peak bin as the center.
+(`rolling_burst.py:164-165`); viz and span queries also assume
+`center ± bandwidth/2 == occupied range`. For a narrowband tone midpoint ≈ peak, but
+for any asymmetric/partially-bridged component the midpoint is off (this is the
+915.0 MHz artifact). The reference reports the peak bin as the burst frequency.
 
-Design decision: **redefine `center_freq_hz` as the peak-power frequency** and stop
-depending on the `center ± bandwidth/2 == occupied range` invariant. To keep the
-rolling tracker correct, `BurstFingerprint` carries the occupied edges explicitly:
+Design decision (per review): **keep `center_freq_hz` = geometric midpoint,
+unchanged everywhere**, and **add a new `peak_freq_hz` field** carrying the
+peak-power bin frequency. This is purely additive — the `center ± bandwidth/2`
+invariant, the rolling tracker, viz, and span queries are untouched.
 
-- Add `f_lo_hz: float` and `f_hi_hz: float` to `BurstFingerprint` (models.py).
-- `_extract_fingerprints`: set `center_freq_hz = center + freq_axis[peak_col]`
-  (peak column within the component), and `f_lo_hz = center + f_min`,
-  `f_hi_hz = center + f_max`; `bandwidth_hz = f_hi_hz - f_lo_hz` unchanged.
-- `rolling_burst.py`: use `burst.f_lo_hz / burst.f_hi_hz` directly instead of
-  `center ± bandwidth/2` for `_absorb`.
-- DB (`storage/database.py`) and API: persist/expose `f_lo_hz`/`f_hi_hz` alongside
-  the existing fields (additive columns/keys; migration = additive, tolerate old
-  rows as NULL). `center_freq_hz` semantics change from midpoint to peak; document
-  in the model docstring.
+- Add `peak_freq_hz: float` to `BurstFingerprint` (models.py); document it as the
+  peak-power frequency (vs `center_freq_hz` = occupied-band midpoint).
+- `_extract_fingerprints`: compute the peak column within the component and set
+  `peak_freq_hz = center + freq_axis[peak_col]`. `center_freq_hz`, `bandwidth_hz`
+  unchanged.
+- `rolling_burst.py`: unchanged (still derives `f_lo/f_hi` from `center ±
+  bandwidth/2`). When the tracker merges detections into a `_TrackedBurst`, carry
+  the peak of the highest-power constituent through to the emitted fingerprint's
+  `peak_freq_hz`.
+- DB (`storage/database.py`) and API: persist/expose `peak_freq_hz` additively
+  (new column tolerant of old NULL rows; new JSON key). No change to existing
+  `center_freq_hz` columns/keys.
 
-If, during implementation, the synthetic matrix shows midpoint and peak are
-interchangeable within tolerance for all its cases (likely, since those bursts are
-symmetric), the `f_lo_hz/f_hi_hz` additions are still required so the tracker and
-span queries remain exact once center is the (possibly off-center) peak.
+The acceptance test (below) compares the reference hop centers against
+`peak_freq_hz`. With the median floor + adequate threshold making bursts narrow,
+`center_freq_hz` (midpoint) will usually also land near the hop; `peak_freq_hz` is
+the robust one to assert.
 
 ### 3. Merge time
 
@@ -122,12 +126,15 @@ verify it is.
 ## Files
 
 - `src/rfobserver/processing/spectral.py` — `compute_noise_floor(grid, percentile=10.0)`
-- `src/rfobserver/processing/burst.py` — config field; pass percentile; peak-freq
-  center; set `f_lo_hz/f_hi_hz`
-- `src/rfobserver/processing/rolling_burst.py` — use explicit `f_lo_hz/f_hi_hz`
-- `src/rfobserver/models.py` — `BurstFingerprint.f_lo_hz/f_hi_hz`; center docstring
+- `src/rfobserver/processing/burst.py` — config field; pass percentile; compute
+  `peak_freq_hz`
+- `src/rfobserver/processing/rolling_burst.py` — carry the peak of the
+  highest-power constituent into the emitted `peak_freq_hz` (tracker logic
+  otherwise unchanged)
+- `src/rfobserver/models.py` — add `BurstFingerprint.peak_freq_hz`
 - `src/rfobserver/config.py` — `BURST_NOISE_FLOOR_PERCENTILE = 50.0`
-- `src/rfobserver/storage/database.py` + web routes — persist/expose new fields
+- `src/rfobserver/storage/database.py` + web routes — persist/expose `peak_freq_hz`
+  (additive; `center_freq_hz` unchanged)
 - `tests/unit/test_burst.py` (+ matrix) — floor percentile, peak center, edges
 - `tests/integration/test_replay_reference.py` — reference-reproduction test
 

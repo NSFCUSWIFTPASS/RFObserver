@@ -67,6 +67,7 @@ class AppSettings(BaseSettings):
     BURST_THRESHOLD_LOW_RATIO: float = 0.6
     BURST_MERGE_FREQ_BINS: int = 5
     BURST_MERGE_TIME_MS: float = 3.0
+    BURST_NOISE_FLOOR_PERCENTILE: float = 50.0
 
     # Identity
     #

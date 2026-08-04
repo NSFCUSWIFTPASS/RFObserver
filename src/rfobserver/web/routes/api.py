@@ -601,7 +601,8 @@ async def detections_json(
 
     Sibling of the HTML ``/detections`` fragment so non-browser clients don't
     scrape HTML. Rows are ``query_detections`` dicts (center_freq_hz,
-    bandwidth_hz, duration_ms, peak_power_db, start/stop_time, sdr context).
+    peak_freq_hz, bandwidth_hz, duration_ms, peak_power_db, start/stop_time,
+    sdr context).
     """
     db = _get_db(request)
     if db is None:

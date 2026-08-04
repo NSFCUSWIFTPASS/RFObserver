@@ -1155,6 +1155,7 @@ class StreamingProcessor:
             threshold_low_ratio=s.BURST_THRESHOLD_LOW_RATIO,
             merge_freq_bins=s.BURST_MERGE_FREQ_BINS,
             merge_time_sec=s.BURST_MERGE_TIME_MS / 1000.0,
+            noise_floor_percentile=s.BURST_NOISE_FLOOR_PERCENTILE,
         )
 
     # -- Async result consumer (event loop) --
@@ -1465,6 +1466,7 @@ class StreamingProcessor:
                     peak_power_db=burst.peak_power_db,
                     duration_ms=burst.duration_ms,
                     detection_timestamp=burst.detection_timestamp,
+                    peak_freq_hz=burst.peak_freq_hz,
                     sdr_center_freq_hz=float(sdr_center_freq_hz),
                     sample_rate_hz=sample_rate_hz,
                     lo_offset_hz=0.0,

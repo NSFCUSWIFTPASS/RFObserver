@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS detections (
     peak_power_db REAL NOT NULL,
     duration_ms REAL NOT NULL,
     detection_timestamp TEXT NOT NULL,
+    peak_freq_hz REAL,
     -- SDR capture context (how the radio was tuned when the burst was found).
     -- Distinct from center_freq_hz/bandwidth_hz above, which describe the burst
     -- signal itself. Nullable so pre-migration rows and uncalibrated paths work.
@@ -73,9 +74,10 @@ CREATE INDEX IF NOT EXISTS idx_stats_time ON stats(timestamp);
 CREATE INDEX IF NOT EXISTS idx_tone_checks_time ON tone_checks(timestamp);
 """
 
-# SDR capture-context columns added after the original detections schema.
-# Existing databases predate them, so connect() adds any that are missing via
-# ALTER TABLE (SQLite has no "ADD COLUMN IF NOT EXISTS").
+# Columns added after the original detections schema (SDR capture-context
+# fields, plus peak_freq_hz). Existing databases predate them, so connect()
+# adds any that are missing via ALTER TABLE (SQLite has no
+# "ADD COLUMN IF NOT EXISTS").
 _DETECTION_SDR_COLUMNS: dict[str, str] = {
     "sdr_center_freq_hz": "REAL",
     "sample_rate_hz": "REAL",
@@ -84,6 +86,7 @@ _DETECTION_SDR_COLUMNS: dict[str, str] = {
     "gain_db": "REAL",
     "antenna": "TEXT",
     "device_serial": "TEXT",
+    "peak_freq_hz": "REAL",
 }
 
 
@@ -166,6 +169,7 @@ class SensorDatabase:
         gain_db: float | None = None,
         antenna: str | None = None,
         device_serial: str | None = None,
+        peak_freq_hz: float = 0.0,
     ) -> None:
         assert self._db is not None
         await self._db.execute(
@@ -173,8 +177,8 @@ class SensorDatabase:
                (burst_id, start_time, stop_time, center_freq_hz, bandwidth_hz,
                 peak_power_db, duration_ms, detection_timestamp,
                 sdr_center_freq_hz, sample_rate_hz, lo_offset_hz, analog_bw_hz,
-                gain_db, antenna, device_serial)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                gain_db, antenna, device_serial, peak_freq_hz)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 burst_id,
                 start_time.isoformat(),
@@ -191,6 +195,7 @@ class SensorDatabase:
                 gain_db,
                 antenna,
                 device_serial,
+                peak_freq_hz,
             ),
         )
         await self._db.commit()

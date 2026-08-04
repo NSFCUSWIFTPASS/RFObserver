@@ -1,11 +1,42 @@
 """Tests for rfobserver.processing.burst -- CCL on PSD grids."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 
-from rfobserver.processing.burst import BurstDetectionConfig, detect_bursts
-from rfobserver.processing.spectral import PSDGridResult
+from rfobserver.models import BurstFingerprint
+from rfobserver.processing.burst import BurstDetectionConfig, _merge_bursts, detect_bursts
+from rfobserver.processing.spectral import PSDGridResult, compute_noise_floor
+
+
+def test_merge_bursts_carries_stronger_peak_freq_hz():
+    """A merged burst keeps the peak frequency of the stronger constituent, not 0.0."""
+    from datetime import timedelta
+
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    a = BurstFingerprint(
+        start_time=t0,
+        stop_time=t0 + timedelta(milliseconds=10),
+        center_freq_hz=915_000_000.0,
+        peak_freq_hz=915_020_000.0,
+        bandwidth_hz=200_000.0,
+        peak_power_db=-70.0,
+        duration_ms=10.0,
+        detection_timestamp=t0,
+    )
+    b = BurstFingerprint(
+        start_time=t0 + timedelta(milliseconds=11),
+        stop_time=t0 + timedelta(milliseconds=20),
+        center_freq_hz=915_050_000.0,
+        peak_freq_hz=915_070_000.0,
+        bandwidth_hz=200_000.0,
+        peak_power_db=-50.0,  # stronger
+        duration_ms=9.0,
+        detection_timestamp=t0,
+    )
+    merged = _merge_bursts([a, b], max_time_gap=0.005, freq_tolerance=500_000.0)
+    assert len(merged) == 1
+    assert merged[0].peak_freq_hz == 915_070_000.0  # stronger constituent's peak
 
 
 def _make_grid(
@@ -159,3 +190,33 @@ def test_noise_floor_reported():
     grid = _make_grid(noise_db=-60.0)
     result = detect_bursts(grid, capture_time=datetime(2026, 1, 1))
     np.testing.assert_allclose(result.noise_floor_db, -60.0, atol=1.0)
+
+
+def test_compute_noise_floor_percentile_param():
+    # 100 rows: 90 at 0 dB, 10 at 100 dB -> p10=0, median=0, p95=100
+    grid = np.zeros((100, 4), dtype=np.float32)
+    grid[90:, :] = 100.0
+    assert np.allclose(compute_noise_floor(grid), 0.0)  # default p10
+    assert np.allclose(compute_noise_floor(grid, 50.0), 0.0)  # median
+    assert np.allclose(compute_noise_floor(grid, 95.0), 100.0)  # high pct
+
+
+def test_peak_freq_hz_reports_peak_bin_not_midpoint():
+    # 20 rows x 8 bins; occupied band bins 2..6, but the PEAK is at bin 3 (asymmetric).
+    grid = np.full((20, 8), -100.0, dtype=np.float32)
+    grid[5:15, 2:7] = -50.0  # occupied plateau -> midpoint at bin 4
+    grid[5:15, 3] = -10.0  # strong peak at bin 3
+    freq_axis = (np.arange(8) - 4) * 1_000_000.0  # 1 MHz bins, centered
+    psd = PSDGridResult(
+        grid=grid,
+        time_axis=np.arange(20) * 0.001,
+        freq_axis=freq_axis,
+        ffts_per_slice=1,
+        total_ffts=20,
+    )
+    cfg = BurstDetectionConfig(threshold_high_db=20.0, min_duration_sec=0.0)
+    res = detect_bursts(psd, cfg, center_freq_hz=915e6, capture_time=datetime.now(timezone.utc))
+    assert len(res.bursts) == 1
+    b = res.bursts[0]
+    assert abs(b.peak_freq_hz - (915e6 + freq_axis[3])) < 1.0  # peak = bin 3
+    assert abs(b.center_freq_hz - (915e6 + freq_axis[4])) < 1.0  # midpoint = bin 4 (unchanged)

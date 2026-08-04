@@ -26,6 +26,7 @@ class BurstDetectionConfig:
     min_duration_sec: float = 0.001
     merge_freq_bins: int = 5
     merge_time_sec: float = 0.003
+    noise_floor_percentile: float = 50.0
 
     @property
     def threshold_low_db(self) -> float:
@@ -50,7 +51,10 @@ def detect_bursts(
     """Detect RF bursts in a PSD grid using dual-threshold hysteresis + CCL.
 
     Algorithm:
-    1. Estimate noise floor as 10th percentile per frequency bin.
+    1. Estimate noise floor per frequency bin at config.noise_floor_percentile
+       (default median; a lower percentile like 10 sits below the true floor and
+       fragments detections, a strong signal on a broadband pedestal needs the
+       median to keep the pedestal sub-threshold).
     2. Create high-threshold mask: cells > noise_floor + T_H.
     3. Create low-threshold mask: cells > noise_floor + T_L.
     4. Label connected components in the low-threshold mask (8-connectivity).
@@ -67,7 +71,7 @@ def detect_bursts(
     grid = psd_grid.grid
     time_axis = psd_grid.time_axis
     freq_axis = psd_grid.freq_axis
-    noise_floor = compute_noise_floor(grid)
+    noise_floor = compute_noise_floor(grid, config.noise_floor_percentile)
     avg_noise = float(np.mean(noise_floor))
 
     # Dual-threshold masks
@@ -154,6 +158,7 @@ def _extract_fingerprints(
         region_powers = grid[rows, cols]
         peak_idx = int(np.argmax(region_powers))
         peak_power = float(region_powers[peak_idx])
+        peak_freq_hz = center_freq_hz + float(freq_axis[cols[peak_idx]])
 
         burst_center_freq = center_freq_hz + (f_min + f_max) / 2
 
@@ -162,6 +167,7 @@ def _extract_fingerprints(
                 start_time=capture_time + timedelta(seconds=t_start),
                 stop_time=capture_time + timedelta(seconds=t_end),
                 center_freq_hz=burst_center_freq,
+                peak_freq_hz=peak_freq_hz,
                 bandwidth_hz=max(bandwidth, 0.0),
                 peak_power_db=peak_power,
                 duration_ms=duration_sec * 1000.0,
@@ -204,6 +210,12 @@ def _merge_bursts(
             new_bw = new_f_hi - new_f_lo
             new_center = (new_f_lo + new_f_hi) / 2
             new_peak = max(current.peak_power_db, next_burst.peak_power_db)
+            # Carry the peak frequency of the stronger constituent (matches the
+            # rolling tracker's rule), not the geometric midpoint.
+            if current.peak_power_db >= next_burst.peak_power_db:
+                new_peak_freq = current.peak_freq_hz
+            else:
+                new_peak_freq = next_burst.peak_freq_hz
             new_duration = (new_stop - current.start_time).total_seconds() * 1000.0
 
             current = BurstFingerprint(
@@ -211,6 +223,7 @@ def _merge_bursts(
                 start_time=current.start_time,
                 stop_time=new_stop,
                 center_freq_hz=new_center,
+                peak_freq_hz=new_peak_freq,
                 bandwidth_hz=new_bw,
                 peak_power_db=new_peak,
                 duration_ms=new_duration,

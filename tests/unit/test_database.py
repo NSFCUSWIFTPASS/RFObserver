@@ -119,6 +119,22 @@ async def test_insert_without_sdr_context_yields_nulls(db):
     assert row["gain_db"] is None
 
 
+async def test_insert_with_peak_freq_hz_roundtrips(db):
+    await db.insert_detection(
+        burst_id="peak-1",
+        start_time=datetime(2026, 1, 1),
+        stop_time=datetime(2026, 1, 1, 0, 0, 1),
+        center_freq_hz=915e6,
+        bandwidth_hz=1e6,
+        peak_power_db=-30.0,
+        duration_ms=1000.0,
+        detection_timestamp=datetime(2026, 1, 1),
+        peak_freq_hz=917.3e6,
+    )
+    row = (await db.query_detections())[0]
+    assert row["peak_freq_hz"] == 917.3e6
+
+
 async def test_query_filters_by_sdr_context(db):
     common = dict(
         start_time=datetime(2026, 1, 1),

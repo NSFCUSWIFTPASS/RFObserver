@@ -350,6 +350,7 @@ def _process_capture_blocking(
         threshold_low_ratio=s.BURST_THRESHOLD_LOW_RATIO,
         merge_freq_bins=s.BURST_MERGE_FREQ_BINS,
         merge_time_sec=s.BURST_MERGE_TIME_MS / 1000.0,
+        noise_floor_percentile=s.BURST_NOISE_FLOOR_PERCENTILE,
     )
     detection_result = detect_bursts(
         psd_grid,

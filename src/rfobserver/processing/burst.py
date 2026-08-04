@@ -26,6 +26,7 @@ class BurstDetectionConfig:
     min_duration_sec: float = 0.001
     merge_freq_bins: int = 5
     merge_time_sec: float = 0.003
+    noise_floor_percentile: float = 50.0
 
     @property
     def threshold_low_db(self) -> float:
@@ -67,7 +68,7 @@ def detect_bursts(
     grid = psd_grid.grid
     time_axis = psd_grid.time_axis
     freq_axis = psd_grid.freq_axis
-    noise_floor = compute_noise_floor(grid)
+    noise_floor = compute_noise_floor(grid, config.noise_floor_percentile)
     avg_noise = float(np.mean(noise_floor))
 
     # Dual-threshold masks

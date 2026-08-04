@@ -5,7 +5,7 @@ from datetime import datetime
 import numpy as np
 
 from rfobserver.processing.burst import BurstDetectionConfig, detect_bursts
-from rfobserver.processing.spectral import PSDGridResult
+from rfobserver.processing.spectral import PSDGridResult, compute_noise_floor
 
 
 def _make_grid(
@@ -159,3 +159,12 @@ def test_noise_floor_reported():
     grid = _make_grid(noise_db=-60.0)
     result = detect_bursts(grid, capture_time=datetime(2026, 1, 1))
     np.testing.assert_allclose(result.noise_floor_db, -60.0, atol=1.0)
+
+
+def test_compute_noise_floor_percentile_param():
+    # 100 rows: 90 at 0 dB, 10 at 100 dB -> p10=0, median=0, p95=100
+    grid = np.zeros((100, 4), dtype=np.float32)
+    grid[90:, :] = 100.0
+    assert np.allclose(compute_noise_floor(grid), 0.0)  # default p10
+    assert np.allclose(compute_noise_floor(grid, 50.0), 0.0)  # median
+    assert np.allclose(compute_noise_floor(grid, 95.0), 100.0)  # high pct

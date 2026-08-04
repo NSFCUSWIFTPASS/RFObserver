@@ -155,6 +155,7 @@ def _extract_fingerprints(
         region_powers = grid[rows, cols]
         peak_idx = int(np.argmax(region_powers))
         peak_power = float(region_powers[peak_idx])
+        peak_freq_hz = center_freq_hz + float(freq_axis[cols[peak_idx]])
 
         burst_center_freq = center_freq_hz + (f_min + f_max) / 2
 
@@ -163,6 +164,7 @@ def _extract_fingerprints(
                 start_time=capture_time + timedelta(seconds=t_start),
                 stop_time=capture_time + timedelta(seconds=t_end),
                 center_freq_hz=burst_center_freq,
+                peak_freq_hz=peak_freq_hz,
                 bandwidth_hz=max(bandwidth, 0.0),
                 peak_power_db=peak_power,
                 duration_ms=duration_sec * 1000.0,

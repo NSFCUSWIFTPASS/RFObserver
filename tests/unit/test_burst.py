@@ -1,6 +1,6 @@
 """Tests for rfobserver.processing.burst -- CCL on PSD grids."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -168,3 +168,24 @@ def test_compute_noise_floor_percentile_param():
     assert np.allclose(compute_noise_floor(grid), 0.0)  # default p10
     assert np.allclose(compute_noise_floor(grid, 50.0), 0.0)  # median
     assert np.allclose(compute_noise_floor(grid, 95.0), 100.0)  # high pct
+
+
+def test_peak_freq_hz_reports_peak_bin_not_midpoint():
+    # 20 rows x 8 bins; occupied band bins 2..6, but the PEAK is at bin 3 (asymmetric).
+    grid = np.full((20, 8), -100.0, dtype=np.float32)
+    grid[5:15, 2:7] = -50.0  # occupied plateau -> midpoint at bin 4
+    grid[5:15, 3] = -10.0  # strong peak at bin 3
+    freq_axis = (np.arange(8) - 4) * 1_000_000.0  # 1 MHz bins, centered
+    psd = PSDGridResult(
+        grid=grid,
+        time_axis=np.arange(20) * 0.001,
+        freq_axis=freq_axis,
+        ffts_per_slice=1,
+        total_ffts=20,
+    )
+    cfg = BurstDetectionConfig(threshold_high_db=20.0, min_duration_sec=0.0)
+    res = detect_bursts(psd, cfg, center_freq_hz=915e6, capture_time=datetime.now(timezone.utc))
+    assert len(res.bursts) == 1
+    b = res.bursts[0]
+    assert abs(b.peak_freq_hz - (915e6 + freq_axis[3])) < 1.0  # peak = bin 3
+    assert abs(b.center_freq_hz - (915e6 + freq_axis[4])) < 1.0  # midpoint = bin 4 (unchanged)

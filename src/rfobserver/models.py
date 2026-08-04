@@ -107,6 +107,8 @@ class BurstFingerprint(BaseModel):
     start_time: datetime
     stop_time: datetime
     center_freq_hz: float
+    # Absolute Hz of the peak-power bin (center_freq_hz is the band midpoint).
+    peak_freq_hz: float = 0.0
     bandwidth_hz: float
     peak_power_db: float
     duration_ms: float = 0.0

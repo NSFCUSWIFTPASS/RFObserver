@@ -428,13 +428,19 @@
         psdVisible = v;
         sendView();
     }
+    // Observe the whole live-charts group, not just the PSD canvas: the "psd"
+    // message also drives the time-series and waterfall charts in this group, so
+    // gating on the PSD canvas alone would freeze the waterfall when the user
+    // scrolls down to watch it. Stop streaming only when the entire group is
+    // off-screen (or the tab is hidden).
     let psdInView = true;
-    const psdCard = document.getElementById("psd-card") || psdCanvas.closest(".card");
-    if (psdCard && "IntersectionObserver" in window) {
+    const liveCharts =
+        psdCanvas.closest(".graph-group") || document.getElementById("psd-card");
+    if (liveCharts && "IntersectionObserver" in window) {
         new IntersectionObserver(function(entries) {
             psdInView = entries[0].isIntersecting;
             setPsdVisible(psdInView && document.visibilityState === "visible");
-        }, {threshold: 0.01}).observe(psdCard);
+        }, {threshold: 0.01}).observe(liveCharts);
     }
     document.addEventListener("visibilitychange", function() {
         setPsdVisible(document.visibilityState === "visible" && psdInView);

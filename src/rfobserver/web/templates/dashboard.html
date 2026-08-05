@@ -36,7 +36,7 @@
                 </div>
                 <div id="ts-tooltip" class="graph-tooltip" style="display: none;"></div>
             </div>
-            <div style="position: relative;">
+            <div id="psd-card" style="position: relative;">
                 <canvas id="psd-canvas" width="920" height="160" style="width: 100%; height: 160px;"></canvas>
                 <div id="psd-tooltip" class="graph-tooltip" style="display: none;"></div>
             </div>
@@ -101,6 +101,9 @@
     let highRes = false;
     let showBursts = true;
     let ws = null;
+    // Live-PSD visibility gating: only stream "psd" frames while the PSD
+    // card is on-screen and the tab is visible.
+    let psdVisible = true;
 
     const burstToggle = document.getElementById("burst-toggle");
     const burstToggleLabel = document.getElementById("burst-toggle-label");
@@ -413,6 +416,29 @@
     const psdCanvas = document.getElementById("psd-canvas");
     const psdCtx = psdCanvas.getContext("2d");
     const psdTooltip = document.getElementById("psd-tooltip");
+
+    // --- Gate live-PSD streaming on visibility ---
+    function sendView() {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({type: "set_view", psd_visible: psdVisible}));
+        }
+    }
+    function setPsdVisible(v) {
+        if (v === psdVisible) return;
+        psdVisible = v;
+        sendView();
+    }
+    let psdInView = true;
+    const psdCard = document.getElementById("psd-card") || psdCanvas.closest(".card");
+    if (psdCard && "IntersectionObserver" in window) {
+        new IntersectionObserver(function(entries) {
+            psdInView = entries[0].isIntersecting;
+            setPsdVisible(psdInView && document.visibilityState === "visible");
+        }, {threshold: 0.01}).observe(psdCard);
+    }
+    document.addEventListener("visibilitychange", function() {
+        setPsdVisible(document.visibilityState === "visible" && psdInView);
+    });
 
     let lastPowers = [];
     let lastMaxPowers = [];        // per-bin max across the chunk's PSD rows
@@ -887,6 +913,7 @@
             if (highRes) {
                 ws.send(JSON.stringify({type: "set_mode", high_res: true}));
             }
+            sendView();
         };
 
         ws.onmessage = function(evt) {

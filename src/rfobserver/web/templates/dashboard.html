@@ -104,9 +104,13 @@
 
     const burstToggle = document.getElementById("burst-toggle");
     const burstToggleLabel = document.getElementById("burst-toggle-label");
+    // Burst-tuning threshold panel is intentionally hidden. Flip to true to restore
+    // the draggable high/low threshold display; all its draw/drag code is retained.
+    const SHOW_BURST_TUNING = false;
     const burstTuningWrap = document.getElementById("burst-tuning-wrap");
     function applyBurstTuningVisibility() {
-        burstTuningWrap.style.display = (highRes && showBursts) ? "" : "none";
+        burstTuningWrap.style.display =
+            (SHOW_BURST_TUNING && highRes && showBursts) ? "" : "none";
     }
     burstToggle.addEventListener("change", function() {
         showBursts = this.checked;

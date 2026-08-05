@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+import logging
+import struct
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 from rfobserver.storage import psd_grid
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -97,6 +101,89 @@ async def capture_detail(request: Request, filename: str) -> dict[str, Any]:
     return result
 
 
+def _open_psd(sc16_path: Path) -> tuple[np.ndarray[Any, np.dtype[Any]], dict[str, Any]] | None:
+    """Load the PSD grid (new raw .psd first, then legacy .npz) plus its metadata.
+
+    Returns ``(grid, info)`` where ``grid`` may be a read-only memmap (only the
+    windowed slice is ever materialized) and ``info`` carries freq_axis (np array),
+    time_resolution_s, center_freq_hz, bandwidth_hz, total_rows, num_bins, grid_min,
+    grid_max, and cal_offset_db. Returns ``None`` if no PSD companion exists.
+    """
+    loaded = psd_grid.load_grid(sc16_path)
+    if loaded is not None:
+        grid, meta = loaded
+        return grid, {
+            "freq_axis": np.asarray(meta["freq_axis"]),
+            "time_resolution_s": float(meta["time_resolution_s"]),
+            "center_freq_hz": int(meta["center_freq_hz"]),
+            "bandwidth_hz": int(meta["bandwidth_hz"]),
+            "total_rows": int(meta["rows"]),
+            "num_bins": int(meta["num_bins"]),
+            "grid_min": float(meta["grid_min"]),
+            "grid_max": float(meta["grid_max"]),
+            "cal_offset_db": float(meta["cal_offset_db"]) if "cal_offset_db" in meta else None,
+        }
+
+    npz_path = sc16_path.with_suffix(".npz")
+    if not npz_path.exists():
+        return None
+    data = np.load(npz_path)
+    grid = data["grid"]  # shape: (total_rows, num_bins)
+    total_rows, num_bins = grid.shape
+    return grid, {
+        "freq_axis": data["freq_axis"],
+        "time_resolution_s": float(data["time_resolution_s"]),
+        "center_freq_hz": int(data["center_freq_hz"]),
+        "bandwidth_hz": int(data["bandwidth_hz"]),
+        "total_rows": int(total_rows),
+        "num_bins": int(num_bins),
+        # Global range over the whole grid so the waterfall colour mapping stays
+        # stable while the client lazy-loads pages (a per-page min/max would jump).
+        "grid_min": float(grid.min()) if total_rows else -120.0,
+        "grid_max": float(grid.max()) if total_rows else -40.0,
+        # Display calibration baked in at record time (absent → client uses dBFS).
+        "cal_offset_db": float(data["cal_offset_db"]) if "cal_offset_db" in data.files else None,
+    }
+
+
+def _slice_psd(
+    grid: np.ndarray[Any, np.dtype[Any]],
+    freq_axis: np.ndarray[Any, np.dtype[Any]],
+    num_bins: int,
+    start: int,
+    count: int,
+    max_bins: int,
+) -> tuple[np.ndarray[Any, np.dtype[Any]], np.ndarray[Any, np.dtype[Any]], int]:
+    """Row-slice + optional bin-downsample, shared by the HTTP and WS endpoints.
+
+    Returns ``(sliced, ds_freq_axis, ds_num_bins)`` where ``sliced`` is a
+    contiguous C-order float32 array ready for ``.tolist()`` / ``.tobytes()``.
+    """
+    total_rows = grid.shape[0]
+    start = max(0, min(start, total_rows))
+    end = min(start + count, total_rows)
+    sliced = grid[start:end]
+
+    if num_bins > max_bins:
+        factor = num_bins // max_bins
+        trim = factor * max_bins
+        sliced = sliced[:, :trim].reshape(sliced.shape[0], max_bins, factor).mean(axis=2)
+        freq_axis = freq_axis[:trim].reshape(max_bins, factor).mean(axis=1)
+        num_bins = max_bins
+
+    return np.ascontiguousarray(sliced, dtype=np.float32), np.asarray(freq_axis), num_bins
+
+
+def _psd_frame_bytes(start: int, sliced: np.ndarray[Any, np.dtype[Any]]) -> bytes:
+    """Pack a PSD window into a binary WS frame.
+
+    Little-endian 12-byte header ``int32 start, count, num_bins`` followed by
+    ``count*num_bins`` float32 (C-order, row-major).
+    """
+    header = struct.pack("<iii", int(start), int(sliced.shape[0]), int(sliced.shape[1]))
+    return header + np.ascontiguousarray(sliced, dtype="<f4").tobytes()
+
+
 @router.get("/psd/{filename}")
 async def capture_psd(
     request: Request,
@@ -117,60 +204,103 @@ async def capture_psd(
     # New format (raw .psd + .psd.json, memmap) first, then legacy .npz.
     base = filename.replace(".sc16", "").replace(".npz", "")
     sc16_path = _validate_filename(base + ".sc16", storage)
-    loaded = psd_grid.load_grid(sc16_path)
-    if loaded is not None:
-        grid, meta = loaded  # grid is a read-only memmap; only the window is materialized
-        freq_axis = np.asarray(meta["freq_axis"])
-        time_res = float(meta["time_resolution_s"])
-        center_freq = int(meta["center_freq_hz"])
-        bandwidth = int(meta["bandwidth_hz"])
-        total_rows = int(meta["rows"])
-        num_bins = int(meta["num_bins"])
-        grid_min = float(meta["grid_min"])
-        grid_max = float(meta["grid_max"])
-        cal_offset_db = float(meta["cal_offset_db"]) if "cal_offset_db" in meta else None
-    else:
-        npz_path = _validate_filename(base + ".npz", storage)
-        if not npz_path.exists():
-            raise HTTPException(status_code=404, detail="PSD data not found")
-        data = np.load(npz_path)
-        grid = data["grid"]  # shape: (total_rows, num_bins)
-        freq_axis = data["freq_axis"]
-        time_res = float(data["time_resolution_s"])
-        center_freq = int(data["center_freq_hz"])
-        bandwidth = int(data["bandwidth_hz"])
-        total_rows, num_bins = grid.shape
-        # Global range over the whole grid so the waterfall colour mapping stays
-        # stable while the client lazy-loads pages (a per-page min/max would jump).
-        grid_min = float(grid.min()) if total_rows else -120.0
-        grid_max = float(grid.max()) if total_rows else -40.0
-        # Display calibration baked in at record time (absent → client uses dBFS).
-        cal_offset_db = float(data["cal_offset_db"]) if "cal_offset_db" in data.files else None
+    opened = _open_psd(sc16_path)
+    if opened is None:
+        raise HTTPException(status_code=404, detail="PSD data not found")
+    grid, info = opened
+    total_rows = info["total_rows"]
 
-    # Slice rows
     start = max(0, min(start, total_rows))
-    end = min(start + count, total_rows)
-    sliced = grid[start:end]
-
-    # Downsample bins if needed
-    if num_bins > max_bins:
-        factor = num_bins // max_bins
-        trim = factor * max_bins
-        sliced = sliced[:, :trim].reshape(sliced.shape[0], max_bins, factor).mean(axis=2)
-        freq_axis = freq_axis[:trim].reshape(max_bins, factor).mean(axis=1)
-        num_bins = max_bins
+    sliced, freq_axis, num_bins = _slice_psd(
+        grid, info["freq_axis"], info["num_bins"], start, count, max_bins
+    )
 
     return {
         "grid": sliced.tolist(),
         "freq_axis": freq_axis.tolist(),
-        "time_resolution_s": time_res,
+        "time_resolution_s": info["time_resolution_s"],
         "total_rows": total_rows,
         "num_bins": num_bins,
-        "grid_min": grid_min,
-        "grid_max": grid_max,
-        "cal_offset_db": cal_offset_db,
+        "grid_min": info["grid_min"],
+        "grid_max": info["grid_max"],
+        "cal_offset_db": info["cal_offset_db"],
         "start": start,
-        "count": end - start,
-        "center_freq_hz": center_freq,
-        "bandwidth_hz": bandwidth,
+        "count": int(sliced.shape[0]),
+        "center_freq_hz": info["center_freq_hz"],
+        "bandwidth_hz": info["bandwidth_hz"],
     }
+
+
+@router.websocket("/ws/psd/{filename}")
+async def capture_psd_ws(websocket: WebSocket, filename: str) -> None:
+    """Stream PSD windows as binary frames, pushing scroll-ahead neighbours.
+
+    Client sends JSON range requests ``{start, count, max_bins, have?}``; the
+    server replies with a binary frame for the requested window, then proactively
+    for the next and previous windows (bounded to the grid, skipping any starts
+    the client lists in ``have``). Reached at ``/captures/ws/psd/{filename}``.
+    """
+    storage = Path(websocket.app.state.settings.STORAGE_PATH)
+    base = filename.replace(".sc16", "").replace(".npz", "")
+    try:
+        sc16_path = _validate_filename(base + ".sc16", storage)
+    except HTTPException:
+        await websocket.close(code=1011)
+        return
+
+    opened = _open_psd(sc16_path)
+    if opened is None:
+        await websocket.close(code=1011)
+        return
+    grid, info = opened
+    total_rows = int(info["total_rows"])
+
+    await websocket.accept()
+
+    # Meta frame uses the default-max_bins downsample so num_bins matches the data
+    # frames the client will receive for a default request.
+    default_max_bins = 512
+    _, ds_axis, ds_num_bins = _slice_psd(
+        grid, info["freq_axis"], info["num_bins"], 0, 0, default_max_bins
+    )
+    await websocket.send_json(
+        {
+            "type": "meta",
+            "freq_axis": ds_axis.tolist(),
+            "time_resolution_s": info["time_resolution_s"],
+            "total_rows": total_rows,
+            "num_bins": ds_num_bins,
+            "grid_min": info["grid_min"],
+            "grid_max": info["grid_max"],
+            "cal_offset_db": info["cal_offset_db"],
+            "center_freq_hz": info["center_freq_hz"],
+            "bandwidth_hz": info["bandwidth_hz"],
+        }
+    )
+
+    async def serve(s: int, count: int, max_bins: int, have: set[int], skip_have: bool) -> None:
+        if s < 0 or s >= total_rows:
+            return
+        if skip_have and s in have:
+            return
+        sliced, _fa, _nb = _slice_psd(grid, info["freq_axis"], info["num_bins"], s, count, max_bins)
+        if sliced.shape[0] == 0:
+            return
+        await websocket.send_bytes(_psd_frame_bytes(s, sliced))
+
+    try:
+        while True:
+            msg = await websocket.receive_json()
+            start = int(msg.get("start", 0))
+            count = int(msg.get("count", 500))
+            max_bins = int(msg.get("max_bins", default_max_bins))
+            have = {int(x) for x in msg.get("have", [])}
+
+            # Requested window first, then the bounded push-ahead neighbours.
+            await serve(start, count, max_bins, have, skip_have=False)
+            await serve(start + count, count, max_bins, have, skip_have=True)
+            await serve(start - count, count, max_bins, have, skip_have=True)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.exception("Captures PSD WebSocket error for %s", filename)

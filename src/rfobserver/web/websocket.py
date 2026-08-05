@@ -18,11 +18,12 @@ _QueueType = asyncio.Queue[dict[str, Any]]
 class _Subscriber:
     """Per-client subscriber state."""
 
-    __slots__ = ("queue", "high_res")
+    __slots__ = ("queue", "high_res", "wants_psd")
 
     def __init__(self) -> None:
         self.queue: _QueueType = asyncio.Queue(maxsize=10)
         self.high_res: bool = False
+        self.wants_psd: bool = True
 
 
 class LiveBroadcast:
@@ -40,13 +41,16 @@ class LiveBroadcast:
         self._subscribers.discard(sub)
 
     def has_high_res_subscribers(self) -> bool:
-        return any(s.high_res for s in self._subscribers)
+        return any(s.high_res and s.wants_psd for s in self._subscribers)
 
     async def publish(self, data: dict[str, Any]) -> None:
         # Separate grid_rows from the base message — only send to high_res clients
         grid_rows = data.pop("grid_rows", None)
+        is_psd = data.get("type") == "psd"
 
         for sub in list(self._subscribers):
+            if is_psd and not sub.wants_psd:
+                continue
             msg = data
             if sub.high_res and grid_rows is not None:
                 msg = {**data, "grid_rows": grid_rows}
@@ -74,6 +78,9 @@ async def websocket_endpoint(websocket: WebSocket, broadcast: LiveBroadcast) -> 
             if msg.get("type") == "set_mode":
                 sub.high_res = bool(msg.get("high_res", False))
                 logger.info("Client set high_res=%s", sub.high_res)
+            elif msg.get("type") == "set_view":
+                sub.wants_psd = bool(msg.get("psd_visible", True))
+                logger.info("Client set wants_psd=%s", sub.wants_psd)
 
     try:
         await asyncio.gather(send_loop(), recv_loop())

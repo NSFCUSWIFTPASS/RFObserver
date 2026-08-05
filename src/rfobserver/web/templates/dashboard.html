@@ -36,7 +36,7 @@
                 </div>
                 <div id="ts-tooltip" class="graph-tooltip" style="display: none;"></div>
             </div>
-            <div style="position: relative;">
+            <div id="psd-card" style="position: relative;">
                 <canvas id="psd-canvas" width="920" height="160" style="width: 100%; height: 160px;"></canvas>
                 <div id="psd-tooltip" class="graph-tooltip" style="display: none;"></div>
             </div>
@@ -101,12 +101,19 @@
     let highRes = false;
     let showBursts = true;
     let ws = null;
+    // Live-PSD visibility gating: only stream "psd" frames while the PSD
+    // card is on-screen and the tab is visible.
+    let psdVisible = true;
 
     const burstToggle = document.getElementById("burst-toggle");
     const burstToggleLabel = document.getElementById("burst-toggle-label");
+    // Burst-tuning threshold panel is intentionally hidden. Flip to true to restore
+    // the draggable high/low threshold display; all its draw/drag code is retained.
+    const SHOW_BURST_TUNING = false;
     const burstTuningWrap = document.getElementById("burst-tuning-wrap");
     function applyBurstTuningVisibility() {
-        burstTuningWrap.style.display = (highRes && showBursts) ? "" : "none";
+        burstTuningWrap.style.display =
+            (SHOW_BURST_TUNING && highRes && showBursts) ? "" : "none";
     }
     burstToggle.addEventListener("change", function() {
         showBursts = this.checked;
@@ -409,6 +416,35 @@
     const psdCanvas = document.getElementById("psd-canvas");
     const psdCtx = psdCanvas.getContext("2d");
     const psdTooltip = document.getElementById("psd-tooltip");
+
+    // --- Gate live-PSD streaming on visibility ---
+    function sendView() {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({type: "set_view", psd_visible: psdVisible}));
+        }
+    }
+    function setPsdVisible(v) {
+        if (v === psdVisible) return;
+        psdVisible = v;
+        sendView();
+    }
+    // Observe the whole live-charts group, not just the PSD canvas: the "psd"
+    // message also drives the time-series and waterfall charts in this group, so
+    // gating on the PSD canvas alone would freeze the waterfall when the user
+    // scrolls down to watch it. Stop streaming only when the entire group is
+    // off-screen (or the tab is hidden).
+    let psdInView = true;
+    const liveCharts =
+        psdCanvas.closest(".graph-group") || document.getElementById("psd-card");
+    if (liveCharts && "IntersectionObserver" in window) {
+        new IntersectionObserver(function(entries) {
+            psdInView = entries[0].isIntersecting;
+            setPsdVisible(psdInView && document.visibilityState === "visible");
+        }, {threshold: 0.01}).observe(liveCharts);
+    }
+    document.addEventListener("visibilitychange", function() {
+        setPsdVisible(document.visibilityState === "visible" && psdInView);
+    });
 
     let lastPowers = [];
     let lastMaxPowers = [];        // per-bin max across the chunk's PSD rows
@@ -883,6 +919,7 @@
             if (highRes) {
                 ws.send(JSON.stringify({type: "set_mode", high_res: true}));
             }
+            sendView();
         };
 
         ws.onmessage = function(evt) {

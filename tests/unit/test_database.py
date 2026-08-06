@@ -1,6 +1,6 @@
 """Tests for rfobserver.storage.database."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -368,8 +368,10 @@ async def test_cleanup_old_data(db):
 
 
 async def test_cleanup_covers_detections_stats_tone_checks(db):
-    old = (datetime.utcnow() - timedelta(days=30)).isoformat()
-    new = datetime.utcnow().isoformat()
+    # Use the tz-aware isoformat the pipeline actually stores (datetime.now(timezone.utc)
+    # in streaming/zms), so this exercises the real cutoff comparison, not a naive-only path.
+    old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    new = datetime.now(timezone.utc).isoformat()
     # one old + one recent row in each of the three growing tables
     for ts in (old, new):
         await db._db.execute(

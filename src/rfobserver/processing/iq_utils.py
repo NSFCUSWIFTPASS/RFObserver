@@ -74,8 +74,20 @@ class IQMoments:
 
 
 def moments_from_iq(data: np.ndarray) -> IQMoments:
-    """Compute additive power moments from a chunk of complex IQ data, full resolution."""
-    mag = np.abs(data).astype(np.float64)  # float64: exact sums over 10s of M samples
+    """Additive power moments. max is full-resolution (exact peak); the sums and
+    median histogram use a ~262K subsample so per-chunk cost stays realtime on
+    constrained sensors (folded over an interval this is a very large sample)."""
+    n_full = data.shape[0]
+    if n_full == 0:
+        return IQMoments(0, 0.0, 0.0, 0.0, 0.0, np.zeros(len(HIST_EDGES) - 1, dtype=np.int64))
+    # Full-resolution max power (no sqrt): max(re^2 + im^2)
+    re = data.real.astype(np.float64)
+    im = data.imag.astype(np.float64)
+    max_pow = float(np.max(re * re + im * im))
+    # Subsample everything else
+    step = max(1, n_full // (1 << 18))
+    sub = data[::step]
+    mag = np.abs(sub).astype(np.float64)
     p = mag * mag
     hist, _ = np.histogram(p, bins=HIST_EDGES)
     return IQMoments(
@@ -83,7 +95,7 @@ def moments_from_iq(data: np.ndarray) -> IQMoments:
         s_abs=float(mag.sum()),
         s_pow=float(p.sum()),
         s_pow2=float(np.dot(p, p)),
-        max_pow=float(p.max()) if mag.size else 0.0,
+        max_pow=max_pow,
         hist=hist.astype(np.int64),
     )
 

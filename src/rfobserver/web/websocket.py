@@ -82,11 +82,23 @@ async def websocket_endpoint(websocket: WebSocket, broadcast: LiveBroadcast) -> 
                 sub.wants_psd = bool(msg.get("psd_visible", True))
                 logger.info("Client set wants_psd=%s", sub.wants_psd)
 
+    tasks = [asyncio.create_task(send_loop()), asyncio.create_task(recv_loop())]
     try:
-        await asyncio.gather(send_loop(), recv_loop())
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+        # surface a non-cancel, non-disconnect error from a finished task
+        for t in done:
+            exc = t.exception()
+            if exc and not isinstance(exc, (WebSocketDisconnect, asyncio.CancelledError)):
+                raise exc
     except WebSocketDisconnect:
         pass
     except Exception:
         logger.exception("WebSocket handler error")
     finally:
+        for t in tasks:
+            t.cancel()
+        with contextlib.suppress(BaseException):
+            await asyncio.gather(*tasks, return_exceptions=True)
         broadcast.unsubscribe(sub)

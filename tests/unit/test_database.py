@@ -1,10 +1,14 @@
 """Tests for rfobserver.storage.database."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from rfobserver.storage.database import SensorDatabase
+
+
+def _dt(i: int) -> datetime:
+    return datetime(2026, 1, 1, 0, 0, i)
 
 
 @pytest.fixture
@@ -363,6 +367,36 @@ async def test_cleanup_old_data(db):
     assert results[0]["burst_id"] == "new"
 
 
+async def test_cleanup_covers_detections_stats_tone_checks(db):
+    # Use the tz-aware isoformat the pipeline actually stores (datetime.now(timezone.utc)
+    # in streaming/zms), so this exercises the real cutoff comparison, not a naive-only path.
+    old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    new = datetime.now(timezone.utc).isoformat()
+    # one old + one recent row in each of the three growing tables
+    for ts in (old, new):
+        await db._db.execute(
+            "INSERT INTO detections (burst_id,start_time,stop_time,center_freq_hz,"
+            "bandwidth_hz,peak_power_db,duration_ms,detection_timestamp) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (ts, ts, ts, 1e6, 1e3, -50.0, 1.0, ts),
+        )
+        await db._db.execute("INSERT INTO stats (timestamp,data) VALUES (?,?)", (ts, "{}"))
+        await db._db.execute(
+            "INSERT INTO tone_checks (timestamp,tone_freq_hz,sdr_center_freq_hz,"
+            "in_band,tone_power_db,noise_floor_db,snr_db,detected) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (ts, 1e6, 1e6, 1, -50.0, -90.0, 40.0, 1),
+        )
+    await db._db.commit()
+
+    deleted = await db.cleanup_old_data(days=7)
+    assert deleted == 3  # one old row per table
+
+    for tbl in ("detections", "stats", "tone_checks"):
+        async with db._db.execute(f"SELECT COUNT(*) FROM {tbl}") as c:
+            assert (await c.fetchone())[0] == 1  # recent row survives
+
+
 async def test_tone_check_roundtrips(db):
     await db.insert_tone_check(
         timestamp=datetime(2026, 1, 1, 12, 0, 0),
@@ -392,3 +426,26 @@ async def test_tone_check_roundtrips(db):
     detected_row = next(r for r in rows if r["detected"])
     assert detected_row["tone_freq_hz"] == 915.5e6
     assert abs(detected_row["snr_db"] - 50.0) < 1e-6
+
+
+async def test_count_detections_is_monotonic_marker(db):
+    assert await db.count_detections() == 0  # empty -> 0
+
+    for i in range(3):
+        await db.insert_detection(
+            burst_id=f"b{i}",
+            start_time=_dt(i),
+            stop_time=_dt(i),
+            center_freq_hz=1e6,
+            bandwidth_hz=1e3,
+            peak_power_db=-50.0,
+            duration_ms=1.0,
+            detection_timestamp=_dt(i),
+        )
+    m3 = await db.count_detections()
+    assert m3 == 3  # MAX(id) after 3 inserts
+
+    # monotonic across a delete of the oldest row (marker must not go backward)
+    await db._db.execute("DELETE FROM detections WHERE id = 1")
+    await db._db.commit()
+    assert await db.count_detections() == m3  # still 3 (MAX(id) unchanged)

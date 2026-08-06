@@ -96,6 +96,10 @@ class AppSettings(BaseSettings):
     DB_PATH: str = "/tmp/rfobserver/rfobserver.db"
     ARCHIVE_MAX_GB: float = 50.0
     HISTORY_DAYS: int = 7
+    # Scheduled DB retention: rows older than DB_RETENTION_DAYS are pruned
+    # every DB_CLEANUP_INTERVAL_SEC (0 disables the retention loop).
+    DB_RETENTION_DAYS: int = 7
+    DB_CLEANUP_INTERVAL_SEC: float = 3600.0
 
     # WebUI
     WEB_HOST: str = "0.0.0.0"

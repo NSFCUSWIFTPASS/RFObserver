@@ -127,6 +127,8 @@ async def run(settings: AppSettings) -> None:
     if settings.WEB_PORT > 0:
         tasks.append(_run_web_server(settings, supervisor, db, broadcast))
         tasks.append(_heartbeat_loop(settings, supervisor, db, local_storage, broadcast))
+    if settings.DB_RETENTION_DAYS > 0:
+        tasks.append(_cleanup_loop(settings, db))
     # Keep the process alive even in Standby / headless (no web) mode; the
     # supervisor owns the processor task independently of this gather.
     tasks.append(asyncio.Event().wait())
@@ -210,6 +212,27 @@ async def _heartbeat_loop(
             logger.exception("Heartbeat publish failed; continuing")
 
         await asyncio.sleep(interval_sec)
+
+
+async def _cleanup_loop(settings: AppSettings, db: Any) -> None:
+    """Scheduled DB retention: prune rows older than DB_RETENTION_DAYS.
+
+    Runs one cleanup immediately, then repeats every
+    ``DB_CLEANUP_INTERVAL_SEC``. Each pass is wrapped in try/except so a
+    transient DB error never kills the process (the pipeline keeps running).
+    """
+    while True:
+        try:
+            removed = await db.cleanup_old_data(settings.DB_RETENTION_DAYS)
+            logger.info(
+                "Retention: pruned %d rows older than %d days",
+                removed,
+                settings.DB_RETENTION_DAYS,
+            )
+        except Exception:
+            logger.exception("Retention cleanup failed; continuing")
+
+        await asyncio.sleep(settings.DB_CLEANUP_INTERVAL_SEC)
 
 
 async def _run_web_server(

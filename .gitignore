@@ -48,3 +48,6 @@ CLAUDE.md
 
 # Reference software (private, not distributed)
 reference_software/
+
+# Superpowers subagent-driven-development scratch (coordinator ledger)
+.superpowers/

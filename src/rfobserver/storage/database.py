@@ -388,16 +388,18 @@ class SensorDatabase:
             return [dict(row) for row in rows]
 
     async def count_detections(self) -> int:
-        """Return the total number of rows in the detections table.
+        """Monotonic change-marker for the detections table (O(1)).
 
-        Used by the WebSocket heartbeat as a monotonic counter — clients
-        refresh the detections table when this increments instead of polling
-        the HTML endpoint on a fixed interval.
+        Used only by the heartbeat as a "did a new detection arrive" trigger
+        (clients refresh when it increments), so the exact value is
+        irrelevant; MAX(id) is O(1) via the integer PK and stays monotonic
+        across retention deletes (SQLite does not reuse rowids without
+        VACUUM).
         """
         assert self._db is not None
-        async with self._db.execute("SELECT COUNT(*) FROM detections") as cursor:
+        async with self._db.execute("SELECT MAX(id) FROM detections") as cursor:
             row = await cursor.fetchone()
-            return int(row[0]) if row else 0
+            return int(row[0]) if row and row[0] is not None else 0
 
     async def set_config(self, key: str, value: str) -> None:
         assert self._db is not None

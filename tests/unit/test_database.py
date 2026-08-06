@@ -7,6 +7,10 @@ import pytest
 from rfobserver.storage.database import SensorDatabase
 
 
+def _dt(i: int) -> datetime:
+    return datetime(2026, 1, 1, 0, 0, i)
+
+
 @pytest.fixture
 async def db(tmp_path):
     database = SensorDatabase(str(tmp_path / "test.db"))
@@ -392,3 +396,26 @@ async def test_tone_check_roundtrips(db):
     detected_row = next(r for r in rows if r["detected"])
     assert detected_row["tone_freq_hz"] == 915.5e6
     assert abs(detected_row["snr_db"] - 50.0) < 1e-6
+
+
+async def test_count_detections_is_monotonic_marker(db):
+    assert await db.count_detections() == 0  # empty -> 0
+
+    for i in range(3):
+        await db.insert_detection(
+            burst_id=f"b{i}",
+            start_time=_dt(i),
+            stop_time=_dt(i),
+            center_freq_hz=1e6,
+            bandwidth_hz=1e3,
+            peak_power_db=-50.0,
+            duration_ms=1.0,
+            detection_timestamp=_dt(i),
+        )
+    m3 = await db.count_detections()
+    assert m3 == 3  # MAX(id) after 3 inserts
+
+    # monotonic across a delete of the oldest row (marker must not go backward)
+    await db._db.execute("DELETE FROM detections WHERE id = 1")
+    await db._db.commit()
+    assert await db.count_detections() == m3  # still 3 (MAX(id) unchanged)

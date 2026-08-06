@@ -424,7 +424,7 @@ class SensorDatabase:
         await self._db.commit()
 
     async def cleanup_old_data(self, days: int = 7) -> int:
-        """Remove detections and stats older than the given number of days."""
+        """Remove detections, stats, and tone_checks older than ``days`` days."""
         assert self._db is not None
         cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
 
@@ -432,9 +432,11 @@ class SensorDatabase:
         det_count = cursor.rowcount
         cursor = await self._db.execute("DELETE FROM stats WHERE timestamp < ?", (cutoff,))
         stats_count = cursor.rowcount
+        cursor = await self._db.execute("DELETE FROM tone_checks WHERE timestamp < ?", (cutoff,))
+        tc_count = cursor.rowcount
 
         await self._db.commit()
-        total: int = det_count + stats_count
+        total: int = det_count + stats_count + tc_count
         if total > 0:
             logger.info("Cleaned up %d old records (cutoff: %s)", total, cutoff)
         return total

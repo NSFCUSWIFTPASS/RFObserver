@@ -367,6 +367,34 @@ async def test_cleanup_old_data(db):
     assert results[0]["burst_id"] == "new"
 
 
+async def test_cleanup_covers_detections_stats_tone_checks(db):
+    old = (datetime.utcnow() - timedelta(days=30)).isoformat()
+    new = datetime.utcnow().isoformat()
+    # one old + one recent row in each of the three growing tables
+    for ts in (old, new):
+        await db._db.execute(
+            "INSERT INTO detections (burst_id,start_time,stop_time,center_freq_hz,"
+            "bandwidth_hz,peak_power_db,duration_ms,detection_timestamp) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (ts, ts, ts, 1e6, 1e3, -50.0, 1.0, ts),
+        )
+        await db._db.execute("INSERT INTO stats (timestamp,data) VALUES (?,?)", (ts, "{}"))
+        await db._db.execute(
+            "INSERT INTO tone_checks (timestamp,tone_freq_hz,sdr_center_freq_hz,"
+            "in_band,tone_power_db,noise_floor_db,snr_db,detected) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (ts, 1e6, 1e6, 1, -50.0, -90.0, 40.0, 1),
+        )
+    await db._db.commit()
+
+    deleted = await db.cleanup_old_data(days=7)
+    assert deleted == 3  # one old row per table
+
+    for tbl in ("detections", "stats", "tone_checks"):
+        async with db._db.execute(f"SELECT COUNT(*) FROM {tbl}") as c:
+            assert (await c.fetchone())[0] == 1  # recent row survives
+
+
 async def test_tone_check_roundtrips(db):
     await db.insert_tone_check(
         timestamp=datetime(2026, 1, 1, 12, 0, 0),

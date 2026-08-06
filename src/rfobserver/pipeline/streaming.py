@@ -34,7 +34,12 @@ import numpy as np
 
 from rfobserver.capture.buffer import CircularBuffer
 from rfobserver.processing.burst import BurstDetectionConfig
-from rfobserver.processing.iq_utils import calculate_iq_statistics, convert_sc16_to_complex
+from rfobserver.processing.iq_utils import (
+    IQMoments,
+    convert_sc16_to_complex,
+    finalize_moments,
+    moments_from_iq,
+)
 from rfobserver.processing.rolling_burst import RollingBurstDetector
 from rfobserver.processing.spectral import (
     PSDGridConfig,
@@ -66,6 +71,7 @@ class _StreamResult:
     __slots__ = (
         "summary_psd",
         "iq_stats",
+        "iq_moments",
         "bursts",
         "psd_grid",
         "center_freq_hz",
@@ -84,9 +90,11 @@ class _StreamResult:
         capture_num: int,
         process_ms: float,
         latency_ms: float,
+        iq_moments: IQMoments,
     ) -> None:
         self.summary_psd = summary_psd
         self.iq_stats = iq_stats
+        self.iq_moments = iq_moments
         self.bursts = bursts
         self.psd_grid = psd_grid
         self.center_freq_hz = center_freq_hz
@@ -101,6 +109,7 @@ class _ChunkResult:
     __slots__ = (
         "psd_grid",
         "iq_stats",
+        "iq_moments",
         "summary_psd",
         "center_freq_hz",
         "capture_num",
@@ -119,9 +128,11 @@ class _ChunkResult:
         recv_time: float,
         process_ms: float,
         sc16_buf: np.ndarray[Any, np.dtype[Any]],
+        iq_moments: IQMoments,
     ) -> None:
         self.psd_grid = psd_grid
         self.iq_stats = iq_stats
+        self.iq_moments = iq_moments
         self.summary_psd = summary_psd
         self.center_freq_hz = center_freq_hz
         self.capture_num = capture_num
@@ -960,7 +971,8 @@ class StreamingProcessor:
         psd_grid = compute_psd_grid(complex_chunk, self._settings.BANDWIDTH, config=grid_config)
         t_psd = time.monotonic()
 
-        iq_stats = calculate_iq_statistics(complex_chunk)
+        iq_moments = moments_from_iq(complex_chunk)
+        iq_stats = finalize_moments(iq_moments)
         t_stats = time.monotonic()
 
         summary_psd = compute_summary_psd(psd_grid, center_freq, self._settings.BANDWIDTH)
@@ -986,6 +998,7 @@ class StreamingProcessor:
             recv_time=recv_time,
             process_ms=process_ms,
             sc16_buf=sc16_buf,
+            iq_moments=iq_moments,
         )
 
     def _handle_chunk_result(self, cr: _ChunkResult) -> None:
@@ -1036,6 +1049,7 @@ class StreamingProcessor:
             capture_num=cr.capture_num,
             process_ms=cr.process_ms,
             latency_ms=latency_ms,
+            iq_moments=cr.iq_moments,
         )
 
         if self._loop is not None:
@@ -1175,6 +1189,7 @@ class StreamingProcessor:
         import numpy as _np
 
         accum_powers: list[list[float]] = []
+        accum_moments: IQMoments | None = None
         accum_start = time.monotonic()
         last_result: _StreamResult | None = None
 
@@ -1186,9 +1201,14 @@ class StreamingProcessor:
                 # Flush accumulator on timeout if data pending
                 if accum_powers and last_result is not None:
                     avg = _np.mean(accum_powers, axis=0).tolist()
+                    # accum_moments is folded right after each accum_powers.append,
+                    # so it is non-None whenever accum_powers is non-empty.
+                    assert accum_moments is not None
+                    interval_stats = finalize_moments(accum_moments)
                     await self._broadcast_averaged(avg, last_result, len(accum_powers))
-                    await self._publish_processed(avg, last_result)
+                    await self._publish_processed(avg, last_result, interval_stats)
                     accum_powers.clear()
+                    accum_moments = None
                     accum_start = time.monotonic()
                     last_result = None
                 continue
@@ -1207,14 +1227,22 @@ class StreamingProcessor:
             new_powers = result.summary_psd.powers
             if accum_powers and len(accum_powers[0]) != len(new_powers):
                 accum_powers.clear()
+                accum_moments = None
                 accum_start = time.monotonic()
                 last_result = None
             accum_powers.append(new_powers)
+            accum_moments = (
+                result.iq_moments if accum_moments is None else accum_moments.add(result.iq_moments)
+            )
             last_result = result
 
             elapsed = time.monotonic() - accum_start
             if elapsed >= self._settings.DURATION_SEC:
                 avg = _np.mean(accum_powers, axis=0).tolist()
+                # accum_moments is folded right after each accum_powers.append,
+                # so it is non-None whenever accum_powers is non-empty.
+                assert accum_moments is not None
+                interval_stats = finalize_moments(accum_moments)
 
                 if self._settings.TONE_CHECK_ENABLED:
                     await self._run_tone_check(avg, result)
@@ -1224,9 +1252,10 @@ class StreamingProcessor:
                     await self._broadcast_averaged(avg, result, len(accum_powers))
 
                 # ZMS + NATS always get DURATION_SEC-averaged data
-                await self._publish_processed(avg, result)
+                await self._publish_processed(avg, result, interval_stats)
 
                 accum_powers.clear()
+                accum_moments = None
                 accum_start = time.monotonic()
                 last_result = None
 
@@ -1317,7 +1346,7 @@ class StreamingProcessor:
         )
 
     def _build_envelope(
-        self, avg_powers: list[float], result: _StreamResult
+        self, avg_powers: list[float], result: _StreamResult, iq_stats: IQStatistics
     ) -> ProcessedDataEnvelope:
         """Construct a ProcessedDataEnvelope from a DURATION_SEC-averaged result.
 
@@ -1353,7 +1382,7 @@ class StreamingProcessor:
         )
         return ProcessedDataEnvelope(
             metadata=meta,
-            statistics=result.iq_stats,
+            statistics=iq_stats,
             psd_data=averaged_psd,
         )
 
@@ -1390,7 +1419,9 @@ class StreamingProcessor:
             f"{tc['noise_floor_db']:.1f}" if tc["noise_floor_db"] is not None else "n/a",
         )
 
-    async def _publish_processed(self, avg_powers: list[float], result: _StreamResult) -> None:
+    async def _publish_processed(
+        self, avg_powers: list[float], result: _StreamResult, iq_stats: IQStatistics
+    ) -> None:
         """Build the per-window envelope once, fan out to ZMS + NATS.
 
         Both fanouts run as background tasks so the consumer loop returns
@@ -1401,7 +1432,7 @@ class StreamingProcessor:
         if self._zms_monitor is None and self._nats_producer is None:
             return
         try:
-            envelope = self._build_envelope(avg_powers, result)
+            envelope = self._build_envelope(avg_powers, result, iq_stats)
         except Exception:
             logger.exception("Envelope construction failed (chunk #%d)", result.capture_num)
             return

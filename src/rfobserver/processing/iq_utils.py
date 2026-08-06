@@ -75,7 +75,7 @@ class IQMoments:
 
 def moments_from_iq(data: np.ndarray) -> IQMoments:
     """Additive power moments. max is full-resolution (exact peak); the sums and
-    median histogram use a ~262K subsample so per-chunk cost stays realtime on
+    median histogram use a ~64K strided subsample so per-chunk cost stays realtime on
     constrained sensors (folded over an interval this is a very large sample)."""
     n_full = data.shape[0]
     if n_full == 0:

@@ -5,6 +5,8 @@ Ported from rf_processor.iq_utils with rf-shared models vendored into rfobserver
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from rfobserver.models import IQStatistics
@@ -37,44 +39,87 @@ def convert_bytes_to_complex(iq_data_bytes: bytes) -> np.ndarray:
     return convert_sc16_to_complex(sc16)
 
 
-def calculate_iq_statistics(data: np.ndarray) -> IQStatistics:
-    """Compute power statistics from complex IQ data.
+_DB_OFFSET = -16.989700043360187  # 10*log10(50)
 
-    Power is |z|^2 / 50. The /50 is a constant -17 dB offset applied after
-    log10 to avoid allocating and writing a second full-length array.
+# Log-spaced |z|^2 bin edges (uniform in dB) for the streaming median. |z| is
+# normalized to [-1,1] so p=|z|^2 <= ~2; span well below the noise floor to +20 dB.
+HIST_EDGES = np.logspace(-12.0, 2.0, 4001)  # 4000 bins, ~0.035 dB each
 
-    All statistics are computed on a subsample (~262K samples) to keep this
-    function fast (~5ms) without meaningful accuracy loss for monitoring.
+
+@dataclass
+class IQMoments:
+    """Additive moments of an IQ chunk's power, foldable across chunks.
+
+    Accumulating these across chunks and calling ``finalize_moments`` on the
+    sum reproduces the whole-capture statistics exactly (histogram median is
+    an approximation to within one bin, ~0.035 dB).
     """
-    # Subsample for all stats — 262K samples is plenty for monitoring accuracy
-    step = max(1, len(data) // (1 << 18))
-    sub = data[::step]
 
-    # |z|^2 via abs+square (faster than real**2 + imag**2 due to memory access)
-    power_sq = np.abs(sub)
-    np.square(power_sq, out=power_sq)
+    n: int
+    s_abs: float
+    s_pow: float
+    s_pow2: float
+    max_pow: float
+    hist: np.ndarray  # int64 counts, len == len(HIST_EDGES) - 1
 
-    # dB relative to 50 ohm: 10*log10(|z|^2/50) = 10*log10(|z|^2) - 16.99
-    db_offset = -16.989700043360187  # 10*log10(50)
+    def add(self, other: IQMoments) -> IQMoments:
+        return IQMoments(
+            n=self.n + other.n,
+            s_abs=self.s_abs + other.s_abs,
+            s_pow=self.s_pow + other.s_pow,
+            s_pow2=self.s_pow2 + other.s_pow2,
+            max_pow=max(self.max_pow, other.max_pow),
+            hist=self.hist + other.hist,
+        )
 
-    mean_db = float(10.0 * np.log10(np.mean(power_sq)) + db_offset)
-    max_db = float(10.0 * np.log10(np.max(power_sq)) + db_offset)
-    median_db = float(10.0 * np.log10(np.median(power_sq)) + db_offset)
 
-    variance = np.mean(power_sq) - np.mean(sub.real) ** 2 - np.mean(sub.imag) ** 2
-    standard_dev = float(np.sqrt(max(0.0, variance)))
-
-    # Spectral kurtosis estimator: k = M * S2/S1^2 - 1, scaled by (M+1)/(M-1)
-    m = len(power_sq)
-    s1 = np.sum(power_sq)
-    s2 = float(np.dot(power_sq, power_sq))  # dot avoids allocating power_sq^2
-    k = m * s2 / (float(s1) ** 2) - 1.0
-    spec_kurtosis = float(k * (m + 1.0) / (m - 1.0))
-
-    return IQStatistics(
-        average=mean_db,
-        max=max_db,
-        median=median_db,
-        std=standard_dev,
-        kurtosis=spec_kurtosis,
+def moments_from_iq(data: np.ndarray) -> IQMoments:
+    """Compute additive power moments from a chunk of complex IQ data, full resolution."""
+    mag = np.abs(data).astype(np.float64)  # float64: exact sums over 10s of M samples
+    p = mag * mag
+    hist, _ = np.histogram(p, bins=HIST_EDGES)
+    return IQMoments(
+        n=int(mag.size),
+        s_abs=float(mag.sum()),
+        s_pow=float(p.sum()),
+        s_pow2=float(np.dot(p, p)),
+        max_pow=float(p.max()) if mag.size else 0.0,
+        hist=hist.astype(np.int64),
     )
+
+
+def _hist_median_pow(m: IQMoments) -> float:
+    total = int(m.hist.sum())
+    if total == 0:
+        return 0.0
+    cum = np.cumsum(m.hist)
+    idx = int(np.searchsorted(cum, (total + 1) / 2.0))
+    idx = min(idx, len(HIST_EDGES) - 2)
+    lo, hi = HIST_EDGES[idx], HIST_EDGES[idx + 1]
+    return float(np.sqrt(lo * hi))  # geometric center (bin midpoint in dB)
+
+
+def finalize_moments(m: IQMoments) -> IQStatistics:
+    """Turn accumulated moments into the final power statistics (dB relative to 50 ohm)."""
+    if m.n == 0:
+        return IQStatistics(average=0.0, max=0.0, median=0.0, std=0.0, kurtosis=0.0)
+    mean_pow = m.s_pow / m.n
+    mean_abs = m.s_abs / m.n
+    variance = max(0.0, mean_pow - mean_abs * mean_abs)  # Var(|z|) = E[|z|^2]-E[|z|]^2
+    average = 10.0 * np.log10(mean_pow) + _DB_OFFSET
+    max_db = 10.0 * np.log10(m.max_pow) + _DB_OFFSET
+    median_db = 10.0 * np.log10(_hist_median_pow(m)) + _DB_OFFSET
+    k = m.n * m.s_pow2 / (m.s_pow**2) - 1.0
+    kurtosis = k * (m.n + 1.0) / (m.n - 1.0) if m.n > 1 else k
+    return IQStatistics(
+        average=float(average),
+        max=float(max_db),
+        median=float(median_db),
+        std=float(np.sqrt(variance)),
+        kurtosis=float(kurtosis),
+    )
+
+
+def calculate_iq_statistics(data: np.ndarray) -> IQStatistics:
+    """Power statistics matching rf-processor (full resolution, no subsampling)."""
+    return finalize_moments(moments_from_iq(data))

@@ -8,9 +8,20 @@ import pytest
 from rfobserver.capture.mock_receiver import MockReceiver
 from rfobserver.capture.receiver import ReceiverConfig
 from rfobserver.processing.burst import BurstDetectionConfig
-from rfobserver.processing.iq_utils import convert_bytes_to_complex, convert_sc16_to_complex
+from rfobserver.processing.iq_utils import (
+    calculate_iq_statistics,
+    convert_bytes_to_complex,
+    convert_sc16_to_complex,
+    finalize_moments,
+    moments_from_iq,
+)
 from rfobserver.processing.rolling_burst import RollingBurstDetector
-from rfobserver.processing.spectral import PSDGridResult
+from rfobserver.processing.spectral import (
+    PSDGridConfig,
+    PSDGridResult,
+    compute_psd_grid,
+    compute_summary_psd,
+)
 
 # ---------------------------------------------------------------------------
 # Phase 1: SC16 conversion
@@ -196,3 +207,102 @@ class TestRollingBurstDetector:
 
         # Should detect at least one burst
         assert len(bursts) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Interval-accumulated envelope statistics
+# ---------------------------------------------------------------------------
+
+
+class TestIntervalEnvelopeStatistics:
+    def _make_processor(self, tmp_path):
+        from rfobserver.config import AppSettings
+        from rfobserver.pipeline.streaming import StreamingProcessor
+        from rfobserver.storage.database import SensorDatabase
+        from rfobserver.storage.local import LocalStorage
+
+        storage_path = tmp_path / "storage"
+        storage_path.mkdir()
+        settings = AppSettings(
+            FREQUENCY_START=915_000_000,
+            FREQUENCY_END=915_000_000,
+            BANDWIDTH=1_000_000,
+            DURATION_SEC=0.5,
+            GAIN=35,
+            NUM_FFT_BINS=64,
+            PSD_TIME_RESOLUTION_MS=0.5,
+            STREAMING_CHUNK_SLICES=10,
+            MOCK_RECEIVER=True,
+            STORAGE_PATH=str(storage_path),
+            DB_PATH=str(tmp_path / "test.db"),
+            ARCHIVE_MAX_GB=0.01,
+            _env_file=None,
+        )
+        rx_config = ReceiverConfig(
+            gain_db=settings.GAIN,
+            bandwidth_hz=settings.BANDWIDTH,
+            duration_sec=settings.DURATION_SEC,
+        )
+        rx = MockReceiver(receiver_config=rx_config)
+        rx.initialize()
+        proc = StreamingProcessor(
+            receiver=rx,
+            database=SensorDatabase(settings.DB_PATH),
+            local_storage=LocalStorage(
+                storage_path=settings.STORAGE_PATH, max_gb=settings.ARCHIVE_MAX_GB
+            ),
+            settings=settings,
+        )
+        return proc, settings
+
+    def _make_result(self, iq, center_freq, bandwidth):
+        from rfobserver.pipeline.streaming import _StreamResult
+
+        grid_config = PSDGridConfig(num_bins=64, time_resolution_ms=0.5, num_workers=1)
+        psd_grid = compute_psd_grid(iq, bandwidth, config=grid_config)
+        summary = compute_summary_psd(psd_grid, center_freq, bandwidth)
+        moments = moments_from_iq(iq)
+        return _StreamResult(
+            summary_psd=summary,
+            iq_stats=finalize_moments(moments),
+            bursts=[],
+            psd_grid=psd_grid,
+            center_freq_hz=center_freq,
+            capture_num=1,
+            process_ms=1.0,
+            latency_ms=1.0,
+            iq_moments=moments,
+        ), moments
+
+    def test_envelope_stats_are_interval_accumulated(self, tmp_path):
+        """The envelope uses the folded interval moments, not the last chunk."""
+        proc, settings = self._make_processor(tmp_path)
+        center_freq = settings.FREQUENCY_START
+        bandwidth = settings.BANDWIDTH
+
+        rng = np.random.default_rng(0)
+        n = 40_000
+        iq_lo = ((rng.standard_normal(n) + 1j * rng.standard_normal(n)) * 0.01).astype(np.complex64)
+        iq_hi = ((rng.standard_normal(n) + 1j * rng.standard_normal(n)) * 0.20).astype(np.complex64)
+
+        result_lo, m0 = self._make_result(iq_lo, center_freq, bandwidth)
+        result_hi, m1 = self._make_result(iq_hi, center_freq, bandwidth)
+
+        interval_stats = finalize_moments(m0.add(m1))
+
+        # Interval-accumulated average must differ from either chunk's own average.
+        assert abs(interval_stats.average - result_lo.iq_stats.average) > 0.5
+        assert abs(interval_stats.average - result_hi.iq_stats.average) > 0.5
+
+        # Folded moments equal the whole-array computation over the concatenation.
+        whole = calculate_iq_statistics(np.concatenate([iq_lo, iq_hi]))
+        assert abs(interval_stats.average - whole.average) < 1e-6
+        assert abs(interval_stats.kurtosis - whole.kurtosis) < 1e-6
+
+        avg_powers = result_hi.summary_psd.powers
+        envelope = proc._build_envelope(avg_powers, result_hi, interval_stats)
+
+        assert envelope.statistics.average == interval_stats.average
+        assert envelope.statistics.kurtosis == interval_stats.kurtosis
+        # NOT the last chunk's stats.
+        assert envelope.statistics.average != result_hi.iq_stats.average

@@ -22,8 +22,7 @@
     <div class="card-body">
         <p style="font-size:12px;opacity:0.7;margin:0;">
             When off, the sensor goes to Standby: capture and processing stop and the SDR is
-            released so another process can use it. The switch updates only after the backend
-            confirms the change.
+            released so another process can use it.
         </p>
     </div>
 </div>
@@ -142,7 +141,7 @@
             <div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px;">
                 Offset is added to raw dBFS/Hz so the spectrum and waterfall show absolute dBm/Hz.
                 Leave empty for uncalibrated dBFS display. Scale bounds pin the display range;
-                empty bounds auto-scale. Display only — published and stored data stay raw.
+                empty bounds auto-scale. Display only; published and stored data stay raw.
             </div>
         </div>
     </div>
@@ -299,7 +298,7 @@
 
 <!-- Map picker modal. Lazy-loads Leaflet from CDN on first open so the
      rest of the page doesn't carry the asset cost when the user never
-     touches the map. Geocoding uses OpenStreetMap Nominatim — no API
+     touches the map. Geocoding uses OpenStreetMap Nominatim; no API
      key, light-touch rate limit (1 req/s, enforced by debounce). -->
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
       integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
@@ -510,7 +509,7 @@
     connectStatusWs();
 
     // pollStatus() is used by the toggle handlers (below) to refresh the UI
-    // immediately after a mutation — heartbeat would catch up in ~1 s, but
+    // immediately after a mutation; heartbeat would catch up in ~1 s, but
     // mutation-feedback should be instant.
     async function pollStatus() {
         try {
@@ -606,7 +605,7 @@
     const applyBtn = modal.querySelector('.map-modal-apply');
     const overlay = modal.querySelector('.map-modal-overlay');
 
-    // Hat Creek Radio Observatory — sensible default for an empty config.
+    // Hat Creek Radio Observatory: sensible default for an empty config.
     const DEFAULT_LAT = 40.8258;
     const DEFAULT_LON = -121.4702;
 

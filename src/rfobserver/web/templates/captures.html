@@ -102,6 +102,11 @@
     // dBm/Hz the live view showed when recording. 0 / "dBFS" when uncalibrated.
     let viewerOffset = 0;
     let viewerUnit = "dBFS";
+    // Per-capture detections loaded from the independent sidecar
+    // (GET /captures/detections/<file>). Reset on every capture switch.
+    let viewerDetections = [];
+    let viewerDetPending = false;
+    let selectedDetection = null;
 
     const VIEW_ROWS = 400;     // waterfall viewport height in rows (1px/row)
     const PAGE = 500;          // rows fetched per request
@@ -167,6 +172,9 @@
                 loadPsdViewer(filename);
             } else {
                 closePsdWs();
+                viewerDetections = [];
+                viewerDetPending = false;
+                selectedDetection = null;
                 viewerContainer.style.display = "none";
                 viewerEl.innerHTML = "";
             }
@@ -203,6 +211,9 @@
         pageCache = new Map();
         pageLoading = new Set();
         viewerCrosshairBin = -1;
+        viewerDetections = [];
+        viewerDetPending = false;
+        selectedDetection = null;
 
         try {
             // The first page doubles as the metadata probe (total rows, time
@@ -229,9 +240,16 @@
             html += '<div class="viewer-label" id="viewer-wf-label"></div>';
             html += '<div class="viewer-wf-scroll" id="viewer-wf-scroll" style="height:' + viewH + 'px;">';
             html += '<div class="viewer-wf-spacer" style="height:' + totalRows + 'px;">';
+            // Both canvases live in a sticky wrapper pinned to the top of the
+            // scroll viewport so the overlay tracks the waterfall 1:1.
+            html += '<div class="viewer-wf-sticky" style="position:sticky;top:0;width:100%;height:'
+                + viewH + 'px;">';
             html += '<canvas id="viewer-wf" class="viewer-wf-canvas" width="920" height="' + viewH
-                + '" style="height:' + viewH + 'px;"></canvas>';
-            html += '</div></div>';
+                + '" style="height:' + viewH + 'px;position:absolute;top:0;left:0;"></canvas>';
+            html += '<canvas id="viewer-wf-overlay" width="920" height="' + viewH
+                + '" style="width:100%;height:' + viewH
+                + 'px;position:absolute;top:0;left:0;pointer-events:none;"></canvas>';
+            html += '</div></div></div>';
             html += '<div class="viewer-slider-row">';
             html += '<input type="range" id="viewer-slider" min="0" max="' + (viewH - 1)
                 + '" value="0" class="viewer-slider">';
@@ -248,12 +266,25 @@
             html += '<span class="legend-label">' + viewerMax.toFixed(0) + '</span>';
             html += '<span class="legend-label" style="margin-left:2px;">' + viewerUnit + '</span>';
             html += '</div>';
+
+            // Per-capture detections table (populated client-side from the
+            // sidecar). Rebuilt each time a capture is opened.
+            html += '<div class="viewer-label" style="margin-top:14px;">Detections</div>';
+            html += '<div class="card" style="padding:0;max-height:240px;overflow-y:auto;">';
+            html += '<table class="data-table"><thead><tr>'
+                + '<th>Time</th><th>Freq</th><th>Bandwidth</th><th>Duration</th><th>Peak</th>'
+                + '</tr></thead><tbody id="viewer-det-tbody">'
+                + '<tr><td colspan="5" class="placeholder-text">Loading detections...</td></tr>'
+                + '</tbody></table></div>';
             viewerEl.innerHTML = html;
 
             const scrollEl = document.getElementById("viewer-wf-scroll");
             const wfLabel = document.getElementById("viewer-wf-label");
             const wfCanvas = document.getElementById("viewer-wf");
             const wfCtx = wfCanvas.getContext("2d");
+            const overlayCanvas = document.getElementById("viewer-wf-overlay");
+            const overlayCtx = overlayCanvas.getContext("2d");
+            const detTbody = document.getElementById("viewer-det-tbody");
             const psdCanvas = document.getElementById("viewer-psd");
             const psdCtx = psdCanvas.getContext("2d");
             const psdTooltip = document.getElementById("viewer-psd-tooltip");
@@ -393,6 +424,65 @@
                 }
                 wfCtx.putImageData(img, 0, 0);
                 drawHighlight();
+                drawDetectionOverlay();
+            }
+
+            // Draw the detection boxes on the overlay canvas, aligned 1:1 with
+            // the waterfall. Vertical position from absolute rows (offset by the
+            // current scroll), horizontal from center +/- bandwidth/2 mapped
+            // across the freq axis onto width 920. Mirrors the dashboard's
+            // drawBurstOverlay. The selected detection gets a brighter stroke.
+            function drawDetectionOverlay() {
+                overlayCtx.clearRect(0, 0, 920, viewH);
+                if (!viewerDetections.length || !viewerFreqs || viewerFreqs.length < 2) return;
+                const fLow = viewerFreqs[0];
+                const fHigh = viewerFreqs[viewerFreqs.length - 1];
+                const fSpan = fHigh - fLow;
+                if (fSpan <= 0) return;
+                for (const det of viewerDetections) {
+                    const yTop = det.row_start - firstVisibleRow;
+                    const yBot = det.row_stop - firstVisibleRow;
+                    if (yBot < 0 || yTop > viewH) continue;
+                    let xLo = ((det.center_freq_hz - det.bandwidth_hz / 2) - fLow) / fSpan * 920;
+                    let xHi = ((det.center_freq_hz + det.bandwidth_hz / 2) - fLow) / fSpan * 920;
+                    xLo = Math.max(0, Math.min(920, xLo));
+                    xHi = Math.max(0, Math.min(920, xHi));
+                    const x = Math.min(xLo, xHi);
+                    const w = Math.max(2, Math.abs(xHi - xLo));
+                    const y = Math.max(0, yTop);
+                    const h = Math.max(2, Math.min(viewH, yBot) - y);
+                    const sel = (det === selectedDetection);
+                    overlayCtx.strokeStyle = sel ? "rgba(255,120,120,1)" : "rgba(255,60,60,0.9)";
+                    overlayCtx.lineWidth = sel ? 2 : 1.5;
+                    overlayCtx.strokeRect(x, y, w, h);
+                    overlayCtx.fillStyle = sel ? "rgba(255,60,60,0.18)" : "rgba(255,60,60,0.08)";
+                    overlayCtx.fillRect(x, y, w, h);
+                }
+            }
+
+            // Build the per-capture Detections table body from viewerDetections.
+            function buildDetectionsTable() {
+                if (!detTbody) return;
+                if (!viewerDetections.length) {
+                    const msg = viewerDetPending
+                        ? "Detections pending (still processing)"
+                        : "No detections in this capture";
+                    detTbody.innerHTML = '<tr><td colspan="5" class="placeholder-text">' + msg + '</td></tr>';
+                    return;
+                }
+                let h = '';
+                for (let i = 0; i < viewerDetections.length; i++) {
+                    const det = viewerDetections[i];
+                    const t = (det.row_start * viewerTimeRes).toFixed(3) + "s";
+                    const fHz = (det.peak_freq_hz != null) ? det.peak_freq_hz : det.center_freq_hz;
+                    const f = (fHz / 1e6).toFixed(3) + " MHz";
+                    const bw = (det.bandwidth_hz / 1e3).toFixed(1) + " kHz";
+                    const dur = det.duration_ms.toFixed(2) + " ms";
+                    const peak = det.peak_power_db.toFixed(1) + " dB";
+                    h += '<tr data-det-idx="' + i + '"><td>' + t + '</td><td>' + f + '</td><td>'
+                        + bw + '</td><td>' + dur + '</td><td>' + peak + '</td></tr>';
+                }
+                detTbody.innerHTML = h;
             }
 
             function drawViewerPSD(absRow) {
@@ -470,6 +560,34 @@
                     slider.dispatchEvent(new Event("input"));
                 }
             });
+
+            // Click a detection row -> center it in the waterfall, select its
+            // box, and sync the slider/PSD to its start row.
+            if (detTbody) {
+                detTbody.addEventListener("click", function(e) {
+                    const tr = e.target.closest("tr[data-det-idx]");
+                    if (!tr) return;
+                    const det = viewerDetections[parseInt(tr.dataset.detIdx)];
+                    if (!det) return;
+                    selectedDetection = det;
+                    detTbody.querySelectorAll("tr").forEach(function(r) {
+                        r.classList.remove("is-selected");
+                    });
+                    tr.classList.add("is-selected");
+
+                    scrollEl.scrollTop = Math.max(0, det.row_start - Math.floor(viewH / 2));
+                    firstVisibleRow = Math.max(0, Math.min(
+                        totalRows - viewH, Math.round(scrollEl.scrollTop)));
+                    rescopeSlider();
+                    updateLabel();
+                    slider.value = Math.min(parseInt(slider.max),
+                        Math.max(parseInt(slider.min), det.row_start));
+                    slider.dispatchEvent(new Event("input"));   // repaints wf + PSD
+                    ensureVisible(firstVisibleRow);
+                    renderWaterfall();
+                    drawDetectionOverlay();
+                });
+            }
 
             // PSD crosshair
             psdCanvas.addEventListener("mousemove", function(e) {
@@ -549,6 +667,26 @@
             updateLabel();
             renderWaterfall();
             drawViewerPSD(0);
+
+            // Load detections from the independent sidecar, then populate the
+            // table + overlay. Guarded against a capture switch mid-flight.
+            (async function loadDetections() {
+                try {
+                    const r = await fetch("/captures/detections/" + encodeURIComponent(filename));
+                    if (viewerFilename !== filename) return;   // superseded
+                    if (r.ok) {
+                        const dd = await r.json();
+                        if (viewerFilename !== filename) return;
+                        viewerDetections = dd.detections || [];
+                        viewerDetPending = !!dd.pending;
+                    }
+                } catch (_) {
+                    viewerDetections = [];
+                    viewerDetPending = false;
+                }
+                buildDetectionsTable();
+                drawDetectionOverlay();
+            })();
 
         } catch (_) {
             viewerEl.innerHTML = '<div class="placeholder-text">Failed to load PSD data</div>';

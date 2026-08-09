@@ -828,13 +828,22 @@ class StreamingProcessor:
         import json as _json
 
         s = self._settings
+        # Read tuning from the receiver's achieved config (same source and
+        # fallback the detection-insert path uses at _process_bursts), so the
+        # capture's sample_rate/gain exactly match the sdr_center_freq/
+        # sample_rate/gain stored on its detections. Hardware coerces requested
+        # settings to achievable values, so reading raw settings here would make
+        # the detections sidecar's exact-match filter silently return nothing.
+        rx_config = getattr(self._receiver, "config", None)
+        sample_rate_hz = float(getattr(rx_config, "bandwidth_hz", None) or s.BANDWIDTH)
+        gain_db = float(getattr(rx_config, "gain_db", None) or s.GAIN)
         meta = {
             "file": filename,
             "format": "sc16",
-            "sample_rate_hz": s.BANDWIDTH,
+            "sample_rate_hz": sample_rate_hz,
             "center_freq_hz": s.FREQUENCY_START,
-            "bandwidth_hz": s.BANDWIDTH,
-            "gain_db": s.GAIN,
+            "bandwidth_hz": sample_rate_hz,
+            "gain_db": gain_db,
             "start_time": datetime.fromtimestamp(
                 time.time() - duration, tz=timezone.utc
             ).isoformat(),

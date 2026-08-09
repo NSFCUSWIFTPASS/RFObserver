@@ -140,3 +140,17 @@ async def test_recent_capture_without_sidecar_is_pending(app_and_db):
     payload = r.json()
     assert payload["detections"] == []
     assert payload["pending"] is True
+
+
+@pytest.mark.asyncio
+async def test_nonexistent_capture_returns_404_and_writes_no_sidecar(app_and_db):
+    app, db, settings = app_and_db
+    # No capture seeded: the endpoint must 404 rather than fall through to
+    # write_sidecar (which would create a stray <base>.detections.json).
+    r = await _get(app, "/captures/detections/does-not-exist.sc16")
+    assert r.status_code == 404
+
+    from pathlib import Path
+
+    storage = Path(settings.STORAGE_PATH)
+    assert not (storage / "does-not-exist.detections.json").exists()

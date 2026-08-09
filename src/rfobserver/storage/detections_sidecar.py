@@ -93,6 +93,12 @@ async def build_sidecar_payload(sc16_path: Path, db: SensorDatabase) -> dict[str
     for row in rows:
         det_start = datetime.fromisoformat(row["start_time"]).timestamp()
         det_stop = datetime.fromisoformat(row["stop_time"]).timestamp()
+        # Clamp to [0, grid_rows]: a burst that starts in-window but ends after
+        # the capture's last row would otherwise map row_stop past the grid.
+        row_start = int(round((det_start - cap_start) / dur * grid_rows))
+        row_stop = int(round((det_stop - cap_start) / dur * grid_rows))
+        row_start = max(0, min(grid_rows, row_start))
+        row_stop = max(0, min(grid_rows, row_stop))
         detections.append(
             {
                 "start_time": row["start_time"],
@@ -102,8 +108,8 @@ async def build_sidecar_payload(sc16_path: Path, db: SensorDatabase) -> dict[str
                 "peak_freq_hz": row.get("peak_freq_hz"),
                 "peak_power_db": row["peak_power_db"],
                 "duration_ms": row["duration_ms"],
-                "row_start": int(round((det_start - cap_start) / dur * grid_rows)),
-                "row_stop": int(round((det_stop - cap_start) / dur * grid_rows)),
+                "row_start": row_start,
+                "row_stop": row_stop,
             }
         )
     out["detections"] = detections

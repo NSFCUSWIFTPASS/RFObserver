@@ -442,6 +442,20 @@ body {
     border-bottom: none;
 }
 
+/* Per-capture Detections table: clickable rows, selected row highlight */
+#viewer-det-tbody tr {
+    cursor: pointer;
+    transition: background 0.15s;
+}
+
+#viewer-det-tbody tr:hover td {
+    background: rgba(0, 113, 227, 0.04);
+}
+
+#viewer-det-tbody tr.is-selected td {
+    background: rgba(0, 113, 227, 0.1);
+}
+
 /* Graph stack layout */
 .graph-stack {
     display: flex;

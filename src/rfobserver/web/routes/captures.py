@@ -260,6 +260,9 @@ async def capture_detections(request: Request, filename: str) -> dict[str, Any]:
         if cached is not None:
             return cached
 
+    if not sc16_path.exists():
+        raise HTTPException(status_code=404, detail="Capture not found")
+
     db = getattr(request.app.state, "database", None)
     grace = float(request.app.state.settings.DETECTIONS_SIDECAR_GRACE_SEC)
 

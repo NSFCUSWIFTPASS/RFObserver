@@ -246,9 +246,12 @@ class RollingBurstDetector:
         n_rows = t.abs_end - t.abs_start
         duration_sec = n_rows * self._time_resolution_s
         now = datetime.now(timezone.utc)
+        tres = self._time_resolution_s
+        start_time = now - timedelta(seconds=(self._total_rows_written - t.abs_start) * tres)
+        stop_time = now - timedelta(seconds=(self._total_rows_written - t.abs_end) * tres)
         return BurstFingerprint(
-            start_time=now - timedelta(seconds=duration_sec),
-            stop_time=now,
+            start_time=start_time,
+            stop_time=stop_time,
             center_freq_hz=t.center_freq_hz,
             peak_freq_hz=t.peak_freq_hz,
             bandwidth_hz=max(t.f_hi_hz - t.f_lo_hz, 0.0),

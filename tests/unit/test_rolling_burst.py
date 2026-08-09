@@ -90,6 +90,47 @@ def test_interior_burst_not_re_emitted_each_eval() -> None:
     assert abs(emitted[0].duration_ms - 40.0) <= 2.0
 
 
+def test_emitted_times_anchored_to_absolute_row_not_emission_time() -> None:
+    """start_time/stop_time must lag emission by the abs-row gap, not be ~now.
+
+    Geometry (window=100, eval=50, chunk=50, burst 40 rows at abs rows
+    78-118) reproduces the same "pending then complete" case used above: the
+    burst stops growing and is emitted on the THIRD chunk (abs rows 100-150),
+    well after its true abs_end (~118). At that point total_rows_written is
+    150, so the emitted stop_time should trail detection_timestamp by
+    roughly (150 - abs_end) * tres =~ 32 ms -- not ~0 ms, which is what the
+    old "now - duration" / "now" stamping produced.
+    """
+    tres = 0.001
+    num_bins = 64
+    grid = np.full((250, num_bins), -120.0, dtype=np.float32)
+    grid[78:118, 25:40] = 0.0  # 40-row burst, abs rows 78-118
+
+    det = _detector(window=100, eval_iv=50, num_bins=num_bins, tres_s=tres)
+    emitted = _feed_grid(det, grid, chunk=50, tres_s=tres)
+
+    assert len(emitted) == 1
+    b = emitted[0]
+
+    lag_stop_ms = (b.detection_timestamp - b.stop_time).total_seconds() * 1000.0
+    lag_start_ms = (b.detection_timestamp - b.start_time).total_seconds() * 1000.0
+
+    # Old code stamped stop_time == detection_timestamp (lag ~= 0) and
+    # start_time == detection_timestamp - duration. The new code must lag
+    # meaningfully behind emission because the burst finished growing well
+    # before the eval that emitted it (abs_end ~118, emitted with
+    # total_rows_written = 150).
+    assert lag_stop_ms > 15.0, (
+        f"stop_time should lag detection_timestamp by ~32ms (abs-row gap), "
+        f"got {lag_stop_ms:.1f} ms -- looks like emission-time stamping"
+    )
+    assert lag_stop_ms < 50.0, f"stop_time lag implausibly large: {lag_stop_ms:.1f} ms"
+    assert lag_start_ms > lag_stop_ms, "start_time must lag more than stop_time"
+
+    # start/stop lag difference must equal the reported duration (consistency).
+    assert abs((lag_start_ms - lag_stop_ms) - b.duration_ms) < 3.0
+
+
 def test_emitted_burst_carries_peak_freq_hz_of_strongest_constituent() -> None:
     """peak_freq_hz must track the peak-power bin, not the band midpoint.
 

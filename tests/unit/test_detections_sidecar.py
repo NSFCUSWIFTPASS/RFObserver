@@ -12,7 +12,13 @@ from rfobserver.storage.database import SensorDatabase
 
 CAP_START = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 DURATION_SEC = 10.0
+# Nominal PSD time resolution. Deliberately does NOT satisfy
+# ROWS * TRES == DURATION_SEC: rows * tres = 40 * 0.5 = 20s != 10s. The sidecar
+# must map detections proportionally (offset / duration * rows), NOT via the
+# nominal tres, and must report the effective tres (duration / rows).
 TRES = 0.5
+ROWS = 40
+EFF_TRES = DURATION_SEC / ROWS  # 0.25 s/row
 CENTER = 915e6
 SAMPLE_RATE = 56e6
 GAIN = 40.0
@@ -38,11 +44,11 @@ def _write_capture_meta(sc16_path, **overrides):
     sc16_path.with_suffix(".json").write_text(json.dumps(meta))
 
 
-def _write_psd_meta(sc16_path, time_resolution_s=TRES):
+def _write_psd_meta(sc16_path, time_resolution_s=TRES, rows=ROWS):
     from rfobserver.storage import psd_grid
 
     _raw, meta_path = psd_grid.grid_paths(sc16_path)
-    meta_path.write_text(json.dumps({"time_resolution_s": time_resolution_s}))
+    meta_path.write_text(json.dumps({"time_resolution_s": time_resolution_s, "rows": rows}))
 
 
 async def _insert(db, burst_id, start_time, stop_time, **overrides):
@@ -107,14 +113,17 @@ async def test_write_sidecar_filters_by_window_and_tuning(tmp_path, db):
     payload = await ds.write_sidecar(sc16, db)
 
     assert payload["capture_start_time"] == CAP_START.isoformat()
-    assert payload["time_resolution_s"] == TRES
+    # Effective resolution (duration / rows), NOT the nominal PSD tres.
+    assert payload["time_resolution_s"] == EFF_TRES
     assert payload["center_freq_hz"] == CENTER
     assert payload["sample_rate_hz"] == SAMPLE_RATE
     assert payload["gain_db"] == GAIN
     assert len(payload["detections"]) == 1
     det = payload["detections"][0]
-    assert det["row_start"] == 4  # round(2.0 / 0.5)
-    assert det["row_stop"] == 6  # round(3.0 / 0.5)
+    # Proportional mapping: offset / duration * rows. Under the old /tres math
+    # these would be 4 and 6 (round(2.0/0.5), round(3.0/0.5)).
+    assert det["row_start"] == 8  # round(2.0 / 10.0 * 40)
+    assert det["row_stop"] == 12  # round(3.0 / 10.0 * 40)
     assert det["center_freq_hz"] == CENTER
     assert det["peak_power_db"] == -30.0
 

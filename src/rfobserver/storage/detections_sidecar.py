@@ -54,22 +54,29 @@ async def build_sidecar_payload(sc16_path: Path, db: SensorDatabase) -> dict[str
     _raw_path, psd_meta_path = psd_grid.grid_paths(sc16_path)
     psd_meta = _read_json(psd_meta_path) or {}
 
-    tres = float(psd_meta.get("time_resolution_s", 0.0)) or None
     start_iso = meta.get("start_time")
     dur = float(meta.get("duration_sec", 0.0))
+    grid_rows = int(psd_meta.get("rows", 0))
+    # Effective time resolution: the PSD grid's nominal `time_resolution_s` does
+    # NOT satisfy rows * tres == duration_sec, so a nominal-tres row mapping
+    # places detections far outside the grid. Use a consistent effective
+    # resolution (duration / rows) for BOTH row placement here and the waterfall
+    # time axis, so detections queried within [start, start+dur] always land in
+    # [0, rows] and align with the grid the viewer shows.
+    eff_tres = (dur / grid_rows) if (dur and grid_rows > 0) else None
     center = meta.get("center_freq_hz")
     sample_rate = meta.get("sample_rate_hz")
     gain = meta.get("gain_db")
 
     out: dict[str, Any] = {
         "capture_start_time": start_iso,
-        "time_resolution_s": tres,
+        "time_resolution_s": eff_tres,
         "center_freq_hz": center,
         "sample_rate_hz": sample_rate,
         "gain_db": gain,
         "detections": [],
     }
-    if not (start_iso and tres and dur):
+    if not (start_iso and dur and grid_rows):
         return out
 
     start = datetime.fromisoformat(start_iso)
@@ -95,8 +102,8 @@ async def build_sidecar_payload(sc16_path: Path, db: SensorDatabase) -> dict[str
                 "peak_freq_hz": row.get("peak_freq_hz"),
                 "peak_power_db": row["peak_power_db"],
                 "duration_ms": row["duration_ms"],
-                "row_start": int(round((det_start - cap_start) / tres)),
-                "row_stop": int(round((det_stop - cap_start) / tres)),
+                "row_start": int(round((det_start - cap_start) / dur * grid_rows)),
+                "row_stop": int(round((det_stop - cap_start) / dur * grid_rows)),
             }
         )
     out["detections"] = detections

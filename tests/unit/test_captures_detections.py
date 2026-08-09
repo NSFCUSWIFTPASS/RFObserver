@@ -18,6 +18,10 @@ SAMPLE_RATE = 56e6
 GAIN = 40.0
 TRES = 0.5
 DURATION_SEC = 10.0
+# Grid rows chosen so the effective tres (duration / rows) equals the nominal
+# TRES, keeping the row assertions below independent of the tres-vs-effective
+# distinction (that distinction is exercised in test_detections_sidecar).
+ROWS = 20
 
 
 @pytest.fixture
@@ -55,7 +59,7 @@ def _seed_capture(settings, base, cap_start):
     }
     sc16.with_suffix(".json").write_text(json.dumps(meta))
     _raw, psd_meta_path = psd_grid.grid_paths(sc16)
-    psd_meta_path.write_text(json.dumps({"time_resolution_s": TRES}))
+    psd_meta_path.write_text(json.dumps({"time_resolution_s": TRES, "rows": ROWS}))
     return sc16
 
 

@@ -169,7 +169,7 @@
             if (hasPsd) {
                 viewerContainer.style.display = "";
                 viewerEl.innerHTML = '<div class="viewer-label">Loading PSD data...</div>';
-                loadPsdViewer(filename);
+                loadPsdViewer(filename, m.duration_sec);
             } else {
                 closePsdWs();
                 viewerDetections = [];
@@ -205,7 +205,7 @@
         }
     }
 
-    async function loadPsdViewer(filename) {
+    async function loadPsdViewer(filename, durationSec) {
         viewerFilename = filename;
         closePsdWs();
         pageCache = new Map();
@@ -222,8 +222,16 @@
             if (!first) { viewerEl.innerHTML = '<div class="placeholder-text">PSD data unavailable</div>'; return; }
 
             viewerFreqs = first.freq_axis;
-            viewerTimeRes = first.time_resolution_s;
             viewerTotalRows = first.total_rows;
+            // Effective time resolution: the PSD grid's nominal
+            // time_resolution_s does NOT satisfy total_rows * tres == duration,
+            // so labels/table Time (and the sidecar rows) drift out of the grid.
+            // Use duration / total_rows so the time axis matches the grid and
+            // the sidecar's proportional row placement. Fall back to the nominal
+            // PSD tres when duration or rows are unavailable.
+            viewerTimeRes = (durationSec && viewerTotalRows > 0)
+                ? (durationSec / viewerTotalRows)
+                : first.time_resolution_s;
             const calSet = typeof first.cal_offset_db === "number";
             viewerOffset = calSet ? first.cal_offset_db : 0;
             viewerUnit = calSet ? "dBm/Hz" : "dBFS";

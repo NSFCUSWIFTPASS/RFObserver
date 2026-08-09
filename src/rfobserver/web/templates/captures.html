@@ -270,6 +270,7 @@
             }
 
             let firstVisibleRow = 0;
+            let lastFirstVisibleRow = 0;        // for scroll-direction detection
             let currentNeeded = new Set([0]);   // pages the viewport needs (for LRU + async fills)
 
             const pageIndexFor = function(absRow) { return Math.floor(absRow / PAGE); };
@@ -327,6 +328,39 @@
                 }));
                 evict(needed);
                 return true;
+            }
+
+            // Prefetch pages beyond the currently-visible span in the scroll
+            // direction (2 ahead when scrolling forward, 1 behind when
+            // scrolling back). Reuses the same WS-request / HTTP-fallback
+            // path as ensureVisible and dedups via pageCache/pageLoading.
+            function prefetchPages(pages) {
+                const lastPage = pageIndexFor(totalRows - 1);
+                const toFetch = pages.filter(function(p) {
+                    return p >= 0 && p <= lastPage && !pageCache.has(p) && !pageLoading.has(p);
+                });
+                if (toFetch.length === 0) return;
+
+                if (psdWs && psdWs.readyState === WebSocket.OPEN) {
+                    const have = Array.from(pageCache.keys()).map(function(idx) { return idx * PAGE; });
+                    for (const p of toFetch) {
+                        pageLoading.add(p);
+                        psdWs.send(JSON.stringify({start: p * PAGE, count: PAGE, max_bins: 512, have: have}));
+                    }
+                    return;
+                }
+
+                // HTTP fallback (socket not open / errored).
+                toFetch.forEach(async function(p) {
+                    pageLoading.add(p);
+                    const resp = await fetchPageRaw(p * PAGE);
+                    pageLoading.delete(p);
+                    if (resp) {
+                        shiftRows(resp.grid);
+                        pageCache.set(p, resp.grid);
+                        evict(currentNeeded);
+                    }
+                });
             }
 
             function drawHighlight() {
@@ -398,6 +432,19 @@
                     renderWaterfall();          // repaint once fetched pages land
                     drawViewerPSD(parseInt(slider.value));
                 }
+
+                // Preload further ahead in the scroll direction than the
+                // visible span alone requires.
+                const dir = Math.sign(firstVisibleRow - lastFirstVisibleRow);
+                const lastVisibleRow = Math.min(totalRows - 1, firstVisibleRow + viewH - 1);
+                const firstPage = pageIndexFor(firstVisibleRow);
+                const lastPage = pageIndexFor(lastVisibleRow);
+                if (dir >= 0) {
+                    prefetchPages([lastPage + 1, lastPage + 2]);
+                } else {
+                    prefetchPages([firstPage - 1]);
+                }
+                lastFirstVisibleRow = firstVisibleRow;
             }
 
             scrollEl.addEventListener("scroll", function() {

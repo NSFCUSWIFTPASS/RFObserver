@@ -82,10 +82,11 @@ def test_ws_streams_meta_then_binary_window(client, seeded_filename):
 
         ws.send_json({"start": 0, "count": 2, "max_bins": 512})
 
-        # Requested window plus the bounded push-ahead neighbours arrive as
-        # binary frames (order is not guaranteed, so classify by start).
+        # Requested window plus the bounded push-ahead neighbours (+count,
+        # +2*count) arrive as binary frames (order is not guaranteed, so
+        # classify by start). Prev (-count) is out of range and skipped.
         frames = {}
-        for _ in range(2):
+        for _ in range(3):
             raw = ws.receive_bytes()
             s, count, num_bins = struct.unpack("<iii", raw[:12])
             rows = np.frombuffer(raw[12:], dtype="<f4").reshape(count, num_bins)
@@ -93,6 +94,7 @@ def test_ws_streams_meta_then_binary_window(client, seeded_filename):
 
         assert 0 in frames  # the requested window
         assert 2 in frames  # push-ahead next neighbour (start + count)
+        assert 4 in frames  # push-ahead 2-windows-ahead neighbour (start + 2*count)
 
         rows = frames[0]
         assert rows.shape[0] == 2
@@ -104,13 +106,15 @@ def test_ws_streams_meta_then_binary_window(client, seeded_filename):
 def test_ws_honours_have_to_skip_cached_neighbours(client, seeded_filename):
     with client.websocket_connect(f"/captures/ws/psd/{seeded_filename}") as ws:
         ws.receive_json()  # meta
-        # Request 1: client already has the next-neighbour window at start=2, so
-        # only the requested window (start=0) should come back (prev is negative).
-        ws.send_json({"start": 0, "count": 2, "max_bins": 512, "have": [2]})
-        # Request 2 acts as a fence: it serves start=4 (next=6 is out of range,
-        # prev=2 is in `have`). If the server wrongly emitted start=2 for request
-        # 1, it would arrive before the fence frame and be caught below.
-        ws.send_json({"start": 4, "count": 2, "max_bins": 512, "have": [0, 2]})
+        # Request 1: client already has the next and 2-ahead neighbours (start=2,
+        # start=4), so only the requested window (start=0) should come back
+        # (prev is negative).
+        ws.send_json({"start": 0, "count": 2, "max_bins": 512, "have": [2, 4]})
+        # Request 2 acts as a fence: it serves start=4 (next=6 and next-next=8 are
+        # out of range, prev=2 is in `have`). If the server wrongly emitted
+        # start=2 or start=4 for request 1, it would arrive before the fence
+        # frame and be caught below.
+        ws.send_json({"start": 4, "count": 2, "max_bins": 512, "have": [0, 2, 4]})
         starts = []
         for _ in range(2):
             raw = ws.receive_bytes()

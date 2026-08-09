@@ -237,8 +237,9 @@ async def capture_psd_ws(websocket: WebSocket, filename: str) -> None:
 
     Client sends JSON range requests ``{start, count, max_bins, have?}``; the
     server replies with a binary frame for the requested window, then proactively
-    for the next and previous windows (bounded to the grid, skipping any starts
-    the client lists in ``have``). Reached at ``/captures/ws/psd/{filename}``.
+    for the next window, the window two ahead, and the previous window (bounded
+    to the grid, skipping any starts the client lists in ``have``). Reached at
+    ``/captures/ws/psd/{filename}``.
     """
     storage = Path(websocket.app.state.settings.STORAGE_PATH)
     base = filename.replace(".sc16", "").replace(".npz", "")
@@ -296,9 +297,11 @@ async def capture_psd_ws(websocket: WebSocket, filename: str) -> None:
             max_bins = int(msg.get("max_bins", default_max_bins))
             have = {int(x) for x in msg.get("have", [])}
 
-            # Requested window first, then the bounded push-ahead neighbours.
+            # Requested window first, then the bounded push-ahead neighbours:
+            # next, two-ahead, then previous.
             await serve(start, count, max_bins, have, skip_have=False)
             await serve(start + count, count, max_bins, have, skip_have=True)
+            await serve(start + 2 * count, count, max_bins, have, skip_have=True)
             await serve(start - count, count, max_bins, have, skip_have=True)
     except WebSocketDisconnect:
         pass

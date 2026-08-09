@@ -276,6 +276,7 @@ class SensorDatabase:
         min_freq: float | None = None,
         max_freq: float | None = None,
         since: datetime | None = None,
+        until: datetime | None = None,
         sdr_center_freq: float | None = None,
         sample_rate: float | None = None,
         gain: float | None = None,
@@ -295,6 +296,9 @@ class SensorDatabase:
         if since is not None:
             conditions.append("start_time >= ?")
             params.append(since.isoformat())
+        if until is not None:
+            conditions.append("start_time < ?")
+            params.append(until.isoformat())
         # Exact-match SDR capture-context filters (categorize by tuning config).
         sdr_conditions, sdr_params = self._sdr_conditions(sdr_center_freq, sample_rate, gain)
         conditions.extend(sdr_conditions)

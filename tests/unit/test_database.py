@@ -315,6 +315,43 @@ async def test_query_detections_duration_range_is_half_open(db):
     assert durs == [80.0, 84.9]  # 79 excluded (< lo), 85 excluded (== hi, half-open)
 
 
+async def test_query_detections_until_is_half_open(db):
+    common = dict(
+        center_freq_hz=915e6,
+        bandwidth_hz=1e6,
+        peak_power_db=-30.0,
+        duration_ms=1000.0,
+    )
+    old = datetime(2026, 1, 1, 0, 0, 0)
+    mid = datetime(2026, 1, 1, 0, 0, 10)
+    new = datetime(2026, 1, 1, 0, 0, 20)
+    await db.insert_detection(
+        burst_id="old",
+        start_time=old,
+        stop_time=old,
+        detection_timestamp=old,
+        **common,
+    )
+    await db.insert_detection(
+        burst_id="mid",
+        start_time=mid,
+        stop_time=mid,
+        detection_timestamp=mid,
+        **common,
+    )
+    await db.insert_detection(
+        burst_id="new",
+        start_time=new,
+        stop_time=new,
+        detection_timestamp=new,
+        **common,
+    )
+
+    rows = await db.query_detections(since=old, until=new)
+    burst_ids = sorted(r["burst_id"] for r in rows)
+    assert burst_ids == ["mid", "old"]  # old included (>=), new excluded (< until)
+
+
 async def test_config_set_and_get(db):
     await db.set_config("gain", "35")
     value = await db.get_config("gain")

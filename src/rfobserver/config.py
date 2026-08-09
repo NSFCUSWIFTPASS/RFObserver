@@ -100,6 +100,11 @@ class AppSettings(BaseSettings):
     # every DB_CLEANUP_INTERVAL_SEC (0 disables the retention loop).
     DB_RETENTION_DAYS: int = 7
     DB_CLEANUP_INTERVAL_SEC: float = 3600.0
+    # Grace period after a recording stops before its detections sidecar
+    # (<base>.detections.json) is written, so late-arriving burst detections
+    # that fall inside the capture window are captured. The captures route
+    # treats a capture younger than this as "pending" if no sidecar exists yet.
+    DETECTIONS_SIDECAR_GRACE_SEC: float = 3.0
 
     # WebUI
     WEB_HOST: str = "0.0.0.0"

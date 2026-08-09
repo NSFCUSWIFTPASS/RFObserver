@@ -231,6 +231,55 @@ async def capture_psd(
     }
 
 
+@router.get("/detections/{filename}")
+async def capture_detections(request: Request, filename: str) -> dict[str, Any]:
+    """Return a capture's detections sidecar (`<base>.detections.json`).
+
+    Serves the sidecar file if it exists. Otherwise, if the capture ended more
+    than ``DETECTIONS_SIDECAR_GRACE_SEC`` ago and a database is wired, lazily
+    builds and writes the sidecar (backstop for captures whose record-stop
+    deferred write never ran). A still-fresh capture with no sidecar returns
+    ``{"detections": [], "pending": True}`` so the client can retry.
+    """
+    from datetime import datetime, timezone
+
+    from rfobserver.storage import detections_sidecar as ds
+
+    storage = _get_storage(request)
+    base = (
+        filename.replace(".sc16", "")
+        .replace(".detections", "")
+        .replace(".json", "")
+        .replace(".npz", "")
+    )
+    sc16_path = _validate_filename(base + ".sc16", storage)
+
+    sidecar = ds.sidecar_path(sc16_path)
+    if sidecar.exists():
+        cached = ds._read_json(sidecar)
+        if cached is not None:
+            return cached
+
+    db = getattr(request.app.state, "database", None)
+    grace = float(request.app.state.settings.DETECTIONS_SIDECAR_GRACE_SEC)
+
+    meta = ds._read_json(sc16_path.with_suffix(".json")) or {}
+    start_iso = meta.get("start_time")
+    dur = float(meta.get("duration_sec", 0.0))
+    too_new = False
+    if start_iso:
+        try:
+            end = datetime.fromisoformat(start_iso).timestamp() + dur
+            too_new = (datetime.now(timezone.utc).timestamp() - end) < grace
+        except ValueError:
+            too_new = False
+
+    if db is None or too_new:
+        return {"detections": [], "pending": True}
+
+    return await ds.write_sidecar(sc16_path, db)
+
+
 @router.websocket("/ws/psd/{filename}")
 async def capture_psd_ws(websocket: WebSocket, filename: str) -> None:
     """Stream PSD windows as binary frames, pushing scroll-ahead neighbours.

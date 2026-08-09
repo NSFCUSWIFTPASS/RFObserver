@@ -48,6 +48,8 @@ from rfobserver.processing.spectral import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from rfobserver.capture.receiver import IReceiver
     from rfobserver.config import AppSettings
     from rfobserver.models import BurstFingerprint, IQStatistics, ProcessedDataEnvelope, PSDData
@@ -791,6 +793,17 @@ class StreamingProcessor:
         # Write companion metadata JSON
         self._write_recording_metadata(base_name, duration)
 
+        # Schedule the detections sidecar (<base>.detections.json) after a grace
+        # period so late-arriving burst detections inside the capture window are
+        # persisted. This method runs off the event loop, so hand the coroutine
+        # back to the loop thread-safely; failures never affect recording.
+        if self._loop is not None and self._db is not None:
+            sc16 = self._storage.storage_path / base_name
+            grace = self._settings.DETECTIONS_SIDECAR_GRACE_SEC
+            self._loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self._deferred_sidecar(sc16, grace))
+            )
+
         logger.info(
             "Recording saved: %s (%d bytes, %.1fs, %d dropped)",
             base_name,
@@ -798,6 +811,17 @@ class StreamingProcessor:
             duration,
             self._recording_dropped,
         )
+
+    async def _deferred_sidecar(self, sc16_path: Path, grace: float) -> None:
+        """Write the detections sidecar after a grace delay (runs on the loop)."""
+        from rfobserver.storage.detections_sidecar import write_sidecar
+
+        try:
+            await asyncio.sleep(grace)
+            if self._db is not None:
+                await write_sidecar(sc16_path, self._db)
+        except Exception:
+            logger.exception("Detections sidecar write failed for %s", sc16_path.name)
 
     def _write_recording_metadata(self, filename: str, duration: float) -> None:
         """Write companion .json with capture metadata."""

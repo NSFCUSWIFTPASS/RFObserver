@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+import numpy as np
 import pytest
 
 from rfobserver.config import AppSettings
@@ -58,6 +60,52 @@ def test_replay_mode_begin_recording_is_noop(tmp_path):
     proc, _db, _zms, _nats = _proc(True, tmp_path)
     proc.start_recording()
     assert proc._recording_state == "idle"
+
+
+def _above_threshold_buf(n: int = 64) -> np.ndarray:
+    """SC16 buffer (packed int32) whose power is well above TRIGGER_THRESHOLD_DB."""
+    raw16 = np.full((n, 2), 30000, dtype=np.int16)
+    result: np.ndarray = raw16.view(np.int32).reshape(-1)
+    return result
+
+
+def test_replay_mode_arm_trigger_never_arms(tmp_path):
+    proc, _db, _zms, _nats = _proc(True, tmp_path)
+
+    proc.arm_trigger()
+    assert proc._recording_state == "idle"
+
+    buf = _above_threshold_buf()
+    before_qsize = proc._recording_queue.qsize()
+    proc._check_trigger_and_record(buf)
+    assert proc._recording_state == "idle"
+    assert proc._recording_queue.qsize() == before_qsize
+
+
+def test_replay_mode_check_trigger_inert_even_if_armed(tmp_path):
+    """Defense-in-depth: even if state were somehow 'armed', the trigger/record
+    path must stay fully inert under replay_mode (the reviewer-found leak)."""
+    proc, _db, _zms, _nats = _proc(True, tmp_path)
+    proc._recording_state = "armed"
+
+    buf = _above_threshold_buf()
+    before_qsize = proc._recording_queue.qsize()
+    proc._check_trigger_and_record(buf)
+
+    assert proc._recording_state == "armed"
+    assert not proc._trigger_initiated
+    assert proc._recording_queue.qsize() == before_qsize
+
+
+@pytest.mark.asyncio
+async def test_replay_mode_publish_processed_skips_egress(tmp_path, monkeypatch):
+    proc, _db, _zms, _nats = _proc(True, tmp_path)
+    mock_create_task = MagicMock()
+    monkeypatch.setattr(asyncio, "create_task", mock_create_task)
+
+    await proc._publish_processed([], MagicMock(), MagicMock())
+
+    mock_create_task.assert_not_called()
 
 
 def _fake_burst():

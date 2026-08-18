@@ -409,6 +409,8 @@ class StreamingProcessor:
 
     def start_recording(self) -> None:
         """Start recording IQ data immediately (manual mode)."""
+        if self._replay_mode:
+            return
         if self._recording_state == "recording":
             return
         self._trigger_initiated = False
@@ -416,6 +418,8 @@ class StreamingProcessor:
 
     def arm_trigger(self) -> None:
         """Arm the power trigger — recording starts when threshold is exceeded."""
+        if self._replay_mode:
+            return
         if self._recording_state == "recording":
             return
         self._recording_state = "armed"
@@ -584,6 +588,8 @@ class StreamingProcessor:
 
     def _check_trigger_and_record(self, sc16_buf: np.ndarray[Any, np.dtype[Any]]) -> None:
         """Handle recording and trigger logic for each chunk."""
+        if self._replay_mode:
+            return
         state = self._recording_state
 
         if state == "recording":

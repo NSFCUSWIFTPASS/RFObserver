@@ -835,6 +835,25 @@ body {
     color: #ff3b30;
 }
 
+/* Capture viewer's Re-detect panel: re-run burst detection on the capture's
+   stored PSD grid at custom thresholds, independent of when it was recorded.
+   Same accent tint as the dashboard's #replay-banner for visual consistency;
+   inputs/button reuse .form-row/.form-group/.btn-apply. */
+.redetect-panel {
+    display: grid;
+    gap: 12px;
+    padding: 12px 14px;
+    border-radius: var(--radius);
+    background: rgba(0, 113, 227, 0.08);
+    border: 1px solid rgba(0, 113, 227, 0.18);
+}
+
+.redetect-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
 .psd-badge {
     display: inline-block;
     font-size: 9px;
@@ -1184,4 +1203,13 @@ body {
     outline: none;
     border-color: var(--accent);
     box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.15);
+}
+
+/* Replay banner's own Record toggle (opt in/out of writing the active
+   replay's IQ to disk). Reuses .rec-btn / .rec-start / .rec-stop / pulse-red
+   from the live-SDR recording controls above so the two look identical. */
+.replay-banner-rec {
+    display: flex;
+    align-items: center;
+    gap: 6px;
 }

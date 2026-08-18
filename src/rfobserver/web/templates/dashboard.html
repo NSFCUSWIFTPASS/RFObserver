@@ -69,6 +69,10 @@
                     Burst Low Ratio
                     <input type="number" id="replay-banner-burst-low" step="0.05" min="0" max="1">
                 </label>
+                <span class="replay-banner-rec">
+                    <button type="button" id="replay-banner-record" class="rec-btn rec-start" title="Record this replay">Record</button>
+                    <span id="replay-banner-rec-status" class="rec-status-label"></span>
+                </span>
                 <button type="button" id="replay-banner-stop" class="rec-btn rec-stop">Stop</button>
             </div>
             <div id="wf-wrapper" style="position: relative;">
@@ -1073,6 +1077,8 @@
     const replayBannerTrigger = document.getElementById("replay-banner-trigger");
     const replayBannerBurstHigh = document.getElementById("replay-banner-burst-high");
     const replayBannerBurstLow = document.getElementById("replay-banner-burst-low");
+    const replayBannerRecord = document.getElementById("replay-banner-record");
+    const replayBannerRecStatus = document.getElementById("replay-banner-rec-status");
 
     function handleReplay(replay) {
         if (!replay) {
@@ -1178,6 +1184,53 @@
         }
     }
 
+    // Replay banner's own Record toggle: opt in/out of writing the active
+    // replay's IQ to disk (separate from the live-SDR rec/arm/stop controls
+    // above). State comes straight off the heartbeat's `recording` field, so
+    // it stays in sync even if the toggle was flipped from another tab.
+    let replayRecordBusy = false;
+    function updateReplayRecordUI(recording) {
+        const isRecording = !!recording && recording.state === "recording";
+        replayBannerRecord.textContent = isRecording ? "Stop record" : "Record";
+        replayBannerRecord.classList.toggle("rec-start", !isRecording);
+        replayBannerRecord.classList.toggle("rec-stop", isRecording);
+        if (isRecording) {
+            replayBannerRecStatus.innerHTML = '<span class="pulse-red"></span> '
+                + formatBytes(recording.bytes || 0) + " &middot; " + (recording.duration_sec || 0).toFixed(1) + "s";
+        } else {
+            replayBannerRecStatus.textContent = "";
+        }
+    }
+
+    replayBannerRecord.addEventListener("click", async function() {
+        if (replayRecordBusy) return;
+        replayRecordBusy = true;
+        const turningOn = !replayBannerRecord.classList.contains("rec-stop");
+        replayBannerRecord.disabled = true;
+        try {
+            const r = await fetch("/api/replay/record", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({on: turningOn}),
+            });
+            if (!r.ok) {
+                let detail = "Record toggle failed";
+                try {
+                    const err = await r.json();
+                    if (err && err.detail) detail = err.detail;
+                } catch (_) {}
+                replayBannerRecStatus.innerHTML = '<span class="replay-error">' + detail + '</span>';
+                return;
+            }
+            updateReplayRecordUI(await r.json());
+        } catch (_) {
+            replayBannerRecStatus.innerHTML = '<span class="replay-error">Record toggle failed</span>';
+        } finally {
+            replayBannerRecord.disabled = false;
+            replayRecordBusy = false;
+        }
+    });
+
     // Recording state + status bar arrive over /ws/live as a "heartbeat"
     // message (see ws.onmessage). No HTTP polling needed.
     let lastBurstSeqSeen = -1;
@@ -1203,6 +1256,9 @@
         }
         if (d.modules) {
             _renderModulesFrom(d.modules);
+        }
+        if (!replayRecordBusy) {
+            updateReplayRecordUI(d.recording);
         }
         handleReplay(d.replay);
         if (typeof d.detection_count === "number" && d.detection_count !== lastDetectionCount) {

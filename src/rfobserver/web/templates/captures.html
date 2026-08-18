@@ -342,6 +342,29 @@
                 + '</tr></thead><tbody id="viewer-det-tbody">'
                 + '<tr><td colspan="5" class="placeholder-text">Loading detections...</td></tr>'
                 + '</tbody></table></div>';
+
+            // Re-detect: re-run burst detection on this capture's stored PSD
+            // grid at custom thresholds, independent of when it was recorded.
+            html += '<div class="viewer-label" style="margin-top:14px;">Re-detect</div>';
+            html += '<div class="redetect-panel">';
+            html += '<div class="form-row">';
+            html += '<div class="form-group"><label for="redetect-threshold-high">Threshold High (dB)</label>'
+                + '<input type="number" id="redetect-threshold-high" step="0.5" value="40"></div>';
+            html += '<div class="form-group"><label for="redetect-threshold-low">Threshold Low Ratio</label>'
+                + '<input type="number" id="redetect-threshold-low" step="0.05" min="0" max="1" value="0.6"></div>';
+            html += '</div>';
+            html += '<div class="form-row">';
+            html += '<div class="form-group"><label for="redetect-noise-floor">Noise Floor Percentile</label>'
+                + '<input type="number" id="redetect-noise-floor" step="1" min="0" max="100" value="50"></div>';
+            html += '<div class="form-group"><label for="redetect-merge-time">Merge Time (ms)</label>'
+                + '<input type="number" id="redetect-merge-time" step="1" min="0" value="30"></div>';
+            html += '</div>';
+            html += '<div class="redetect-actions">';
+            html += '<button type="button" id="redetect-btn" class="btn-apply">Re-detect</button>';
+            html += '<span id="redetect-error" class="replay-error"></span>';
+            html += '</div>';
+            html += '</div>';
+
             viewerEl.innerHTML = html;
 
             const scrollEl = document.getElementById("viewer-wf-scroll");
@@ -351,6 +374,12 @@
             const overlayCanvas = document.getElementById("viewer-wf-overlay");
             const overlayCtx = overlayCanvas.getContext("2d");
             const detTbody = document.getElementById("viewer-det-tbody");
+            const redetectThresholdHigh = document.getElementById("redetect-threshold-high");
+            const redetectThresholdLow = document.getElementById("redetect-threshold-low");
+            const redetectNoiseFloor = document.getElementById("redetect-noise-floor");
+            const redetectMergeTime = document.getElementById("redetect-merge-time");
+            const redetectBtn = document.getElementById("redetect-btn");
+            const redetectError = document.getElementById("redetect-error");
             const psdCanvas = document.getElementById("viewer-psd");
             const psdCtx = psdCanvas.getContext("2d");
             const psdTooltip = document.getElementById("viewer-psd-tooltip");
@@ -736,7 +765,10 @@
 
             // Load detections from the independent sidecar, then populate the
             // table + overlay. Guarded against a capture switch mid-flight.
-            (async function loadDetections() {
+            // Named (rather than the previous anonymous IIFE) so the Re-detect
+            // button below can call it again after POSTing new thresholds,
+            // reusing this same load + draw path instead of duplicating it.
+            async function loadDetections() {
                 try {
                     const r = await fetch("/captures/detections/" + encodeURIComponent(filename));
                     if (viewerFilename !== filename) return;   // superseded
@@ -745,6 +777,10 @@
                         if (viewerFilename !== filename) return;
                         viewerDetections = dd.detections || [];
                         viewerDetPending = !!dd.pending;
+                        if (redetectThresholdHigh && dd.params
+                                && typeof dd.params.threshold_high_db === "number") {
+                            redetectThresholdHigh.value = dd.params.threshold_high_db;
+                        }
                     }
                 } catch (_) {
                     viewerDetections = [];
@@ -752,7 +788,51 @@
                 }
                 buildDetectionsTable();
                 drawDetectionOverlay();
-            })();
+            }
+            loadDetections();
+
+            // Re-detect: POST the panel's thresholds against this capture's
+            // stored PSD grid, then reload the sidecar via loadDetections()
+            // (above) so the overlay + table refresh in place without
+            // duplicating the drawing logic.
+            if (redetectBtn) {
+                redetectBtn.addEventListener("click", async function() {
+                    if (viewerFilename !== filename) return;
+                    redetectError.textContent = "";
+                    redetectBtn.disabled = true;
+                    const prevLabel = redetectBtn.textContent;
+                    redetectBtn.textContent = "Re-detecting...";
+                    try {
+                        const body = {
+                            threshold_high_db: parseFloat(redetectThresholdHigh.value),
+                            threshold_low_ratio: parseFloat(redetectThresholdLow.value),
+                            noise_floor_percentile: parseFloat(redetectNoiseFloor.value),
+                            merge_time_ms: parseFloat(redetectMergeTime.value),
+                        };
+                        const r = await fetch("/captures/redetect/" + encodeURIComponent(filename), {
+                            method: "POST",
+                            headers: {"Content-Type": "application/json"},
+                            body: JSON.stringify(body),
+                        });
+                        if (!r.ok) {
+                            let detail = "Re-detect failed";
+                            try {
+                                const err = await r.json();
+                                if (err && err.detail) detail = err.detail;
+                            } catch (_) {}
+                            redetectError.textContent = detail;
+                            return;
+                        }
+                        if (viewerFilename !== filename) return;   // superseded mid-flight
+                        await loadDetections();
+                    } catch (_) {
+                        redetectError.textContent = "Re-detect failed";
+                    } finally {
+                        redetectBtn.disabled = false;
+                        redetectBtn.textContent = prevLabel;
+                    }
+                });
+            }
 
         } catch (_) {
             viewerEl.innerHTML = '<div class="placeholder-text">Failed to load PSD data</div>';

@@ -118,3 +118,25 @@ def test_replay_receiver_reproduces_then_exhausts(tmp_path):
     for _ in range(10):
         rx.recv_chunk(out)
     assert rx.exhausted
+
+
+def test_parse_capture_filename_hcro_convention():
+    from rfobserver.capture.sigmf_reader import parse_capture_filename
+
+    name = (
+        "iq_capture_hcro-rpi-002_2025-12-12T19-33-52.92Z_915MHz_26.0Msps_20.0s_35dB"
+        "_ssm_fhss_OVF.dat"
+    )
+    p = parse_capture_filename(name)
+    assert p["center_freq_hz"] == 915e6
+    assert p["sample_rate_hz"] == 26.0e6
+    assert p["duration_sec"] == 20.0
+    assert p["gain_db"] == 35.0
+
+
+def test_parse_capture_filename_missing_fields_omitted():
+    from rfobserver.capture.sigmf_reader import parse_capture_filename
+
+    assert parse_capture_filename("random_file.dat") == {}
+    p = parse_capture_filename("x_915MHz_26.0Msps.dat")
+    assert p == {"center_freq_hz": 915e6, "sample_rate_hz": 26.0e6}

@@ -10,6 +10,7 @@ are streamed, not loaded into RAM. Supports the two datatypes our captures use:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -113,6 +114,27 @@ def load_raw(
         raw=raw,
         meta={"raw": True},
     )
+
+
+def parse_capture_filename(name: str) -> dict[str, float]:
+    """Extract tuning params from the HCRO capture-filename convention.
+
+    Matches `_<c>MHz_`, `_<sr>Msps_`, `_<dur>s_`, `_<gain>dB_` (any subset),
+    returning Hz / seconds / dB. Keys with no match are omitted so callers can
+    prefill a form and leave the rest editable.
+    """
+    out: dict[str, float] = {}
+    patterns = {
+        "center_freq_hz": (r"_(\d+(?:\.\d+)?)MHz", 1e6),
+        "sample_rate_hz": (r"_(\d+(?:\.\d+)?)Msps", 1e6),
+        "duration_sec": (r"_(\d+(?:\.\d+)?)s(?:_|\.)", 1.0),
+        "gain_db": (r"_(\d+(?:\.\d+)?)dB", 1.0),
+    }
+    for key, (pat, scale) in patterns.items():
+        m = re.search(pat, name)
+        if m is not None:
+            out[key] = float(m.group(1)) * scale
+    return out
 
 
 def to_sc16_int32(

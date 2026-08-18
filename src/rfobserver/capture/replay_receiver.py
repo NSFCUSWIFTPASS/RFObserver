@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -33,6 +34,11 @@ class FileReplayReceiver(MockReceiver):
         capture: SigmfCapture,
         receiver_config: ReceiverConfig,
         max_samples: int | None = None,
+        *,
+        paced: bool = False,
+        loop: bool = False,
+        speed: float = 1.0,
+        source_name: str = "",
     ) -> None:
         super().__init__(receiver_config=receiver_config)
         self._cap = capture
@@ -41,6 +47,11 @@ class FileReplayReceiver(MockReceiver):
         self._n = (
             capture.num_samples if max_samples is None else min(capture.num_samples, max_samples)
         )
+        self._paced = paced
+        self.loop = loop
+        self.source_name = source_name
+        self._speed_lock = threading.Lock()
+        self._speed = max(0.01, float(speed))
         self._exhausted = threading.Event()
         self._drain_rng = np.random.default_rng(0)
         # Estimate the capture's NOISE FLOOR (not RMS) so trailing drain noise
@@ -63,6 +74,15 @@ class FileReplayReceiver(MockReceiver):
     def exhausted(self) -> bool:
         return self._exhausted.is_set()
 
+    @property
+    def speed(self) -> float:
+        with self._speed_lock:
+            return self._speed
+
+    def set_speed(self, speed: float) -> None:
+        with self._speed_lock:
+            self._speed = max(0.01, float(speed))
+
     def _fill_drain(self, out_buf: np.ndarray[Any, np.dtype[Any]], start: int = 0) -> None:
         n = len(out_buf) - start
         if n <= 0:
@@ -77,16 +97,28 @@ class FileReplayReceiver(MockReceiver):
 
     def recv_chunk(self, out_buf: np.ndarray[Any, np.dtype[Any]]) -> int:
         n = len(out_buf)  # samples requested
-        remaining = self._n - self._pos
-        if remaining <= 0:
-            self._exhausted.set()
-            self._fill_drain(out_buf)
-            return n
-        take = min(n, remaining)
-        sl = self._cap.raw[self._pos * 2 : (self._pos + take) * 2]
-        out_buf[:take] = to_sc16_int32(sl, self._cap.datatype)
-        if take < n:
-            self._fill_drain(out_buf, start=take)
-            self._exhausted.set()
-        self._pos += take
+        filled = 0
+        while filled < n:
+            remaining = self._n - self._pos
+            if remaining <= 0:
+                if self.loop:
+                    self._pos = 0
+                    remaining = self._n
+                    if remaining <= 0:
+                        break
+                else:
+                    self._exhausted.set()
+                    self._fill_drain(out_buf, start=filled)
+                    filled = n
+                    break
+            take = min(n - filled, remaining)
+            sl = self._cap.raw[self._pos * 2 : (self._pos + take) * 2]
+            out_buf[filled : filled + take] = to_sc16_int32(sl, self._cap.datatype)
+            self._pos += take
+            filled += take
+        if self._paced:
+            # Pace to wall-clock: n samples at sample_rate * speed.
+            delay = n / (self._cap.sample_rate_hz * self.speed)
+            if delay > 0:
+                time.sleep(delay)
         return n

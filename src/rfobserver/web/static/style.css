@@ -1116,7 +1116,7 @@ body {
     font-style: italic;
 }
 
-/* Dashboard replay banner — shown only while a capture/raw-file replay is
+/* Dashboard replay banner: shown only while a capture/raw-file replay is
    driving the pipeline in place of the live SDR. Hidden by default; toggled
    via inline display in dashboard.html's heartbeat handler. */
 #replay-banner {

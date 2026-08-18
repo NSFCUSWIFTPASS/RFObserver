@@ -237,6 +237,10 @@ class StreamingProcessor:
         # never pollutes the DB or emits upstream. The live _broadcast path
         # is untouched by this flag.
         self._replay_mode = replay_mode
+        # Opt-in: even under replay_mode, an explicit manual record can be
+        # allowed to write a real .sc16 (the replayed capture becomes a real
+        # capture on disk). Off by default; set via set_replay_recording().
+        self._replay_record = False
 
         total_cores = os.cpu_count() or 4
         self._num_proc_workers = max(1, total_cores - 3)
@@ -407,9 +411,13 @@ class StreamingProcessor:
         self._config_generation += 1
         logger.info("Reconfiguration requested (gen=%d)", self._config_generation)
 
+    def set_replay_recording(self, on: bool) -> None:
+        """Opt in/out of recording during replay (manual record only)."""
+        self._replay_record = bool(on)
+
     def start_recording(self) -> None:
         """Start recording IQ data immediately (manual mode)."""
-        if self._replay_mode:
+        if self._replay_mode and not self._replay_record:
             return
         if self._recording_state == "recording":
             return
@@ -651,7 +659,11 @@ class StreamingProcessor:
 
     def _begin_recording(self) -> None:
         """Start recording: allocate RAM buffer or start disk writer."""
-        if self._replay_mode:
+        # The trigger path (arm_trigger / _check_trigger_and_record) already
+        # gates itself before ever calling this, so this gate in practice only
+        # guards the manual start_recording() call chain -- and must let it
+        # through once the user has opted in via set_replay_recording(True).
+        if self._replay_mode and not self._replay_record:
             return
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         self._recording_file = f"{self._receiver.serial}-{self._settings.HOSTNAME}-{ts}.sc16"
@@ -828,12 +840,28 @@ class StreamingProcessor:
         )
 
     async def _deferred_sidecar(self, sc16_path: Path, grace: float) -> None:
-        """Write the detections sidecar after a grace delay (runs on the loop)."""
-        from rfobserver.storage.detections_sidecar import write_sidecar
+        """Write the detections sidecar after a grace delay (runs on the loop).
+
+        Replay detections are never inserted into the DB (replay_mode
+        suppresses all persistence), so a replay recording's sidecar is built
+        by re-running burst detection on the recorded PSD grid instead of
+        querying the DB.
+        """
+        from rfobserver.storage.detections_sidecar import write_sidecar, write_sidecar_from_grid
 
         try:
             await asyncio.sleep(grace)
-            if self._db is not None:
+            if self._replay_mode:
+                s = self._settings
+                cfg = BurstDetectionConfig(
+                    threshold_high_db=s.BURST_THRESHOLD_HIGH_DB,
+                    threshold_low_ratio=s.BURST_THRESHOLD_LOW_RATIO,
+                    noise_floor_percentile=s.BURST_NOISE_FLOOR_PERCENTILE,
+                    merge_time_sec=s.BURST_MERGE_TIME_MS / 1000.0,
+                    merge_freq_bins=s.BURST_MERGE_FREQ_BINS,
+                )
+                write_sidecar_from_grid(sc16_path, cfg)
+            elif self._db is not None:
                 await write_sidecar(sc16_path, self._db)
         except Exception:
             logger.exception("Detections sidecar write failed for %s", sc16_path.name)

@@ -221,6 +221,13 @@ def test_apply_config_during_replay_does_not_persist_then_stop_persists(app_ctx,
     assert settings.TRIGGER_THRESHOLD_DB == -42.0
 
 
+def test_replay_record_requires_active_replay(app_ctx):
+    app, _src = app_ctx
+    c = _client(app)
+    r = c.post("/api/replay/record", json={"on": True})
+    assert r.status_code == 409
+
+
 def test_replay_speed_missing_body_field_returns_400(app_ctx):
     app, src = app_ctx
     c = _client(app)

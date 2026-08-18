@@ -365,6 +365,30 @@ async def replay_speed(request: Request) -> dict[str, Any]:
     return {"replay": supervisor.replay_status()}
 
 
+@router.post("/replay/record")
+async def replay_record(request: Request) -> dict[str, Any]:
+    """Opt in/out of recording IQ during an active replay (manual record only).
+
+    Lets a replay be recorded so the SSM `.dat` becomes a real capture on
+    disk. 409 when no replay is active.
+    """
+    supervisor = getattr(request.app.state, "supervisor", None)
+    if supervisor is None or supervisor.replay_status() is None:
+        raise HTTPException(status_code=409, detail="No active replay")
+    proc = _get_processor(request)
+    if proc is None:
+        raise HTTPException(status_code=409, detail="No active processor")
+    body = await request.json()
+    on = bool(body.get("on", False))
+    if on:
+        proc.set_replay_recording(True)
+        proc.start_recording()
+    else:
+        await asyncio.to_thread(proc.stop_recording)
+        proc.set_replay_recording(False)
+    return _rec_status(proc)
+
+
 @router.post("/trigger")
 async def trigger_capture(request: Request) -> dict[str, str]:
     """Activate manual IQ capture trigger (backward compat)."""

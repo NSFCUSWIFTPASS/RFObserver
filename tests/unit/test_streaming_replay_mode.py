@@ -24,8 +24,10 @@ def _proc(replay_mode: bool, tmp_path):
     zms = MagicMock()
     nats = MagicMock()
     nats.publish_stats = AsyncMock()
+    receiver = MagicMock()
+    receiver.serial = "sim0"
     proc = StreamingProcessor(
-        receiver=MagicMock(),
+        receiver=receiver,
         database=db,
         local_storage=storage,
         settings=settings,
@@ -60,6 +62,54 @@ def test_replay_mode_begin_recording_is_noop(tmp_path):
     proc, _db, _zms, _nats = _proc(True, tmp_path)
     proc.start_recording()
     assert proc._recording_state == "idle"
+
+
+def test_replay_mode_start_recording_requires_opt_in(tmp_path):
+    """start_recording() stays inert under replay_mode until the user opts in
+    via set_replay_recording(True); after opting in it actually records."""
+    proc, _db, _zms, _nats = _proc(True, tmp_path)
+
+    proc.start_recording()
+    assert proc._recording_state == "idle"
+
+    proc.set_replay_recording(True)
+    proc.start_recording()
+    assert proc._recording_state == "recording"
+
+    proc.stop_recording()
+    assert proc._recording_state == "idle"
+
+
+def test_replay_mode_arm_trigger_inert_even_after_record_opt_in(tmp_path):
+    """arm_trigger() must stay inert during replay regardless of the opt-in --
+    only explicit manual record is allowed during replay."""
+    proc, _db, _zms, _nats = _proc(True, tmp_path)
+    proc.set_replay_recording(True)
+
+    proc.arm_trigger()
+    assert proc._recording_state == "idle"
+
+
+@pytest.mark.asyncio
+async def test_replay_mode_deferred_sidecar_uses_grid_path(tmp_path, monkeypatch):
+    """Replay detections never land in the DB, so record-stop must build the
+    sidecar from the recorded PSD grid, not query the DB."""
+    import rfobserver.storage.detections_sidecar as sidecar_mod
+
+    proc, db, _zms, _nats = _proc(True, tmp_path)
+
+    grid_mock = MagicMock(return_value={})
+    db_mock = MagicMock()
+    monkeypatch.setattr(sidecar_mod, "write_sidecar_from_grid", grid_mock)
+    monkeypatch.setattr(sidecar_mod, "write_sidecar", db_mock)
+
+    sc16 = tmp_path / "cap.sc16"
+    await proc._deferred_sidecar(sc16, 0)
+
+    grid_mock.assert_called_once()
+    assert grid_mock.call_args[0][0] == sc16
+    db_mock.assert_not_called()
+    assert db is proc._db  # sanity: db is present but unused on the grid path
 
 
 def _above_threshold_buf(n: int = 64) -> np.ndarray:

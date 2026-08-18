@@ -181,7 +181,10 @@ def _psd_frame_bytes(start: int, sliced: np.ndarray[Any, np.dtype[Any]]) -> byte
     ``count*num_bins`` float32 (C-order, row-major).
     """
     header = struct.pack("<iii", int(start), int(sliced.shape[0]), int(sliced.shape[1]))
-    return header + np.ascontiguousarray(sliced, dtype="<f4").tobytes()
+    # Annotate the buffer explicitly: CI type-checks without numpy installed, so
+    # ndarray.tobytes() infers as Any there and trips no-any-return otherwise.
+    frame: bytes = np.ascontiguousarray(sliced, dtype="<f4").tobytes()
+    return header + frame
 
 
 @router.get("/psd/{filename}")

@@ -286,6 +286,44 @@ async def capture_detections(request: Request, filename: str) -> dict[str, Any]:
     return await ds.write_sidecar(sc16_path, db)
 
 
+@router.post("/redetect/{filename}")
+async def capture_redetect(request: Request, filename: str) -> dict[str, Any]:
+    """Re-run burst detection on a capture's stored PSD grid at given thresholds.
+
+    Works on any capture that has a stored `.psd`/`.psd.json` grid, independent
+    of when it was recorded. Rewrites `<base>.detections.json` and returns the
+    new sidecar payload. All body fields are optional and default to the
+    configured `BURST_*` settings.
+    """
+    from rfobserver.processing.burst import BurstDetectionConfig
+    from rfobserver.storage import detections_sidecar as ds
+    from rfobserver.storage import psd_grid
+
+    storage = _get_storage(request)
+    base = filename.replace(".sc16", "").replace(".json", "").replace(".detections", "")
+    sc16 = _validate_filename(base + ".sc16", storage)
+    if psd_grid.load_grid(sc16) is None:
+        raise HTTPException(status_code=404, detail="No PSD grid for this capture")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    s = request.app.state.settings
+    cfg = BurstDetectionConfig(
+        threshold_high_db=float(body.get("threshold_high_db", s.BURST_THRESHOLD_HIGH_DB)),
+        threshold_low_ratio=float(body.get("threshold_low_ratio", s.BURST_THRESHOLD_LOW_RATIO)),
+        noise_floor_percentile=float(
+            body.get("noise_floor_percentile", s.BURST_NOISE_FLOOR_PERCENTILE)
+        ),
+        merge_time_sec=float(body.get("merge_time_ms", s.BURST_MERGE_TIME_MS)) / 1000.0,
+        merge_freq_bins=int(body.get("merge_freq_bins", s.BURST_MERGE_FREQ_BINS)),
+        min_duration_sec=float(body.get("min_duration_ms", 1.0)) / 1000.0,
+    )
+    return ds.write_sidecar_from_grid(sc16, cfg)
+
+
 @router.websocket("/ws/psd/{filename}")
 async def capture_psd_ws(websocket: WebSocket, filename: str) -> None:
     """Stream PSD windows as binary frames, pushing scroll-ahead neighbours.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -169,8 +170,13 @@ async def sensor_state(request: Request) -> dict[str, Any]:
     """
     supervisor = getattr(request.app.state, "supervisor", None)
     if supervisor is not None:
-        return {"active": bool(supervisor.active), "available": True}
-    return {"active": bool(request.app.state.settings.SENSOR_ACTIVE), "available": False}
+        replay = getattr(supervisor, "replay_status", lambda: None)()
+        return {"active": bool(supervisor.active), "available": True, "replay": replay}
+    return {
+        "active": bool(request.app.state.settings.SENSOR_ACTIVE),
+        "available": False,
+        "replay": None,
+    }
 
 
 @router.post("/sensor")
@@ -205,6 +211,109 @@ async def sensor_set(request: Request) -> dict[str, Any]:
     _persist_settings(settings)
     logger.info("Sensor set active=%s via API (persisted)", confirmed)
     return {"active": confirmed, "detail": "active" if confirmed else "standby"}
+
+
+def _resolve_replay_path(request: Request, path_str: str) -> Path:
+    settings = request.app.state.settings
+    roots = []
+    if settings.REPLAY_SOURCE_DIR:
+        roots.append(Path(settings.REPLAY_SOURCE_DIR).resolve())
+    roots.append(Path(settings.STORAGE_PATH).resolve())
+    p = Path(path_str).resolve()
+    if not any(p.is_relative_to(r) for r in roots):
+        raise HTTPException(status_code=400, detail="Path not in an allowed replay directory")
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="Replay file not found")
+    return p
+
+
+@router.post("/replay/start")
+async def replay_start(request: Request) -> dict[str, Any]:
+    from rfobserver.capture.receiver import ReceiverConfig
+    from rfobserver.capture.replay_receiver import FileReplayReceiver
+    from rfobserver.capture.sigmf_reader import load_raw
+
+    supervisor = getattr(request.app.state, "supervisor", None)
+    if supervisor is None:
+        raise HTTPException(status_code=503, detail="Pipeline not available")
+    settings = request.app.state.settings
+    body = await request.json()
+
+    # Managed capture (filename) -> read params from its .json; else raw path.
+    filename = body.get("filename")
+    if filename:
+        from rfobserver.web.routes.captures import _get_storage, _validate_filename
+
+        storage = _get_storage(request)
+        base = filename.replace(".sc16", "").replace(".json", "")
+        sc16 = _validate_filename(base + ".sc16", storage)
+        import json as _json
+
+        meta = _json.loads(sc16.with_suffix(".json").read_text())
+        path = sc16
+        sample_rate = float(meta["sample_rate_hz"])
+        center = float(meta["center_freq_hz"])
+        gain = float(meta.get("gain_db", settings.GAIN))
+        datatype = "ci16_le"
+    else:
+        path = _resolve_replay_path(request, body["path"])
+        sample_rate = float(body["sample_rate_hz"])
+        center = float(body.get("center_freq_hz", 0.0))
+        gain = float(body.get("gain_db", settings.GAIN))
+        datatype = body.get("datatype", "ci16_le")
+
+    speed = float(body.get("speed", 1.0))
+    cap = load_raw(path, datatype=datatype, sample_rate_hz=sample_rate, center_freq_hz=center)
+    rx_cfg = ReceiverConfig(gain_db=int(gain), bandwidth_hz=int(sample_rate), duration_sec=1.0)
+    receiver = FileReplayReceiver(
+        cap, rx_cfg, paced=True, loop=True, speed=speed, source_name=Path(path).name
+    )
+
+    # Snapshot + set tuning so the pipeline runs at the capture's config.
+    snap = {
+        k: getattr(settings, k)
+        for k in ("BANDWIDTH", "FREQUENCY_START", "FREQUENCY_STEP", "FREQUENCY_END", "GAIN")
+    }
+    snap["_active"] = bool(supervisor.active)
+    request.app.state._replay_snapshot = snap
+    object.__setattr__(settings, "BANDWIDTH", int(sample_rate))
+    object.__setattr__(settings, "FREQUENCY_START", int(center))
+    object.__setattr__(settings, "FREQUENCY_STEP", 0)
+    object.__setattr__(settings, "FREQUENCY_END", int(center))
+    object.__setattr__(settings, "GAIN", int(gain))
+
+    await supervisor.start_replay(receiver)
+    return {"replay": supervisor.replay_status()}
+
+
+@router.post("/replay/stop")
+async def replay_stop(request: Request) -> dict[str, Any]:
+    supervisor = getattr(request.app.state, "supervisor", None)
+    if supervisor is None:
+        raise HTTPException(status_code=503, detail="Pipeline not available")
+    await supervisor.stop_replay()
+    settings = request.app.state.settings
+    snap = getattr(request.app.state, "_replay_snapshot", None)
+    prior_active = False
+    if snap:
+        prior_active = bool(snap.pop("_active", False))
+        for k, v in snap.items():
+            object.__setattr__(settings, k, v)
+        request.app.state._replay_snapshot = None
+    if prior_active:
+        await supervisor.set_active(True)
+    return {"replay": None}
+
+
+@router.post("/replay/speed")
+async def replay_speed(request: Request) -> dict[str, Any]:
+    supervisor = getattr(request.app.state, "supervisor", None)
+    rx = getattr(supervisor, "receiver", None) if supervisor is not None else None
+    if supervisor is None or supervisor.replay_status() is None or rx is None:
+        raise HTTPException(status_code=409, detail="No active replay")
+    body = await request.json()
+    rx.set_speed(float(body["speed"]))
+    return {"replay": supervisor.replay_status()}
 
 
 @router.post("/trigger")

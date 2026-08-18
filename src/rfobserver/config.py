@@ -91,6 +91,9 @@ class AppSettings(BaseSettings):
     NATS_PORT: int = 4222
     NATS_TOKEN: SecretStr | None = None
 
+    # Replay (capture replay as a live threshold-tuning source)
+    REPLAY_SOURCE_DIR: str = ""  # allowlist root for raw replay files; empty disables raw replay
+
     # Storage
     STORAGE_PATH: str = "/tmp/rfobserver"
     DB_PATH: str = "/tmp/rfobserver/rfobserver.db"

@@ -14,6 +14,8 @@ import json
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from rfobserver.processing.burst import BurstDetectionConfig, detect_bursts
+from rfobserver.processing.spectral import PSDGridResult
 from rfobserver.storage import psd_grid
 
 if TYPE_CHECKING:
@@ -22,12 +24,16 @@ if TYPE_CHECKING:
     from rfobserver.storage.database import SensorDatabase
 
 
+def _base(sc16_path: Path) -> Path:
+    """Strip a trailing `.sc16` suffix, returning the shared companion-file base."""
+    if sc16_path.suffix == ".sc16":
+        return sc16_path.with_suffix("")
+    return sc16_path
+
+
 def sidecar_path(sc16_path: Path) -> Path:
     """Return the `<base>.detections.json` path for a recording's `.sc16` path."""
-    base = sc16_path
-    if base.suffix == ".sc16":
-        base = base.with_suffix("")
-    return base.with_suffix(".detections.json")
+    return _base(sc16_path).with_suffix(".detections.json")
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -47,9 +53,7 @@ async def build_sidecar_payload(sc16_path: Path, db: SensorDatabase) -> dict[str
     companion metadata degrades to an empty `detections` list rather than
     raising.
     """
-    base = sc16_path
-    if base.suffix == ".sc16":
-        base = base.with_suffix("")
+    base = _base(sc16_path)
     meta = _read_json(base.with_suffix(".json")) or {}
     _raw_path, psd_meta_path = psd_grid.grid_paths(sc16_path)
     psd_meta = _read_json(psd_meta_path) or {}
@@ -119,5 +123,78 @@ async def build_sidecar_payload(sc16_path: Path, db: SensorDatabase) -> dict[str
 async def write_sidecar(sc16_path: Path, db: SensorDatabase) -> dict[str, Any]:
     """Build the sidecar payload and write it to `<base>.detections.json`."""
     payload = await build_sidecar_payload(sc16_path, db)
+    sidecar_path(sc16_path).write_text(json.dumps(payload, indent=2))
+    return payload
+
+
+def build_sidecar_from_grid(sc16_path: Path, config: BurstDetectionConfig) -> dict[str, Any]:
+    """Build the sidecar payload by re-running burst detection on a stored PSD grid.
+
+    Unlike `build_sidecar_payload` (which queries the live DB for detections
+    made during the original recording), this runs `detect_bursts` directly
+    against the capture's `<base>.psd`/`.psd.json` grid, so it works for any
+    capture that has a stored grid -- independent of the DB and reusable with
+    an arbitrary `config` (e.g. a re-detect endpoint or a replay record-stop
+    path). Missing grid/capture metadata degrades to an empty payload rather
+    than raising.
+    """
+    import numpy as np
+
+    meta_cap = _read_json(_base(sc16_path).with_suffix(".json")) or {}
+    loaded = psd_grid.load_grid(sc16_path)
+    start_iso = meta_cap.get("start_time")
+    out: dict[str, Any] = {
+        "capture_start_time": start_iso,
+        "time_resolution_s": None,
+        "center_freq_hz": meta_cap.get("center_freq_hz"),
+        "sample_rate_hz": meta_cap.get("sample_rate_hz"),
+        "gain_db": meta_cap.get("gain_db"),
+        "detections": [],
+    }
+    if loaded is None or not start_iso:
+        return out
+    grid, gmeta = loaded
+    tres = float(gmeta.get("time_resolution_s") or 0.0)
+    rows = int(gmeta.get("rows") or grid.shape[0])
+    out["time_resolution_s"] = tres or None
+    if tres <= 0 or rows <= 0:
+        return out
+    freq_axis = np.asarray(gmeta.get("freq_axis", []), dtype=np.float64)
+    center = float(gmeta.get("center_freq_hz") or 0.0)
+    psd = PSDGridResult(
+        grid=np.asarray(grid),
+        time_axis=np.arange(rows, dtype=np.float64) * tres,
+        freq_axis=freq_axis,
+        ffts_per_slice=0,
+        total_ffts=rows,
+    )
+    cap_start = datetime.fromisoformat(start_iso)
+    result = detect_bursts(psd, config, center, cap_start)
+    dets: list[dict[str, Any]] = []
+    for b in result.bursts:
+        t0 = (b.start_time - cap_start).total_seconds()
+        t1 = (b.stop_time - cap_start).total_seconds()
+        row_start = max(0, min(rows, int(round(t0 / tres))))
+        row_stop = max(0, min(rows, int(round(t1 / tres))))
+        dets.append(
+            {
+                "start_time": b.start_time.isoformat(),
+                "stop_time": b.stop_time.isoformat(),
+                "center_freq_hz": b.center_freq_hz,
+                "bandwidth_hz": b.bandwidth_hz,
+                "peak_freq_hz": b.peak_freq_hz,
+                "peak_power_db": b.peak_power_db,
+                "duration_ms": b.duration_ms,
+                "row_start": row_start,
+                "row_stop": row_stop,
+            }
+        )
+    out["detections"] = dets
+    return out
+
+
+def write_sidecar_from_grid(sc16_path: Path, config: BurstDetectionConfig) -> dict[str, Any]:
+    """Build the from-grid sidecar payload and write it to `<base>.detections.json`."""
+    payload = build_sidecar_from_grid(sc16_path, config)
     sidecar_path(sc16_path).write_text(json.dumps(payload, indent=2))
     return payload

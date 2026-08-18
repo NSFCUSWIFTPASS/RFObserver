@@ -154,3 +154,70 @@ async def test_build_sidecar_payload_missing_psd_meta_is_empty(tmp_path, db):
     payload = await ds.build_sidecar_payload(sc16, db)
     assert payload["detections"] == []
     assert payload["time_resolution_s"] is None
+
+
+def test_write_sidecar_from_grid_threshold_changes_detections(tmp_path):
+    import numpy as np
+
+    from rfobserver.processing.burst import BurstDetectionConfig
+    from rfobserver.storage import detections_sidecar as ds
+    from rfobserver.storage import psd_grid
+
+    rows, num_bins = 200, 64
+    tres = 0.001
+    sc16 = tmp_path / "cap.sc16"
+    sc16.write_bytes(b"\x00" * 8)
+    # capture meta
+    start = "2026-08-18T00:00:00+00:00"
+    sc16.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "start_time": start,
+                "duration_sec": rows * tres,
+                "center_freq_hz": 915e6,
+                "sample_rate_hz": 26e6,
+                "gain_db": 35,
+            }
+        )
+    )
+    # synthetic grid: flat -100 dB noise + one strong burst (rows 50..70, bins 30..33)
+    grid = np.full((rows, num_bins), -100.0, dtype=np.float32)
+    grid[50:71, 30:34] = -40.0
+    raw_path, meta_path = psd_grid.grid_paths(sc16)
+    grid.tofile(raw_path)
+    freq_axis = (np.arange(num_bins) - num_bins / 2) * (26e6 / num_bins)
+    psd_grid.write_meta(
+        meta_path,
+        rows=rows,
+        num_bins=num_bins,
+        time_resolution_s=tres,
+        center_freq_hz=915_000_000,
+        bandwidth_hz=26_000_000,
+        freq_axis=freq_axis,
+        grid_min=-100.0,
+        grid_max=-40.0,
+        cal_offset_db=None,
+    )
+
+    _hi = ds.write_sidecar_from_grid(sc16, BurstDetectionConfig(threshold_high_db=50.0))
+    lo = ds.write_sidecar_from_grid(sc16, BurstDetectionConfig(threshold_high_db=20.0))
+    # A 60 dB burst over a -100 floor: threshold 50 catches it, 20 catches it too;
+    # threshold above the burst height (e.g. 70) catches nothing.
+    none = ds.write_sidecar_from_grid(sc16, BurstDetectionConfig(threshold_high_db=70.0))
+    assert len(lo["detections"]) >= 1
+    assert len(none["detections"]) == 0
+    d = lo["detections"][0]
+    assert 45 <= d["row_start"] <= 55 and 68 <= d["row_stop"] <= 75  # burst rows ~50..70
+    assert set(d) >= {
+        "start_time",
+        "stop_time",
+        "center_freq_hz",
+        "bandwidth_hz",
+        "peak_freq_hz",
+        "peak_power_db",
+        "duration_ms",
+        "row_start",
+        "row_stop",
+    }
+    # the active sidecar was written
+    assert ds.sidecar_path(sc16).exists()

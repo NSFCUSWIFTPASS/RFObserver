@@ -143,3 +143,76 @@ async def test_start_replay_uses_override_and_reports_status() -> None:
     await sup.stop_replay()
     assert sup.replay_status() is None
     assert not sup.active
+
+
+@pytest.mark.asyncio
+async def test_standby_toggle_clears_replay_and_returns_to_live_sdr() -> None:
+    """A plain Standby off/on (set_active) must drop replay state, not resume it."""
+    receivers: list[FakeReceiver] = []
+    calls: list[dict[str, object]] = []
+
+    def build_receiver() -> FakeReceiver:
+        r = FakeReceiver()
+        receivers.append(r)
+        return r
+
+    def build_processor(receiver: object, *, replay_mode: bool = False) -> _FakeReplayProc:
+        calls.append({"receiver": receiver, "replay_mode": replay_mode})
+        return _FakeReplayProc()
+
+    sup = PipelineSupervisor(build_receiver, build_processor)
+
+    rx = _FakeReplayReceiver("replay.dat")
+    await sup.start_replay(rx)
+    assert sup.replay_status() is not None
+    assert calls[-1]["replay_mode"] is True
+    assert calls[-1]["receiver"] is rx
+    assert len(receivers) == 0  # override receiver used, live build_receiver not called
+
+    # Plain Standby toggle off then on -- must NOT resume the replay receiver.
+    await sup.set_active(False)
+    assert sup.active is False
+    assert sup.replay_status() is None
+
+    await sup.set_active(True)
+    assert sup.active is True
+    assert sup.replay_status() is None
+    assert calls[-1]["replay_mode"] is False
+    assert len(receivers) == 1
+    assert calls[-1]["receiver"] is receivers[0]
+    assert sup.receiver is receivers[0]
+    assert sup.receiver is not rx
+
+
+@pytest.mark.asyncio
+async def test_start_replay_stops_active_live_pipeline_first() -> None:
+    """start_replay() with a live pipeline running stops it before switching over."""
+    receivers: list[FakeReceiver] = []
+    calls: list[dict[str, object]] = []
+
+    def build_receiver() -> FakeReceiver:
+        r = FakeReceiver()
+        receivers.append(r)
+        return r
+
+    def build_processor(receiver: object, *, replay_mode: bool = False) -> _FakeReplayProc:
+        calls.append({"receiver": receiver, "replay_mode": replay_mode})
+        return _FakeReplayProc()
+
+    sup = PipelineSupervisor(build_receiver, build_processor)
+
+    await sup.set_active(True)
+    assert sup.active is True
+    live_receiver = receivers[0]
+    assert live_receiver.closed == 0
+    assert calls[-1]["replay_mode"] is False
+
+    rx = _FakeReplayReceiver("replay.dat")
+    await sup.start_replay(rx)
+
+    assert live_receiver.closed == 1  # the live pipeline was stopped first
+    assert sup.active is True
+    assert sup.receiver is rx
+    assert calls[-1]["replay_mode"] is True
+    assert calls[-1]["receiver"] is rx
+    assert sup.replay_status() is not None

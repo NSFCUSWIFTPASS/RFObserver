@@ -131,6 +131,8 @@ class PipelineSupervisor:
         self._receiver = None
         self._task = None
         self._active = False
+        self._receiver_override = None
+        self._replay = False
         logger.info("Sensor deactivated (SDR released)")
         self._notify(None)
 

@@ -256,8 +256,17 @@ async def replay_start(request: Request) -> dict[str, Any]:
         gain = float(meta.get("gain_db", settings.GAIN))
         datatype = "ci16_le"
     else:
-        path = _resolve_replay_path(request, body["path"])
-        sample_rate = float(body["sample_rate_hz"])
+        try:
+            raw_path = body["path"]
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail="Missing 'path'") from exc
+        path = _resolve_replay_path(request, raw_path)
+        try:
+            sample_rate = float(body["sample_rate_hz"])
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail="Missing 'sample_rate_hz'") from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid 'sample_rate_hz'") from exc
         center = float(body.get("center_freq_hz", 0.0))
         gain = float(body.get("gain_db", settings.GAIN))
         datatype = body.get("datatype", "ci16_le")
@@ -269,13 +278,18 @@ async def replay_start(request: Request) -> dict[str, Any]:
         cap, rx_cfg, paced=True, loop=True, speed=speed, source_name=Path(path).name
     )
 
-    # Snapshot + set tuning so the pipeline runs at the capture's config.
-    snap = {
-        k: getattr(settings, k)
-        for k in ("BANDWIDTH", "FREQUENCY_START", "FREQUENCY_STEP", "FREQUENCY_END", "GAIN")
-    }
-    snap["_active"] = bool(supervisor.active)
-    request.app.state._replay_snapshot = snap
+    # Snapshot the pre-replay tuning only on the first start of a replay session.
+    # A second /replay/start without an intervening /replay/stop must NOT
+    # overwrite the snapshot with the already-mutated (replay) tuning, or
+    # /replay/stop would restore the wrong state and could unintentionally
+    # re-activate the live SDR.
+    if getattr(request.app.state, "_replay_snapshot", None) is None:
+        snap = {
+            k: getattr(settings, k)
+            for k in ("BANDWIDTH", "FREQUENCY_START", "FREQUENCY_STEP", "FREQUENCY_END", "GAIN")
+        }
+        snap["_active"] = bool(supervisor.active)
+        request.app.state._replay_snapshot = snap
     object.__setattr__(settings, "BANDWIDTH", int(sample_rate))
     object.__setattr__(settings, "FREQUENCY_START", int(center))
     object.__setattr__(settings, "FREQUENCY_STEP", 0)
@@ -312,7 +326,13 @@ async def replay_speed(request: Request) -> dict[str, Any]:
     if supervisor is None or supervisor.replay_status() is None or rx is None:
         raise HTTPException(status_code=409, detail="No active replay")
     body = await request.json()
-    rx.set_speed(float(body["speed"]))
+    try:
+        speed = float(body["speed"])
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail="Missing 'speed'") from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid 'speed'") from exc
+    rx.set_speed(speed)
     return {"replay": supervisor.replay_status()}
 
 

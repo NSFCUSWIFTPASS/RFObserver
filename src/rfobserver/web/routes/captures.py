@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import struct
@@ -321,7 +322,10 @@ async def capture_redetect(request: Request, filename: str) -> dict[str, Any]:
         merge_freq_bins=int(body.get("merge_freq_bins", s.BURST_MERGE_FREQ_BINS)),
         min_duration_sec=float(body.get("min_duration_ms", 1.0)) / 1000.0,
     )
-    return ds.write_sidecar_from_grid(sc16, cfg)
+    # detect_bursts on a full grid is multi-second CPU work; run it off the event
+    # loop so the live WS/heartbeat stay responsive during a re-detect.
+    payload: dict[str, Any] = await asyncio.to_thread(ds.write_sidecar_from_grid, sc16, cfg)
+    return payload
 
 
 @router.websocket("/ws/psd/{filename}")

@@ -860,7 +860,9 @@ class StreamingProcessor:
                     merge_time_sec=s.BURST_MERGE_TIME_MS / 1000.0,
                     merge_freq_bins=s.BURST_MERGE_FREQ_BINS,
                 )
-                write_sidecar_from_grid(sc16_path, cfg)
+                # detect_bursts on a full grid is multi-second CPU work; keep it
+                # off the event loop so the live WS/heartbeat stay responsive.
+                await asyncio.to_thread(write_sidecar_from_grid, sc16_path, cfg)
             elif self._db is not None:
                 await write_sidecar(sc16_path, self._db)
         except Exception:

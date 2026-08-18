@@ -824,7 +824,18 @@
                             return;
                         }
                         if (viewerFilename !== filename) return;   // superseded mid-flight
-                        await loadDetections();
+                        // Refresh from the POST response directly (it returns the
+                        // full sidecar payload). Re-GETting /captures/detections is
+                        // cache-prone (same URL) and can serve a stale body.
+                        const dd = await r.json();
+                        viewerDetections = dd.detections || [];
+                        viewerDetPending = !!dd.pending;
+                        if (redetectThresholdHigh && dd.params
+                                && typeof dd.params.threshold_high_db === "number") {
+                            redetectThresholdHigh.value = dd.params.threshold_high_db;
+                        }
+                        buildDetectionsTable();
+                        drawDetectionOverlay();
                     } catch (_) {
                         redetectError.textContent = "Re-detect failed";
                     } finally {

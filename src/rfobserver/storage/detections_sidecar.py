@@ -14,6 +14,8 @@ import json
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+
 from rfobserver.processing.burst import BurstDetectionConfig, detect_bursts
 from rfobserver.processing.spectral import PSDGridResult
 from rfobserver.storage import psd_grid
@@ -138,8 +140,6 @@ def build_sidecar_from_grid(sc16_path: Path, config: BurstDetectionConfig) -> di
     path). Missing grid/capture metadata degrades to an empty payload rather
     than raising.
     """
-    import numpy as np
-
     meta_cap = _read_json(_base(sc16_path).with_suffix(".json")) or {}
     loaded = psd_grid.load_grid(sc16_path)
     start_iso = meta_cap.get("start_time")
@@ -150,6 +150,14 @@ def build_sidecar_from_grid(sc16_path: Path, config: BurstDetectionConfig) -> di
         "sample_rate_hz": meta_cap.get("sample_rate_hz"),
         "gain_db": meta_cap.get("gain_db"),
         "detections": [],
+        "params": {
+            "threshold_high_db": config.threshold_high_db,
+            "threshold_low_ratio": config.threshold_low_ratio,
+            "noise_floor_percentile": config.noise_floor_percentile,
+            "merge_time_ms": config.merge_time_sec * 1000.0,
+            "merge_freq_bins": config.merge_freq_bins,
+            "min_duration_ms": config.min_duration_sec * 1000.0,
+        },
     }
     if loaded is None or not start_iso:
         return out
@@ -160,6 +168,8 @@ def build_sidecar_from_grid(sc16_path: Path, config: BurstDetectionConfig) -> di
     if tres <= 0 or rows <= 0:
         return out
     freq_axis = np.asarray(gmeta.get("freq_axis", []), dtype=np.float64)
+    if freq_axis.size == 0:
+        return out
     center = float(gmeta.get("center_freq_hz") or 0.0)
     psd = PSDGridResult(
         grid=np.asarray(grid),

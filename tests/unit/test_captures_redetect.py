@@ -114,6 +114,17 @@ async def test_redetect_empty_body_uses_defaults(app, settings):
 
 
 @pytest.mark.asyncio
+async def test_redetect_null_field_falls_back_to_default(app, settings):
+    """A blank UI field posts JSON null (not an absent key); float(None) used
+    to raise TypeError -> 500. A null value must fall back to the default."""
+    _seed_grid_capture(settings, "cap")
+
+    r = await _post(app, "/captures/redetect/cap.sc16", {"threshold_high_db": None})
+    assert r.status_code == 200
+    assert "detections" in r.json()
+
+
+@pytest.mark.asyncio
 async def test_redetect_404_without_grid(app, settings):
     _seed_capture_without_grid(settings, "cap")
 

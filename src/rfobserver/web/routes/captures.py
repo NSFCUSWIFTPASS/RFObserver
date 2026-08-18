@@ -30,6 +30,18 @@ def _has_psd(sc16_path: Path) -> bool:
     return (raw.exists() and meta.exists()) or sc16_path.with_suffix(".npz").exists()
 
 
+def _strip_suffix(name: str, *suffixes: str) -> str:
+    """Strip each given suffix from the end of ``name``, in order, if present.
+
+    Anchored to the end of the string (unlike ``str.replace``, which would
+    also strip a match found mid-string).
+    """
+    for suf in suffixes:
+        if name.endswith(suf):
+            name = name[: -len(suf)]
+    return name
+
+
 def _validate_filename(filename: str, storage: Path) -> Path:
     """Validate filename has no path traversal and resolve to storage path."""
     if "/" in filename or "\\" in filename or ".." in filename:
@@ -287,6 +299,17 @@ async def capture_detections(request: Request, filename: str) -> dict[str, Any]:
     return await ds.write_sidecar(sc16_path, db)
 
 
+def _num(body: dict[str, Any], key: str, default: float) -> float:
+    """Read a numeric field from a request body, defaulting on missing OR null.
+
+    A blank field in the UI posts JSON ``null`` (not an absent key), and
+    ``float(None)`` raises ``TypeError`` -> 500. Treat null the same as
+    missing: fall back to ``default``.
+    """
+    value = body.get(key)
+    return default if value is None else float(value)
+
+
 @router.post("/redetect/{filename}")
 async def capture_redetect(request: Request, filename: str) -> dict[str, Any]:
     """Re-run burst detection on a capture's stored PSD grid at given thresholds.
@@ -301,7 +324,7 @@ async def capture_redetect(request: Request, filename: str) -> dict[str, Any]:
     from rfobserver.storage import psd_grid
 
     storage = _get_storage(request)
-    base = filename.replace(".sc16", "").replace(".json", "").replace(".detections", "")
+    base = _strip_suffix(filename, ".sc16", ".json", ".detections")
     sc16 = _validate_filename(base + ".sc16", storage)
     if psd_grid.load_grid(sc16) is None:
         raise HTTPException(status_code=404, detail="No PSD grid for this capture")
@@ -313,14 +336,12 @@ async def capture_redetect(request: Request, filename: str) -> dict[str, Any]:
 
     s = request.app.state.settings
     cfg = BurstDetectionConfig(
-        threshold_high_db=float(body.get("threshold_high_db", s.BURST_THRESHOLD_HIGH_DB)),
-        threshold_low_ratio=float(body.get("threshold_low_ratio", s.BURST_THRESHOLD_LOW_RATIO)),
-        noise_floor_percentile=float(
-            body.get("noise_floor_percentile", s.BURST_NOISE_FLOOR_PERCENTILE)
-        ),
-        merge_time_sec=float(body.get("merge_time_ms", s.BURST_MERGE_TIME_MS)) / 1000.0,
-        merge_freq_bins=int(body.get("merge_freq_bins", s.BURST_MERGE_FREQ_BINS)),
-        min_duration_sec=float(body.get("min_duration_ms", 1.0)) / 1000.0,
+        threshold_high_db=_num(body, "threshold_high_db", s.BURST_THRESHOLD_HIGH_DB),
+        threshold_low_ratio=_num(body, "threshold_low_ratio", s.BURST_THRESHOLD_LOW_RATIO),
+        noise_floor_percentile=_num(body, "noise_floor_percentile", s.BURST_NOISE_FLOOR_PERCENTILE),
+        merge_time_sec=_num(body, "merge_time_ms", s.BURST_MERGE_TIME_MS) / 1000.0,
+        merge_freq_bins=int(_num(body, "merge_freq_bins", s.BURST_MERGE_FREQ_BINS)),
+        min_duration_sec=_num(body, "min_duration_ms", 1.0) / 1000.0,
     )
     # detect_bursts on a full grid is multi-second CPU work; run it off the event
     # loop so the live WS/heartbeat stay responsive during a re-detect.

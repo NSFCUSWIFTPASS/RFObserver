@@ -596,7 +596,7 @@ class StreamingProcessor:
 
     def _check_trigger_and_record(self, sc16_buf: np.ndarray[Any, np.dtype[Any]]) -> None:
         """Handle recording and trigger logic for each chunk."""
-        if self._replay_mode:
+        if self._replay_mode and not self._replay_record:
             return
         state = self._recording_state
 

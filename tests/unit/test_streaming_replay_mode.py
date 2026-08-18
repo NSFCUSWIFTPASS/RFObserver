@@ -132,6 +132,48 @@ def test_replay_mode_arm_trigger_never_arms(tmp_path):
     assert proc._recording_queue.qsize() == before_qsize
 
 
+def test_replay_mode_check_trigger_and_record_writes_full_iq_when_recording(tmp_path):
+    """Reviewer-found bug: _check_trigger_and_record used to early-return
+    unconditionally under replay_mode, so a manual replay recording
+    (_replay_record=True, state='recording') never reached
+    _write_recording_chunk -- only the pre-trigger buffer landed in the
+    .sc16 while the .psd grid was written in full. Opting in via
+    set_replay_recording(True) and actually starting a recording must let
+    every subsequent chunk reach the writer."""
+    proc, _db, _zms, _nats = _proc(True, tmp_path)
+    proc.set_replay_recording(True)
+    proc.start_recording()
+    assert proc._recording_state == "recording"
+
+    calls: list[np.ndarray] = []
+    proc._write_recording_chunk = lambda buf: calls.append(buf)  # type: ignore[method-assign]
+
+    buf = _above_threshold_buf()
+    proc._check_trigger_and_record(buf)
+
+    assert len(calls) == 1
+    assert calls[0] is buf
+
+    proc.stop_recording()
+
+
+def test_replay_mode_check_trigger_still_inert_without_opt_in(tmp_path):
+    """Without set_replay_recording(True), _check_trigger_and_record must keep
+    early-returning under replay_mode (no write, no state change) even if
+    _recording_state were somehow 'recording'."""
+    proc, _db, _zms, _nats = _proc(True, tmp_path)
+    assert proc._replay_record is False
+    proc._recording_state = "recording"
+
+    calls: list[np.ndarray] = []
+    proc._write_recording_chunk = lambda buf: calls.append(buf)  # type: ignore[method-assign]
+
+    buf = _above_threshold_buf()
+    proc._check_trigger_and_record(buf)
+
+    assert calls == []
+
+
 def test_replay_mode_check_trigger_inert_even_if_armed(tmp_path):
     """Defense-in-depth: even if state were somehow 'armed', the trigger/record
     path must stay fully inert under replay_mode (the reviewer-found leak)."""

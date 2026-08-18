@@ -221,3 +221,50 @@ def test_write_sidecar_from_grid_threshold_changes_detections(tmp_path):
     }
     # the active sidecar was written
     assert ds.sidecar_path(sc16).exists()
+
+    # params block reflects the config used, so the viewer can prefill its
+    # threshold controls from the last re-detect run.
+    assert lo["params"]["threshold_high_db"] == 20.0
+    assert "params" in _hi and "params" in none
+
+
+def test_build_sidecar_from_grid_empty_freq_axis_is_safe(tmp_path):
+    """A malformed .psd.json with rows > 0 but an empty freq_axis (e.g. a
+    corrupted write) must degrade to the empty payload, not raise."""
+    import numpy as np
+
+    from rfobserver.processing.burst import BurstDetectionConfig
+    from rfobserver.storage import psd_grid
+
+    rows, num_bins = 10, 4
+    sc16 = tmp_path / "malformed.sc16"
+    sc16.with_suffix(".json").write_text(json.dumps({"start_time": "2026-08-18T00:00:00+00:00"}))
+    grid = np.zeros((rows, num_bins), dtype=np.float32)
+    raw_path, meta_path = psd_grid.grid_paths(sc16)
+    grid.tofile(raw_path)
+    psd_grid.write_meta(
+        meta_path,
+        rows=rows,
+        num_bins=num_bins,
+        time_resolution_s=0.001,
+        center_freq_hz=915_000_000,
+        bandwidth_hz=1_000_000,
+        freq_axis=np.array([]),  # malformed: empty despite num_bins > 0
+        grid_min=-100.0,
+        grid_max=-40.0,
+        cal_offset_db=None,
+    )
+
+    payload = ds.build_sidecar_from_grid(sc16, BurstDetectionConfig())
+    assert payload["detections"] == []
+
+
+def test_build_sidecar_from_grid_params_present_on_empty_payload(tmp_path):
+    """params must be present even on the empty-payload path (no grid/meta)."""
+    from rfobserver.processing.burst import BurstDetectionConfig
+
+    sc16 = tmp_path / "nogrid.sc16"
+    cfg = BurstDetectionConfig(threshold_high_db=42.0)
+    payload = ds.build_sidecar_from_grid(sc16, cfg)
+    assert payload["detections"] == []
+    assert payload["params"]["threshold_high_db"] == 42.0

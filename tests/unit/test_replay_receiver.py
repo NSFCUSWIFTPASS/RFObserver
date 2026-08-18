@@ -53,6 +53,31 @@ def test_paced_sleeps_scaled_by_speed(monkeypatch):
     assert slept and abs(slept[-1] - 0.0005) < 0.00025  # 2x -> half the delay
 
 
+def test_empty_capture_with_loop_fills_buffer_without_hanging():
+    """A zero-sample capture with loop=True must not spin resetting `remaining`
+    to 0 forever, nor return a buffer with an uninitialized tail; it should
+    serve drain noise for the whole chunk instead."""
+    cap = _capture(0)
+    rx = FileReplayReceiver(cap, _cfg(), loop=True)
+    buf = np.full(32, -1, dtype=np.int32)
+
+    calls: list[tuple[int, int]] = []
+    orig_fill_drain = rx._fill_drain
+
+    def _spy_fill_drain(out_buf, start=0):
+        calls.append((len(out_buf), start))
+        orig_fill_drain(out_buf, start=start)
+
+    rx._fill_drain = _spy_fill_drain  # type: ignore[method-assign]
+
+    n = rx.recv_chunk(buf)
+
+    assert n == 32
+    # Filled once, for the whole buffer (start=0) -- not a spin loop.
+    assert calls == [(32, 0)]
+    assert not rx.exhausted  # looping never sets exhausted
+
+
 def test_unpaced_default_does_not_sleep(monkeypatch):
     cap = _capture(1000)
     rx = FileReplayReceiver(cap, _cfg())  # paced=False, loop=False (batch default)

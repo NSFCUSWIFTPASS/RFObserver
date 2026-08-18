@@ -27,7 +27,14 @@ logger = logging.getLogger(__name__)
 
 
 class FileReplayReceiver(MockReceiver):
-    """Replays a ``SigmfCapture`` as an SC16 stream (no real-time pacing)."""
+    """Replays a ``SigmfCapture`` as an SC16 stream.
+
+    Pacing and looping are both optional and controlled by the ``paced`` and
+    ``loop`` constructor args: unpaced batch replay serves chunks as fast as
+    the pipeline can consume them, while paced replay sleeps to match
+    wall-clock playback at ``speed`` real-time; ``loop`` re-seeks to the start
+    of the capture on exhaustion instead of draining to a noise tail.
+    """
 
     def __init__(
         self,
@@ -97,6 +104,13 @@ class FileReplayReceiver(MockReceiver):
 
     def recv_chunk(self, out_buf: np.ndarray[Any, np.dtype[Any]]) -> int:
         n = len(out_buf)  # samples requested
+        if self._n <= 0:
+            # Empty capture: looping would otherwise spin resetting `remaining`
+            # to 0 forever and returning a partially/never-filled buffer. Serve
+            # drain noise for the whole chunk instead of hanging or leaving
+            # uninitialized tail data.
+            self._fill_drain(out_buf)
+            return n
         filled = 0
         while filled < n:
             remaining = self._n - self._pos

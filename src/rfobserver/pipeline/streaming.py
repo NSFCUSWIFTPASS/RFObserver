@@ -1436,6 +1436,8 @@ class StreamingProcessor:
 
     async def _run_tone_check(self, avg_powers: list[float], result: _StreamResult) -> None:
         """Evaluate the tone check on the averaged PSD and persist + log it."""
+        if self._replay_mode:
+            return
         from rfobserver.processing.tone_check import evaluate_tone_check
 
         tc = evaluate_tone_check(

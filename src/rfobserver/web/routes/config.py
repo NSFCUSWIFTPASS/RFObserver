@@ -78,6 +78,10 @@ async def apply_config(request: Request) -> dict[str, Any]:
     """Apply configuration changes to the running pipeline."""
     settings = request.app.state.settings
     processor = getattr(request.app.state, "processor", None)
+    supervisor = getattr(request.app.state, "supervisor", None)
+    replaying = bool(
+        supervisor is not None and getattr(supervisor, "replay_status", lambda: None)() is not None
+    )
 
     try:
         body = await request.json()
@@ -202,8 +206,13 @@ async def apply_config(request: Request) -> dict[str, Any]:
             reconfigure()
             logger.info("Pipeline reconfigured: %s", changed)
 
-    # Persist settings to .env so they survive restarts
-    _persist_settings(settings)
+    # While a replay is active, `settings` holds the capture's tuning
+    # (BANDWIDTH/FREQUENCY_*/GAIN), not the live SDR's -- persisting now would
+    # write that capture tuning into .env. Skip persistence here; the pre-replay
+    # tuning (with any threshold edits made during replay retained) is
+    # persisted on /api/replay/stop instead.
+    if not replaying:
+        _persist_settings(settings)
 
     logger.info("Config applied: %s", changed)
     return {"status": "ok", "changed": changed}

@@ -249,7 +249,14 @@ async def replay_start(request: Request) -> dict[str, Any]:
         sc16 = _validate_filename(base + ".sc16", storage)
         import json as _json
 
-        meta = _json.loads(sc16.with_suffix(".json").read_text())
+        try:
+            meta_text = sc16.with_suffix(".json").read_text()
+        except OSError as exc:
+            raise HTTPException(status_code=404, detail="Capture metadata not found") from exc
+        try:
+            meta = _json.loads(meta_text)
+        except _json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Invalid capture metadata") from exc
         path = sc16
         sample_rate = float(meta["sample_rate_hz"])
         center = float(meta["center_freq_hz"])
@@ -270,6 +277,9 @@ async def replay_start(request: Request) -> dict[str, Any]:
         center = float(body.get("center_freq_hz", 0.0))
         gain = float(body.get("gain_db", settings.GAIN))
         datatype = body.get("datatype", "ci16_le")
+
+    if sample_rate <= 0:
+        raise HTTPException(status_code=400, detail="sample_rate_hz must be positive")
 
     speed = float(body.get("speed", 1.0))
     cap = load_raw(path, datatype=datatype, sample_rate_hz=sample_rate, center_freq_hz=center)
@@ -296,7 +306,19 @@ async def replay_start(request: Request) -> dict[str, Any]:
     object.__setattr__(settings, "FREQUENCY_END", int(center))
     object.__setattr__(settings, "GAIN", int(gain))
 
-    await supervisor.start_replay(receiver)
+    try:
+        await supervisor.start_replay(receiver)
+    except Exception as exc:
+        # Don't leave `settings` mutated to the capture's tuning (and the
+        # snapshot dangling) if the pipeline never actually started replaying.
+        fail_snap = getattr(request.app.state, "_replay_snapshot", None)
+        if fail_snap is not None:
+            fail_snap.pop("_active", None)
+            for k, v in fail_snap.items():
+                object.__setattr__(settings, k, v)
+            request.app.state._replay_snapshot = None
+        logger.exception("start_replay failed; restored pre-replay settings")
+        raise HTTPException(status_code=500, detail=f"start_replay failed: {exc}") from exc
     return {"replay": supervisor.replay_status()}
 
 
@@ -314,6 +336,13 @@ async def replay_stop(request: Request) -> dict[str, Any]:
         for k, v in snap.items():
             object.__setattr__(settings, k, v)
         request.app.state._replay_snapshot = None
+        # Restore the pre-replay tuning to .env now. Any threshold edits made
+        # via the replay banner while replaying were applied to `settings` in
+        # memory but never persisted (see apply_config); persist here so they
+        # survive a restart alongside the correct (pre-replay) tuning.
+        from rfobserver.web.routes.config import _persist_settings
+
+        _persist_settings(settings)
     if prior_active:
         await supervisor.set_active(True)
     return {"replay": None}

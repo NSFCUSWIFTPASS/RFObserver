@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import numpy as np
 import pytest
 
@@ -162,6 +164,61 @@ def test_replay_start_missing_body_fields_returns_400(app_ctx):
     path = str(src / "iq_capture_x_915MHz_1.0Msps_0.1s_30dB_test.dat")
     r = c.post("/api/replay/start", json={"path": path})
     assert r.status_code == 400
+
+
+def test_replay_start_zero_sample_rate_returns_400(app_ctx):
+    app, src = app_ctx
+    c = _client(app)
+    path = str(src / "iq_capture_x_915MHz_1.0Msps_0.1s_30dB_test.dat")
+    r = c.post(
+        "/api/replay/start",
+        json={"path": path, "sample_rate_hz": 0, "center_freq_hz": 915e6},
+    )
+    assert r.status_code == 400
+
+
+def test_apply_config_during_replay_does_not_persist_then_stop_persists(app_ctx, monkeypatch):
+    """Threshold edits during replay must apply live but not persist the
+    capture's tuning to .env; the pre-replay tuning (with the threshold edit
+    retained) is persisted once on /api/replay/stop instead."""
+    import rfobserver.web.routes.config as config_mod
+
+    app, src = app_ctx
+    c = _client(app)
+    settings = app.state.settings
+
+    orig_bandwidth = settings.BANDWIDTH
+    orig_freq_start = settings.FREQUENCY_START
+    orig_freq_end = settings.FREQUENCY_END
+    orig_gain = settings.GAIN
+
+    path = str(src / "iq_capture_x_915MHz_1.0Msps_0.1s_30dB_test.dat")
+    r = c.post(
+        "/api/replay/start",
+        json={"path": path, "sample_rate_hz": 1e6, "center_freq_hz": 433e6, "gain_db": 20},
+    )
+    assert r.status_code == 200
+    assert settings.BANDWIDTH == 1_000_000  # mutated to capture tuning
+
+    persist_spy = MagicMock(wraps=config_mod._persist_settings)
+    monkeypatch.setattr(config_mod, "_persist_settings", persist_spy)
+
+    r = c.post("/config/apply", json={"trigger_threshold_db": -42.0})
+    assert r.status_code == 200
+    assert settings.TRIGGER_THRESHOLD_DB == -42.0
+    persist_spy.assert_not_called()
+
+    r = c.post("/api/replay/stop")
+    assert r.status_code == 200
+    persist_spy.assert_called_once()
+
+    # Pre-replay tuning restored...
+    assert orig_bandwidth == settings.BANDWIDTH
+    assert orig_freq_start == settings.FREQUENCY_START
+    assert orig_freq_end == settings.FREQUENCY_END
+    assert orig_gain == settings.GAIN
+    # ...but the threshold edited during replay is retained.
+    assert settings.TRIGGER_THRESHOLD_DB == -42.0
 
 
 def test_replay_speed_missing_body_field_returns_400(app_ctx):

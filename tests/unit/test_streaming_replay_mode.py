@@ -108,6 +108,35 @@ async def test_replay_mode_publish_processed_skips_egress(tmp_path, monkeypatch)
     mock_create_task.assert_not_called()
 
 
+def _tone_check_result():
+    result = MagicMock()
+    result.center_freq_hz = 915e6
+    result.summary_psd.frequencies = [913e6, 914e6, 915e6, 916e6, 917e6]
+    return result
+
+
+@pytest.mark.asyncio
+async def test_replay_mode_skips_tone_check_insert(tmp_path):
+    """_run_tone_check is a second DB-write path (independent of _drain_burst_results)
+    and must also be gated under replay_mode."""
+    proc, db, _zms, _nats = _proc(True, tmp_path)
+    db.insert_tone_check = AsyncMock()
+
+    await proc._run_tone_check([-90.0, -80.0, -70.0, -80.0, -90.0], _tone_check_result())
+
+    db.insert_tone_check.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_normal_mode_tone_check_inserts(tmp_path):
+    proc, db, _zms, _nats = _proc(False, tmp_path)
+    db.insert_tone_check = AsyncMock()
+
+    await proc._run_tone_check([-90.0, -80.0, -70.0, -80.0, -90.0], _tone_check_result())
+
+    db.insert_tone_check.assert_called_once()
+
+
 def _fake_burst():
     from datetime import datetime, timezone
 

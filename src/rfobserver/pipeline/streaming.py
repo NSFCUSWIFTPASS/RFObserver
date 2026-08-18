@@ -215,6 +215,7 @@ class StreamingProcessor:
         zms_monitor: ZmsMonitor | None = None,
         nats_producer: NatsProducer | None = None,
         drop_on_overflow: bool = True,
+        replay_mode: bool = False,
     ) -> None:
         self._receiver = receiver
         self._db = database
@@ -230,6 +231,12 @@ class StreamingProcessor:
         # lossless mode, where the producer and dispatch loop instead block
         # until there is room — every chunk is processed, deterministically.
         self._drop_on_overflow = drop_on_overflow
+        # When True, this processor drives only the live WS overlay from a
+        # replayed capture: every persistence/egress side effect (DB insert,
+        # ZMS submit, NATS publish, IQ recording) is suppressed so replay
+        # never pollutes the DB or emits upstream. The live _broadcast path
+        # is untouched by this flag.
+        self._replay_mode = replay_mode
 
         total_cores = os.cpu_count() or 4
         self._num_proc_workers = max(1, total_cores - 3)
@@ -638,6 +645,8 @@ class StreamingProcessor:
 
     def _begin_recording(self) -> None:
         """Start recording: allocate RAM buffer or start disk writer."""
+        if self._replay_mode:
+            return
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         self._recording_file = f"{self._receiver.serial}-{self._settings.HOSTNAME}-{ts}.sc16"
         self._recording_bytes = 0
@@ -1462,6 +1471,8 @@ class StreamingProcessor:
         awaiting them inline previously blocked the next high-res FFT
         broadcast every DURATION_SEC, which the user saw as a stutter.
         """
+        if self._replay_mode:
+            return
         if self._zms_monitor is None and self._nats_producer is None:
             return
         try:
@@ -1521,6 +1532,8 @@ class StreamingProcessor:
             device_serial = getattr(self._receiver, "serial", None)
 
             for burst in bursts:
+                if self._replay_mode:
+                    continue
                 await self._db.insert_detection(
                     burst_id=burst.burst_id,
                     start_time=burst.start_time,

@@ -1,205 +1,183 @@
-# Analyze a capture to a re-detectable, full-resolution capture (threshold tuning)
+# Record a replay + re-run detection on any capture (threshold tuning)
 
 ## Goal
 
-Turn a raw IQ file (e.g. the December SSM/FHSS `.dat`) into a viewable capture
-whose PSD spectrogram is stored at full internal resolution, so each burst can be
-inspected at ~0.2 ms/row in the existing Captures viewer, and whose detections can
-be re-computed on that stored grid at different thresholds without reprocessing the
-IQ. This gives a fast tune-and-inspect loop: the expensive spectrogram is built
-once; re-tuning is a cheap detection pass, and multiple labeled detection sets can
-be compared on the same spectrogram.
+Let a raw IQ file (e.g. the December SSM/FHSS `.dat`) become a full-resolution,
+inspectable capture, and let a capture's detections be re-computed at different
+thresholds without re-recording — so bursts can be studied at ~0.2 ms/row in the
+existing Captures viewer and the detection threshold tuned in place. Reuse the
+existing replay + recording + viewer machinery; keep the new code minimal.
+
+## Approach (reuse what exists)
+
+The replay already plays a file through the live pipeline, and the pipeline's
+*recording* path already builds and persists the full-resolution `.psd` grid. So:
+
+1. **Record the replay once** -> a normal capture (`.sc16` + `.psd` + `.json`),
+   turning the raw `.dat` into an inspectable capture (IQ copied once).
+2. **Re-run detection on a capture's stored `.psd` grid** to (re)write its
+   detections sidecar at chosen thresholds -- reusing IQ+PSD, no re-record. This
+   works on **any** existing capture with a `.psd` grid, field recordings included.
+
+One shared new helper does the detection pass; the rest is small wiring.
 
 ## Background (from code audit)
 
-- **Recorded `.psd` grids are full resolution.** Recording appends every PSD row
-  at `PSD_TIME_RESOLUTION_MS` (default 0.2 ms -> 5000 rows/s), written to
-  `<base>.psd` (float32 memmap) + `<base>.psd.json` (`rows`, `num_bins`,
-  `time_resolution_s`, `freq_axis`, `grid_min/max`, `center_freq_hz`,
-  `bandwidth_hz`). The Captures viewer renders this 1px/row (virtualized, paged)
-  with the detection overlay + click-to-scroll (built in the
-  2026-08-09 capture-detections-overlay feature).
-- **The live/replay waterfall is much coarser** (normal = `DURATION_SEC`-averaged;
-  high-res = per-dwell-chunk into a bounded display buffer), so it is unsuitable
-  for per-burst inspection. That is why we persist a grid instead.
+- **Recording writes a full-resolution grid.** `_end_recording`
+  (`pipeline/streaming.py:733`) finalizes `<base>.psd` (float32 memmap, every PSD
+  row at `PSD_TIME_RESOLUTION_MS`, default 0.2 ms) + `<base>.psd.json`
+  (`rows`, `num_bins`, `time_resolution_s`, `freq_axis`, `grid_min/max`,
+  `center_freq_hz`, `bandwidth_hz`) via `storage/psd_grid.py::write_meta`, and
+  schedules `_deferred_sidecar` -> `detections_sidecar.write_sidecar(sc16, db)`
+  (DB-sourced).
+- **Replay recording is currently gated off.** `start_recording` / `arm_trigger`
+  / `_begin_recording` / `_check_trigger_and_record` early-return when
+  `self._replay_mode` (the Task-3 hardening). Recording during replay needs an
+  opt-in that lifts the manual-record gate for a deliberate replay-record.
 - **The batch detector runs on a whole grid.**
   `processing/burst.py::detect_bursts(psd_grid: PSDGridResult, config:
-  BurstDetectionConfig | None, center_freq_hz: float, capture_time)` returns a
-  `BurstDetectionResult`. `BurstDetectionConfig` fields: `threshold_high_db`,
-  `threshold_low_ratio` (T_L = T_H*ratio), `noise_floor_percentile` (default 50 =
-  median), `min_duration_sec`, `merge_freq_bins`, `merge_time_sec`. This is the
-  same whole-grid method the validated `gr-modules/iq-processing/waterfall_plot.py`
-  reference uses; `--burst-threshold 40` there == `threshold_high_db=40`.
-- **Grid IO.** `storage/psd_grid.py::grid_paths(sc16_path)` -> `(<base>.psd,
-  <base>.psd.json)`; a reader memmaps the raw grid + parses meta. A writer for a
-  full grid is needed (mirror the recording write path).
-- **Captures list globs `*.sc16`** (`web/routes/captures.py::captures_list`), and
-  the detail/PSD/detections endpoints resolve `<base>` from the `.sc16` name.
-- **Raw-file plumbing exists** from the replay feature: `sigmf_reader.load_raw`,
-  `parse_capture_filename`, the `REPLAY_SOURCE_DIR` allowlist +
-  `_resolve_replay_path`.
-- **Detections sidecar schema** (`storage/detections_sidecar.py`):
+  BurstDetectionConfig | None, center_freq_hz, capture_time)` returns
+  `BurstDetectionResult` (bursts with `start_time`/`stop_time` = `capture_time +
+  t`, `center_freq_hz`, `peak_freq_hz`, `bandwidth_hz`, `peak_power_db`,
+  `duration_ms`). This is the whole-grid method the validated
+  `waterfall_plot.py` uses; `--burst-threshold 40` == `threshold_high_db=40`
+  (see [[reference_ssm_waterfall_plot_params]]).
+- **Grid IO.** `storage/psd_grid.py::grid_paths(sc16)` and `load_grid(sc16) ->
+  (mm ndarray (rows,num_bins), meta)`. `PSDGridResult` (`processing/spectral.py`)
+  fields: `grid`, `time_axis`, `freq_axis`, `ffts_per_slice`, `total_ffts`
+  (detect_bursts uses only `grid`/`time_axis`/`freq_axis`).
+- **Sidecar schema + helpers.** `storage/detections_sidecar.py`: `sidecar_path`,
+  `build_sidecar_payload(sc16, db)`, `write_sidecar(sc16, db)`; schema
   `{capture_start_time, time_resolution_s, center_freq_hz, sample_rate_hz,
-  gain_db, detections: [{start_time, stop_time, center_freq_hz, bandwidth_hz,
+  gain_db, detections:[{start_time, stop_time, center_freq_hz, bandwidth_hz,
   peak_freq_hz, peak_power_db, duration_ms, row_start, row_stop}]}`.
-
-## Decisions (from brainstorming)
-
-1. **Analyze-to-capture, one-shot, unpaced** (not a live-replay recording).
-2. Detection params come from **explicit fields on the Analyze panel**, stamped
-   into the output; grid params (`num_fft_bins`, `time_resolution_ms`) in an
-   advanced area.
-3. **Shared grid + swappable detection sets**: build the spectrogram once; re-tune
-   with a cheap detection pass on the stored grid.
-4. **Multiple named detection sets per capture + a selector** in the viewer.
-5. **`<base>.sc16` is a symlink to the source `.dat`** (zero copy); the list and
-   viewer work unchanged.
+- **Endpoints/allowlist** from the replay feature: `/api/replay/{start,stop,speed}`,
+  `REPLAY_SOURCE_DIR` + `_resolve_replay_path`, and the replay banner in
+  `dashboard.html`. The Captures viewer + overlay + Detections table +
+  click-to-scroll are already built (`captures.html`).
 
 ## Design
 
-### Part 1 - Grid + analyze builder (`storage/analyze.py`, new)
+### Part 1 - Shared helper: `write_sidecar_from_grid` (`storage/detections_sidecar.py`)
 
-`async def analyze_capture(source_path, *, sample_rate_hz, center_freq_hz,
-gain_db, datatype, num_fft_bins, time_resolution_ms, detection: BurstDetectionConfig,
-label: str, storage: LocalStorage) -> str` (returns the capture base name):
+`async def build_sidecar_from_grid(sc16_path, config: BurstDetectionConfig) ->
+dict` and `def write_sidecar_from_grid(sc16_path, config) -> dict` (sync file
+write; detect is CPU, no awaits needed):
 
-- **Capture identity = (source basename, num_fft_bins, time_resolution_ms).** Base
-  name is a deterministic slug, e.g. `<sourceslug>__fft<N>_tres<ms>` (sanitized).
-  Same grid params -> same base -> the grid is reused; only a detection set is
-  (re)written. Different grid params -> a new capture.
-- If the grid does not exist yet:
-  1. `cap = load_raw(source_path, datatype=datatype, sample_rate_hz=,
-     center_freq_hz=)` (memmap).
-  2. Compute the PSD grid over the whole file at `(num_fft_bins,
-     time_resolution_ms)`: chunk the memmap, per `slice = sample_rate *
-     tres/1000` samples take an `num_fft_bins`-point windowed FFT ->
-     power-dB row; assemble rows. Reuse the pipeline's PSD compute
-     (`processing/spectral`) so the spectrogram matches the live/replay path.
-     Stream rows to `<base>.psd` (bounded RAM, like disk-mode recording).
-  3. Write `<base>.psd.json` (`rows`, `num_bins`, `time_resolution_s =
-     time_resolution_ms/1000`, `freq_axis`, `grid_min/max`, `center_freq_hz`,
-     `bandwidth_hz = sample_rate_hz`).
-  4. Write `<base>.json` capture meta: `file`, `format: "sc16"`, `sample_rate_hz`,
-     `center_freq_hz`, `bandwidth_hz`, `gain_db`, `start_time` (from the source
-     filename's timestamp if parseable, else file mtime, UTC iso),
-     `duration_sec = rows * time_resolution_s`, `source_path`, `analyzed: true`,
-     `num_fft_bins`, `time_resolution_ms`.
-  5. Symlink `<base>.sc16 -> source_path` (a raw ci16_le `.dat` is byte-compatible
-     with `.sc16`; if a symlink already exists, leave it).
-- Always: run `redetect(base, detection, label, storage)` (Part 2) to write the
-  detection set for this analyze call.
+1. `load_grid(sc16_path)` -> `(mm, meta)`; if absent, return an empty payload /
+   raise a clear error the callers turn into 404.
+2. Reconstruct `PSDGridResult(grid=mm, time_axis=arange(rows)*tres,
+   freq_axis=np.asarray(meta["freq_axis"]), ffts_per_slice=0, total_ffts=rows)`
+   where `tres = meta["time_resolution_s"]`.
+3. Read the capture `.json` for `start_time` (-> `capture_start`),
+   `center_freq_hz`, `sample_rate_hz`, `gain_db`. `center_freq_hz` for
+   `detect_bursts` comes from `meta["center_freq_hz"]`.
+4. `result = detect_bursts(psd_grid, config, center_freq_hz, capture_time=capture_start)`.
+5. For each burst, `row_start = round((b.start_time - capture_start).total_seconds()
+   / tres)`, `row_stop = round((b.stop_time - capture_start).total_seconds() /
+   tres)`, both clamped to `[0, rows]` (exact grid rows -- no effective-tres
+   ambiguity). Build the same sidecar dict schema as `build_sidecar_payload`.
+6. Write to `sidecar_path(sc16_path)` (overwrites the active detections sidecar).
 
-### Part 2 - Re-detect on the stored grid (`storage/analyze.py`)
+This one helper is reused by both callers below. It is threshold-only work on the
+stored grid: fast, no IQ reprocessing.
 
-`async def redetect(base, detection: BurstDetectionConfig, label, storage) ->
-dict`:
-- Load the stored grid via `psd_grid` reader -> ndarray `(rows, num_bins)` +
-  `freq_axis` + `time_resolution_s`; wrap in a `PSDGridResult` (grid, freq_axis,
-  `time_axis = arange(rows)*tres`, `time_resolution`).
-- `result = detect_bursts(psd_grid, detection, center_freq_hz)`.
-- Map each burst to grid rows directly from its time-axis indices (row_start/
-  row_stop are exact grid rows - no time-based mapping, so none of the
-  effective-tres ambiguity of DB-sourced sidecars). Build the sidecar detections
-  list (same schema + `peak_freq_hz` from `detect_bursts`).
-- Write the set to `<base>.detset.<labelslug>.json` with an extra
-  `{"label": ..., "params": {threshold_high_db, threshold_low_ratio,
-  noise_floor_percentile, merge_time_ms, merge_freq_bins, min_duration_ms}}`
-  block, and copy it to `<base>.detections.json` (the "active" set, so the
-  existing `GET /captures/detections/{filename}` and any tooling keep working).
-- Label defaults to a param slug, e.g. `thr40_floor50_merge30`, when not provided.
+### Part 2 - Re-detect endpoint (`web/routes/captures.py`)
 
-### Part 3 - Detection-set API (`web/routes/captures.py`)
+`POST /captures/redetect/{filename}` body `{threshold_high_db, threshold_low_ratio,
+noise_floor_percentile, merge_time_ms, min_duration_ms}` (all optional, default to
+the settings' `BURST_*`): resolve `<base>` via `_validate_filename`; 404 if the
+`.sc16` or its `.psd` grid is missing. Build a `BurstDetectionConfig` from the body
+(map `merge_time_ms`/`min_duration_ms` -> seconds; `merge_freq_bins` from settings)
+and call `write_sidecar_from_grid`. Return the new payload. Works on any capture
+with a grid (replay-recorded or field). This is the tuning mechanism.
 
-- `GET /captures/detection-sets/{filename}` -> `[{label, params, count, active}]`
-  (glob `<base>.detset.*.json`).
-- Extend `GET /captures/detections/{filename}` with optional `?set=<label>`:
-  return that set's file; default (no `set`) returns `<base>.detections.json` as
-  today.
+### Part 3 - Record during replay (`pipeline/streaming.py` + replay endpoints)
 
-### Part 4 - Endpoints (`web/routes/api.py` or a small `analyze` router)
+- Add `self._replay_record = False` and a setter `set_replay_recording(bool)` on
+  `StreamingProcessor`. Change the manual-record gate: `start_recording` proceeds
+  when `not self._replay_mode or self._replay_record` (arm/trigger stay gated off;
+  only explicit manual record is allowed during replay).
+- In `_end_recording`'s deferred sidecar (`_deferred_sidecar`): when
+  `self._replay_mode` (a replay recording; the DB has no replay detections),
+  build the sidecar from the recorded grid at the current burst config
+  (`write_sidecar_from_grid`) instead of `write_sidecar(sc16, db)`. Non-replay
+  recordings are unchanged (DB path).
+- Endpoint `POST /api/replay/record` body `{on: bool}`: when `on`, set
+  `processor.set_replay_recording(True)` then `processor.start_recording()`; when
+  `off`, `processor.stop_recording()` (which triggers `_end_recording` + the
+  grid-based sidecar) and clear the flag. 409 if no replay is active. Returns the
+  recording state.
 
-- `POST /api/analyze` body `{path, sample_rate_hz, center_freq_hz, gain_db,
-  datatype, num_fft_bins, time_resolution_ms, threshold_high_db,
-  threshold_low_ratio, noise_floor_percentile, merge_time_ms, min_duration_ms,
-  label}`. Resolve `path` via `_resolve_replay_path` (allowlist reused). Build a
-  `BurstDetectionConfig` from the detection params, call `analyze_capture`, return
-  `{capture: <base>.sc16, set: <label>}`. `sample_rate_hz <= 0` -> 400 (as replay).
-- `POST /captures/redetect/{filename}` body `{threshold_high_db, ...,
-  label}`: resolve `<base>`, call `redetect`, return the set. 404 if the capture
-  or its grid is missing.
+### Part 4 - UI (`dashboard.html` + `captures.html`)
 
-### Part 5 - UI (`web/templates/captures.html`)
+- **Replay banner** (`dashboard.html`): add a **Record / Stop-record** toggle that
+  POSTs `/api/replay/record {on}`. Show a small recording indicator + the current
+  recording bytes/duration from the existing heartbeat `recording` field (already
+  broadcast). After stop, the new capture appears on the Captures page.
+- **Capture viewer** (`captures.html`): add a **Re-detect** panel (burst-hi dB,
+  low ratio, floor %, merge ms inputs prefilled from the capture's current
+  sidecar/config + a button) -> `POST /captures/redetect/{filename}` -> reload the
+  detections and refresh the overlay + Detections table in place. Reuse the
+  existing overlay/table/click-to-scroll.
 
-- Rename the existing raw-file panel to **"Analyze a raw file"**: keep the path
-  input + auto-parsed tuning (center/rate/gain/datatype via
-  `parse_capture_filename`), add detection-param inputs (burst-hi dB, low ratio,
-  floor %, merge ms), an advanced `<details>` area (fft bins default 2048,
-  time-res ms default 0.2), and a label. **Analyze** -> `POST /api/analyze` ->
-  select + open the returned capture.
-- Capture viewer: add a **re-detect panel** (the detection-param inputs + label +
-  **Re-detect**) that `POST /captures/redetect/{filename}`, then reloads the
-  detection set and refreshes the overlay + Detections table in place; and a
-  **detection-set `<select>`** populated from `GET /captures/detection-sets` that,
-  on change, loads `GET /captures/detections/{filename}?set=<label>` and re-draws
-  the overlay + table. Reuse the existing overlay/table/click-to-scroll.
+### Part 5 - Reuse (no new code)
 
-### Part 6 - Grid-only captures via symlink
-
-`<base>.sc16` is a symlink to the source `.dat`, so `captures_list` (globs
-`*.sc16`), detail, PSD, and detections endpoints work unchanged. If the symlink is
-broken (source moved), the viewer still renders from `<base>.psd`; the list shows
-the entry (guard the `.sc16.stat()` / size read so a broken link does not 500).
+Captures list/detail/PSD/detections endpoints, the `.psd` viewer, overlay,
+Detections table, click-to-scroll, `.sc16` recording, `.psd` grid write, and
+`detect_bursts` are all existing. The `.sc16` is copied once by the normal
+recorder (accepted); re-detect never re-copies.
 
 ## Testing
 
-- `tests/unit/test_analyze.py`: `analyze_capture` on a small synthetic raw file
-  writes `<base>.psd`/`.psd.json`/`.json` + the `.sc16` symlink + an initial
-  detection set; `rows == round(duration/tres)`; grid reused when called again
-  with the same grid params (grid file mtime unchanged, new detection set added).
-- `redetect` on a stored grid with a synthetic burst: a high `threshold_high_db`
-  yields fewer/narrower detections than a low one; `row_start/row_stop` land on
-  the burst's grid rows; the `params` block is stamped.
-- `test_captures_detection_sets`: `GET /captures/detection-sets` lists sets;
-  `GET /captures/detections?set=` returns the chosen set; unknown set -> 404 or
-  falls back with a clear response.
-- `POST /api/analyze` (allowlist reused; 400 on bad rate) and
-  `POST /captures/redetect` route tests with a seeded grid.
-- UI: manual browser verification (analyze the SSM `.dat`, scrub bursts at 0.2 ms,
-  re-detect at thr 40 vs 35, switch sets). Local Jetson smoke; do NOT touch HCRO.
-- Full CI per CLAUDE.md (ruff, ruff format, mypy, unit, integration@NATS:4222).
+- `tests/unit/test_detections_sidecar.py` (extend): `write_sidecar_from_grid` on a
+  seeded `<base>.psd`/`.psd.json` (+ `.json`) with a synthetic burst: a high
+  `threshold_high_db` yields fewer/narrower detections than a low one; the burst's
+  `row_start/row_stop` land on its grid rows; schema matches `build_sidecar_payload`.
+  Missing grid -> clear empty/error handled.
+- `tests/unit/test_captures_redetect.py`: `POST /captures/redetect/{filename}` on a
+  seeded grid capture rewrites the sidecar and returns the detections; 404 when the
+  grid is absent; params map to `BurstDetectionConfig`.
+- `tests/unit/test_streaming_replay_mode.py` (extend): with `replay_mode=True` and
+  `set_replay_recording(True)`, `start_recording()` proceeds (state -> recording),
+  while `arm_trigger()` stays inert; and the replay-record `_deferred_sidecar` uses
+  the grid path (assert `write_sidecar_from_grid` is called, DB `insert_detection`
+  still not).
+- Route test for `POST /api/replay/record` (409 when idle; toggles state).
+- UI: manual/browser -- record the SSM replay -> open the capture -> scrub bursts
+  @0.2 ms -> re-detect at thr 40 vs 35, overlay updates. Local Jetson smoke; do NOT
+  touch HCRO.
+- Full CI per CLAUDE.md (ruff, ruff format, mypy, unit, integration@NATS:4222; note
+  the CI lint job type-checks without numpy -- keep return types concrete).
 
 ## Files
 
-- `src/rfobserver/storage/analyze.py` (new) - `analyze_capture`, `redetect`,
-  grid builder, set IO.
-- `src/rfobserver/storage/psd_grid.py` - add a full-grid writer if not reusable
-  from the recording path.
-- `src/rfobserver/web/routes/api.py` (or new `web/routes/analyze.py`) -
-  `/api/analyze`, `/captures/redetect/{filename}`.
-- `src/rfobserver/web/routes/captures.py` - `/captures/detection-sets`,
-  `?set=` on `/captures/detections`, broken-symlink guard in the list.
-- `src/rfobserver/web/templates/captures.html` - Analyze panel + viewer re-detect
-  panel + detection-set selector.
-- Tests: `test_analyze.py`, `test_captures_detection_sets.py`, route tests.
+- `src/rfobserver/storage/detections_sidecar.py` - `build_sidecar_from_grid` +
+  `write_sidecar_from_grid` (the shared helper).
+- `src/rfobserver/web/routes/captures.py` - `POST /captures/redetect/{filename}`.
+- `src/rfobserver/pipeline/streaming.py` - `_replay_record` flag +
+  `set_replay_recording`; gate change in `start_recording`; grid-based sidecar in
+  `_deferred_sidecar` for replay recordings.
+- `src/rfobserver/web/routes/api.py` - `POST /api/replay/record`.
+- `src/rfobserver/web/templates/dashboard.html` - Record toggle in the replay banner.
+- `src/rfobserver/web/templates/captures.html` - Re-detect panel in the viewer.
+- Tests: extend `test_detections_sidecar.py`, `test_streaming_replay_mode.py`; add
+  `test_captures_redetect.py` + the `/api/replay/record` route test.
 
 ## Out of scope
 
-- Live-replay recording (superseded by analyze-to-capture for inspection).
-- Editing/deleting detection sets from the UI beyond creating them (a set is
-  overwritten when re-detected with the same label).
-- Re-tuning grid params in the viewer (changing fft/tres makes a new capture via
-  Analyze, by design).
-- Copying the IQ into the capture (symlink only).
+- A separate analyze/batch grid builder or `/api/analyze` (recording builds the grid).
+- Multiple named detection sets + selector (re-detect overwrites the one sidecar;
+  to compare, record/keep separate captures).
+- Skipping the `.sc16` copy (accepted: normal recorder copies it once).
+- Changing grid params (fft bins / time-res) per capture (that is a re-record).
 
 ## Notes / risks
 
-- A full grid is ~`rows * num_fft_bins * 4` bytes (~800 MB for 20 s at 2048 bins /
-  0.2 ms). One grid per (source, grid params); detection sets are tiny. Watch the
-  Jetson NVMe; document that lowering `time_resolution_ms` resolution or bins
-  shrinks it.
-- Analyze is CPU-bound (whole-file FFTs) but unpaced, so seconds-to-a-minute for
-  the 20 s file; runs on the server host (may be the Jetson).
-- `detect_bursts` (batch, whole-grid) is the reference method; the live rolling
-  detector is a separate path. Detection sets reflect the batch detector, matching
-  `waterfall_plot.py`. See [[reference_ssm_waterfall_plot_params]] for the
-  validated params (`threshold_high_db=40`, median floor, merge 30 ms).
+- A replay recording copies the source IQ into `.sc16` once (~2 GB for the 20 s
+  SSM file) plus the `.psd` grid (~800 MB at 2048 bins / 0.2 ms). Deliberate and
+  user-triggered; watch the Jetson NVMe.
+- Detection sets reflect the batch `detect_bursts` (whole-grid), matching
+  `waterfall_plot.py` -- the live rolling detector is a separate path.
+- Re-detect overwrites the capture's single detections sidecar; the previous
+  detection result is not retained (re-run to change it back).

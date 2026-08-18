@@ -43,6 +43,34 @@
             <div id="burst-tuning-wrap" style="position: relative; display: none;">
                 <canvas id="burst-tuning-canvas" width="920" height="140" style="width: 100%; height: 140px;"></canvas>
             </div>
+            <div id="replay-banner" style="display: none;">
+                <span class="replay-banner-label">Replaying</span>
+                <span id="replay-banner-source" class="replay-banner-source">--</span>
+                <span id="replay-banner-looping" class="replay-banner-loop" style="display: none;">Looping</span>
+                <span style="flex: 1;"></span>
+                <label class="replay-banner-field">
+                    Speed
+                    <select id="replay-banner-speed">
+                        <option value="0.25">0.25x</option>
+                        <option value="1">1x</option>
+                        <option value="2">2x</option>
+                        <option value="4">4x</option>
+                    </select>
+                </label>
+                <label class="replay-banner-field">
+                    Trigger (dB)
+                    <input type="number" id="replay-banner-trigger" step="0.1">
+                </label>
+                <label class="replay-banner-field">
+                    Burst High (dB)
+                    <input type="number" id="replay-banner-burst-high" step="0.5">
+                </label>
+                <label class="replay-banner-field">
+                    Burst Low Ratio
+                    <input type="number" id="replay-banner-burst-low" step="0.05" min="0" max="1">
+                </label>
+                <button type="button" id="replay-banner-stop" class="rec-btn rec-stop">Stop</button>
+            </div>
             <div id="wf-wrapper" style="position: relative;">
                 <canvas id="waterfall-canvas" width="920" height="260" style="width: 100%; height: 260px;"></canvas>
                 <canvas id="burst-overlay" width="920" height="260" style="position: absolute; top: 0; left: 0; width: 100%; height: 260px; pointer-events: none;"></canvas>
@@ -1034,6 +1062,93 @@
     const stopBtn = document.getElementById("stop-btn");
     const recStatus = document.getElementById("rec-status");
 
+    // --- Replay banner ---
+    // Shown only while the pipeline is being driven by a capture/raw-file
+    // replay in place of the live SDR (data.replay on the heartbeat).
+    const replayBanner = document.getElementById("replay-banner");
+    const replayBannerSource = document.getElementById("replay-banner-source");
+    const replayBannerLooping = document.getElementById("replay-banner-looping");
+    const replayBannerSpeed = document.getElementById("replay-banner-speed");
+    const replayBannerStop = document.getElementById("replay-banner-stop");
+    const replayBannerTrigger = document.getElementById("replay-banner-trigger");
+    const replayBannerBurstHigh = document.getElementById("replay-banner-burst-high");
+    const replayBannerBurstLow = document.getElementById("replay-banner-burst-low");
+
+    function handleReplay(replay) {
+        if (!replay) {
+            replayBanner.style.display = "none";
+            document.body.classList.remove("replaying");
+            return;
+        }
+        document.body.classList.add("replaying");
+        replayBanner.style.display = "";
+        replayBannerSource.textContent = replay.source || "replay";
+        replayBannerLooping.style.display = replay.looping ? "" : "none";
+        if (document.activeElement !== replayBannerSpeed && typeof replay.speed === "number") {
+            replayBannerSpeed.value = String(replay.speed);
+        }
+        // Threshold values aren't carried on the heartbeat's replay payload;
+        // they're kept live via the psd stream (triggerThresholdDb etc, see
+        // the "psd" branch above), so mirror those here unless the user is
+        // actively editing the field.
+        if (document.activeElement !== replayBannerTrigger && typeof triggerThresholdDb === "number") {
+            replayBannerTrigger.value = Math.round(triggerThresholdDb * 10) / 10;
+        }
+        if (document.activeElement !== replayBannerBurstHigh && typeof burstThresholdHighDb === "number") {
+            replayBannerBurstHigh.value = Math.round(burstThresholdHighDb * 10) / 10;
+        }
+        if (document.activeElement !== replayBannerBurstLow && typeof burstThresholdLowRatio === "number") {
+            replayBannerBurstLow.value = Math.round(burstThresholdLowRatio * 1000) / 1000;
+        }
+    }
+
+    replayBannerSpeed.addEventListener("change", async function() {
+        await fetch("/api/replay/speed", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({speed: parseFloat(this.value)}),
+        });
+    });
+
+    replayBannerStop.addEventListener("click", async function() {
+        replayBannerStop.disabled = true;
+        try {
+            await fetch("/api/replay/stop", {method: "POST"});
+        } finally {
+            replayBannerStop.disabled = false;
+        }
+    });
+
+    replayBannerTrigger.addEventListener("change", function() {
+        const val = Math.round(parseFloat(this.value) * 10) / 10;
+        if (isNaN(val)) return;
+        fetch("/config/apply", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({trigger_threshold_db: String(val)}),
+        });
+    });
+
+    replayBannerBurstHigh.addEventListener("change", function() {
+        const val = Math.round(parseFloat(this.value) * 10) / 10;
+        if (isNaN(val)) return;
+        fetch("/config/apply", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({burst_threshold_high_db: String(val)}),
+        });
+    });
+
+    replayBannerBurstLow.addEventListener("change", function() {
+        const val = Math.round(parseFloat(this.value) * 1000) / 1000;
+        if (isNaN(val)) return;
+        fetch("/config/apply", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({burst_threshold_low_ratio: String(val)}),
+        });
+    });
+
     function formatBytes(b) {
         if (b < 1024) return b + " B";
         if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
@@ -1089,6 +1204,7 @@
         if (d.modules) {
             _renderModulesFrom(d.modules);
         }
+        handleReplay(d.replay);
         if (typeof d.detection_count === "number" && d.detection_count !== lastDetectionCount) {
             // Either first heartbeat (lastDetectionCount === -1) or new
             // detections landed since the last tick — ask HTMX to refetch.

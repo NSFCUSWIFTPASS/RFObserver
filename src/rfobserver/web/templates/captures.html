@@ -20,6 +20,59 @@
     </div>
 </div>
 
+<div class="card" style="margin-top: 16px;">
+    <div class="card-header">Replay a Raw File</div>
+    <div class="card-body">
+        <div class="config-form">
+            <div class="form-row" style="grid-template-columns: 1fr;">
+                <div class="form-group">
+                    <label for="replay-path">File Path</label>
+                    <input type="text" id="replay-path" placeholder="/path/to/capture.dat">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="replay-center-mhz">Center Freq (MHz)</label>
+                    <input type="number" id="replay-center-mhz" step="0.001">
+                </div>
+                <div class="form-group">
+                    <label for="replay-rate-msps">Sample Rate (Msps)</label>
+                    <input type="number" id="replay-rate-msps" step="0.001">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="replay-gain-db">Gain (dB)</label>
+                    <input type="number" id="replay-gain-db" step="0.1">
+                </div>
+                <div class="form-group">
+                    <label for="replay-datatype">Datatype</label>
+                    <select id="replay-datatype">
+                        <option value="ci16_le" selected>ci16_le</option>
+                        <option value="cf32_le">cf32_le</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="replay-speed">Speed</label>
+                    <select id="replay-speed">
+                        <option value="0.25">0.25x</option>
+                        <option value="1" selected>1x</option>
+                        <option value="2">2x</option>
+                        <option value="4">4x</option>
+                    </select>
+                </div>
+                <div class="form-group" style="justify-content: flex-end;">
+                    <label>&nbsp;</label>
+                    <button type="button" id="replay-raw-start-btn" class="btn-apply" style="width: 100%;">Start replay</button>
+                </div>
+            </div>
+            <span id="replay-raw-error" class="replay-error"></span>
+        </div>
+    </div>
+</div>
+
 <script>
 (function() {
     const listEl = document.getElementById("captures-list");
@@ -162,6 +215,11 @@
             if (m.hostname) html += row("Hostname", m.hostname);
             if (m.serial) html += row("Serial", m.serial);
             html += '</table>';
+            html += '<div class="detail-actions">';
+            html += '<button type="button" id="replay-capture-btn" class="btn-apply" data-filename="'
+                + d.filename + '">Replay this capture</button>';
+            html += '<span id="replay-capture-error" class="replay-error"></span>';
+            html += '</div>';
 
             detailEl.innerHTML = html;
 
@@ -709,6 +767,103 @@
         const item = e.target.closest(".capture-item");
         if (item) showDetail(item.dataset.file, item.dataset.hasPsd === "1");
     });
+
+    // --- Replay this capture (managed capture, resolved server-side from its .json) ---
+    detailEl.addEventListener("click", async function(e) {
+        const btn = e.target.closest("#replay-capture-btn");
+        if (!btn) return;
+        const errEl = document.getElementById("replay-capture-error");
+        if (errEl) errEl.textContent = "";
+        btn.disabled = true;
+        try {
+            const r = await fetch("/api/replay/start", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({filename: btn.dataset.filename}),
+            });
+            if (r.ok) {
+                location.href = "/";
+                return;
+            }
+            const err = await r.json().catch(function() { return {}; });
+            if (errEl) errEl.textContent = err.detail || "Failed to start replay";
+        } catch (err) {
+            if (errEl) errEl.textContent = "Network error: " + err.message;
+        }
+        btn.disabled = false;
+    });
+
+    // --- Replay a raw file (arbitrary path outside the managed capture store) ---
+    (function() {
+        const pathInput = document.getElementById("replay-path");
+        const centerInput = document.getElementById("replay-center-mhz");
+        const rateInput = document.getElementById("replay-rate-msps");
+        const gainInput = document.getElementById("replay-gain-db");
+        const datatypeSelect = document.getElementById("replay-datatype");
+        const speedSelect = document.getElementById("replay-speed");
+        const startBtn = document.getElementById("replay-raw-start-btn");
+        const errEl = document.getElementById("replay-raw-error");
+
+        // Mirrors rfobserver.capture.sigmf_reader.parse_capture_filename's
+        // regexes so a raw filename prefills the same fields the managed
+        // capture flow derives server-side. Fields with no match are left
+        // untouched (editable, not overwritten with blanks).
+        function extractParams(pathStr) {
+            const name = pathStr.split("/").pop() || pathStr;
+            const out = {};
+            let m;
+            if ((m = name.match(/_(\d+(?:\.\d+)?)MHz/))) out.center_mhz = parseFloat(m[1]);
+            if ((m = name.match(/_(\d+(?:\.\d+)?)Msps/))) out.rate_msps = parseFloat(m[1]);
+            if ((m = name.match(/_(\d+(?:\.\d+)?)dB/))) out.gain_db = parseFloat(m[1]);
+            return out;
+        }
+
+        pathInput.addEventListener("change", function() {
+            const params = extractParams(pathInput.value);
+            if (params.center_mhz != null) centerInput.value = params.center_mhz;
+            if (params.rate_msps != null) rateInput.value = params.rate_msps;
+            if (params.gain_db != null) gainInput.value = params.gain_db;
+        });
+
+        startBtn.addEventListener("click", async function() {
+            const path = pathInput.value.trim();
+            errEl.textContent = "";
+            if (!path) { errEl.textContent = "Path is required"; return; }
+            const rateMsps = parseFloat(rateInput.value);
+            if (isNaN(rateMsps) || rateMsps <= 0) {
+                errEl.textContent = "Sample rate is required";
+                return;
+            }
+            const centerMhz = parseFloat(centerInput.value);
+            const gainDb = parseFloat(gainInput.value);
+
+            startBtn.disabled = true;
+            const body = {
+                path: path,
+                sample_rate_hz: rateMsps * 1e6,
+                center_freq_hz: isNaN(centerMhz) ? 0 : centerMhz * 1e6,
+                gain_db: isNaN(gainDb) ? 0 : gainDb,
+                datatype: datatypeSelect.value,
+                speed: parseFloat(speedSelect.value),
+            };
+            try {
+                const r = await fetch("/api/replay/start", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify(body),
+                });
+                if (r.ok) {
+                    location.href = "/";
+                    return;
+                }
+                const err = await r.json().catch(function() { return {}; });
+                errEl.textContent = err.detail || "Failed to start replay";
+            } catch (err) {
+                errEl.textContent = "Network error: " + err.message;
+            }
+            startBtn.disabled = false;
+        });
+    })();
 
     loadList();
 

@@ -144,7 +144,8 @@
     // user scrolls, cached (with a bounded LRU so very long captures don't
     // exhaust memory), and only the visible window is ever drawn. The slider is
     // scoped to whatever rows are currently on screen.
-    let viewerFreqs = null;    // freq axis
+    let viewerFreqs = null;    // freq axis (relative to the SDR center)
+    let viewerCenterFreq = 0;  // absolute SDR center; detections are absolute, freq_axis is relative
     let viewerTimeRes = 0;     // seconds per row
     let viewerTotalRows = 0;
     let viewerMin = -120;
@@ -215,11 +216,6 @@
             if (m.hostname) html += row("Hostname", m.hostname);
             if (m.serial) html += row("Serial", m.serial);
             html += '</table>';
-            html += '<div class="detail-actions">';
-            html += '<button type="button" id="replay-capture-btn" class="btn-apply" data-filename="'
-                + d.filename + '">Replay this capture</button>';
-            html += '<span id="replay-capture-error" class="replay-error"></span>';
-            html += '</div>';
 
             detailEl.innerHTML = html;
 
@@ -280,6 +276,7 @@
             if (!first) { viewerEl.innerHTML = '<div class="placeholder-text">PSD data unavailable</div>'; return; }
 
             viewerFreqs = first.freq_axis;
+            viewerCenterFreq = first.center_freq_hz || 0;
             viewerTotalRows = first.total_rows;
             // Effective time resolution: the PSD grid's nominal
             // time_resolution_s does NOT satisfy total_rows * tres == duration,
@@ -538,8 +535,11 @@
                     const yTop = det.row_start - firstVisibleRow;
                     const yBot = det.row_stop - firstVisibleRow;
                     if (yBot < 0 || yTop > viewH) continue;
-                    let xLo = ((det.center_freq_hz - det.bandwidth_hz / 2) - fLow) / fSpan * 920;
-                    let xHi = ((det.center_freq_hz + det.bandwidth_hz / 2) - fLow) / fSpan * 920;
+                    // det.center_freq_hz is absolute; fLow/fHigh (freq_axis) are
+                    // relative to the capture's SDR center, so shift into that space.
+                    const relCenter = det.center_freq_hz - viewerCenterFreq;
+                    let xLo = ((relCenter - det.bandwidth_hz / 2) - fLow) / fSpan * 920;
+                    let xHi = ((relCenter + det.bandwidth_hz / 2) - fLow) / fSpan * 920;
                     xLo = Math.max(0, Math.min(920, xLo));
                     xHi = Math.max(0, Math.min(920, xHi));
                     const x = Math.min(xLo, xHi);
@@ -868,31 +868,6 @@
     listEl.addEventListener("click", function(e) {
         const item = e.target.closest(".capture-item");
         if (item) showDetail(item.dataset.file, item.dataset.hasPsd === "1");
-    });
-
-    // --- Replay this capture (managed capture, resolved server-side from its .json) ---
-    detailEl.addEventListener("click", async function(e) {
-        const btn = e.target.closest("#replay-capture-btn");
-        if (!btn) return;
-        const errEl = document.getElementById("replay-capture-error");
-        if (errEl) errEl.textContent = "";
-        btn.disabled = true;
-        try {
-            const r = await fetch("/api/replay/start", {
-                method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({filename: btn.dataset.filename}),
-            });
-            if (r.ok) {
-                location.href = "/";
-                return;
-            }
-            const err = await r.json().catch(function() { return {}; });
-            if (errEl) errEl.textContent = err.detail || "Failed to start replay";
-        } catch (err) {
-            if (errEl) errEl.textContent = "Network error: " + err.message;
-        }
-        btn.disabled = false;
     });
 
     // --- Replay a raw file (arbitrary path outside the managed capture store) ---

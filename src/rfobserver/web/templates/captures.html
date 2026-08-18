@@ -801,7 +801,17 @@
                     redetectError.textContent = "";
                     redetectBtn.disabled = true;
                     const prevLabel = redetectBtn.textContent;
-                    redetectBtn.textContent = "Re-detecting...";
+                    // Live elapsed counter: detection on a large grid can take
+                    // tens of seconds (esp. on the Jetson), so tick every second
+                    // so it never looks frozen. Total time is not predictable
+                    // client-side (depends on grid size + CPU), so show elapsed.
+                    const startedAt = Date.now();
+                    const fmtElapsed = () =>
+                        "Re-detecting... " + Math.round((Date.now() - startedAt) / 1000) + "s";
+                    redetectBtn.textContent = fmtElapsed();
+                    const redetectTicker = setInterval(() => {
+                        redetectBtn.textContent = fmtElapsed();
+                    }, 1000);
                     try {
                         const body = {
                             threshold_high_db: parseFloat(redetectThresholdHigh.value),
@@ -839,6 +849,7 @@
                     } catch (_) {
                         redetectError.textContent = "Re-detect failed";
                     } finally {
+                        clearInterval(redetectTicker);
                         redetectBtn.disabled = false;
                         redetectBtn.textContent = prevLabel;
                     }

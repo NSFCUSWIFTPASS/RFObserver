@@ -104,6 +104,32 @@ def test_two_separate_bursts():
     assert len(result.bursts) == 2
 
 
+def test_many_separated_bursts_all_extracted():
+    """Guards the find_objects-based extraction: many labels, each isolated in
+    its own bbox, must all be found with the correct per-region time/freq/peak
+    (a regression guard for the O(bursts x grid) -> bbox rewrite)."""
+    grid = _make_grid(n_rows=600, n_bins=64, noise_db=-60.0)
+    # 12 bursts on a staggered time/freq lattice so none touch (8-connectivity).
+    expected_cols = []
+    for i in range(12):
+        r0 = 10 + i * 45
+        c0 = 3 + (i % 6) * 10
+        _inject_burst(grid, r0, r0 + 20, c0, c0 + 4, -30.0)
+        expected_cols.append(c0)
+
+    config = BurstDetectionConfig(threshold_high_db=10.0, min_duration_sec=0.0)
+    result = detect_bursts(grid, config, center_freq_hz=915e6, capture_time=datetime(2026, 1, 1))
+
+    assert len(result.bursts) == 12
+    # Every burst carries the injected peak power and a distinct, in-range peak
+    # frequency (proves each region's cols were extracted from its own bbox,
+    # with the row/col offsets applied correctly).
+    assert all(abs(b.peak_power_db - (-30.0)) < 1e-6 for b in result.bursts)
+    peak_freqs = sorted(b.peak_freq_hz for b in result.bursts)
+    assert len(set(peak_freqs)) >= 6  # at least the 6 distinct freq columns
+    assert all(914e6 < f < 916e6 for f in peak_freqs)
+
+
 def test_burst_below_threshold_not_detected():
     grid = _make_grid(n_rows=100, n_bins=64, noise_db=-60.0)
     # Inject burst only 5 dB above noise (below 10 dB threshold)

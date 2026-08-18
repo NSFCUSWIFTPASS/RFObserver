@@ -130,10 +130,22 @@ def _extract_fingerprints(
     """Extract five-parameter fingerprints from labeled regions."""
     bursts: list[BurstFingerprint] = []
 
+    # Bounding box for every label in ONE pass. Extracting each region within
+    # its own (small) bbox avoids an O(num_labels * grid_size) full-grid
+    # `np.where(labeled == label_id)` scan per label, which made re-detection on
+    # large grids (e.g. a 25 s / 2048-bin capture) take minutes.
+    objects = ndimage.find_objects(labeled)
+
     for label_id in valid_labels:
-        rows, cols = np.where(labeled == label_id)
-        if len(rows) == 0:
+        sl = objects[label_id - 1]
+        if sl is None:
             continue
+        region_mask = labeled[sl] == label_id
+        rows_local, cols_local = np.where(region_mask)
+        if len(rows_local) == 0:
+            continue
+        rows = rows_local + sl[0].start
+        cols = cols_local + sl[1].start
 
         # Time bounds
         start_row, end_row = int(rows.min()), int(rows.max())
@@ -155,7 +167,7 @@ def _extract_fingerprints(
         # center_freq_hz — visualizations and span queries assume it sits
         # at the geometric center so that center +/- bandwidth/2 reproduces
         # the actual occupied range.
-        region_powers = grid[rows, cols]
+        region_powers = grid[sl][region_mask]
         peak_idx = int(np.argmax(region_powers))
         peak_power = float(region_powers[peak_idx])
         peak_freq_hz = center_freq_hz + float(freq_axis[cols[peak_idx]])

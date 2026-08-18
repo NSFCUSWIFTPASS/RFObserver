@@ -38,7 +38,7 @@ async def test_receiver_not_initialized_until_active() -> None:
         spies.append(s)
         return s
 
-    sup = PipelineSupervisor(build_receiver=build, build_processor=lambda r: Proc(r))
+    sup = PipelineSupervisor(build_receiver=build, build_processor=lambda r, **kwargs: Proc(r))
     # Constructing the supervisor and staying inactive must not build/init a receiver.
     assert spies == []
     await sup.set_active(True)

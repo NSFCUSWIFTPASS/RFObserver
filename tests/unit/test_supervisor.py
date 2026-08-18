@@ -44,7 +44,7 @@ def _make() -> tuple[PipelineSupervisor, tuple[list, list]]:
 
     sup = PipelineSupervisor(
         build_receiver=build_receiver,
-        build_processor=lambda r: FakeProcessor(r),
+        build_processor=lambda r, **kwargs: FakeProcessor(r),
         on_processor_change=changes.append,
     )
     return sup, (receivers, changes)
@@ -90,3 +90,56 @@ async def test_reenable_uses_fresh_receiver() -> None:
     await sup.set_active(True)
     assert len(receivers) == 2
     assert receivers[1].initialized == 1
+
+
+class _FakeReplayReceiver:
+    def __init__(self, name: str) -> None:
+        self.source_name = name
+        self.speed = 1.0
+        self.loop = True
+
+    def initialize(self) -> None:  # off-loop in _start
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class _FakeReplayProc:
+    def __init__(self) -> None:
+        self.stopped = False
+
+    async def run(self) -> None:
+        while not self.stopped:
+            await asyncio.sleep(0.01)
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+@pytest.mark.asyncio
+async def test_start_replay_uses_override_and_reports_status() -> None:
+    seen: dict[str, object] = {}
+
+    def build_receiver() -> _FakeReplayReceiver:
+        return _FakeReplayReceiver("SDR")
+
+    def build_processor(receiver: object, *, replay_mode: bool = False) -> _FakeReplayProc:
+        seen["replay_mode"] = replay_mode
+        seen["receiver"] = receiver
+        return _FakeReplayProc()
+
+    sup = PipelineSupervisor(build_receiver, build_processor)
+    assert sup.replay_status() is None
+
+    rx = _FakeReplayReceiver("ssm_fhss_OVF.dat")
+    rx.speed = 2.0
+    await sup.start_replay(rx)
+    assert seen["replay_mode"] is True
+    assert seen["receiver"] is rx
+    st = sup.replay_status()
+    assert st == {"source": "ssm_fhss_OVF.dat", "speed": 2.0, "looping": True}
+
+    await sup.stop_replay()
+    assert sup.replay_status() is None
+    assert not sup.active

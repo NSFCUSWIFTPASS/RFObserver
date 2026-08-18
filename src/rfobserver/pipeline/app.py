@@ -78,7 +78,7 @@ async def run(settings: AppSettings) -> None:
 
         return Receiver(receiver_config)
 
-    def build_processor(receiver: IReceiver) -> Any:
+    def build_processor(receiver: IReceiver, *, replay_mode: bool = False) -> Any:
         # streaming for single-freq / trigger, batch for sweeps
         is_sweep = settings.FREQUENCY_STEP > 0 and settings.FREQUENCY_END > settings.FREQUENCY_START
         use_streaming = settings.TRIGGER_ENABLED or not is_sweep
@@ -94,6 +94,7 @@ async def run(settings: AppSettings) -> None:
                 broadcast=broadcast,
                 zms_monitor=zms_monitor,
                 nats_producer=nats_producer,
+                replay_mode=replay_mode,
             )
             # Attach module manager for upstream signal processing
             proc._module_manager = ModuleManager()
@@ -201,6 +202,7 @@ async def _heartbeat_loop(
                     "type": "heartbeat",
                     "status_bar_html": build_status_bar_html(settings, active=supervisor.active),
                     "recording": rec_status,
+                    "replay": supervisor.replay_status(),
                     "zms": build_zms_status_payload(settings, processor),
                     "nats": build_nats_status_payload(settings, processor),
                     "modules": build_modules_payload(module_manager),

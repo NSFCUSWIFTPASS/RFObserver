@@ -29,7 +29,7 @@ class PipelineSupervisor:
     def __init__(
         self,
         build_receiver: Callable[[], IReceiver],
-        build_processor: Callable[[IReceiver], Any],
+        build_processor: Callable[..., Any],
         on_processor_change: Callable[[Any | None], None] | None = None,
     ) -> None:
         self._build_receiver = build_receiver
@@ -40,6 +40,8 @@ class PipelineSupervisor:
         self._task: asyncio.Task[Any] | None = None
         self._active = False
         self._lock = asyncio.Lock()
+        self._receiver_override: IReceiver | None = None
+        self._replay = False
 
     @property
     def active(self) -> bool:
@@ -66,12 +68,39 @@ class PipelineSupervisor:
                 await self._stop()
             return self._active
 
+    async def start_replay(self, receiver: IReceiver) -> None:
+        """Stop any live pipeline and start with `receiver` in replay mode."""
+        if self._active:
+            await self.set_active(False)
+        async with self._lock:
+            self._receiver_override = receiver
+            self._replay = True
+            await self._start()
+
+    async def stop_replay(self) -> None:
+        """Stop the replay pipeline and clear the override (leaves sensor stopped)."""
+        async with self._lock:
+            if self._active:
+                await self._stop()
+            self._receiver_override = None
+            self._replay = False
+
+    def replay_status(self) -> dict[str, Any] | None:
+        if not self._replay or self._receiver is None:
+            return None
+        rx = self._receiver
+        return {
+            "source": getattr(rx, "source_name", "") or "replay",
+            "speed": float(getattr(rx, "speed", 1.0)),
+            "looping": bool(getattr(rx, "loop", False)),
+        }
+
     async def _start(self) -> None:
         loop = asyncio.get_running_loop()
-        receiver = self._build_receiver()
+        receiver = self._receiver_override or self._build_receiver()
         # initialize() claims + configures hardware (blocking) — run off-loop.
         await loop.run_in_executor(None, receiver.initialize)
-        processor = self._build_processor(receiver)
+        processor = self._build_processor(receiver, replay_mode=self._replay)
         self._receiver = receiver
         self._processor = processor
         self._task = asyncio.create_task(processor.run())

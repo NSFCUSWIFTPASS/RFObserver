@@ -115,6 +115,58 @@
 </div>
 
 <div class="card" style="margin-bottom: 16px;">
+    <div class="card-header">Trigger &amp; Recording</div>
+    <div class="card-body">
+        <div class="config-form">
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="trigger-threshold">Trigger Threshold (dB)</label>
+                    <input type="number" id="trigger-threshold" name="trigger_threshold_db" value="{{ settings.TRIGGER_THRESHOLD_DB }}" step="1">
+                </div>
+                <div class="form-group">
+                    <label for="trigger-hysteresis">Hysteresis (chunks)</label>
+                    <input type="number" id="trigger-hysteresis" name="trigger_hysteresis" value="{{ settings.TRIGGER_HYSTERESIS }}" step="1" min="1">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="trigger-pre-sec">Pre-trigger (s)</label>
+                    <input type="number" id="trigger-pre-sec" name="trigger_pre_sec" value="{{ settings.TRIGGER_PRE_SEC }}" step="0.1" min="0">
+                </div>
+                <div class="form-group">
+                    <label for="recording-max-sec">Max Record (s)</label>
+                    <input type="number" id="recording-max-sec" name="recording_max_sec" value="{{ settings.RECORDING_MAX_SEC }}" step="1" min="0">
+                </div>
+                <div class="form-group">
+                    <label for="recording-mem-fraction">RAM Fraction</label>
+                    <input type="number" id="recording-mem-fraction" name="recording_mem_fraction" value="{{ settings.RECORDING_MEM_FRACTION }}" step="0.05" min="0.1" max="0.9">
+                </div>
+            </div>
+            <div class="form-row" style="align-items: center;">
+                <div class="form-group" style="flex: 0 0 auto;">
+                    <label class="toggle-label" title="Keep the trigger armed after each capture and record continuously while the sensor is active">
+                        <input type="checkbox" id="trigger-continuous" name="trigger_continuous" {% if settings.TRIGGER_CONTINUOUS %}checked{% endif %}>
+                        <span class="toggle-text">Continuous Trigger</span>
+                    </label>
+                </div>
+                <div class="form-group" style="flex: 0 0 auto;">
+                    <label class="toggle-label" title="Buffer the capture in RAM instead of streaming to disk (duration is then capped by available RAM)">
+                        <input type="checkbox" id="recording-ram-buffer" name="recording_ram_buffer" {% if settings.RECORDING_RAM_BUFFER %}checked{% endif %}>
+                        <span class="toggle-text">RAM Buffer</span>
+                    </label>
+                </div>
+            </div>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px;">
+                Continuous trigger auto-arms whenever the sensor is active and re-arms immediately
+                after each capture, so recordings keep filling the disk as a FIFO ring bounded by
+                Storage &rarr; Archive Max (GB) (oldest captures are evicted first). Max Record 0 = no
+                limit. Pre-trigger prepends buffered lead-in to each capture.
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card" style="margin-bottom: 16px;">
     <div class="card-header">Display</div>
     <div class="card-body">
         <div class="config-form">
@@ -333,7 +385,24 @@
     let initialMap = {};
     for (const [k, v] of initial.entries()) initialMap[k] = v;
 
+    // Checkboxes are tracked by .checked, not FormData: an unchecked box is
+    // absent from FormData, so the entries() loop below cannot see a
+    // checked -> unchecked change.
+    const boolIds = ['trigger-continuous', 'recording-ram-buffer'];
+    let initialChecks = {};
+    function snapshotChecks() {
+        boolIds.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) initialChecks[id] = el.checked;
+        });
+    }
+    snapshotChecks();
+
     function hasChanges() {
+        for (const id of boolIds) {
+            const el = document.getElementById(id);
+            if (el && el.checked !== initialChecks[id]) return true;
+        }
         const current = new FormData(form);
         for (const [k, v] of current.entries()) {
             if (initialMap[k] !== v) return true;
@@ -369,13 +438,16 @@
         }
     }
 
-    form.addEventListener('input', function() {
+    function refreshDirty() {
         if (hasChanges()) {
             setState('dirty');
         } else {
             setState('clean');
         }
-    });
+    }
+    form.addEventListener('input', refreshDirty);
+    // Checkbox toggles fire 'change'; ensure they update the dirty state too.
+    form.addEventListener('change', refreshDirty);
 
     form.addEventListener('submit', async function(e) {
         e.preventDefault();
@@ -398,6 +470,12 @@
                 data[k] = v;
             }
         }
+        // Send real booleans for checkboxes (FormData omits unchecked ones and
+        // sends "on" for checked ones -- neither round-trips to a bool cleanly).
+        boolIds.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) data[el.name] = el.checked;
+        });
 
         try {
             const resp = await fetch('/config/apply', {
@@ -415,6 +493,7 @@
             const current = new FormData(form);
             initialMap = {};
             for (const [k, v] of current.entries()) initialMap[k] = v;
+            snapshotChecks();
             setState('applied');
         } catch (err) {
             alert('Network error: ' + err.message);

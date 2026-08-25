@@ -4,15 +4,26 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import SecretStr
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _to_bool(raw: Any) -> bool:
+    """Cast a form value to bool. Checkboxes send real JSON booleans, but be
+    tolerant of the "true"/"on"/"1" string forms too."""
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("true", "on", "1", "yes")
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -89,7 +100,7 @@ async def apply_config(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Invalid JSON") from exc
 
     # Map form fields to settings attributes
-    field_map: dict[str, tuple[str, type]] = {
+    field_map: dict[str, tuple[str, Callable[[Any], Any]]] = {
         "frequency_start": ("FREQUENCY_START", int),
         "frequency_end": ("FREQUENCY_END", int),
         "frequency_step": ("FREQUENCY_STEP", int),
@@ -97,6 +108,12 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "gain": ("GAIN", int),
         "duration_sec": ("DURATION_SEC", float),
         "trigger_threshold_db": ("TRIGGER_THRESHOLD_DB", float),
+        "trigger_hysteresis": ("TRIGGER_HYSTERESIS", int),
+        "trigger_pre_sec": ("TRIGGER_PRE_SEC", float),
+        "trigger_continuous": ("TRIGGER_CONTINUOUS", _to_bool),
+        "recording_max_sec": ("RECORDING_MAX_SEC", float),
+        "recording_mem_fraction": ("RECORDING_MEM_FRACTION", float),
+        "recording_ram_buffer": ("RECORDING_RAM_BUFFER", _to_bool),
         "burst_threshold_high_db": ("BURST_THRESHOLD_HIGH_DB", float),
         "burst_threshold_low_ratio": ("BURST_THRESHOLD_LOW_RATIO", float),
         "psd_time_resolution_ms": ("PSD_TIME_RESOLUTION_MS", float),
@@ -197,6 +214,9 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "FREQUENCY_END",
         "FREQUENCY_STEP",
         "TRIGGER_THRESHOLD_DB",
+        # Pre-trigger seconds sizes the circular buffer rebuilt in
+        # _recompute_chunk_params, so a change must reconfigure the pipeline.
+        "TRIGGER_PRE_SEC",
         "BURST_THRESHOLD_HIGH_DB",
         "BURST_THRESHOLD_LOW_RATIO",
     }

@@ -74,6 +74,11 @@ def test_toggle_persists_to_env_and_reloads(monkeypatch, tmp_path):
     assert AppSettings().SENSOR_ACTIVE is False
 
 
+def test_trigger_continuous_defaults_false():
+    settings = AppSettings(_env_file=None)
+    assert settings.TRIGGER_CONTINUOUS is False
+
+
 def test_zms_none_when_incomplete():
     settings = AppSettings(_env_file=None)
     assert settings.zms is None

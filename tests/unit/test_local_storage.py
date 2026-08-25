@@ -42,3 +42,51 @@ def test_creates_directory(tmp_path):
     path = tmp_path / "sub" / "dir"
     LocalStorage(str(path))
     assert path.exists()
+
+
+def _write_capture(storage, base, sc16_bytes):
+    """Write a full capture set: .sc16 + the companions a streaming capture emits."""
+    d = storage.storage_path
+    (d / f"{base}.sc16").write_bytes(b"\x00" * sc16_bytes)
+    (d / f"{base}.psd").write_bytes(b"\x00" * sc16_bytes)  # grid is comparable in size
+    (d / f"{base}.psd.json").write_text("{}")
+    (d / f"{base}.json").write_text("{}")
+    (d / f"{base}.detections.json").write_text("[]")
+
+
+def test_get_usage_counts_companions(tmp_path):
+    """Usage must count the whole capture footprint, not just the .sc16."""
+    storage = LocalStorage(str(tmp_path), max_gb=1.0)
+    _write_capture(storage, "a", 500)
+    # 500 (.sc16) + 500 (.psd) + 2 (.psd.json) + 2 (.json) + 2 (.detections.json)
+    assert storage.get_usage_bytes() == 1006
+
+
+def test_enforce_cap_evicts_oldest_full_set(tmp_path):
+    import time
+
+    # Cap ~1.5 KB; two captures at ~1 KB each -> the oldest must go entirely.
+    storage = LocalStorage(str(tmp_path), max_gb=1500 / (1024**3))
+    _write_capture(storage, "old", 500)
+    time.sleep(0.05)  # ensure a later mtime
+    _write_capture(storage, "new", 500)
+
+    storage.enforce_cap()
+
+    names = {p.name for p in tmp_path.iterdir()}
+    # Every companion of the oldest capture is gone.
+    for suf in (".sc16", ".psd", ".psd.json", ".json", ".detections.json"):
+        assert f"old{suf}" not in names
+    # The newest capture survives intact.
+    assert "new.sc16" in names
+    assert "new.psd" in names
+    assert "new.detections.json" in names
+    assert storage.get_usage_bytes() <= storage.max_bytes
+
+
+def test_enforce_cap_keeps_newest_even_when_over_cap(tmp_path):
+    # A single capture larger than the cap is never deleted (nothing older to evict).
+    storage = LocalStorage(str(tmp_path), max_gb=100 / (1024**3))
+    _write_capture(storage, "only", 500)
+    storage.enforce_cap()
+    assert (tmp_path / "only.sc16").exists()

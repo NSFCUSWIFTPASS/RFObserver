@@ -65,7 +65,8 @@ async def _record_briefly(settings: AppSettings, db: SensorDatabase) -> Path:
         proc.stop()
 
     await asyncio.wait_for(asyncio.gather(proc.run(), driver()), timeout=30.0)
-    return Path(settings.STORAGE_PATH)
+    # Manual start_recording() writes into the manual/ subdir.
+    return Path(settings.STORAGE_PATH) / "manual"
 
 
 @pytest.mark.asyncio

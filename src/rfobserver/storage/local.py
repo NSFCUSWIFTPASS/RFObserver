@@ -26,6 +26,26 @@ class LocalStorage:
         self.storage_path = Path(storage_path)
         self.max_bytes = int(max_gb * 1024**3)
         self.storage_path.mkdir(parents=True, exist_ok=True)
+        # Captures are split by origin: auto/ holds triggered + continuous
+        # recordings (FIFO-evicted to stay within the cap); manual/ holds manual
+        # and replay records and is never evicted.
+        self.auto_dir = self.storage_path / "auto"
+        self.manual_dir = self.storage_path / "manual"
+        self.auto_dir.mkdir(exist_ok=True)
+        self.manual_dir.mkdir(exist_ok=True)
+        self.migrate_flat_captures_to_manual()
+
+    def migrate_flat_captures_to_manual(self) -> None:
+        """Move any legacy root-level captures into manual/ (one-time, at startup).
+
+        Older builds wrote captures straight into the storage root; those are
+        treated as manual (deliberate keeps) so the auto/ FIFO never evicts them.
+        Only root-level ``*.sc16`` are touched; the subdirs are left alone.
+        """
+        for sc16 in self.storage_path.glob("*.sc16"):
+            for src in [sc16, *self._companion_paths(sc16)]:
+                if src.exists():
+                    src.rename(self.manual_dir / src.name)
 
     def save_capture(self, filename: str, data: bytes) -> Path:
         """Save raw IQ data to a file, rotating old files if needed."""
@@ -36,9 +56,13 @@ class LocalStorage:
         return dest
 
     def _companion_paths(self, sc16_path: Path) -> list[Path]:
-        """Paths of the companion files for a capture (whether or not they exist)."""
+        """Paths of the companion files for a capture (whether or not they exist).
+
+        Resolved relative to the .sc16's own directory so this works for a
+        capture in auto/, manual/, or the legacy root alike.
+        """
         base = sc16_path.name[: -len(".sc16")]
-        return [self.storage_path / f"{base}{suf}" for suf in _COMPANION_SUFFIXES]
+        return [sc16_path.parent / f"{base}{suf}" for suf in _COMPANION_SUFFIXES]
 
     def _capture_size(self, sc16_path: Path) -> int:
         """Total bytes of a capture: its .sc16 plus every existing companion."""
@@ -72,17 +96,21 @@ class LocalStorage:
         operates on captures already on disk and never deletes the single newest
         capture, so a just-finalized recording is always kept even if it alone
         exceeds the cap. Called after each streaming recording so continuous
-        triggering stays bounded by ARCHIVE_MAX_GB.
+        triggering stays bounded by ARCHIVE_MAX_GB. Only the auto/ set is
+        considered -- manual captures are never counted and never evicted.
         """
-        captures = sorted(self.storage_path.glob("*.sc16"), key=lambda f: f.stat().st_mtime)
+        captures = sorted(self.auto_dir.glob("*.sc16"), key=lambda f: f.stat().st_mtime)
         usage = sum(self._capture_size(c) for c in captures)
         while usage > self.max_bytes and len(captures) > 1:
             oldest = captures.pop(0)
             usage -= self._delete_capture(oldest)
 
     def get_usage_bytes(self) -> int:
-        """Return total bytes used by captures (.sc16 files and their companions)."""
-        return sum(self._capture_size(c) for c in self.storage_path.glob("*.sc16"))
+        """Bytes used by the managed (auto) capture set, including companions.
+
+        Manual captures are excluded -- they are outside the FIFO budget.
+        """
+        return sum(self._capture_size(c) for c in self.auto_dir.glob("*.sc16"))
 
     def get_usage_gb(self) -> float:
         return self.get_usage_bytes() / (1024**3)

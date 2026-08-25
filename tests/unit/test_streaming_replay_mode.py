@@ -21,6 +21,12 @@ def _proc(replay_mode: bool, tmp_path):
     db.insert_detection = AsyncMock()
     storage = MagicMock()
     storage.storage_path = tmp_path
+    # Honor the LocalStorage contract: real auto/ and manual/ subdirs so the
+    # recording write paths resolve to actual directories.
+    storage.auto_dir = tmp_path / "auto"
+    storage.manual_dir = tmp_path / "manual"
+    storage.auto_dir.mkdir(exist_ok=True)
+    storage.manual_dir.mkdir(exist_ok=True)
     zms = MagicMock()
     nats = MagicMock()
     nats.publish_stats = AsyncMock()

@@ -291,6 +291,46 @@ class TestConfigApply:
         assert settings.ARCHIVE_MAX_GB == 100.0
         processor.reconfigure.assert_not_called()
 
+    def test_apply_trigger_continuous_bool(self, client_with_processor):
+        client, settings, processor = client_with_processor
+        resp = client.post("/config/apply", json={"trigger_continuous": True})
+        assert resp.status_code == 200
+        assert settings.TRIGGER_CONTINUOUS is True
+        # Read live each chunk -> no pipeline reconfigure needed.
+        processor.reconfigure.assert_not_called()
+        # Turning it back off is honored (real boolean, not truthy string).
+        resp = client.post("/config/apply", json={"trigger_continuous": False})
+        assert resp.status_code == 200
+        assert settings.TRIGGER_CONTINUOUS is False
+
+    def test_apply_recording_ram_buffer_bool(self, client_with_processor):
+        client, settings, _ = client_with_processor
+        resp = client.post("/config/apply", json={"recording_ram_buffer": True})
+        assert resp.status_code == 200
+        assert settings.RECORDING_RAM_BUFFER is True
+
+    def test_apply_recording_max_sec_no_reconfigure(self, client_with_processor):
+        client, settings, processor = client_with_processor
+        resp = client.post("/config/apply", json={"recording_max_sec": "12.5"})
+        assert resp.status_code == 200
+        assert settings.RECORDING_MAX_SEC == 12.5
+        processor.reconfigure.assert_not_called()
+
+    def test_apply_trigger_pre_sec_triggers_reconfigure(self, client_with_processor):
+        client, settings, processor = client_with_processor
+        # Pre-trigger buffer is rebuilt in _recompute_chunk_params, so a change
+        # must reconfigure the pipeline.
+        resp = client.post("/config/apply", json={"trigger_pre_sec": "2.0"})
+        assert resp.status_code == 200
+        assert settings.TRIGGER_PRE_SEC == 2.0
+        processor.reconfigure.assert_called_once()
+
+    def test_apply_trigger_hysteresis(self, client_with_processor):
+        client, settings, _ = client_with_processor
+        resp = client.post("/config/apply", json={"trigger_hysteresis": "5"})
+        assert resp.status_code == 200
+        assert settings.TRIGGER_HYSTERESIS == 5
+
     def test_apply_invalid_json(self, client):
         resp = client.post(
             "/config/apply",

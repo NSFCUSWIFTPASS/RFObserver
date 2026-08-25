@@ -264,6 +264,10 @@ class StreamingProcessor:
         self._recording_dropped: int = 0
         self._trigger_initiated: bool = False  # True if trigger fired (vs manual)
         self._below_threshold_count = 0
+        # True when the current "armed" state came from continuous auto-arm (vs a
+        # manual arm_trigger). Lets a continuous-off toggle release an auto-armed
+        # wait without disarming a deliberately manual arm.
+        self._continuous_armed: bool = False
 
         # Disk-streaming write queue (default mode)
         self._recording_queue: queue.Queue[Any] = queue.Queue(maxsize=64)
@@ -431,6 +435,7 @@ class StreamingProcessor:
         if self._recording_state == "recording":
             return
         self._recording_state = "armed"
+        self._continuous_armed = False  # a deliberate manual arm, not continuous
         logger.info("Trigger armed (threshold=%.1f dB)", self._settings.TRIGGER_THRESHOLD_DB)
 
     def stop_recording(self) -> None:
@@ -616,6 +621,21 @@ class StreamingProcessor:
                         self.stop_recording()
                 else:
                     self._below_threshold_count = 0
+            return
+
+        continuous = self._settings.TRIGGER_CONTINUOUS
+        if state == "idle" and continuous and not self._replay_mode:
+            # Continuous trigger auto-arms whenever idle -- on sensor start, when
+            # the toggle is switched on, and (since a capture ends in the idle
+            # state) as the immediate re-arm after each capture.
+            self._recording_state = "armed"
+            self._continuous_armed = True
+            state = "armed"
+        elif state == "armed" and self._continuous_armed and not continuous:
+            # Toggling continuous off releases an auto-armed waiting state; a
+            # manual arm (_continuous_armed False) is left untouched.
+            self._recording_state = "idle"
+            self._continuous_armed = False
             return
 
         # If armed, check threshold to start recording
@@ -838,6 +858,14 @@ class StreamingProcessor:
             duration,
             self._recording_dropped,
         )
+
+        # Keep the capture archive bounded by ARCHIVE_MAX_GB via FIFO eviction of
+        # oldest captures. Runs for every finalized capture (this newest one is
+        # never evicted), so continuous triggering cannot fill the disk. Sync the
+        # cap from settings first -- ARCHIVE_MAX_GB may have been changed at
+        # runtime via /config/apply after LocalStorage snapshotted it at startup.
+        self._storage.max_bytes = int(self._settings.ARCHIVE_MAX_GB * 1024**3)
+        self._storage.enforce_cap()
 
     async def _deferred_sidecar(self, sc16_path: Path, grace: float) -> None:
         """Write the detections sidecar after a grace delay (runs on the loop).

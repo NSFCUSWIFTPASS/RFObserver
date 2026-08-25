@@ -42,14 +42,29 @@ def _strip_suffix(name: str, *suffixes: str) -> str:
     return name
 
 
+def _capture_dirs(storage: Path) -> list[Path]:
+    """Locations captures may live in: the auto/ and manual/ subdirs, plus the
+    legacy root (pre-split captures, before startup migration moves them)."""
+    return [storage / "manual", storage / "auto", storage]
+
+
 def _validate_filename(filename: str, storage: Path) -> Path:
-    """Validate filename has no path traversal and resolve to storage path."""
+    """Validate a bare capture filename (no path traversal) and resolve it.
+
+    Captures are split across auto/ and manual/; the filename stays a unique
+    basename, so resolve it by searching those subdirs (then the legacy root)
+    for the existing file. Falls back to the root path when nothing matches so
+    callers still get a clean 404 via a later ``.exists()`` check.
+    """
     if "/" in filename or "\\" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
-    resolved = (storage / filename).resolve()
-    if not str(resolved).startswith(str(storage.resolve())):
-        raise HTTPException(status_code=400, detail="Invalid filename")
-    return resolved
+    for d in _capture_dirs(storage):
+        candidate = (d / filename).resolve()
+        if not str(candidate).startswith(str(storage.resolve())):
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        if candidate.exists():
+            return candidate
+    return (storage / filename).resolve()
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -65,10 +80,19 @@ async def captures_list(request: Request) -> list[dict[str, Any]]:
     if not storage.exists():
         return []
 
+    # Scan auto/ and manual/ (and the legacy root for any not-yet-migrated
+    # captures), newest first across all of them.
+    found: list[tuple[Path, str]] = []
+    for d in _capture_dirs(storage):
+        if d.exists():
+            origin = d.name if d != storage else "manual"
+            found.extend((sc16, origin) for sc16 in d.glob("*.sc16"))
+
     captures: list[dict[str, Any]] = []
-    for sc16 in sorted(storage.glob("*.sc16"), key=lambda f: f.stat().st_mtime, reverse=True):
+    for sc16, origin in sorted(found, key=lambda t: t[0].stat().st_mtime, reverse=True):
         entry: dict[str, Any] = {
             "filename": sc16.name,
+            "origin": origin,
             "size_bytes": sc16.stat().st_size,
             "has_psd": _has_psd(sc16),
         }

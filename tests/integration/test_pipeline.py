@@ -369,15 +369,16 @@ async def test_streaming_manual_recording(
         timeout=10.0,
     )
 
+    # Manual recordings land in the manual/ subdir (never FIFO-evicted).
+    manual_dir = Path(settings.STORAGE_PATH) / "manual"
+
     # Verify .sc16 file created with data
-    sc16_files = list(Path(settings.STORAGE_PATH).glob("*.sc16"))
+    sc16_files = list(manual_dir.glob("*.sc16"))
     assert len(sc16_files) >= 1
     assert sc16_files[0].stat().st_size > 0
 
     # Verify companion .json metadata file
-    json_files = [
-        p for p in Path(settings.STORAGE_PATH).glob("*.json") if not p.name.endswith(".psd.json")
-    ]
+    json_files = [p for p in manual_dir.glob("*.json") if not p.name.endswith(".psd.json")]
     assert len(json_files) >= 1
     import json
 
@@ -391,7 +392,7 @@ async def test_streaming_manual_recording(
     # Verify companion PSD grid (new raw .psd + .psd.json format, memmap-backed)
     from rfobserver.storage import psd_grid
 
-    assert not list(Path(settings.STORAGE_PATH).glob("*.npz"))  # legacy format retired
+    assert not list(manual_dir.glob("*.npz"))  # legacy format retired
     loaded = psd_grid.load_grid(sc16_files[0])
     assert loaded is not None
     grid, grid_meta = loaded
@@ -484,7 +485,8 @@ async def test_streaming_start_recording_while_armed(
         timeout=10.0,
     )
 
-    sc16_files = list(Path(settings.STORAGE_PATH).glob("*.sc16"))
+    # Manual record (overrode the arm) -> manual/.
+    sc16_files = list((Path(settings.STORAGE_PATH) / "manual").glob("*.sc16"))
     assert len(sc16_files) >= 1
 
 
@@ -638,17 +640,15 @@ async def test_ram_recording_creates_file(
         timeout=10.0,
     )
 
+    # Manual RAM recording -> manual/.
+    manual_dir = Path(ram_settings.STORAGE_PATH) / "manual"
     # Verify file flushed to disk
-    sc16_files = list(Path(ram_settings.STORAGE_PATH).glob("*.sc16"))
+    sc16_files = list(manual_dir.glob("*.sc16"))
     assert len(sc16_files) >= 1
     assert sc16_files[0].stat().st_size > 0
 
     # Verify companion JSON
-    json_files = [
-        p
-        for p in Path(ram_settings.STORAGE_PATH).glob("*.json")
-        if not p.name.endswith(".psd.json")
-    ]
+    json_files = [p for p in manual_dir.glob("*.json") if not p.name.endswith(".psd.json")]
     assert len(json_files) >= 1
     import json
 
@@ -674,14 +674,15 @@ async def test_ram_recording_no_file_during_capture(
         while ram_processor._capture_count < target:
             await asyncio.sleep(0.02)
 
-        # File should NOT exist yet (still in RAM)
-        sc16_files = list(Path(ram_settings.STORAGE_PATH).glob("*.sc16"))
+        # File should NOT exist yet (still in RAM). Manual recording -> manual/.
+        manual_dir = Path(ram_settings.STORAGE_PATH) / "manual"
+        sc16_files = list(manual_dir.glob("*.sc16"))
         assert len(sc16_files) == 0
 
         ram_processor.stop_recording()
 
         # NOW file should exist
-        sc16_files = list(Path(ram_settings.STORAGE_PATH).glob("*.sc16"))
+        sc16_files = list(manual_dir.glob("*.sc16"))
         assert len(sc16_files) >= 1
 
         ram_processor.stop()
@@ -724,16 +725,14 @@ async def test_ram_recording_arm_and_fire(
         timeout=10.0,
     )
 
-    sc16_files = list(Path(ram_settings.STORAGE_PATH).glob("*.sc16"))
+    # Triggered RAM recording -> auto/.
+    auto_dir = Path(ram_settings.STORAGE_PATH) / "auto"
+    sc16_files = list(auto_dir.glob("*.sc16"))
     assert len(sc16_files) >= 1
 
     import json
 
-    json_files = [
-        p
-        for p in Path(ram_settings.STORAGE_PATH).glob("*.json")
-        if not p.name.endswith(".psd.json")
-    ]
+    json_files = [p for p in auto_dir.glob("*.json") if not p.name.endswith(".psd.json")]
     meta = json.loads(json_files[0].read_text())
     assert meta["trigger_initiated"] is True
     assert meta["ram_buffered"] is True

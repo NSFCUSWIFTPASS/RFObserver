@@ -191,8 +191,9 @@ async def _heartbeat_loop(
                 detection_count = 0
 
             try:
+                # rglob: captures live under auto/ and manual/ subdirs now.
                 capture_count = (
-                    sum(1 for _ in storage_path.glob("*.sc16")) if storage_path.exists() else 0
+                    sum(1 for _ in storage_path.rglob("*.sc16")) if storage_path.exists() else 0
                 )
             except Exception:
                 capture_count = 0

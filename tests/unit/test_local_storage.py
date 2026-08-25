@@ -12,9 +12,10 @@ def test_save_capture(tmp_path):
 
 
 def test_get_usage(tmp_path):
+    # Usage tracks the managed (auto) set, which is what the cap bounds.
     storage = LocalStorage(str(tmp_path), max_gb=1.0)
     assert storage.get_usage_bytes() == 0
-    storage.save_capture("test.sc16", b"\x00" * 500)
+    (storage.auto_dir / "test.sc16").write_bytes(b"\x00" * 500)
     assert storage.get_usage_bytes() == 500
 
 
@@ -44,14 +45,22 @@ def test_creates_directory(tmp_path):
     assert path.exists()
 
 
-def _write_capture(storage, base, sc16_bytes):
-    """Write a full capture set: .sc16 + the companions a streaming capture emits."""
-    d = storage.storage_path
+def _write_capture(storage, base, sc16_bytes, sub="auto"):
+    """Write a full capture set (.sc16 + companions) into a storage subdir."""
+    d = getattr(storage, f"{sub}_dir")
     (d / f"{base}.sc16").write_bytes(b"\x00" * sc16_bytes)
     (d / f"{base}.psd").write_bytes(b"\x00" * sc16_bytes)  # grid is comparable in size
     (d / f"{base}.psd.json").write_text("{}")
     (d / f"{base}.json").write_text("{}")
     (d / f"{base}.detections.json").write_text("[]")
+
+
+def test_creates_auto_and_manual_subdirs(tmp_path):
+    storage = LocalStorage(str(tmp_path), max_gb=1.0)
+    assert storage.auto_dir.is_dir()
+    assert storage.manual_dir.is_dir()
+    assert storage.auto_dir == tmp_path / "auto"
+    assert storage.manual_dir == tmp_path / "manual"
 
 
 def test_get_usage_counts_companions(tmp_path):
@@ -60,6 +69,14 @@ def test_get_usage_counts_companions(tmp_path):
     _write_capture(storage, "a", 500)
     # 500 (.sc16) + 500 (.psd) + 2 (.psd.json) + 2 (.json) + 2 (.detections.json)
     assert storage.get_usage_bytes() == 1006
+
+
+def test_get_usage_counts_auto_only(tmp_path):
+    """Manual captures are outside the managed budget."""
+    storage = LocalStorage(str(tmp_path), max_gb=1.0)
+    _write_capture(storage, "a", 500, sub="auto")
+    _write_capture(storage, "m", 9000, sub="manual")
+    assert storage.get_usage_bytes() == 1006  # only the auto capture
 
 
 def test_enforce_cap_evicts_oldest_full_set(tmp_path):
@@ -73,7 +90,7 @@ def test_enforce_cap_evicts_oldest_full_set(tmp_path):
 
     storage.enforce_cap()
 
-    names = {p.name for p in tmp_path.iterdir()}
+    names = {p.name for p in storage.auto_dir.iterdir()}
     # Every companion of the oldest capture is gone.
     for suf in (".sc16", ".psd", ".psd.json", ".json", ".detections.json"):
         assert f"old{suf}" not in names
@@ -89,4 +106,41 @@ def test_enforce_cap_keeps_newest_even_when_over_cap(tmp_path):
     storage = LocalStorage(str(tmp_path), max_gb=100 / (1024**3))
     _write_capture(storage, "only", 500)
     storage.enforce_cap()
-    assert (tmp_path / "only.sc16").exists()
+    assert (storage.auto_dir / "only.sc16").exists()
+
+
+def test_enforce_cap_never_evicts_manual(tmp_path):
+    import time
+
+    # Auto over cap, plus a large manual capture that must be left untouched.
+    storage = LocalStorage(str(tmp_path), max_gb=1500 / (1024**3))
+    _write_capture(storage, "m", 9000, sub="manual")
+    _write_capture(storage, "old", 500, sub="auto")
+    time.sleep(0.05)
+    _write_capture(storage, "new", 500, sub="auto")
+
+    storage.enforce_cap()
+
+    # Manual capture and all companions survive regardless of the cap.
+    for suf in (".sc16", ".psd", ".psd.json", ".json", ".detections.json"):
+        assert (storage.manual_dir / f"m{suf}").exists()
+    # Oldest auto capture evicted; newest auto kept.
+    assert not (storage.auto_dir / "old.sc16").exists()
+    assert (storage.auto_dir / "new.sc16").exists()
+
+
+def test_migrate_flat_captures_to_manual(tmp_path):
+    # Pre-seed a legacy capture at the storage root, then construct.
+    root = tmp_path
+    root.mkdir(exist_ok=True)
+    (root / "legacy.sc16").write_bytes(b"\x00" * 800)
+    (root / "legacy.psd").write_bytes(b"\x00" * 400)
+    (root / "legacy.json").write_text("{}")
+
+    storage = LocalStorage(str(root), max_gb=1.0)  # migration runs at construction
+
+    # Moved into manual/, root cleared.
+    assert not (root / "legacy.sc16").exists()
+    assert (storage.manual_dir / "legacy.sc16").exists()
+    assert (storage.manual_dir / "legacy.psd").exists()
+    assert (storage.manual_dir / "legacy.json").exists()

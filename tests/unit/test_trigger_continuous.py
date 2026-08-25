@@ -97,6 +97,29 @@ def test_end_recording_enforces_disk_cap(tmp_path):
     proc._storage.enforce_cap.assert_called_once()
 
 
+def test_manual_record_writes_to_manual_dir(tmp_path):
+    proc, _ = _make_proc(tmp_path)
+    proc.start_recording()  # manual -> _trigger_initiated False
+    assert proc._recording_state == "recording"
+    assert proc._recording_dir == proc._storage.manual_dir
+    proc._end_recording()
+    # The finalized capture lives under manual/.
+    assert list(proc._storage.manual_dir.glob("*.sc16"))
+    assert not list(proc._storage.auto_dir.glob("*.sc16"))
+
+
+def test_triggered_record_writes_to_auto_dir(tmp_path):
+    proc, _ = _make_proc(tmp_path, TRIGGER_THRESHOLD_DB=-400.0)
+    proc.arm_trigger()
+    # A zeros chunk (~ -300 dB) exceeds the -400 threshold -> triggered capture.
+    proc._check_trigger_and_record(_low_power_buf())
+    assert proc._recording_state == "recording"
+    assert proc._recording_dir == proc._storage.auto_dir
+    proc._end_recording()
+    assert list(proc._storage.auto_dir.glob("*.sc16"))
+    assert not list(proc._storage.manual_dir.glob("*.sc16"))
+
+
 def test_end_recording_syncs_cap_from_runtime_settings(tmp_path):
     # LocalStorage snapshots the cap at construction; a runtime ARCHIVE_MAX_GB
     # change (via /config/apply) must reach eviction, or the FIFO uses a stale cap.

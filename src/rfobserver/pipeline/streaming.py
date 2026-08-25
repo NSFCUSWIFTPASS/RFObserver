@@ -293,6 +293,10 @@ class StreamingProcessor:
         self._grid_min: float = float("inf")
         self._grid_max: float = float("-inf")
         self._effective_max_sec: float = float("inf")
+        # Directory the current recording writes into: auto/ for triggered +
+        # continuous captures (FIFO-evicted), manual/ for manual + replay records
+        # (never evicted). Chosen per-recording in _begin_recording.
+        self._recording_dir = local_storage.manual_dir
 
         self._capture_count = 0
 
@@ -687,6 +691,10 @@ class StreamingProcessor:
             return
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         self._recording_file = f"{self._receiver.serial}-{self._settings.HOSTNAME}-{ts}.sc16"
+        # Triggered/continuous captures -> auto/ (FIFO); manual/replay -> manual/.
+        self._recording_dir = (
+            self._storage.auto_dir if self._trigger_initiated else self._storage.manual_dir
+        )
         self._recording_bytes = 0
         self._recording_dropped = 0
         self._recording_start = time.monotonic()
@@ -708,7 +716,7 @@ class StreamingProcessor:
         from rfobserver.storage import psd_grid
 
         if not self._settings.RECORDING_RAM_BUFFER:
-            raw_path, _ = psd_grid.grid_paths(self._storage.storage_path / self._recording_file)
+            raw_path, _ = psd_grid.grid_paths(self._recording_dir / self._recording_file)
             self._grid_raw_path = raw_path
             # Long-lived handle: written per-chunk during recording, closed in
             # _end_recording — a context manager doesn't fit this lifecycle.
@@ -781,7 +789,7 @@ class StreamingProcessor:
             # RAM mode: flush buffer to disk. tofile() streams the array straight
             # to the file — avoids the transient full-size copy that .tobytes()
             # makes, which would double IQ RAM right at the memory-cap boundary.
-            filepath = self._storage.storage_path / base_name
+            filepath = self._recording_dir / base_name
             used = self._recording_buf[: self._recording_buf_pos]
             used.tofile(str(filepath))
             self._recording_bytes = self._recording_buf_pos * 4
@@ -797,8 +805,8 @@ class StreamingProcessor:
             # Rename file if drops occurred
             if self._recording_dropped > 0:
                 orig_name = base_name.replace(f"_drop{self._recording_dropped}.sc16", ".sc16")
-                orig = self._storage.storage_path / orig_name
-                dest = self._storage.storage_path / base_name
+                orig = self._recording_dir / orig_name
+                dest = self._recording_dir / base_name
                 if orig.exists():
                     orig.rename(dest)
 
@@ -807,7 +815,7 @@ class StreamingProcessor:
         # np.concatenate). Either way, no whole-grid RAM copy.
         from rfobserver.storage import psd_grid
 
-        raw_path, meta_path = psd_grid.grid_paths(self._storage.storage_path / base_name)
+        raw_path, meta_path = psd_grid.grid_paths(self._recording_dir / base_name)
         if self._grid_file is not None:
             self._grid_file.close()
             self._grid_file = None
@@ -845,7 +853,7 @@ class StreamingProcessor:
         # persisted. This method runs off the event loop, so hand the coroutine
         # back to the loop thread-safely; failures never affect recording.
         if self._loop is not None and self._db is not None:
-            sc16 = self._storage.storage_path / base_name
+            sc16 = self._recording_dir / base_name
             grace = self._settings.DETECTIONS_SIDECAR_GRACE_SEC
             self._loop.call_soon_threadsafe(
                 lambda: asyncio.ensure_future(self._deferred_sidecar(sc16, grace))
@@ -930,7 +938,7 @@ class StreamingProcessor:
             "hostname": s.HOSTNAME,
             "serial": self._receiver.serial,
         }
-        json_path = self._storage.storage_path / filename.replace(".sc16", ".json")
+        json_path = self._recording_dir / filename.replace(".sc16", ".json")
         json_path.write_text(_json.dumps(meta, indent=2))
 
     def _file_writer_loop(self) -> None:
@@ -947,7 +955,7 @@ class StreamingProcessor:
         except OSError:
             logger.debug("Could not pin writer thread to core")
 
-        filepath = self._storage.storage_path / (self._recording_file or "recording.sc16")
+        filepath = self._recording_dir / (self._recording_file or "recording.sc16")
         try:
             with open(filepath, "wb", buffering=8 * 1024 * 1024) as f:
                 while True:

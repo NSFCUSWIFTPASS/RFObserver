@@ -572,3 +572,73 @@ async def test_get_avg_window_decodes_psd_and_frequencies(db):
 
 async def test_get_avg_window_missing_returns_none(db):
     assert await db.get_avg_window(9999) is None
+
+
+async def test_detections_for_window_associates_by_start_and_tuning(db):
+    win_start = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    await db.insert_avg_window(
+        start_time=win_start,
+        duration_sec=2.0,
+        sdr_center_freq_hz=915e6,
+        sample_rate_hz=56e6,
+        gain_db=40.0,
+        num_bins=2,
+        freq_start_hz=0.0,
+        freq_step_hz=1.0,
+        pwr_avg=-70.0,
+        pwr_max=-50.0,
+        pwr_median=-72.0,
+        pwr_std=3.0,
+        kurtosis=1.0,
+        powers=[-70.0, -60.0],
+    )
+    win = (await db.query_avg_windows(limit=1))[0]
+    full = await db.get_avg_window(win["id"])
+
+    def _det(bid, sec, center=915e6):
+        return dict(
+            burst_id=bid,
+            start_time=win_start + timedelta(seconds=sec),
+            stop_time=win_start + timedelta(seconds=sec + 0.1),
+            center_freq_hz=915.1e6,
+            bandwidth_hz=1e6,
+            peak_power_db=-30.0,
+            duration_ms=100.0,
+            detection_timestamp=win_start + timedelta(seconds=sec),
+            sdr_center_freq_hz=center,
+            sample_rate_hz=56e6,
+            gain_db=40.0,
+        )
+
+    await db.insert_detection(**_det("in", 0.5))  # inside window
+    await db.insert_detection(**_det("out", 5.0))  # after window
+    await db.insert_detection(**_det("wrong-tune", 0.6, center=100e6))  # inside time, wrong center
+
+    dets = await db.detections_for_window(full)
+    assert {d["burst_id"] for d in dets} == {"in"}
+
+
+async def test_cleanup_prunes_old_avg_windows(db):
+    old = datetime.now(timezone.utc) - timedelta(days=30)
+    recent = datetime.now(timezone.utc)
+    common = dict(
+        duration_sec=0.5,
+        sdr_center_freq_hz=100e6,
+        sample_rate_hz=4.0,
+        gain_db=40.0,
+        num_bins=2,
+        freq_start_hz=0.0,
+        freq_step_hz=1.0,
+        pwr_avg=-70.0,
+        pwr_max=-50.0,
+        pwr_median=-72.0,
+        pwr_std=3.0,
+        kurtosis=1.0,
+        powers=[-70.0, -60.0],
+    )
+    await db.insert_avg_window(start_time=old, **common)
+    await db.insert_avg_window(start_time=recent, **common)
+    removed = await db.cleanup_old_data(days=7)
+    assert removed >= 1
+    rows = await db.query_avg_windows(limit=10)
+    assert len(rows) == 1  # only the recent one survives

@@ -385,6 +385,21 @@ class SensorDatabase:
         record["frequencies"] = [start + i * step for i in range(num_bins)]
         return record
 
+    async def detections_for_window(self, window: dict[str, Any]) -> list[dict[str, Any]]:
+        """Detections that started inside this averaged window's time span and
+        match its SDR tuning. Reuses query_detections' since/until (which range on
+        the burst start_time) so a burst is associated with the window it began in."""
+        start = datetime.fromisoformat(window["start_time"])
+        until = start + timedelta(seconds=float(window["duration_sec"]))
+        return await self.query_detections(
+            since=start,
+            until=until,
+            sdr_center_freq=window["sdr_center_freq_hz"],
+            sample_rate=window["sample_rate_hz"],
+            gain=window["gain_db"],
+            limit=1000,
+        )
+
     @staticmethod
     def _sdr_conditions(
         sdr_center_freq: float | None,
@@ -568,7 +583,7 @@ class SensorDatabase:
         await self._db.commit()
 
     async def cleanup_old_data(self, days: int = 7) -> int:
-        """Remove detections, stats, and tone_checks older than ``days`` days."""
+        """Remove detections, stats, tone_checks, and avg_windows older than ``days`` days."""
         assert self._db is not None
         cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
 
@@ -578,9 +593,11 @@ class SensorDatabase:
         stats_count = cursor.rowcount
         cursor = await self._db.execute("DELETE FROM tone_checks WHERE timestamp < ?", (cutoff,))
         tc_count = cursor.rowcount
+        cursor = await self._db.execute("DELETE FROM avg_windows WHERE start_time < ?", (cutoff,))
+        avg_count = cursor.rowcount
 
         await self._db.commit()
-        total: int = det_count + stats_count + tc_count
+        total: int = det_count + stats_count + tc_count + avg_count
         if total > 0:
             logger.info("Cleaned up %d old records (cutoff: %s)", total, cutoff)
         return total

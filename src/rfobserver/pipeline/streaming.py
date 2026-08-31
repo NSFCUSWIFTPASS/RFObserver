@@ -1535,6 +1535,37 @@ class StreamingProcessor:
             f"{tc['noise_floor_db']:.1f}" if tc["noise_floor_db"] is not None else "n/a",
         )
 
+    async def _persist_avg_window(
+        self, avg_powers: list[float], result: _StreamResult, iq_stats: IQStatistics
+    ) -> None:
+        """Store the averaged window locally. Runs for every live window,
+        independent of whether ZMS/NATS are attached. Flags (interference /
+        violations) are not computed in the streaming path yet, so they are left
+        NULL until the PSDProcessor gap is closed."""
+        s = self._settings
+        freqs = result.summary_psd.frequencies
+        freq_start = float(freqs[0]) if freqs else 0.0
+        freq_step = float(freqs[1] - freqs[0]) if len(freqs) > 1 else 0.0
+        try:
+            await self._db.insert_avg_window(
+                start_time=datetime.now(timezone.utc),
+                duration_sec=s.DURATION_SEC,
+                sdr_center_freq_hz=float(result.center_freq_hz),
+                sample_rate_hz=float(s.BANDWIDTH),
+                gain_db=float(s.GAIN),
+                num_bins=result.summary_psd.num_bins,
+                freq_start_hz=freq_start,
+                freq_step_hz=freq_step,
+                pwr_avg=iq_stats.average,
+                pwr_max=iq_stats.max,
+                pwr_median=iq_stats.median,
+                pwr_std=iq_stats.std,
+                kurtosis=iq_stats.kurtosis,
+                powers=avg_powers,
+            )
+        except Exception:
+            logger.exception("avg-window persist failed (chunk #%d)", result.capture_num)
+
     async def _publish_processed(
         self, avg_powers: list[float], result: _StreamResult, iq_stats: IQStatistics
     ) -> None:
@@ -1547,6 +1578,7 @@ class StreamingProcessor:
         """
         if self._replay_mode:
             return
+        await self._persist_avg_window(avg_powers, result, iq_stats)
         if self._zms_monitor is None and self._nats_producer is None:
             return
         try:

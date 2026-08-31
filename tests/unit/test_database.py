@@ -1,5 +1,6 @@
 """Tests for rfobserver.storage.database."""
 
+import math
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -756,3 +757,104 @@ async def test_migration_makes_psd_powers_nullable(tmp_path):
         assert pruned_full["pwr_avg"] == -70.0
     finally:
         await database.close()
+
+
+def _avg_common(**overrides):
+    c = dict(
+        duration_sec=0.5,
+        sdr_center_freq_hz=100e6,
+        sample_rate_hz=4.0,
+        gain_db=40.0,
+        num_bins=4,
+        freq_start_hz=98.0,
+        freq_step_hz=1.0,
+        pwr_avg=-70.0,
+        pwr_max=-50.0,
+        pwr_median=-72.0,
+        pwr_std=3.0,
+        kurtosis=1.0,
+        powers=[-80.0, -70.0, -60.0, -50.0],
+    )
+    c.update(overrides)
+    return c
+
+
+async def test_query_avg_waterfall_buckets_by_time(db):
+    base = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    # 8 windows, 1s apart, 2s buckets -> 4 buckets of 2 windows.
+    for i in range(8):
+        await db.insert_avg_window(start_time=base + timedelta(seconds=i), **_avg_common())
+    result = await db.query_avg_waterfall(
+        since=base, until=base + timedelta(seconds=8), max_rows=4, max_bins=4
+    )
+    assert result["bucket_sec"] == pytest.approx(2.0)
+    assert len(result["buckets"]) == 4
+    assert [b["count"] for b in result["buckets"]] == [2, 2, 2, 2]
+    row0 = result["psd_rows"][0]
+    assert row0 == pytest.approx([-80.0, -70.0, -60.0, -50.0], abs=1e-3)
+    assert result["min_db"] <= -80.0
+    assert result["max_db"] >= -50.0
+    assert result["total_windows"] == 8
+
+
+async def test_query_avg_waterfall_downsamples_bins(db):
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # num_bins=4, max_bins=2 -> factor 2 mean per group.
+    await db.insert_avg_window(
+        start_time=base,
+        **_avg_common(num_bins=4, powers=[-80.0, -70.0, -60.0, -50.0]),
+    )
+    result = await db.query_avg_waterfall(
+        since=base, until=base + timedelta(seconds=1), max_rows=1, max_bins=2
+    )
+    assert result["num_bins"] == 2
+    assert result["psd_rows"][0] == pytest.approx([-75.0, -55.0], abs=1e-3)
+    # Downsampled axis is still uniform: start' = 98 + (2-1)*1/2 = 98.5, step' = 2.
+    assert result["freq_start_hz"] == pytest.approx(98.5)
+    assert result["freq_step_hz"] == pytest.approx(2.0)
+
+
+async def test_query_avg_waterfall_pruned_blob_stats_only(db):
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    await db.insert_avg_window(start_time=base, **_avg_common(powers=[-70.0, -60.0, -50.0, -40.0]))
+    # Prune the blob (retention) -> the window still counts toward stats.
+    await db._db.execute("UPDATE avg_windows SET psd_powers = NULL WHERE id = 1")
+    await db._db.commit()
+    result = await db.query_avg_waterfall(since=base, until=base + timedelta(seconds=1), max_rows=1)
+    assert result["total_windows"] == 0  # no PSD windows
+    assert result["buckets"][0]["count"] == 1  # stats still counted
+    assert all(math.isnan(v) for v in result["psd_rows"][0])
+    assert result["buckets"][0]["pwr_avg"] == pytest.approx(-70.0)
+
+
+async def test_query_avg_waterfall_empty_range(db):
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    result = await db.query_avg_waterfall(since=base, until=base + timedelta(hours=1), max_rows=4)
+    assert result["total_windows"] == 0
+    assert len(result["buckets"]) == 4
+    assert all(b["count"] == 0 for b in result["buckets"])
+    assert all(math.isnan(v) for v in result["psd_rows"][0])
+
+
+async def test_query_avg_stats_works_without_blobs(db):
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    await db.insert_avg_window(start_time=base, **_avg_common(pwr_max=-50.0))
+    await db.insert_avg_window(start_time=base + timedelta(seconds=1), **_avg_common(pwr_max=-45.0))
+    result = await db.query_avg_stats(since=base, until=base + timedelta(seconds=2), max_points=1)
+    assert len(result["points"]) == 1
+    p = result["points"][0]
+    assert p["count"] == 2
+    assert p["pwr_avg"] == pytest.approx(-70.0)
+    assert p["pwr_max"] == pytest.approx(-45.0)  # max of maxes
+
+
+async def test_avg_window_configs_distinct_and_latest(db):
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    await db.insert_avg_window(start_time=base, **_avg_common(sdr_center_freq_hz=100e6))
+    await db.insert_avg_window(start_time=base, **_avg_common(sdr_center_freq_hz=200e6))
+    await db.insert_avg_window(
+        start_time=base + timedelta(seconds=1), **_avg_common(sdr_center_freq_hz=200e6)
+    )
+    result = await db.avg_window_configs()
+    assert {c["sdr_center_freq_hz"] for c in result["configs"]} == {100e6, 200e6}
+    assert result["latest"]["sdr_center_freq_hz"] == 200e6

@@ -477,6 +477,247 @@ class SensorDatabase:
             limit=1000,
         )
 
+    async def query_avg_waterfall(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        sdr_center_freq: float | None = None,
+        sample_rate: float | None = None,
+        gain: float | None = None,
+        max_rows: int = 600,
+        max_bins: int = 512,
+    ) -> dict[str, Any]:
+        """Aggregate the range's averaged windows into ``max_rows`` time buckets.
+
+        Each bucket's PSD row is the per-bin mean of its windows' PSDs (native
+        bins downsampled to ``max_bins`` by group-mean when larger). Scalar
+        stats are mean-of-means except ``pwr_max`` which is max-of-maxes so
+        transient bursts stay visible. Windows whose blob was pruned by
+        retention contribute to the stats but not the PSD (their bucket row is
+        all-NaN). Returns plain lists/float scalars ready for the binary
+        packer in the web layer.
+        """
+        assert self._db is not None
+        span = (until - since).total_seconds()
+        empty = {
+            "bucket_sec": 0.0,
+            "num_bins": 0,
+            "min_db": 0.0,
+            "max_db": 0.0,
+            "total_windows": 0,
+            "freq_start_hz": 0.0,
+            "freq_step_hz": 0.0,
+            "buckets": [],
+            "psd_rows": [],
+        }
+        if span <= 0:
+            return empty
+        bucket_sec = span / max_rows
+        conditions, sdr_params = self._sdr_conditions(sdr_center_freq, sample_rate, gain)
+        where = "WHERE start_time >= ? AND start_time < ?"
+        if conditions:
+            where += " AND " + " AND ".join(conditions)
+        params: list[Any] = [since.isoformat(), until.isoformat()]
+        params.extend(sdr_params)
+        query = (
+            "SELECT start_time, num_bins, freq_start_hz, freq_step_hz, psd_powers, "
+            "pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis "
+            f"FROM avg_windows {where} ORDER BY start_time"
+        )
+        since_epoch = since.timestamp()
+        # Per-bucket accumulators. PSD uses per-bin sums + per-bin counts so a
+        # NaN-padded (short) row never poisons a bucket's mean.
+        psd_sum = np.zeros((max_rows, max_bins), dtype=np.float64)
+        psd_cnt = np.zeros((max_rows, max_bins), dtype=np.int64)
+        stat_avg = [0.0] * max_rows
+        stat_max = [-float("inf")] * max_rows
+        stat_med = [0.0] * max_rows
+        stat_std = [0.0] * max_rows
+        stat_kurt = [0.0] * max_rows
+        stat_n = [0] * max_rows
+        total_windows = 0
+        gmin, gmax = float("inf"), float("-inf")
+        freq_start_hz = 0.0
+        freq_step_hz = 0.0
+        first_axis_num_bins = 0
+        first_axis = True
+        async with self._db.execute(query, params) as cursor:
+            while True:
+                rows = await cursor.fetchmany(5000)
+                if not rows:
+                    break
+                for r in rows:
+                    t = datetime.fromisoformat(r[0]).timestamp()
+                    idx = int((t - since_epoch) / bucket_sec)
+                    idx = max(0, min(idx, max_rows - 1))
+                    num_bins = int(r[1])
+                    if first_axis:
+                        first_axis = False
+                        first_axis_num_bins = num_bins
+                        freq_start_hz = float(r[2])
+                        freq_step_hz = float(r[3])
+                    stat_n[idx] += 1
+                    stat_avg[idx] += float(r[5])
+                    if r[6] is not None:
+                        stat_max[idx] = max(stat_max[idx], float(r[6]))
+                    stat_med[idx] += float(r[7])
+                    stat_std[idx] += float(r[8])
+                    stat_kurt[idx] += float(r[9])
+                    blob = r[4]
+                    if blob is None:
+                        continue
+                    total_windows += 1
+                    powers = np.frombuffer(blob, dtype="<f4")
+                    if powers.size != num_bins:
+                        num_bins = int(powers.size)
+                    if num_bins > max_bins:
+                        factor = num_bins // max_bins
+                        trim = factor * max_bins
+                        powers = powers[:trim].reshape(max_bins, factor).mean(axis=1)
+                    else:
+                        pad = max_bins - num_bins
+                        if pad > 0:
+                            powers = np.concatenate(
+                                [powers, np.full(pad, np.nan, dtype=np.float32)]
+                            )
+                    gmin = min(gmin, float(np.nanmin(powers)))
+                    gmax = max(gmax, float(np.nanmax(powers)))
+                    valid = ~np.isnan(powers)
+                    psd_sum[idx] += np.where(valid, powers, 0.0)
+                    psd_cnt[idx] += valid
+        # The downsampled axis is still uniform: group-mean of a uniform axis
+        # shifts the start by (factor-1)*step/2 and multiplies the step.
+        if first_axis_num_bins > max_bins and freq_step_hz > 0:
+            factor = first_axis_num_bins // max_bins
+            freq_start_hz = freq_start_hz + (factor - 1) * freq_step_hz / 2.0
+            freq_step_hz = factor * freq_step_hz
+        psd_rows: list[list[float]] = []
+        for i in range(max_rows):
+            if psd_cnt[i].any():
+                with np.errstate(invalid="ignore"):
+                    mean_row = psd_sum[i] / psd_cnt[i]
+                psd_rows.append([float(x) for x in mean_row])
+            else:
+                psd_rows.append([float("nan")] * max_bins)
+        buckets = [
+            {
+                "start_epoch": since_epoch + i * bucket_sec,
+                "count": stat_n[i],
+                "pwr_avg": stat_avg[i] / stat_n[i] if stat_n[i] else 0.0,
+                "pwr_max": stat_max[i] if stat_n[i] else 0.0,
+                "pwr_median": stat_med[i] / stat_n[i] if stat_n[i] else 0.0,
+                "pwr_std": stat_std[i] / stat_n[i] if stat_n[i] else 0.0,
+                "kurtosis": stat_kurt[i] / stat_n[i] if stat_n[i] else 0.0,
+            }
+            for i in range(max_rows)
+        ]
+        return {
+            "bucket_sec": bucket_sec,
+            "num_bins": max_bins,
+            "min_db": gmin if gmin != float("inf") else 0.0,
+            "max_db": gmax if gmax != float("-inf") else 0.0,
+            "total_windows": total_windows,
+            "freq_start_hz": freq_start_hz,
+            "freq_step_hz": freq_step_hz,
+            "buckets": buckets,
+            "psd_rows": psd_rows,
+        }
+
+    async def query_avg_stats(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        sdr_center_freq: float | None = None,
+        sample_rate: float | None = None,
+        gain: float | None = None,
+        max_points: int = 600,
+    ) -> dict[str, Any]:
+        """Scalar stats timeline for a range. Reads only the light columns, so
+        it works after retention prunes PSD blobs and over any range."""
+        assert self._db is not None
+        span = (until - since).total_seconds()
+        if span <= 0:
+            return {"bucket_sec": 0.0, "min_pwr": 0.0, "max_pwr": 0.0, "points": []}
+        bucket_sec = span / max_points
+        conditions, sdr_params = self._sdr_conditions(sdr_center_freq, sample_rate, gain)
+        where = "WHERE start_time >= ? AND start_time < ?"
+        if conditions:
+            where += " AND " + " AND ".join(conditions)
+        params: list[Any] = [since.isoformat(), until.isoformat()]
+        params.extend(sdr_params)
+        query = (
+            "SELECT start_time, pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis "
+            f"FROM avg_windows {where} ORDER BY start_time"
+        )
+        since_epoch = since.timestamp()
+        n = [0] * max_points
+        avg = [0.0] * max_points
+        mx = [-float("inf")] * max_points
+        med = [0.0] * max_points
+        std = [0.0] * max_points
+        kurt = [0.0] * max_points
+        gmin, gmax = float("inf"), float("-inf")
+        async with self._db.execute(query, params) as cursor:
+            while True:
+                rows = await cursor.fetchmany(10000)
+                if not rows:
+                    break
+                for r in rows:
+                    idx = int((datetime.fromisoformat(r[0]).timestamp() - since_epoch) / bucket_sec)
+                    idx = max(0, min(idx, max_points - 1))
+                    n[idx] += 1
+                    avg[idx] += float(r[1])
+                    med[idx] += float(r[3])
+                    std[idx] += float(r[4])
+                    kurt[idx] += float(r[5])
+                    if r[2] is not None:
+                        mx[idx] = max(mx[idx], float(r[2]))
+                        gmin = min(gmin, float(r[1]))
+                        gmax = max(gmax, float(r[2]))
+        points = [
+            {
+                "start_time": (since + timedelta(seconds=i * bucket_sec)).isoformat(),
+                "count": n[i],
+                "pwr_avg": avg[i] / n[i] if n[i] else None,
+                "pwr_max": mx[i] if n[i] and mx[i] != -float("inf") else None,
+                "pwr_median": med[i] / n[i] if n[i] else None,
+                "pwr_std": std[i] / n[i] if n[i] else None,
+                "kurtosis": kurt[i] / n[i] if n[i] else None,
+            }
+            for i in range(max_points)
+        ]
+        return {
+            "bucket_sec": bucket_sec,
+            "min_pwr": gmin if gmin != float("inf") else 0.0,
+            "max_pwr": gmax if gmax != float("-inf") else 0.0,
+            "points": points,
+        }
+
+    async def avg_window_configs(self) -> dict[str, Any]:
+        """Distinct SDR tuning configs present in avg_windows + the most recent.
+
+        Feeds the averaged-history page's tuning filter (default = latest).
+        """
+        assert self._db is not None
+        self._db.row_factory = aiosqlite.Row
+        async with self._db.execute(
+            """SELECT DISTINCT sdr_center_freq_hz, sample_rate_hz, gain_db
+               FROM avg_windows
+               WHERE sdr_center_freq_hz IS NOT NULL
+               ORDER BY sdr_center_freq_hz, sample_rate_hz, gain_db"""
+        ) as cursor:
+            configs = [dict(row) for row in await cursor.fetchall()]
+        async with self._db.execute(
+            """SELECT sdr_center_freq_hz, sample_rate_hz, gain_db
+               FROM avg_windows
+               WHERE sdr_center_freq_hz IS NOT NULL
+               ORDER BY start_time DESC LIMIT 1"""
+        ) as cursor:
+            row = await cursor.fetchone()
+        return {"configs": configs, "latest": dict(row) if row else None}
+
     @staticmethod
     def _sdr_conditions(
         sdr_center_freq: float | None,

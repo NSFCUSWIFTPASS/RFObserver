@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -715,6 +716,16 @@ def _opt_float(raw: str | None) -> float | None:
         return None
 
 
+def _opt_dt(raw: str | None) -> datetime | None:
+    """Parse an ISO 8601 timestamp query param, or None when empty/invalid."""
+    if raw is None or raw == "":
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
 @router.get("/detections", response_class=HTMLResponse)
 async def detections_fragment(
     request: Request,
@@ -799,6 +810,56 @@ async def detections_json(
         logger.exception("detections.json query failed")
         return {"detections": []}
     return {"detections": [dict(r) for r in rows]}
+
+
+@router.get("/averaged")
+async def averaged_list(
+    request: Request,
+    since: str | None = None,
+    until: str | None = None,
+    sdr_center: str | None = None,
+    sample_rate: str | None = None,
+    gain: str | None = None,
+    limit: str | None = None,
+) -> dict[str, Any]:
+    """Averaged windows in a datetime/tuning range (no PSD blobs)."""
+    db = _get_db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    rows = await db.query_avg_windows(
+        since=_opt_dt(since),
+        until=_opt_dt(until),
+        sdr_center_freq=_opt_float(sdr_center),
+        sample_rate=_opt_float(sample_rate),
+        gain=_opt_float(gain),
+        limit=int(limit) if limit else 500,
+    )
+    return {"windows": rows}
+
+
+@router.get("/averaged/{window_id}")
+async def averaged_detail(request: Request, window_id: int) -> dict[str, Any]:
+    """One averaged window with decoded PSD + reconstructed frequencies."""
+    db = _get_db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    row = await db.get_avg_window(window_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Averaged window not found")
+    result: dict[str, Any] = row
+    return result
+
+
+@router.get("/averaged/{window_id}/detections")
+async def averaged_detections(request: Request, window_id: int) -> dict[str, Any]:
+    """Detections associated with an averaged window (time + tuning join)."""
+    db = _get_db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    row = await db.get_avg_window(window_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Averaged window not found")
+    return {"detections": await db.detections_for_window(row)}
 
 
 @router.get("/tone-check")

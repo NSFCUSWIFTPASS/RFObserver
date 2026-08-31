@@ -56,3 +56,75 @@ async def test_history_page_renders(app_with_db):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         r = await client.get("/history/")
         assert r.status_code == 200
+
+
+@pytest.fixture
+async def _seed_avg(app_with_db):
+    from datetime import datetime, timedelta, timezone
+
+    app, db = app_with_db
+    start = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    await db.insert_avg_window(
+        start_time=start,
+        duration_sec=2.0,
+        sdr_center_freq_hz=915e6,
+        sample_rate_hz=56e6,
+        gain_db=40.0,
+        num_bins=4,
+        freq_start_hz=0.0,
+        freq_step_hz=1.0,
+        pwr_avg=-70.0,
+        pwr_max=-50.0,
+        pwr_median=-72.0,
+        pwr_std=3.0,
+        kurtosis=1.0,
+        powers=[-80.0, -70.0, -60.0, -50.0],
+    )
+    await db.insert_detection(
+        burst_id="b1",
+        start_time=start + timedelta(seconds=0.5),
+        stop_time=start + timedelta(seconds=0.6),
+        center_freq_hz=915.1e6,
+        bandwidth_hz=1e6,
+        peak_power_db=-30.0,
+        duration_ms=100.0,
+        detection_timestamp=start + timedelta(seconds=0.5),
+        sdr_center_freq_hz=915e6,
+        sample_rate_hz=56e6,
+        gain_db=40.0,
+    )
+    return app, db
+
+
+@pytest.mark.asyncio
+async def test_api_averaged_list(_seed_avg):
+    from httpx import ASGITransport, AsyncClient
+
+    app, _ = _seed_avg
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.get("/api/averaged")
+        assert r.status_code == 200
+        windows = r.json()["windows"]
+        assert len(windows) == 1
+        assert windows[0]["sdr_center_freq_hz"] == 915e6
+        assert "psd_powers" not in windows[0]
+
+
+@pytest.mark.asyncio
+async def test_api_averaged_detail_and_detections(_seed_avg):
+    from httpx import ASGITransport, AsyncClient
+
+    app, _ = _seed_avg
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        wid = (await c.get("/api/averaged")).json()["windows"][0]["id"]
+        detail = await c.get(f"/api/averaged/{wid}")
+        assert detail.status_code == 200
+        body = detail.json()
+        assert body["powers"] == pytest.approx([-80.0, -70.0, -60.0, -50.0], abs=1e-3)
+        assert len(body["frequencies"]) == 4
+
+        dets = await c.get(f"/api/averaged/{wid}/detections")
+        assert dets.status_code == 200
+        assert [d["burst_id"] for d in dets.json()["detections"]] == ["b1"]
+
+        assert (await c.get("/api/averaged/9999")).status_code == 404

@@ -732,9 +732,16 @@ def _opt_float(raw: str | None) -> float | None:
 
 
 def _opt_dt(raw: str | None) -> datetime | None:
-    """Parse an ISO 8601 timestamp query param, or None when empty/invalid."""
+    """Parse an ISO 8601 timestamp query param, or None when empty/invalid.
+
+    Browser ``toISOString()`` timestamps end in ``Z``, which Python 3.10's
+    fromisoformat rejects (the Z suffix is accepted only from 3.11), so a
+    trailing ``Z``/``z`` is normalized to ``+00:00`` first.
+    """
     if raw is None or raw == "":
         return None
+    if raw.endswith(("Z", "z")):
+        raw = raw[:-1] + "+00:00"
     try:
         return datetime.fromisoformat(raw)
     except ValueError:

@@ -259,6 +259,48 @@ async def test_api_averaged_waterfall_rejects_bad_range(app_with_db):
 
 
 @pytest.mark.asyncio
+async def test_api_averaged_accepts_z_suffix(app_with_db):
+    # Browser toISOString() timestamps end in "Z" (e.g. 2026-01-01T00:00:00.000Z).
+    # Python 3.10's fromisoformat rejects the Z suffix, so the parser must
+    # normalize it. Regression for the Jetson (Python 3.10).
+    from datetime import datetime, timezone
+
+    from httpx import ASGITransport, AsyncClient
+
+    app, db = app_with_db
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    await db.insert_avg_window(
+        start_time=start,
+        duration_sec=0.5,
+        sdr_center_freq_hz=915e6,
+        sample_rate_hz=56e6,
+        gain_db=40.0,
+        num_bins=2,
+        freq_start_hz=0.0,
+        freq_step_hz=1.0,
+        pwr_avg=-70.0,
+        pwr_max=-50.0,
+        pwr_median=-72.0,
+        pwr_std=3.0,
+        kurtosis=1.0,
+        powers=[-70.0, -60.0],
+    )
+    since = "2026-01-01T00:00:00.000Z"
+    until = "2026-01-02T00:00:00.000Z"
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        s = await c.get("/api/averaged/stats", params={"since": since, "until": until})
+        assert s.status_code == 200
+        assert s.json()["points"][0]["count"] == 1
+        w = await c.get(
+            "/api/averaged/waterfall",
+            params={"since": since, "until": until, "max_rows": 2, "max_bins": 2},
+        )
+        assert w.status_code == 200
+        d = await c.get("/api/detections.json", params={"since": since, "until": until})
+        assert d.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_api_averaged_stats_and_configs(app_with_db):
     from datetime import datetime, timezone
 

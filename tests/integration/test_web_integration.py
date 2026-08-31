@@ -128,3 +128,49 @@ async def test_api_averaged_detail_and_detections(_seed_avg):
         assert [d["burst_id"] for d in dets.json()["detections"]] == ["b1"]
 
         assert (await c.get("/api/averaged/9999")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_publish_processed_persists_and_is_queryable(app_with_db):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from httpx import ASGITransport, AsyncClient
+
+    from rfobserver.config import AppSettings
+    from rfobserver.models import IQStatistics
+    from rfobserver.pipeline.streaming import StreamingProcessor
+
+    app, db = app_with_db
+    settings = AppSettings(_env_file=None)
+    storage = MagicMock()
+    storage.auto_dir = MagicMock()
+    storage.manual_dir = MagicMock()
+    receiver = MagicMock()
+    receiver.serial = "sim0"
+    proc = StreamingProcessor(
+        receiver=receiver,
+        database=db,
+        local_storage=storage,
+        settings=settings,
+        broadcast=None,
+        zms_monitor=None,
+        nats_producer=None,
+        replay_mode=False,
+    )
+    summary = SimpleNamespace(
+        powers=[-80.0, -70.0],
+        frequencies=[915e6, 916e6],
+        center_freq=915e6,
+        sample_rate=56_000_000,
+        num_bins=2,
+    )
+    result = SimpleNamespace(summary_psd=summary, center_freq_hz=915_000_000, capture_num=1)
+    stats = IQStatistics(average=-70.0, max=-50.0, median=-72.0, std=3.0, kurtosis=1.0)
+
+    await proc._publish_processed([-80.0, -70.0], result, stats)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        windows = (await c.get("/api/averaged")).json()["windows"]
+        assert len(windows) == 1
+        assert windows[0]["sdr_center_freq_hz"] == 915_000_000.0

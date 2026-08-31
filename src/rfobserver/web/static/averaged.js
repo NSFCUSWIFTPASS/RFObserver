@@ -155,6 +155,9 @@
         state.wf = parseWaterfall(buf, state.sinceMs, state.untilMs);
         state.stats = statsResp.ok ? await statsResp.json() : null;
         state.detections = detResp.ok ? (await detResp.json()).detections : [];
+        const slider = $("avg-slider");
+        slider.min = "0";
+        slider.max = String(Math.max(0, state.wf.bucketCount - 1));
         state.selRow = Math.max(0, state.wf.bucketCount - 1);
         $("avg-status").textContent =
             Math.round(state.wf.meta.total_windows) + " windows in " + state.wf.bucketCount + " buckets"

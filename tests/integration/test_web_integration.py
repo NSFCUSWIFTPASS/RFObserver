@@ -58,6 +58,17 @@ async def test_history_page_renders(app_with_db):
         assert r.status_code == 200
 
 
+@pytest.mark.asyncio
+async def test_averaged_page_renders(app_with_db):
+    from httpx import ASGITransport, AsyncClient
+
+    app, db = app_with_db
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.get("/averaged/")
+        assert r.status_code == 200
+        assert "Averaged PSD Waterfall" in r.text
+
+
 @pytest.fixture
 async def _seed_avg(app_with_db):
     from datetime import datetime, timedelta, timezone

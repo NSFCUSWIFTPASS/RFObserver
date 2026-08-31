@@ -1213,3 +1213,25 @@ body {
     align-items: center;
     gap: 6px;
 }
+
+/* Averaged-history page */
+.avg-hint {
+    margin-top: 8px;
+    font-size: 12px;
+    opacity: 0.6;
+}
+
+.avg-status {
+    margin-top: 4px;
+    font-size: 12px;
+    opacity: 0.8;
+}
+
+.avg-bucket-stats {
+    margin-top: 6px;
+    font-size: 12px;
+    opacity: 0.85;
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+}

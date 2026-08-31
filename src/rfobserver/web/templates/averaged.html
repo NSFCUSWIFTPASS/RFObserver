@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% block title %}Averaged History - RFObserver{% endblock %}
+{% block content %}
+<script src="/static/shared-charts.js"></script>
+<div class="page-header">
+    <h1>Averaged History</h1>
+</div>
+
+<div class="card full-width">
+    <div class="card-header">Range</div>
+    <div class="card-body">
+        <form id="avg-range-form" class="detection-filters" onsubmit="return false;">
+            <label class="filter-field">
+                <span>Start</span>
+                <input type="datetime-local" id="avg-since">
+            </label>
+            <label class="filter-field">
+                <span>End</span>
+                <input type="datetime-local" id="avg-until">
+            </label>
+            <button type="button" class="btn-apply" data-preset="day">Last Day</button>
+            <button type="button" class="btn-apply" data-preset="2day">Last 2 Days</button>
+            <button type="button" class="btn-apply" data-preset="week">Last Week</button>
+            <label class="filter-field">
+                <span>SDR Center</span>
+                <select id="avg-center"></select>
+            </label>
+            <label class="filter-field">
+                <span>Sample Rate</span>
+                <select id="avg-samplerate"></select>
+            </label>
+            <label class="filter-field">
+                <span>Gain</span>
+                <select id="avg-gain"></select>
+            </label>
+            <button type="button" id="avg-apply" class="btn-apply">Apply</button>
+        </form>
+        <div class="avg-hint" id="avg-hint"></div>
+        <div class="avg-status" id="avg-status"></div>
+    </div>
+</div>
+
+<div class="card full-width">
+    <div class="card-header">Stats Over Time</div>
+    <div class="card-body">
+        <canvas id="avg-stats-canvas" width="920" height="160" style="width: 100%; height: 160px;"></canvas>
+        <div class="graph-legend">
+            <span class="legend-label" style="color:#0071e3;">avg</span>
+            <span class="legend-label" style="color:#ff6b6b;">max</span>
+            <span class="legend-label" id="avg-stats-unit" style="opacity:0.5;">dB</span>
+        </div>
+    </div>
+</div>
+
+<div class="card full-width">
+    <div class="card-header">
+        Averaged PSD Waterfall
+        <span id="avg-wf-label" class="card-header-label" style="opacity:0.5;"></span>
+    </div>
+    <div class="card-body">
+        <div style="position:relative;">
+            <canvas id="avg-wf" width="920" height="600" style="width:100%;height:600px;"></canvas>
+            <canvas id="avg-wf-overlay" width="920" height="600"
+                    style="position:absolute;top:0;left:0;width:100%;height:600px;pointer-events:none;"></canvas>
+        </div>
+        <div class="spectrogram-legend">
+            <span class="legend-label" id="avg-legend-min">--</span>
+            <canvas id="avg-legend" width="200" height="12" style="width:200px;height:12px;border-radius:3px;"></canvas>
+            <span class="legend-label" id="avg-legend-max">--</span>
+            <span class="legend-label" id="avg-legend-unit" style="margin-left:2px;">dBFS</span>
+        </div>
+        <div class="viewer-slider-row">
+            <input type="range" id="avg-slider" min="0" max="0" value="0" class="viewer-slider" style="width:100%;">
+            <span id="avg-time" class="viewer-time">--</span>
+        </div>
+    </div>
+</div>
+
+<div class="card full-width">
+    <div class="card-header">PSD at Selected Time</div>
+    <div class="card-body">
+        <div style="position:relative;">
+            <canvas id="avg-psd" width="920" height="160" style="width:100%;height:160px;"></canvas>
+            <div id="avg-psd-tooltip" class="graph-tooltip" style="display:none;"></div>
+        </div>
+        <div id="avg-bucket-stats" class="avg-bucket-stats"></div>
+    </div>
+</div>
+
+<div class="card full-width">
+    <div class="card-header">Detections in Range</div>
+    <div class="card-body">
+        <div class="card" style="padding:0;max-height:280px;overflow-y:auto;">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Frequency</th>
+                        <th>Bandwidth</th>
+                        <th>Duration</th>
+                        <th>Peak</th>
+                    </tr>
+                </thead>
+                <tbody id="avg-det-tbody">
+                    <tr><td colspan="5" class="placeholder-text">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<script src="/static/averaged.js"></script>
+{% endblock %}

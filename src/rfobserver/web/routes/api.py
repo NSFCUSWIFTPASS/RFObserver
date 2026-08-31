@@ -20,14 +20,17 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Binary averaged-waterfall format (see the spec):
-#   struct "<4i": magic 0x52464F42, version 1, bucket_count, num_bins
+# Binary averaged-waterfall format v2 (see the spec):
+#   struct "<4i": magic 0x52464F42, version 2, row_count, num_bins
 #   struct "<6d": bucket_sec, min_db, max_db, total_windows, freq_start_hz, freq_step_hz
-#   bucket_count * num_bins float32 (row-major PSD means; NaN = empty/pruned)
-#   bucket_count * struct "<7d": start_epoch, pwr_avg, pwr_max, pwr_median,
-#                                pwr_std, kurtosis, count
+#   row_count * num_bins float32 (row-major PSD means; NaN = empty/pruned)
+#   row_count * struct "<8d": start_epoch, duration_sec, count, pwr_avg, pwr_max,
+#                             pwr_median, pwr_std, kurtosis
+# Rows are individual windows when the range has few (no averaging) or time
+# buckets when it has many; the client renders each row at its own
+# [start_epoch, start_epoch + duration_sec] time span.
 _WATERFALL_MAGIC = 0x52464F42
-_WATERFALL_VERSION = 1
+_WATERFALL_VERSION = 2
 # Small LRU so repeated preset navigation (same range/tuning/rows/bins) is
 # instant after the first ~5-10 s aggregation of a week.
 _WATERFALL_CACHE: OrderedDict[tuple[Any, ...], bytes] = OrderedDict()
@@ -882,14 +885,15 @@ def _pack_waterfall(result: dict[str, Any]) -> bytes:
     psd = b"".join(struct.pack(f"<{nb}f", *row) for row in rows)
     stats = b"".join(
         struct.pack(
-            "<7d",
+            "<8d",
             b["start_epoch"],
+            b["duration_sec"],
+            float(b["count"]),
             b["pwr_avg"],
             b["pwr_max"],
             b["pwr_median"],
             b["pwr_std"],
             b["kurtosis"],
-            float(b["count"]),
         )
         for b in buckets
     )

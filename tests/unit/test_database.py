@@ -787,14 +787,38 @@ async def test_query_avg_waterfall_buckets_by_time(db):
     result = await db.query_avg_waterfall(
         since=base, until=base + timedelta(seconds=8), max_rows=4, max_bins=4
     )
+    assert result["mode"] == 1  # 8 windows > max_rows=4 -> aggregated
     assert result["bucket_sec"] == pytest.approx(2.0)
     assert len(result["buckets"]) == 4
     assert [b["count"] for b in result["buckets"]] == [2, 2, 2, 2]
+    assert [b["duration_sec"] for b in result["buckets"]] == [2.0, 2.0, 2.0, 2.0]
     row0 = result["psd_rows"][0]
     assert row0 == pytest.approx([-80.0, -70.0, -60.0, -50.0], abs=1e-3)
     assert result["min_db"] <= -80.0
     assert result["max_db"] >= -50.0
     assert result["total_windows"] == 8
+
+
+async def test_query_avg_waterfall_raw_mode_below_max_rows(db):
+    base = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    # 3 windows over a 60s span, max_rows=600 -> raw (each window is a row).
+    for i in range(3):
+        await db.insert_avg_window(start_time=base + timedelta(seconds=10 * i), **_avg_common())
+    result = await db.query_avg_waterfall(
+        since=base, until=base + timedelta(seconds=60), max_rows=600, max_bins=4
+    )
+    assert result["mode"] == 0  # 3 windows <= 600 rows -> raw
+    assert len(result["buckets"]) == 3  # one row per window, not 600
+    assert [b["count"] for b in result["buckets"]] == [1, 1, 1]
+    assert [b["duration_sec"] for b in result["buckets"]] == [0.5, 0.5, 0.5]
+    # Each row's start_epoch is its window's own start time.
+    starts = [b["start_epoch"] for b in result["buckets"]]
+    assert starts[0] == pytest.approx(base.timestamp())
+    assert starts[1] == pytest.approx((base + timedelta(seconds=10)).timestamp())
+    # Each row's PSD is that window's own powers.
+    for row in result["psd_rows"]:
+        assert row == pytest.approx([-80.0, -70.0, -60.0, -50.0], abs=1e-3)
+    assert result["total_windows"] == 3
 
 
 async def test_query_avg_waterfall_downsamples_bins(db):
@@ -831,9 +855,8 @@ async def test_query_avg_waterfall_empty_range(db):
     base = datetime(2026, 1, 1, tzinfo=timezone.utc)
     result = await db.query_avg_waterfall(since=base, until=base + timedelta(hours=1), max_rows=4)
     assert result["total_windows"] == 0
-    assert len(result["buckets"]) == 4
-    assert all(b["count"] == 0 for b in result["buckets"])
-    assert all(math.isnan(v) for v in result["psd_rows"][0])
+    assert result["buckets"] == []  # raw mode with no windows -> no rows
+    assert result["psd_rows"] == []
 
 
 async def test_query_avg_stats_works_without_blobs(db):
@@ -846,6 +869,21 @@ async def test_query_avg_stats_works_without_blobs(db):
     assert p["count"] == 2
     assert p["pwr_avg"] == pytest.approx(-70.0)
     assert p["pwr_max"] == pytest.approx(-45.0)  # max of maxes
+
+
+async def test_query_avg_stats_raw_mode(db):
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # 3 windows, max_points=600 -> raw (one point per window).
+    for i in range(3):
+        await db.insert_avg_window(
+            start_time=base + timedelta(seconds=5 * i), **_avg_common(pwr_avg=-70.0 + i)
+        )
+    result = await db.query_avg_stats(
+        since=base, until=base + timedelta(seconds=30), max_points=600
+    )
+    assert len(result["points"]) == 3
+    assert [p["count"] for p in result["points"]] == [1, 1, 1]
+    assert [p["pwr_avg"] for p in result["points"]] == [-70.0, -69.0, -68.0]
 
 
 async def test_avg_window_configs_distinct_and_latest(db):

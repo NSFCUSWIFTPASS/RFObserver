@@ -71,7 +71,7 @@
 
     function parseWaterfall(buf, sinceMs, untilMs) {
         const dv = new DataView(buf);
-        const bucketCount = dv.getInt32(8, true);
+        const rowCount = dv.getInt32(8, true);
         const numBins = dv.getInt32(12, true);
         const meta = {
             bucket_sec: dv.getFloat64(16, true),
@@ -83,26 +83,27 @@
         };
         let off = 64;
         const rows = [];
-        for (let y = 0; y < bucketCount; y++) {
+        for (let y = 0; y < rowCount; y++) {
             rows.push(Array.from(new Float32Array(buf, off, numBins)));
             off += numBins * 4;
         }
         const stats = [];
-        for (let y = 0; y < bucketCount; y++) {
+        for (let y = 0; y < rowCount; y++) {
             stats.push({
                 start_epoch: dv.getFloat64(off, true),
-                pwr_avg: dv.getFloat64(off + 8, true),
-                pwr_max: dv.getFloat64(off + 16, true),
-                pwr_median: dv.getFloat64(off + 24, true),
-                pwr_std: dv.getFloat64(off + 32, true),
-                kurtosis: dv.getFloat64(off + 40, true),
-                count: dv.getFloat64(off + 48, true),
+                duration_sec: dv.getFloat64(off + 8, true),
+                count: dv.getFloat64(off + 16, true),
+                pwr_avg: dv.getFloat64(off + 24, true),
+                pwr_max: dv.getFloat64(off + 32, true),
+                pwr_median: dv.getFloat64(off + 40, true),
+                pwr_std: dv.getFloat64(off + 48, true),
+                kurtosis: dv.getFloat64(off + 56, true),
             });
-            off += 56;
+            off += 64;
         }
         const freqs = [];
         for (let i = 0; i < numBins; i++) freqs.push(meta.freq_start_hz + i * meta.freq_step_hz);
-        return { bucketCount: bucketCount, numBins: numBins, meta: meta, rows: rows, stats: stats, freqs: freqs };
+        return { bucketCount: rowCount, numBins: numBins, meta: meta, rows: rows, stats: stats, freqs: freqs };
     }
 
     // --- loading ---
@@ -158,12 +159,24 @@
         const slider = $("avg-slider");
         slider.min = "0";
         slider.max = String(Math.max(0, state.wf.bucketCount - 1));
+        if (!state.wf.bucketCount) {
+            $("avg-status").textContent = "No averaged windows in this range";
+            renderWaterfall();
+            renderStatsChart();
+            renderDetections();
+            return;
+        }
         state.selRow = Math.max(0, state.wf.bucketCount - 1);
-        $("avg-status").textContent =
-            Math.round(state.wf.meta.total_windows) + " windows in " + state.wf.bucketCount + " buckets"
-            + (state.wf.meta.bucket_sec >= 60
-                ? " (" + (state.wf.meta.bucket_sec / 60).toFixed(1) + " min/row)"
-                : " (" + state.wf.meta.bucket_sec.toFixed(1) + " s/row)");
+        slider.value = String(state.selRow);
+        $("avg-time").textContent = new Date(state.wf.stats[state.selRow].start_epoch * 1000).toLocaleString();
+        const windows = Math.round(state.wf.meta.total_windows);
+        const isRaw = state.wf.bucketCount < MAX_ROWS;
+        $("avg-status").textContent = isRaw
+            ? windows + " windows (no averaging needed)"
+            : windows + " windows in " + state.wf.bucketCount + " buckets"
+                + (state.wf.meta.bucket_sec >= 60
+                    ? " (" + (state.wf.meta.bucket_sec / 60).toFixed(1) + " min/row)"
+                    : " (" + state.wf.meta.bucket_sec.toFixed(1) + " s/row)");
         renderAll();
     }
 
@@ -192,29 +205,39 @@
         $("avg-legend-unit").textContent = "dBFS";
     }
 
+    function spanSec() { return (state.untilMs - state.sinceMs) / 1000; }
+    function sinceSec() { return state.sinceMs / 1000; }
+    function yForSec(sec) { return Math.floor(((sec - sinceSec()) / spanSec()) * WF_H); }
+
+    // Pixel rows covered by row i: [y0, y1] from its own start+duration. In
+    // raw mode (few windows) each window stretches to its real time span; in
+    // aggregated mode buckets tile 1 px each.
+    function rowSpan(idx) {
+        const s = state.wf.stats[idx];
+        const y0 = Math.max(0, Math.min(WF_H - 1, yForSec(s.start_epoch)));
+        const y1 = Math.max(0, Math.min(WF_H - 1, yForSec(s.start_epoch + s.duration_sec)));
+        return { y0: y0, y1: Math.max(y0 + 1, y1) };
+    }
+
     function renderWaterfall() {
         const canvas = $("avg-wf");
         const ctx = canvas.getContext("2d");
         const m = state.wf.meta;
         const min = m.min_db, max = m.max_db;
         const img = ctx.createImageData(WF_W, WF_H);
-        const buckets = state.wf.bucketCount;
+        // Dark base (no data / gaps).
         for (let y = 0; y < WF_H; y++) {
-            let powers;
-            if (y < buckets) {
-                const raw = state.wf.rows[y];
-                powers = raw.map(function (v) { return isNaN(v) ? min : v; });
-            } else {
-                powers = null;
+            const base = y * WF_W * 4;
+            for (let x = 0; x < WF_W; x++) {
+                const i = base + x * 4;
+                img.data[i] = 18; img.data[i + 1] = 18; img.data[i + 2] = 30; img.data[i + 3] = 255;
             }
-            if (powers) {
+        }
+        for (let i = 0; i < state.wf.bucketCount; i++) {
+            const span = rowSpan(i);
+            const powers = state.wf.rows[i].map(function (v) { return isNaN(v) ? min : v; });
+            for (let y = span.y0; y <= span.y1 && y < WF_H; y++) {
                 renderWaterfallRow(img, WF_W, y, powers, min, max);
-            } else {
-                const base = y * WF_W * 4;
-                for (let x = 0; x < WF_W; x++) {
-                    const i = base + x * 4;
-                    img.data[i] = 18; img.data[i + 1] = 18; img.data[i + 2] = 30; img.data[i + 3] = 255;
-                }
             }
         }
         ctx.putImageData(img, 0, 0);
@@ -224,12 +247,15 @@
 
     function drawHighlight() {
         const ctx = $("avg-wf").getContext("2d");
-        if (state.selRow < 0 || state.selRow >= WF_H) return;
+        if (state.selRow < 0 || state.selRow >= state.wf.bucketCount) return;
+        const span = rowSpan(state.selRow);
+        ctx.fillStyle = "rgba(255,255,255,0.10)";
+        ctx.fillRect(0, span.y0, WF_W, span.y1 - span.y0 + 1);
         ctx.strokeStyle = "rgba(255,255,255,0.75)";
         ctx.lineWidth = 1;
         ctx.beginPath();
-        ctx.moveTo(0, state.selRow + 0.5);
-        ctx.lineTo(WF_W, state.selRow + 0.5);
+        ctx.moveTo(0, span.y0 + 0.5);
+        ctx.lineTo(WF_W, span.y0 + 0.5);
         ctx.stroke();
     }
 
@@ -242,12 +268,9 @@
         const fHigh = wf.freqs[wf.freqs.length - 1];
         const fSpan = fHigh - fLow;
         if (fSpan <= 0) return;
-        const sinceSec = state.sinceMs / 1000;
-        const bucketSec = wf.meta.bucket_sec;
         for (const det of state.detections) {
             const startSec = new Date(det.start_time).getTime() / 1000;
-            const y = Math.floor((startSec - sinceSec) / bucketSec);
-            if (y < 0 || y >= WF_H) continue;
+            const y = Math.max(0, Math.min(WF_H - 1, yForSec(startSec)));
             const xLo = ((det.center_freq_hz - det.bandwidth_hz / 2) - fLow) / fSpan * WF_W;
             const xHi = ((det.center_freq_hz + det.bandwidth_hz / 2) - fLow) / fSpan * WF_W;
             const x = Math.max(0, Math.min(WF_W, Math.min(xLo, xHi)));
@@ -256,6 +279,24 @@
             ctx.lineWidth = 1.5;
             ctx.strokeRect(x, y, w, 1);
         }
+    }
+
+    // Map a pixel row back to the row whose time span contains it (or the row
+    // that started just before it when clicking a data gap).
+    function rowForPixelY(y) {
+        const wf = state.wf;
+        if (!wf || !wf.bucketCount) return -1;
+        const tSec = sinceSec() + (y / WF_H) * spanSec();
+        let best = 0;
+        let bestStart = -Infinity;
+        for (let i = 0; i < wf.bucketCount; i++) {
+            const s = wf.stats[i];
+            if (s.start_epoch <= tSec && s.start_epoch >= bestStart) {
+                best = i;
+                bestStart = s.start_epoch;
+            }
+        }
+        return best;
     }
 
     function renderStatsChart() {
@@ -341,10 +382,10 @@
         if (!wf || state.selRow < 0 || state.selRow >= wf.bucketCount) { el.innerHTML = ""; return; }
         const s = wf.stats[state.selRow];
         const start = new Date(s.start_epoch * 1000);
-        const spanSec = wf.meta.bucket_sec;
+        const dur = s.duration_sec;
         const rows = [
             "Time: " + start.toLocaleString(),
-            "Span: " + (spanSec >= 60 ? (spanSec / 60).toFixed(1) + " min" : spanSec.toFixed(1) + " s"),
+            "Span: " + (dur >= 60 ? (dur / 60).toFixed(1) + " min" : dur.toFixed(1) + " s"),
             "Windows: " + Math.round(s.count),
             "Avg: " + s.pwr_avg.toFixed(1) + " dB",
             "Max: " + s.pwr_max.toFixed(1) + " dB",
@@ -356,11 +397,18 @@
     }
 
     function updateWfLabel() {
-        const m = state.wf.meta;
-        $("avg-wf-label").textContent =
-            Math.round(m.total_windows) + " windows, " + state.wf.bucketCount + " rows, "
-            + (m.bucket_sec >= 60 ? (m.bucket_sec / 60).toFixed(1) + " min/row"
-                : m.bucket_sec.toFixed(1) + " s/row");
+        const wf = state.wf;
+        const m = wf.meta;
+        const isRaw = wf.bucketCount < MAX_ROWS;
+        if (isRaw) {
+            $("avg-wf-label").textContent =
+                Math.round(m.total_windows) + " windows, no averaging (raw rows)";
+        } else {
+            $("avg-wf-label").textContent =
+                Math.round(m.total_windows) + " windows, " + wf.bucketCount + " buckets "
+                + (m.bucket_sec >= 60 ? "(" + (m.bucket_sec / 60).toFixed(1) + " min/row)"
+                    : "(" + m.bucket_sec.toFixed(1) + " s/row)");
+        }
     }
 
     function renderDetections() {
@@ -403,7 +451,9 @@
         $("avg-wf").addEventListener("click", function (e) {
             const rect = e.currentTarget.getBoundingClientRect();
             const scaleY = e.currentTarget.height / rect.height;
-            selectRow(Math.floor((e.clientY - rect.top) * scaleY));
+            const y = Math.floor((e.clientY - rect.top) * scaleY);
+            const idx = rowForPixelY(y);
+            if (idx >= 0) selectRow(idx);
         });
         const psd = $("avg-psd");
         psd.addEventListener("mousemove", function (e) {

@@ -51,3 +51,8 @@ reference_software/
 
 # Superpowers subagent-driven-development scratch (coordinator ledger)
 .superpowers/
+
+# Puppeteer UI tests
+node_modules/
+npm-cache/
+tests/ui/*.png

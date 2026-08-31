@@ -1,0 +1,12 @@
+{
+  "name": "rfobserver-ui-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Puppeteer UI tests for RFObserver pages (requires a running instance)",
+  "scripts": {
+    "test": "NODE_PATH=./node_modules node puppeteer_avg_history.js"
+  },
+  "dependencies": {
+    "puppeteer-core": "^23.11.1"
+  }
+}

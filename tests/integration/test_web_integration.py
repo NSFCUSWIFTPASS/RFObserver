@@ -227,7 +227,7 @@ async def test_api_averaged_waterfall_binary(app_with_db):
         assert r.headers["content-type"].startswith("application/octet-stream")
         body = r.content
         magic, version, bucket_count, num_bins = struct.unpack_from("<4i", body, 0)
-        assert magic == 0x52464F42 and version == 1
+        assert magic == 0x52464F42 and version == 2
         assert bucket_count == 2 and num_bins == 2
         bucket_sec, min_db, max_db, total_windows, f_start, f_step = struct.unpack_from(
             "<6d", body, 16
@@ -238,8 +238,62 @@ async def test_api_averaged_waterfall_binary(app_with_db):
         psd = struct.unpack_from(f"<{bucket_count * num_bins}f", body, off)
         assert psd[0] == pytest.approx(-75.0, abs=1e-3)  # mean of [-80,-70]
         off += bucket_count * num_bins * 4
-        stats = struct.unpack_from(f"<{bucket_count * 7}d", body, off)
-        assert stats[6] == 2  # count in first bucket
+        stats = struct.unpack_from(f"<{bucket_count * 8}d", body, off)
+        assert stats[1] == pytest.approx(2.0)  # duration_sec == bucket_sec
+        assert stats[2] == 2  # count in first bucket
+
+
+@pytest.mark.asyncio
+async def test_api_averaged_waterfall_raw_mode(app_with_db):
+    # Few windows <= max_rows -> each returned as its own row (no averaging).
+    import struct
+    from datetime import datetime, timedelta, timezone
+
+    from httpx import ASGITransport, AsyncClient
+
+    app, db = app_with_db
+    start = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    for i in range(3):
+        await db.insert_avg_window(
+            start_time=start + timedelta(seconds=10 * i),
+            duration_sec=0.5,
+            sdr_center_freq_hz=915e6,
+            sample_rate_hz=56e6,
+            gain_db=40.0,
+            num_bins=2,
+            freq_start_hz=0.0,
+            freq_step_hz=1.0,
+            pwr_avg=-70.0,
+            pwr_max=-50.0,
+            pwr_median=-72.0,
+            pwr_std=3.0,
+            kurtosis=1.0,
+            powers=[-80.0, -70.0],
+        )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.get(
+            "/api/averaged/waterfall",
+            params={
+                "since": start.isoformat(),
+                "until": (start + timedelta(seconds=60)).isoformat(),
+                "max_rows": 600,
+                "max_bins": 2,
+            },
+        )
+        assert r.status_code == 200
+        body = r.content
+        magic, version, row_count, num_bins = struct.unpack_from("<4i", body, 0)
+        assert magic == 0x52464F42 and version == 2
+        assert row_count == 3  # one row per window, not 600
+        assert num_bins == 2
+        off = 16 + 48 + row_count * num_bins * 4
+        stats = struct.unpack_from(f"<{row_count * 8}d", body, off)
+        # Row 0: start_epoch, duration_sec=0.5, count=1
+        assert stats[1] == pytest.approx(0.5)
+        assert stats[2] == 1
+        # Rows are 10s apart in start_epoch.
+        row1 = struct.unpack_from("<8d", body, off + 64)
+        assert row1[0] - stats[0] == pytest.approx(10.0)
 
 
 @pytest.mark.asyncio

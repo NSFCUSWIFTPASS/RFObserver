@@ -25,10 +25,10 @@ At defaults (DURATION_SEC=0.5, 2048 bins) the table grows ~172,800 rows/day:
 
 - **Separate `/averaged/` page** (new nav link) that reuses the dashboard look;
   the live dashboard and its WebSocket wiring are untouched.
-- **The waterfall is the compressed view**: a fixed-height canvas (~600 px,
-  1 px per row) where each row is one *time bucket* of the selected range.
-  The range selector is the zoom control (week -> ~17 min/bucket, day ->
-  ~2.4 min/bucket, sub-hour -> individual windows).
+- **The waterfall is the compressed view**: a fixed-height canvas (~600 px)
+  where each row is one window (when few) or one time bucket (when many). The
+  range selector is the zoom control (week -> ~17 min/row, day -> ~2.4
+  min/row, sub-hour -> individual windows, no averaging).
 - **Bucket PSD = per-bin mean** across the bucket's windows (same "averaged
   window" semantics; a bucket is just a longer average). `pwr_max` (max of
   window maxes) rides in the per-bucket stats, not the waterfall.
@@ -60,52 +60,58 @@ Bucket granularity: day -> ~144 s/row; week -> ~1008 s/row. The bin axis is
 downsampled 2048 -> 512 via the reshape-mean already used by
 `captures.py:_slice_psd` (the 920 px canvas cannot use more than 920 bins).
 
-## Aggregation semantics
-
-- Buckets form a fixed grid: `bucket_sec = (until - since) / max_rows`,
-  bucket i covers `[since + i*bucket_sec, since + (i+1)*bucket_sec)`. Windows
-  are bucketed by their `start_time`. Empty buckets (sensor off, or a gap in a
-  sweep) render as dark rows with `count = 0`.
-- Bucket PSD: mean of the per-bin means of the bucket's windows. Windows whose
-  PSD blob was pruned by retention contribute **no PSD** (the bucket's PSD row
-  is NaN-only -> dark row, hint "PSD pruned by retention") but **do** count
-  toward the scalar stats.
-- Bucket scalar stats: `pwr_avg`/`pwr_median`/`pwr_std`/`kurtosis` = mean of
-  window values; `pwr_max` = max of window maxes (keeps bursts visible in the
-  stats chart).
-- Tuning: windows may span multiple SDR centers under a sweep. The waterfall
-  requires an effective tuning (the page filters on it, defaulting to the most
-  recent config); the frequency axis comes from the first window in the range.
-  The scalar stats endpoint accepts "all" tunings (no axis needed).
-
-## Binary response format (`GET /api/averaged/waterfall`)
+## Binary response format v2 (`GET /api/averaged/waterfall`)
 
 All little-endian, `application/octet-stream`:
 
 ```
 Header (16 bytes):  struct "<4i"
     magic           = 0x52464F42 ("RFOB")
-    version         = 1
-    bucket_count
+    version         = 2
+    row_count       (windows in raw mode, buckets in aggregated mode)
     num_bins        (after 2048 -> max_bins downsampling)
 Meta (48 bytes):    struct "<6d"
-    bucket_sec      (seconds per row)
+    bucket_sec      (span / max_rows; reference grid, also each bucket's span)
     min_db          (color-scale floor over all returned powers)
     max_db          (color-scale ceiling)
     total_windows   (windows with PSD in the range)
     freq_start_hz   (downsampled axis start)
     freq_step_hz    (downsampled axis step)
-PSD rows:           bucket_count x num_bins float32, row-major;
-                    NaN = empty or pruned bucket
-Per-bucket stats:   bucket_count x struct "<7d"
+PSD rows:           row_count x num_bins float32, row-major;
+                    NaN = no PSD (empty or pruned)
+Per-row stats:      row_count x struct "<8d"
     start_epoch     (unix seconds, float64)
+    duration_sec    (real window duration in raw mode; bucket_sec aggregated)
+    count           (windows covered; 1 in raw mode)
     pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis
-    count           (windows in the bucket, float64)
 ```
 
 The client rebuilds the axis as `freq_start_hz + i*freq_step_hz` for
-`i in range(num_bins)` and maps a time to a row via
-`floor((t - since) / bucket_sec)`.
+`i in range(num_bins)` and renders each row at its own time span
+`[start_epoch, start_epoch + duration_sec]` mapped onto the canvas by
+`y(t) = floor((t - since) / span * height)`; gaps between rows stay dark. This
+single time-positioned renderer handles both modes.
+
+## Aggregation semantics (adaptive)
+
+- The server **only averages when the data outnumbers what can be displayed**:
+  - `window_count <= max_rows` -> **raw mode**: every window is its own row
+    (its real `start_epoch`/`duration_sec`, its own PSD and stats). A 60 s
+    range with ~100 windows renders ~100 stretched rows, not 600 sparse ones.
+  - `window_count > max_rows` -> **aggregated mode**: `max_rows` time buckets
+    of `bucket_sec = span / max_rows`; per-bin mean PSD, scalar stats
+    mean-of-means except `pwr_max` = max-of-maxes (keeps transient bursts
+    visible). Week view ~17 min/bucket, day ~2.4 min/bucket.
+- A `COUNT(*)` over the range picks the mode before any blob reads.
+- `query_avg_stats` follows the same rule (one point per window when the count
+  fits `max_points`, else buckets) so the stats chart never averages short
+  ranges either.
+- Windows whose PSD blob was pruned by retention contribute stats but no PSD
+  (their row is all-NaN, rendered dark).
+- Tuning: windows may span multiple SDR centers under a sweep. The waterfall
+  requires an effective tuning (the page filters on it, defaulting to the most
+  recent config); the frequency axis comes from the first window in the range.
+  The scalar stats endpoint accepts "all" tunings (no axis needed).
 
 ## API (all under `api.py`; page route in a new `averaged.py`)
 
@@ -131,16 +137,20 @@ The client rebuilds the axis as `freq_start_hz + i*freq_step_hz` for
 ## Database layer (`SensorDatabase`)
 
 - `query_avg_waterfall(*, since, until, sdr_center_freq=None, sample_rate=None,
-  gain=None, max_rows=600, max_bins=512) -> dict` - pages through the range's
+  gain=None, max_rows=600, max_bins=512) -> dict` - counts the range first and
+  returns **raw mode** (one row per window: its `start_epoch`, `duration_sec`,
+  own stats, own PSD) when the count fits `max_rows`, else pages through the
   windows (`fetchmany`), decodes each BLOB via `np.frombuffer(..., "<f4")`,
   bin-downsamples with the `_slice_psd` reshape-mean when `num_bins > max_bins`,
   accumulates per-bucket sums/counts, tracks the global min/max, and returns
-  the header/meta/rows/stats arrays plus the downsampled axis scalars. Rows
-  with a NULL blob contribute stats only. Returns arrays ready for the binary
-  packer (never `np.ndarray.tolist()` on the PSD - keep it concrete for mypy).
+  the header/meta/rows/stats arrays plus the downsampled axis scalars and a
+  `mode` (0 raw / 1 aggregated). Rows with a NULL blob contribute stats only.
+  Returns arrays ready for the binary packer (never `np.ndarray.tolist()` on
+  the PSD - keep it concrete for mypy).
 - `query_avg_stats(*, since, until, sdr_center_freq=None, sample_rate=None,
-  gain=None, max_points=600) -> dict` - same bucketing over the light columns
-  only (no blob reads), so it is O(range) in rows and works after pruning.
+  gain=None, max_points=600) -> dict` - same adaptive rule over the light
+  columns only (no blob reads), so it is O(range) in rows and works after
+  pruning.
 - `avg_window_configs() -> dict` - distinct tuning configs + the latest.
 
 ## UI (`/averaged/`)
@@ -155,11 +165,13 @@ range fits on screen, so the slider spans the full waterfall):
    hint "PSD retained N days; stats and detections kept indefinitely".
 2. Stats timeline card: `pwr_avg` and `pwr_max` lines over the range (canvas,
    dashboard timeseries pattern), fed by `/api/averaged/stats`.
-3. Waterfall card: fixed-height canvas (~600 px, 1 px/bucket) rendered from the
-   binary payload; empty/pruned rows are dark. Slider + horizontal selector
-   line (`drawHighlight` pattern) scoped to the full range; clicking a row
-   selects it. Detection overlay boxes on top (`drawDetectionOverlay` math:
-   time -> row via `bucket_sec`, frequency -> x via the rebuilt axis).
+3. Waterfall card: fixed-height canvas (~600 px) rendered from the binary
+   payload; each row is drawn at its own time span (windows stretch in raw
+   mode, buckets tile 1 px in aggregated mode); empty/pruned rows and gaps are
+   dark. Slider + horizontal selector line (`drawHighlight` pattern) scoped to
+   the full range; clicking a pixel selects the row whose span contains it.
+   Detection overlay boxes on top (`drawDetectionOverlay` math: time -> pixel
+   via the span mapping, frequency -> x via the rebuilt axis).
 4. PSD card: `drawPSD` of the selected bucket's mean powers with crosshair
    tooltip; when the bucket has no PSD (empty/pruned) show a placeholder.
 5. Selected-bucket stats card: count, span, pwr_avg/max/median/std/kurtosis.

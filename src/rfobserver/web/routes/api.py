@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import struct
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 from rfobserver.__about__ import __version__
 from rfobserver.web.routes.config import _persist_settings
@@ -17,6 +19,19 @@ from rfobserver.web.routes.config import _persist_settings
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Binary averaged-waterfall format (see the spec):
+#   struct "<4i": magic 0x52464F42, version 1, bucket_count, num_bins
+#   struct "<6d": bucket_sec, min_db, max_db, total_windows, freq_start_hz, freq_step_hz
+#   bucket_count * num_bins float32 (row-major PSD means; NaN = empty/pruned)
+#   bucket_count * struct "<7d": start_epoch, pwr_avg, pwr_max, pwr_median,
+#                                pwr_std, kurtosis, count
+_WATERFALL_MAGIC = 0x52464F42
+_WATERFALL_VERSION = 1
+# Small LRU so repeated preset navigation (same range/tuning/rows/bins) is
+# instant after the first ~5-10 s aggregation of a week.
+_WATERFALL_CACHE: OrderedDict[tuple[Any, ...], bytes] = OrderedDict()
+_WATERFALL_CACHE_MAX = 8
 
 
 def _get_processor(request: Request) -> Any:
@@ -789,13 +804,15 @@ async def detections_json(
     limit: int = 200,
     sdr_center: str | None = None,
     sample_rate: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """JSON detections for external tooling (e.g. the OTA burst validator).
 
     Sibling of the HTML ``/detections`` fragment so non-browser clients don't
     scrape HTML. Rows are ``query_detections`` dicts (center_freq_hz,
     peak_freq_hz, bandwidth_hz, duration_ms, peak_power_db, start/stop_time,
-    sdr context).
+    sdr context). ``since``/``until`` scope by detection start_time.
     """
     db = _get_db(request)
     if db is None:
@@ -805,6 +822,8 @@ async def detections_json(
             limit=limit,
             sdr_center_freq=_opt_float(sdr_center),
             sample_rate=_opt_float(sample_rate),
+            since=_opt_dt(since),
+            until=_opt_dt(until),
         )
     except Exception:
         logger.exception("detections.json query failed")
@@ -835,6 +854,134 @@ async def averaged_list(
         limit=int(limit) if limit else 500,
     )
     return {"windows": rows}
+
+
+def _pack_waterfall(result: dict[str, Any]) -> bytes:
+    """Pack query_avg_waterfall output into the binary body format."""
+    buckets = result["buckets"]
+    rows = result["psd_rows"]
+    n = len(buckets)
+    nb = result["num_bins"]
+    header = struct.pack("<4i", _WATERFALL_MAGIC, _WATERFALL_VERSION, n, nb)
+    meta = struct.pack(
+        "<6d",
+        result["bucket_sec"],
+        result["min_db"],
+        result["max_db"],
+        result["total_windows"],
+        result["freq_start_hz"],
+        result["freq_step_hz"],
+    )
+    psd = b"".join(struct.pack(f"<{nb}f", *row) for row in rows)
+    stats = b"".join(
+        struct.pack(
+            "<7d",
+            b["start_epoch"],
+            b["pwr_avg"],
+            b["pwr_max"],
+            b["pwr_median"],
+            b["pwr_std"],
+            b["kurtosis"],
+            float(b["count"]),
+        )
+        for b in buckets
+    )
+    return header + meta + psd + stats
+
+
+def _waterfall_cached(key: tuple[Any, ...], result: dict[str, Any]) -> bytes:
+    payload = _pack_waterfall(result)
+    _WATERFALL_CACHE[key] = payload
+    _WATERFALL_CACHE.move_to_end(key)
+    while len(_WATERFALL_CACHE) > _WATERFALL_CACHE_MAX:
+        _WATERFALL_CACHE.popitem(last=False)
+    return payload
+
+
+def _parse_range(since: str, until: str) -> tuple[datetime, datetime]:
+    since_dt = _opt_dt(since)
+    until_dt = _opt_dt(until)
+    if since_dt is None or until_dt is None or since_dt >= until_dt:
+        raise HTTPException(
+            status_code=400, detail="since/until must be valid ISO times with since < until"
+        )
+    return since_dt, until_dt
+
+
+@router.get("/averaged/waterfall")
+async def averaged_waterfall(
+    request: Request,
+    since: str,
+    until: str,
+    sdr_center: str | None = None,
+    sample_rate: str | None = None,
+    gain: str | None = None,
+    max_rows: str | None = None,
+    max_bins: str | None = None,
+) -> Response:
+    """Averaged-window waterfall over a range, as one binary body.
+
+    The response is the spec's header + meta + float32 PSD rows + float64
+    per-bucket stats (little-endian). Buckets are time-averaged on the server,
+    so a full week compresses to ~1.2 MB.
+    """
+    db = _get_db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    since_dt, until_dt = _parse_range(since, until)
+    mr = max(1, min(2000, int(max_rows) if max_rows else 600))
+    mb = max(2, min(2048, int(max_bins) if max_bins else 512))
+    key = (since, until, sdr_center, sample_rate, gain, mr, mb)
+    cached = _WATERFALL_CACHE.get(key)
+    if cached is not None:
+        return Response(content=cached, media_type="application/octet-stream")
+    result = await db.query_avg_waterfall(
+        since=since_dt,
+        until=until_dt,
+        sdr_center_freq=_opt_float(sdr_center),
+        sample_rate=_opt_float(sample_rate),
+        gain=_opt_float(gain),
+        max_rows=mr,
+        max_bins=mb,
+    )
+    return Response(content=_waterfall_cached(key, result), media_type="application/octet-stream")
+
+
+@router.get("/averaged/stats")
+async def averaged_stats(
+    request: Request,
+    since: str,
+    until: str,
+    sdr_center: str | None = None,
+    sample_rate: str | None = None,
+    gain: str | None = None,
+    max_points: str | None = None,
+) -> dict[str, Any]:
+    """Scalar stats timeline for a range (blob-independent, works after PSD
+    retention prunes the blobs)."""
+    db = _get_db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    since_dt, until_dt = _parse_range(since, until)
+    result: dict[str, Any] = await db.query_avg_stats(
+        since=since_dt,
+        until=until_dt,
+        sdr_center_freq=_opt_float(sdr_center),
+        sample_rate=_opt_float(sample_rate),
+        gain=_opt_float(gain),
+        max_points=int(max_points) if max_points else 600,
+    )
+    return result
+
+
+@router.get("/averaged/configs")
+async def averaged_configs(request: Request) -> dict[str, Any]:
+    """Distinct SDR tuning configs in avg_windows + the most recent one."""
+    db = _get_db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    result: dict[str, Any] = await db.avg_window_configs()
+    return result
 
 
 @router.get("/averaged/{window_id}")

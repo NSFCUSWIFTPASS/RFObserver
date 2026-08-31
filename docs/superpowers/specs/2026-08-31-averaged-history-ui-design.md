@@ -111,7 +111,7 @@ The client rebuilds the axis as `freq_start_hz + i*freq_step_hz` for
 
 - `GET /api/averaged/waterfall` - required `since`/`until` (ISO 8601),
   optional `sdr_center`/`sample_rate`/`gain`/`max_rows` (default 600, clamp
-  10..2000)/`max_bins` (default 512, clamp 64..2048). Binary body per above.
+  1..2000)/`max_bins` (default 512, clamp 2..2048). Binary body per above.
   Errors: 400 when `since >= until` or parsing fails; 503 when no DB.
 - `GET /api/averaged/stats` - same params (+`max_points`, default 600), JSON
   `{"bucket_sec":..,"points":[{start_time,count,pwr_avg,pwr_max,pwr_median,

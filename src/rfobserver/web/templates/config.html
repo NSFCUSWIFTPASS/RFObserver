@@ -192,10 +192,14 @@
                            placeholder="auto">
                 </div>
             </div>
+            <div id="scale-error" style="font-size: 12px; color: #ff453a; margin-top: 6px; display: none;">
+                Scale Min must be less than Scale Max.
+            </div>
             <div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px;">
                 Offset is added to raw dBFS/Hz so the spectrum and waterfall show absolute dBm/Hz.
-                Leave empty for uncalibrated dBFS display. Scale bounds pin the display range;
-                empty bounds auto-scale. Display only; published and stored data stay raw.
+                Leave empty for uncalibrated dBFS display. Scale bounds pin the display range
+                (Min is the lower dB, Max the higher); empty bounds auto-scale.
+                Display only; published and stored data stay raw.
             </div>
         </div>
     </div>
@@ -451,8 +455,32 @@
     // Checkbox toggles fire 'change'; ensure they update the dirty state too.
     form.addEventListener('change', refreshDirty);
 
+    // Inline validation for the display scale: Min must be below Max, or the
+    // dashboard silently drops the pins and auto-scales. Returns true if valid.
+    const scaleMinEl = document.getElementById('scale-min');
+    const scaleMaxEl = document.getElementById('scale-max');
+    const scaleErrEl = document.getElementById('scale-error');
+    function validateScale() {
+        const minRaw = scaleMinEl.value.trim();
+        const maxRaw = scaleMaxEl.value.trim();
+        let ok = true;
+        if (minRaw !== '' && maxRaw !== '') {
+            const mn = parseFloat(minRaw), mx = parseFloat(maxRaw);
+            if (!isNaN(mn) && !isNaN(mx) && mn >= mx) ok = false;
+        }
+        scaleErrEl.style.display = ok ? 'none' : 'block';
+        return ok;
+    }
+    scaleMinEl.addEventListener('input', validateScale);
+    scaleMaxEl.addEventListener('input', validateScale);
+
     form.addEventListener('submit', async function(e) {
         e.preventDefault();
+        if (!validateScale()) {
+            scaleErrEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            setState('error');
+            return;
+        }
         setState('submitting');
 
         const data = {};

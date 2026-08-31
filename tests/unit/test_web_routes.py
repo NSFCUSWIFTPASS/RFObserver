@@ -309,6 +309,57 @@ class TestConfigApply:
         assert resp.status_code == 200
         assert settings.RECORDING_RAM_BUFFER is True
 
+    def test_apply_inverted_scale_rejected(self, client_with_processor):
+        # Min above Max is degenerate: the dashboard would silently drop the
+        # pins and auto-scale. Reject it so the user sees the mistake.
+        client, settings, _ = client_with_processor
+        resp = client.post(
+            "/config/apply",
+            json={"psd_scale_min_db": "-65", "psd_scale_max_db": "-100"},
+        )
+        assert resp.status_code == 400
+        # Nothing was mutated.
+        assert settings.PSD_SCALE_MIN_DB is None
+        assert settings.PSD_SCALE_MAX_DB is None
+
+    def test_apply_equal_scale_rejected(self, client_with_processor):
+        client, settings, _ = client_with_processor
+        resp = client.post(
+            "/config/apply",
+            json={"psd_scale_min_db": "-80", "psd_scale_max_db": "-80"},
+        )
+        assert resp.status_code == 400
+        assert settings.PSD_SCALE_MIN_DB is None
+        assert settings.PSD_SCALE_MAX_DB is None
+
+    def test_apply_valid_scale_accepted(self, client_with_processor):
+        client, settings, _ = client_with_processor
+        resp = client.post(
+            "/config/apply",
+            json={"psd_scale_min_db": "-100", "psd_scale_max_db": "-65"},
+        )
+        assert resp.status_code == 200
+        assert settings.PSD_SCALE_MIN_DB == -100.0
+        assert settings.PSD_SCALE_MAX_DB == -65.0
+
+    def test_apply_scale_validates_against_stored_bound(self, client_with_processor):
+        # Only one bound submitted: it must be validated against the bound
+        # already stored, not just co-submitted values.
+        client, settings, _ = client_with_processor
+        object.__setattr__(settings, "PSD_SCALE_MAX_DB", -70.0)
+        resp = client.post("/config/apply", json={"psd_scale_min_db": "-60"})
+        assert resp.status_code == 400
+        assert settings.PSD_SCALE_MIN_DB is None  # rejected, not applied
+
+    def test_apply_clearing_one_bound_skips_scale_check(self, client_with_processor):
+        # Clearing a bound (empty -> None -> auto) can never be inverted.
+        client, settings, _ = client_with_processor
+        object.__setattr__(settings, "PSD_SCALE_MIN_DB", -100.0)
+        object.__setattr__(settings, "PSD_SCALE_MAX_DB", -65.0)
+        resp = client.post("/config/apply", json={"psd_scale_max_db": ""})
+        assert resp.status_code == 200
+        assert settings.PSD_SCALE_MAX_DB is None
+
     def test_apply_recording_max_sec_no_reconfigure(self, client_with_processor):
         client, settings, processor = client_with_processor
         resp = client.post("/config/apply", json={"recording_max_sec": "12.5"})

@@ -218,17 +218,19 @@ async def _heartbeat_loop(
 
 
 async def _cleanup_loop(settings: AppSettings, db: Any) -> None:
-    """Scheduled DB retention: prune rows older than DB_RETENTION_DAYS.
+    """Scheduled DB retention: null out PSD blobs older than DB_RETENTION_DAYS.
 
-    Runs one cleanup immediately, then repeats every
-    ``DB_CLEANUP_INTERVAL_SEC``. Each pass is wrapped in try/except so a
-    transient DB error never kills the process (the pipeline keeps running).
+    Only the heavy PSD/violations blobs of ``avg_windows`` are evicted; the
+    stats rows, detections, and tone_checks are kept permanently. Runs one
+    pass immediately, then repeats every ``DB_CLEANUP_INTERVAL_SEC``. Each
+    pass is wrapped in try/except so a transient DB error never kills the
+    process (the pipeline keeps running).
     """
     while True:
         try:
-            removed = await db.cleanup_old_data(settings.DB_RETENTION_DAYS)
+            removed = await db.prune_avg_psd_blobs(settings.DB_RETENTION_DAYS)
             logger.info(
-                "Retention: pruned %d rows older than %d days",
+                "Retention: pruned PSD blobs for %d windows older than %d days",
                 removed,
                 settings.DB_RETENTION_DAYS,
             )

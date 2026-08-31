@@ -373,7 +373,7 @@ async def test_insert_stats(db):
     await db.insert_stats(datetime(2026, 1, 1), {"avg_power": -50.0})
 
 
-async def test_cleanup_old_data(db):
+async def test_retention_keeps_detections_forever(db):
     old_time = datetime.utcnow() - timedelta(days=10)
     await db.insert_detection(
         burst_id="old",
@@ -396,20 +396,21 @@ async def test_cleanup_old_data(db):
         detection_timestamp=datetime.utcnow(),
     )
 
-    removed = await db.cleanup_old_data(days=7)
-    assert removed >= 1
+    # No avg windows exist, so nothing is pruned.
+    removed = await db.prune_avg_psd_blobs(days=7)
+    assert removed == 0
 
+    # Detections are never evicted by retention: old AND new survive.
     results = await db.query_detections()
-    assert len(results) == 1
-    assert results[0]["burst_id"] == "new"
+    assert {r["burst_id"] for r in results} == {"old", "new"}
 
 
-async def test_cleanup_covers_detections_stats_tone_checks(db):
+async def test_retention_never_prunes_rows_only_blobs(db):
     # Use the tz-aware isoformat the pipeline actually stores (datetime.now(timezone.utc)
     # in streaming/zms), so this exercises the real cutoff comparison, not a naive-only path.
     old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
     new = datetime.now(timezone.utc).isoformat()
-    # one old + one recent row in each of the three growing tables
+    # one old + one recent row in each of the growing tables
     for ts in (old, new):
         await db._db.execute(
             "INSERT INTO detections (burst_id,start_time,stop_time,center_freq_hz,"
@@ -424,14 +425,50 @@ async def test_cleanup_covers_detections_stats_tone_checks(db):
             "VALUES (?,?,?,?,?,?,?,?)",
             (ts, 1e6, 1e6, 1, -50.0, -90.0, 40.0, 1),
         )
+    common = dict(
+        duration_sec=0.5,
+        sample_rate_hz=4.0,
+        gain_db=40.0,
+        num_bins=2,
+        freq_start_hz=0.0,
+        freq_step_hz=1.0,
+        pwr_avg=-70.0,
+        pwr_max=-50.0,
+        pwr_median=-72.0,
+        pwr_std=3.0,
+        kurtosis=1.0,
+        powers=[-70.0, -60.0],
+    )
+    await db.insert_avg_window(
+        start_time=datetime.now(timezone.utc) - timedelta(days=30),
+        sdr_center_freq_hz=100e6,
+        **common,
+    )
+    await db.insert_avg_window(
+        start_time=datetime.now(timezone.utc),
+        sdr_center_freq_hz=100e6,
+        **common,
+    )
     await db._db.commit()
 
-    deleted = await db.cleanup_old_data(days=7)
-    assert deleted == 3  # one old row per table
+    pruned = await db.prune_avg_psd_blobs(days=7)
+    assert pruned == 1  # only the old window's PSD blob
 
-    for tbl in ("detections", "stats", "tone_checks"):
+    # Every row survives in every table: retention only nulls blobs.
+    for tbl in ("detections", "stats", "tone_checks", "avg_windows"):
         async with db._db.execute(f"SELECT COUNT(*) FROM {tbl}") as c:
-            assert (await c.fetchone())[0] == 1  # recent row survives
+            assert (await c.fetchone())[0] == 2
+
+    cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+    for win in await db.query_avg_windows(limit=10):
+        full = await db.get_avg_window(win["id"])
+        assert full is not None
+        if win["start_time"] < cutoff:
+            # Old window: blob evicted, stats + frequency axis intact.
+            assert full["powers"] is None
+            assert len(full["frequencies"]) == full["num_bins"]
+        else:
+            assert full["powers"] == pytest.approx([-70.0, -60.0], abs=1e-3)
 
 
 async def test_tone_check_roundtrips(db):
@@ -618,7 +655,7 @@ async def test_detections_for_window_associates_by_start_and_tuning(db):
     assert {d["burst_id"] for d in dets} == {"in"}
 
 
-async def test_cleanup_prunes_old_avg_windows(db):
+async def test_prune_evicts_old_psd_keeps_stats(db):
     old = datetime.now(timezone.utc) - timedelta(days=30)
     recent = datetime.now(timezone.utc)
     common = dict(
@@ -638,7 +675,84 @@ async def test_cleanup_prunes_old_avg_windows(db):
     )
     await db.insert_avg_window(start_time=old, **common)
     await db.insert_avg_window(start_time=recent, **common)
-    removed = await db.cleanup_old_data(days=7)
-    assert removed >= 1
+    pruned = await db.prune_avg_psd_blobs(days=7)
+    assert pruned == 1
+    # Both stats rows survive; only the old window's PSD blob is evicted.
     rows = await db.query_avg_windows(limit=10)
-    assert len(rows) == 1  # only the recent one survives
+    assert len(rows) == 2
+    cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+    for win in rows:
+        full = await db.get_avg_window(win["id"])
+        assert full is not None
+        if win["start_time"] < cutoff:
+            assert full["powers"] is None
+            assert full["pwr_avg"] == -70.0  # stats survive
+            assert full["frequencies"] == pytest.approx([0.0, 1.0], abs=1e-6)
+        else:
+            assert full["powers"] == pytest.approx([-70.0, -60.0], abs=1e-3)
+    # A second pass reports nothing left to prune.
+    assert await db.prune_avg_psd_blobs(days=7) == 0
+
+
+async def test_migration_makes_psd_powers_nullable(tmp_path):
+    # Simulate a database created before the retention redesign, where
+    # avg_windows.psd_powers was BLOB NOT NULL. connect() must rebuild the
+    # table so the column is nullable (retention nulls the blob in place).
+    import sqlite3
+
+    db_path = str(tmp_path / "old_avg.db")
+    old_schema = """
+        CREATE TABLE avg_windows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            start_time TEXT NOT NULL,
+            duration_sec REAL NOT NULL,
+            sdr_center_freq_hz REAL NOT NULL,
+            sample_rate_hz REAL NOT NULL,
+            gain_db REAL,
+            num_bins INTEGER NOT NULL,
+            freq_start_hz REAL NOT NULL,
+            freq_step_hz REAL NOT NULL,
+            pwr_avg REAL,
+            pwr_max REAL,
+            pwr_median REAL,
+            pwr_std REAL,
+            kurtosis REAL,
+            interference INTEGER,
+            psd_powers BLOB NOT NULL,
+            violations BLOB,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+    """
+    conn = sqlite3.connect(db_path)
+    conn.executescript(old_schema)
+    # One row with a 1-element little-endian float32 blob (1.0).
+    conn.execute(
+        """INSERT INTO avg_windows (start_time, duration_sec, sdr_center_freq_hz,
+           sample_rate_hz, gain_db, num_bins, freq_start_hz, freq_step_hz,
+           pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis, interference,
+           psd_powers, violations)
+           VALUES ('2026-01-01T00:00:00+00:00', 0.5, 100e6, 4.0, 40.0, 4,
+                   98.0, 1.0, -70.0, -50.0, -72.0, 3.0, 1.0, NULL, X'0000803F', NULL)"""
+    )
+    conn.commit()
+    conn.close()
+
+    database = SensorDatabase(db_path)
+    await database.connect()
+    try:
+        # The column is now nullable...
+        async with database._db.execute("PRAGMA table_info(avg_windows)") as c:
+            cols = {row[1]: row for row in await c.fetchall()}
+        assert cols["psd_powers"][3] == 0  # notnull flag cleared
+        # ...the existing row survived with its blob intact...
+        full = await database.get_avg_window(1)
+        assert full is not None
+        assert full["powers"] == pytest.approx([1.0], abs=1e-6)
+        # ...and pruning can now null the blob without dropping the row.
+        assert await database.prune_avg_psd_blobs(days=7) == 1
+        pruned_full = await database.get_avg_window(1)
+        assert pruned_full is not None
+        assert pruned_full["powers"] is None
+        assert pruned_full["pwr_avg"] == -70.0
+    finally:
+        await database.close()

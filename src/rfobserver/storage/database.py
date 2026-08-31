@@ -85,7 +85,9 @@ CREATE TABLE IF NOT EXISTS avg_windows (
     pwr_std REAL,
     kurtosis REAL,
     interference INTEGER,
-    psd_powers BLOB NOT NULL,
+    -- Nullable so retention can evict the heavy PSD blob while keeping the
+    -- cheap stats row permanently (see prune_avg_psd_blobs).
+    psd_powers BLOB,
     violations BLOB,
     created_at TEXT DEFAULT (datetime('now'))
 );
@@ -151,6 +153,7 @@ class SensorDatabase:
         await self._db.execute("PRAGMA synchronous=NORMAL")
         await self._db.executescript(SCHEMA)
         await self._migrate_detection_columns()
+        await self._migrate_avg_windows_psd_nullable()
         # Created after migration: on a pre-existing DB the indexed column is
         # added by the migration above, so this can't run inside SCHEMA.
         await self._db.execute(
@@ -172,6 +175,72 @@ class SensorDatabase:
             if column not in existing:
                 await self._db.execute(f"ALTER TABLE detections ADD COLUMN {column} {col_type}")
                 logger.info("Migrated detections: added column %s", column)
+
+    async def _migrate_avg_windows_psd_nullable(self) -> None:
+        """Make avg_windows.psd_powers nullable on DBs created with NOT NULL.
+
+        Retention evicts the heavy PSD blob by setting it to NULL (keeping the
+        cheap stats row forever), which a NOT NULL column forbids. SQLite cannot
+        drop a NOT NULL constraint in place, so the table is rebuilt -- data is
+        copied, the old table dropped, the new one renamed, indexes recreated.
+        Fresh databases already get the nullable column from SCHEMA.
+        """
+        assert self._db is not None
+        async with self._db.execute("PRAGMA table_info(avg_windows)") as cursor:
+            columns = {row[1]: row for row in await cursor.fetchall()}
+        psd = columns.get("psd_powers")
+        if psd is None or psd[3] == 0:  # missing (fresh DB) or already nullable
+            return
+        await self._db.execute("BEGIN")
+        try:
+            await self._db.execute(
+                """CREATE TABLE avg_windows_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    start_time TEXT NOT NULL,
+                    duration_sec REAL NOT NULL,
+                    sdr_center_freq_hz REAL NOT NULL,
+                    sample_rate_hz REAL NOT NULL,
+                    gain_db REAL,
+                    num_bins INTEGER NOT NULL,
+                    freq_start_hz REAL NOT NULL,
+                    freq_step_hz REAL NOT NULL,
+                    pwr_avg REAL,
+                    pwr_max REAL,
+                    pwr_median REAL,
+                    pwr_std REAL,
+                    kurtosis REAL,
+                    interference INTEGER,
+                    psd_powers BLOB,
+                    violations BLOB,
+                    created_at TEXT DEFAULT (datetime('now'))
+                )"""
+            )
+            await self._db.execute(
+                """INSERT INTO avg_windows_new
+                   (id, start_time, duration_sec, sdr_center_freq_hz, sample_rate_hz,
+                    gain_db, num_bins, freq_start_hz, freq_step_hz, pwr_avg, pwr_max,
+                    pwr_median, pwr_std, kurtosis, interference, psd_powers, violations,
+                    created_at)
+                   SELECT id, start_time, duration_sec, sdr_center_freq_hz, sample_rate_hz,
+                          gain_db, num_bins, freq_start_hz, freq_step_hz, pwr_avg, pwr_max,
+                          pwr_median, pwr_std, kurtosis, interference, psd_powers, violations,
+                          created_at
+                   FROM avg_windows"""
+            )
+            await self._db.execute("DROP TABLE avg_windows")
+            await self._db.execute("ALTER TABLE avg_windows_new RENAME TO avg_windows")
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_avg_windows_time ON avg_windows(start_time)"
+            )
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_avg_windows_center_time "
+                "ON avg_windows(sdr_center_freq_hz, start_time)"
+            )
+            await self._db.commit()
+            logger.info("Migrated avg_windows: psd_powers is now nullable")
+        except Exception:
+            await self._db.rollback()
+            raise
 
     async def close(self) -> None:
         if self._db:
@@ -365,7 +434,12 @@ class SensorDatabase:
 
     async def get_avg_window(self, window_id: int) -> dict[str, Any] | None:
         """One averaged window with its PSD decoded to a list and the frequency
-        axis reconstructed from freq_start_hz + i * freq_step_hz."""
+        axis reconstructed from freq_start_hz + i * freq_step_hz.
+
+        ``powers`` is None when the PSD blob has been pruned by retention (the
+        stats row survives); the frequency axis is metadata-derived and always
+        present.
+        """
         assert self._db is not None
         self._db.row_factory = aiosqlite.Row
         async with self._db.execute(
@@ -377,9 +451,12 @@ class SensorDatabase:
         record = dict(row)
         blob = record.pop("psd_powers")
         num_bins = int(record["num_bins"])
-        # Explicit float() comprehension keeps the return concrete (numpy is
-        # untyped under the CI mypy config; a bare .tolist() would leak Any).
-        record["powers"] = [float(x) for x in np.frombuffer(blob, dtype="<f4")]
+        if blob is None:
+            record["powers"] = None
+        else:
+            # Explicit float() comprehension keeps the return concrete (numpy is
+            # untyped under the CI mypy config; a bare .tolist() would leak Any).
+            record["powers"] = [float(x) for x in np.frombuffer(blob, dtype="<f4")]
         start = float(record["freq_start_hz"])
         step = float(record["freq_step_hz"])
         record["frequencies"] = [start + i * step for i in range(num_bins)]
@@ -552,8 +629,7 @@ class SensorDatabase:
         Used only by the heartbeat as a "did a new detection arrive" trigger
         (clients refresh when it increments), so the exact value is
         irrelevant; MAX(id) is O(1) via the integer PK and stays monotonic
-        across retention deletes (SQLite does not reuse rowids without
-        VACUUM).
+        (SQLite does not reuse rowids without VACUUM).
         """
         assert self._db is not None
         async with self._db.execute("SELECT MAX(id) FROM detections") as cursor:
@@ -582,22 +658,25 @@ class SensorDatabase:
         )
         await self._db.commit()
 
-    async def cleanup_old_data(self, days: int = 7) -> int:
-        """Remove detections, stats, tone_checks, and avg_windows older than ``days`` days."""
+    async def prune_avg_psd_blobs(self, days: int = 7) -> int:
+        """Evict the PSD blobs of averaged windows older than ``days`` days.
+
+        Only the heavy ``psd_powers``/``violations`` blobs are nulled out; the
+        cheap stats row (and detections, stats, tone_checks) is kept
+        permanently. A pruned window still answers the light query and its
+        detail endpoint (with ``powers: null``): at ~8 KB per window the blob
+        is ~98% of the row's storage, so this bounds the DB file without
+        losing any statistics. Returns how many blobs were nulled this pass.
+        """
         assert self._db is not None
         cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-
-        cursor = await self._db.execute("DELETE FROM detections WHERE start_time < ?", (cutoff,))
-        det_count = cursor.rowcount
-        cursor = await self._db.execute("DELETE FROM stats WHERE timestamp < ?", (cutoff,))
-        stats_count = cursor.rowcount
-        cursor = await self._db.execute("DELETE FROM tone_checks WHERE timestamp < ?", (cutoff,))
-        tc_count = cursor.rowcount
-        cursor = await self._db.execute("DELETE FROM avg_windows WHERE start_time < ?", (cutoff,))
-        avg_count = cursor.rowcount
-
+        cursor = await self._db.execute(
+            "UPDATE avg_windows SET psd_powers = NULL, violations = NULL "
+            "WHERE start_time < ? AND psd_powers IS NOT NULL",
+            (cutoff,),
+        )
         await self._db.commit()
-        total: int = det_count + stats_count + tc_count + avg_count
-        if total > 0:
-            logger.info("Cleaned up %d old records (cutoff: %s)", total, cutoff)
-        return total
+        pruned = cursor.rowcount
+        if pruned > 0:
+            logger.info("Pruned PSD blobs for %d avg windows (cutoff: %s)", pruned, cutoff)
+        return pruned

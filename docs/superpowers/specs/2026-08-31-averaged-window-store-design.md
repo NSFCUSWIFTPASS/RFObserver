@@ -30,6 +30,12 @@ We want a local, queryable history of the averaged windows so an operator can:
   left untouched (it stays unused; not removed in this cut).
 - **Stored values are raw dBFS**, consistent with the rest of the system
   ("published and stored data stay raw"); calibration/scale is display-only.
+- **Retention is blob-only.** The PSD blob is ~98% of each window's storage and is
+  the only expensive data; the cheap stats row, `detections`, and `tone_checks`
+  are kept permanently. Retention nulls `psd_powers`/`violations` after
+  `DB_RETENTION_DAYS` instead of deleting rows (locked with the user on
+  2026-08-31: Option A nullable column, prune to NULL; never prune tone_checks;
+  reuse `DB_RETENTION_DAYS`).
 
 ## Data available at the persistence point
 
@@ -82,7 +88,7 @@ CREATE TABLE IF NOT EXISTS avg_windows (
     pwr_std REAL,
     kurtosis REAL,
     interference INTEGER,          -- nullable bool flag (NULL until PSDProcessor gap closed)
-    psd_powers BLOB NOT NULL,      -- num_bins little-endian float32
+    psd_powers BLOB,               -- num_bins little-endian float32; NULL when retention pruned it
     violations BLOB,               -- reserved: per-bin flags, NULL for now
     created_at TEXT DEFAULT (datetime('now'))
 );
@@ -91,11 +97,20 @@ CREATE INDEX IF NOT EXISTS idx_avg_windows_center_time
     ON avg_windows(sdr_center_freq_hz, start_time);
 ```
 
-- Added to the `SCHEMA` executescript block (fresh DBs). No `ALTER TABLE` migration
-  needed since the table is new; existing DBs get it created on next `connect()`.
-- Retention: extend `cleanup_old_data` to also
-  `DELETE FROM avg_windows WHERE start_time < ?` using the same cutoff and count it
-  in the total. Same `DB_RETENTION_DAYS` as detections/stats/tone_checks.
+- Added to the `SCHEMA` executescript block (fresh DBs). Existing DBs get it
+  created on next `connect()`.
+- `psd_powers` is nullable so retention can evict the blob in place. DBs created
+  before this decision (with `BLOB NOT NULL`) are upgraded by a table-rebuild
+  migration in `connect()` (`_migrate_avg_windows_psd_nullable`), which copies the
+  data, drops the old table, renames the new one, and recreates the indexes.
+- Retention: `prune_avg_psd_blobs(days)` does
+  `UPDATE avg_windows SET psd_powers = NULL, violations = NULL
+   WHERE start_time < ? AND psd_powers IS NOT NULL`
+  using the same cutoff and `DB_RETENTION_DAYS` as before. It returns how many
+  blobs were nulled. **No rows are ever deleted by retention**: detections,
+  stats, and tone_checks are kept permanently (measured: ~157 B/window stats row
+  and ~250 B/detection are effectively free; the ~8 KB PSD blob is the only
+  costly data).
 
 ### BLOB encoding
 
@@ -121,7 +136,9 @@ float32 is lossless enough for dBFS PSD display (values ~ -140..0 dB; float32 gi
   (`_sdr_conditions`), and `start_time` range like the detection `since`/`until`.
 - `get_avg_window(window_id) -> dict | None` — one full record; decodes
   `psd_powers` to a `powers` list and reconstructs `frequencies` as
-  `freq_start_hz + i * freq_step_hz` for `i in range(num_bins)`.
+  `freq_start_hz + i * freq_step_hz` for `i in range(num_bins)`. When retention
+  has pruned the blob, `powers` is `null` but the stats row and the
+  (metadata-derived) `frequencies` are still returned.
 
 Association reuses the existing `query_detections(since, until, sdr_center_freq,
 sample_rate, gain)` verbatim: detections for window R are those with
@@ -166,8 +183,13 @@ cut; the follow-up UI consumes them.
   (length == num_bins, endpoints correct).
 - Association: given a window and detections at timestamps inside and outside
   `[start, start+duration)`, only the inside ones (matching tuning) are returned.
-- Retention: `cleanup_old_data` deletes `avg_windows` older than the cutoff and
-  counts them.
+- Retention: `prune_avg_psd_blobs` nulls the PSD blob of windows older than the
+  cutoff and counts them; the stats rows, detections, stats, and tone_checks all
+  survive (verified per table); a pruned window returns `powers: null` with
+  stats + frequency axis intact; a second pass reports 0.
+- Migration: a DB created with the original `psd_powers BLOB NOT NULL` schema is
+  rebuilt on `connect()` so the column is nullable, existing rows and blobs
+  survive, and pruning then works.
 
 **Unit (`tests/unit/test_web_routes.py`):**
 - `/api/averaged` range + filter query returns inserted windows.
@@ -183,10 +205,15 @@ cut; the follow-up UI consumes them.
 ## Storage/volume note
 
 At defaults (DURATION_SEC=0.5 → ~2 windows/s, 2048 bins) the PSD blob is ~8 KB, so
-~1.4 GB/day, pruned by `DB_RETENTION_DAYS` (7 → ~10 GB steady state on the Jetson
-NVMe). Under a frequency sweep there is one row per dwell/window. This is the
-reason for float32 BLOB over JSON text (which would be ~3x larger) and for storing
-the frequency axis as start+step rather than a second array.
+~1.4 GB/day. Retention nulls blobs older than `DB_RETENTION_DAYS` (7 → ~10 GB
+steady state on the Jetson NVMe; SQLite reuses the freed pages, so the file stops
+growing once the window is filled). The permanently-kept data is cheap:
+~157 B/window stats (~23-27 MB/day ≈ 8-10 GB/year) and ~250 B/detection
+(negligible at realistic burst rates; even 10k/day ≈ 0.9 GB/year). Under a
+frequency sweep there is one row per dwell/window. This is the reason for float32
+BLOB over JSON text (which would be ~3x larger), for storing the frequency axis
+as start+step rather than a second array, and for making the blob the *only*
+evictable data.
 
 ## Out of scope (follow-up)
 

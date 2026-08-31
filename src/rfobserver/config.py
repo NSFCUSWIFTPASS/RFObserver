@@ -105,8 +105,10 @@ class AppSettings(BaseSettings):
     DB_PATH: str = "/tmp/rfobserver/rfobserver.db"
     ARCHIVE_MAX_GB: float = 50.0
     HISTORY_DAYS: int = 7
-    # Scheduled DB retention: rows older than DB_RETENTION_DAYS are pruned
-    # every DB_CLEANUP_INTERVAL_SEC (0 disables the retention loop).
+    # Scheduled DB retention: PSD blobs of averaged windows older than
+    # DB_RETENTION_DAYS are nulled out (the cheap stats rows, detections, and
+    # tone_checks are kept permanently) every DB_CLEANUP_INTERVAL_SEC
+    # (0 disables the retention loop).
     DB_RETENTION_DAYS: int = 7
     DB_CLEANUP_INTERVAL_SEC: float = 3600.0
     # Grace period after a recording stops before its detections sidecar

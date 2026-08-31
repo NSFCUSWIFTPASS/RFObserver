@@ -363,6 +363,28 @@ class SensorDatabase:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
+    async def get_avg_window(self, window_id: int) -> dict[str, Any] | None:
+        """One averaged window with its PSD decoded to a list and the frequency
+        axis reconstructed from freq_start_hz + i * freq_step_hz."""
+        assert self._db is not None
+        self._db.row_factory = aiosqlite.Row
+        async with self._db.execute(
+            "SELECT * FROM avg_windows WHERE id = ?", (window_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        record = dict(row)
+        blob = record.pop("psd_powers")
+        num_bins = int(record["num_bins"])
+        # Explicit float() comprehension keeps the return concrete (numpy is
+        # untyped under the CI mypy config; a bare .tolist() would leak Any).
+        record["powers"] = [float(x) for x in np.frombuffer(blob, dtype="<f4")]
+        start = float(record["freq_start_hz"])
+        step = float(record["freq_step_hz"])
+        record["frequencies"] = [start + i * step for i in range(num_bins)]
+        return record
+
     @staticmethod
     def _sdr_conditions(
         sdr_center_freq: float | None,

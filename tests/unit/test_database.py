@@ -543,3 +543,32 @@ async def test_query_avg_windows_time_and_tuning_filters(db):
     # Tuning filter selects one center.
     rows = await db.query_avg_windows(sdr_center_freq=100e6)
     assert [r["sdr_center_freq_hz"] for r in rows] == [100e6]
+
+
+async def test_get_avg_window_decodes_psd_and_frequencies(db):
+    await db.insert_avg_window(
+        start_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        duration_sec=0.5,
+        sdr_center_freq_hz=100e6,
+        sample_rate_hz=4.0,
+        gain_db=40.0,
+        num_bins=4,
+        freq_start_hz=98.0,
+        freq_step_hz=1.0,
+        pwr_avg=-70.0,
+        pwr_max=-50.0,
+        pwr_median=-72.0,
+        pwr_std=3.0,
+        kurtosis=1.0,
+        powers=[-80.0, -70.0, -60.0, -50.0],
+    )
+    rows = await db.query_avg_windows(limit=1)
+    full = await db.get_avg_window(rows[0]["id"])
+    assert full is not None
+    assert full["powers"] == pytest.approx([-80.0, -70.0, -60.0, -50.0], abs=1e-3)
+    assert full["frequencies"] == pytest.approx([98.0, 99.0, 100.0, 101.0], abs=1e-6)
+    assert "psd_powers" not in full
+
+
+async def test_get_avg_window_missing_returns_none(db):
+    assert await db.get_avg_window(9999) is None

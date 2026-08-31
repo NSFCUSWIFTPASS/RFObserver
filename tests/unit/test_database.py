@@ -486,3 +486,60 @@ async def test_count_detections_is_monotonic_marker(db):
     await db._db.execute("DELETE FROM detections WHERE id = 1")
     await db._db.commit()
     assert await db.count_detections() == m3  # still 3 (MAX(id) unchanged)
+
+
+async def test_insert_and_query_avg_window(db):
+    await db.insert_avg_window(
+        start_time=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        duration_sec=0.5,
+        sdr_center_freq_hz=2_437_000_000.0,
+        sample_rate_hz=56_000_000.0,
+        gain_db=40.0,
+        num_bins=4,
+        freq_start_hz=2_409_000_000.0,
+        freq_step_hz=14_000_000.0,
+        pwr_avg=-70.0,
+        pwr_max=-50.0,
+        pwr_median=-72.0,
+        pwr_std=3.0,
+        kurtosis=1.2,
+        powers=[-80.0, -70.0, -60.0, -50.0],
+    )
+    rows = await db.query_avg_windows(limit=10)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["num_bins"] == 4
+    assert r["pwr_avg"] == -70.0
+    assert r["sdr_center_freq_hz"] == 2_437_000_000.0
+    assert r["interference"] is None
+    # The light query does not carry the heavy blobs.
+    assert "psd_powers" not in r
+    assert "violations" not in r
+
+
+async def test_query_avg_windows_time_and_tuning_filters(db):
+    base = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    common = dict(
+        duration_sec=0.5,
+        sample_rate_hz=56e6,
+        gain_db=40.0,
+        num_bins=2,
+        freq_start_hz=0.0,
+        freq_step_hz=1.0,
+        pwr_avg=-70.0,
+        pwr_max=-50.0,
+        pwr_median=-72.0,
+        pwr_std=3.0,
+        kurtosis=1.0,
+        powers=[-70.0, -60.0],
+    )
+    await db.insert_avg_window(start_time=base, sdr_center_freq_hz=100e6, **common)
+    await db.insert_avg_window(
+        start_time=base + timedelta(seconds=10), sdr_center_freq_hz=200e6, **common
+    )
+    # Time window excludes the first.
+    rows = await db.query_avg_windows(since=base + timedelta(seconds=5))
+    assert [r["sdr_center_freq_hz"] for r in rows] == [200e6]
+    # Tuning filter selects one center.
+    rows = await db.query_avg_windows(sdr_center_freq=100e6)
+    assert [r["sdr_center_freq_hz"] for r in rows] == [100e6]

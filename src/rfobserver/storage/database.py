@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -68,10 +69,34 @@ CREATE TABLE IF NOT EXISTS tone_checks (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS avg_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    start_time TEXT NOT NULL,
+    duration_sec REAL NOT NULL,
+    sdr_center_freq_hz REAL NOT NULL,
+    sample_rate_hz REAL NOT NULL,
+    gain_db REAL,
+    num_bins INTEGER NOT NULL,
+    freq_start_hz REAL NOT NULL,
+    freq_step_hz REAL NOT NULL,
+    pwr_avg REAL,
+    pwr_max REAL,
+    pwr_median REAL,
+    pwr_std REAL,
+    kurtosis REAL,
+    interference INTEGER,
+    psd_powers BLOB NOT NULL,
+    violations BLOB,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_detections_time ON detections(start_time);
 CREATE INDEX IF NOT EXISTS idx_detections_freq ON detections(center_freq_hz);
 CREATE INDEX IF NOT EXISTS idx_stats_time ON stats(timestamp);
 CREATE INDEX IF NOT EXISTS idx_tone_checks_time ON tone_checks(timestamp);
+CREATE INDEX IF NOT EXISTS idx_avg_windows_time ON avg_windows(start_time);
+CREATE INDEX IF NOT EXISTS idx_avg_windows_center_time
+    ON avg_windows(sdr_center_freq_hz, start_time);
 """
 
 # Columns added after the original detections schema (SDR capture-context
@@ -244,6 +269,99 @@ class SensorDatabase:
         ) as cursor:
             rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+    async def insert_avg_window(
+        self,
+        *,
+        start_time: datetime,
+        duration_sec: float,
+        sdr_center_freq_hz: float,
+        sample_rate_hz: float,
+        gain_db: float | None,
+        num_bins: int,
+        freq_start_hz: float,
+        freq_step_hz: float,
+        pwr_avg: float,
+        pwr_max: float,
+        pwr_median: float,
+        pwr_std: float,
+        kurtosis: float,
+        powers: list[float],
+        interference: bool | None = None,
+        violations: bytes | None = None,
+    ) -> None:
+        """Persist one DURATION_SEC-averaged window. ``powers`` is stored as a
+        little-endian float32 BLOB (raw dBFS)."""
+        assert self._db is not None
+        psd_blob = np.asarray(powers, dtype="<f4").tobytes()
+        await self._db.execute(
+            """INSERT INTO avg_windows
+               (start_time, duration_sec, sdr_center_freq_hz, sample_rate_hz,
+                gain_db, num_bins, freq_start_hz, freq_step_hz, pwr_avg, pwr_max,
+                pwr_median, pwr_std, kurtosis, interference, psd_powers, violations)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                start_time.isoformat(),
+                duration_sec,
+                sdr_center_freq_hz,
+                sample_rate_hz,
+                gain_db,
+                num_bins,
+                freq_start_hz,
+                freq_step_hz,
+                pwr_avg,
+                pwr_max,
+                pwr_median,
+                pwr_std,
+                kurtosis,
+                None if interference is None else int(interference),
+                psd_blob,
+                violations,
+            ),
+        )
+        await self._db.commit()
+
+    # Columns returned by the light range query -- everything except the heavy blobs.
+    _AVG_LIGHT_COLUMNS = (
+        "id, start_time, duration_sec, sdr_center_freq_hz, sample_rate_hz, gain_db, "
+        "num_bins, freq_start_hz, freq_step_hz, pwr_avg, pwr_max, pwr_median, "
+        "pwr_std, kurtosis, interference, created_at"
+    )
+
+    async def query_avg_windows(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        sdr_center_freq: float | None = None,
+        sample_rate: float | None = None,
+        gain: float | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Averaged windows in a time/tuning range, newest first. Excludes the
+        psd_powers/violations blobs to keep range listings light."""
+        assert self._db is not None
+        conditions: list[str] = []
+        params: list[Any] = []
+        if since is not None:
+            conditions.append("start_time >= ?")
+            params.append(since.isoformat())
+        if until is not None:
+            conditions.append("start_time < ?")
+            params.append(until.isoformat())
+        sdr_conditions, sdr_params = self._sdr_conditions(sdr_center_freq, sample_rate, gain)
+        conditions.extend(sdr_conditions)
+        params.extend(sdr_params)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = (
+            f"SELECT {self._AVG_LIGHT_COLUMNS} FROM avg_windows "
+            f"{where} ORDER BY start_time DESC LIMIT ?"
+        )
+        params.append(limit)
+        self._db.row_factory = aiosqlite.Row
+        async with self._db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
 
     @staticmethod
     def _sdr_conditions(

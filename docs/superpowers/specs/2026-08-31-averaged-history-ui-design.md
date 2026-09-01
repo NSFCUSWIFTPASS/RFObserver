@@ -344,3 +344,44 @@ kurtosis fill height, kurtosis trace pixels, and selection-marker tracking —
 a pixel scan finds the white marker column on the power/kurtosis charts and
 asserts its X fraction tracks follow-latest (~1.0) and a waterfall click at
 25 % width (~0.25 ± 0.06).
+
+## Addendum 5 (2026-09-01, manual display scale, DB-persisted)
+
+- **Per-chart Scale inputs in each panel header** (revised the same day from
+  a single dropdown in the control bar): every chart header — Power, PSD,
+  Waterfall, Kurtosis — carries its own `Scale: [low] [high]` number inputs
+  (right-aligned in the `.card-header`). Empty input = that bound
+  auto-scales from the data. A `change` (Enter/blur) validates the whole set
+  (numbers, low < high per pair; invalid inputs get a red border +
+  tooltip), saves immediately, and re-renders; clearing both bounds returns
+  the chart to auto. The PSD pair (`psd_lo/psd_hi`) is independent of the
+  waterfall pair (`wf_lo/wf_hi`) — both auto-scale from the same waterfall
+  meta range by default, so the correlation holds until overridden.
+- **Persisted server-side in the SQLite config table** (the same key/value
+  store the pipeline config uses): one JSON document under the `ui_prefs`
+  key, exposed via `GET/PUT /api/ui-prefs`. PUT validates keys
+  (wf_lo/wf_hi/psd_lo/psd_hi/pwr_lo/pwr_hi/kurt_lo/kurt_hi), rejects
+  non-finite/bool values and inverted pairs with 400, and replaces the
+  whole document. Server-side storage means the scale is shared by every
+  browser viewing the instance and survives restarts. (Rejected
+  alternative: localStorage, which is per-browser.)
+- **Rendering**: manual bounds override per side — waterfall colors
+  (`wfRange()`), PSD Y (`psdRange()`), power and kurtosis Y
+  (`chartRange()`, which never lets the range invert against the data). The
+  waterfall legend shows the effective bounds. Values outside the range
+  clamp at the chart edges.
+- **Bug found by this round's puppeteer run**: `drawSelectionMarker` could
+  land off-canvas when the selected bucket started in the last half-pixel
+  of the time axis (`Math.round(x) + 0.5 == W`), making the marker
+  invisible in raw mode with a fresh database. Now clamped to the last
+  pixel column. The marker-tracking assertions were also made
+  data-density-proof: they compare against the selected bucket's time, not
+  the click position (a click in a data gap selects the nearest earlier
+  row).
+
+Puppeteer coverage grew: default Auto state, panel open, Apply → legend
+shows the manual bounds, persistence across a full page reload, power-trace
+re-scale (pixel-count drop with an out-of-data range), inverted-bounds
+rejection (panel stays open with an error), and reset to Auto. Python
+integration tests cover the endpoint roundtrip (including the config-table
+write and full-replace semantics) and the 400 validations.

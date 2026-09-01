@@ -22,6 +22,10 @@
  *   - an absolute 60 s range via the picker freezes Now and uses raw mode
  *   - quick ranges re-enable Now and rescale the buckets
  *   - changing a tuning select reloads the range immediately
+ *   - the per-chart Scale inputs apply manual low/high bounds (waterfall
+ *     legend shows them, power trace re-scales), persist them across a page
+ *     reload (stored in the DB config table), reject inverted bounds, and
+ *     clearing them returns to auto
  *
  * Assumes the instance has accrued >600 averaged windows in the last day
  * (any instance up for ~10+ minutes at the default window rate).
@@ -283,11 +287,93 @@ async function main() {
   console.log("time before/after click:", before, "->", after);
   assert(before !== after, "click changed the selected time column");
   assert(Date.parse(after) < Date.parse(before), "clicking left of the selector picks an earlier time");
+  // The markers must track the SELECTED TIME (which is not necessarily the
+  // click position: a gap maps the click to the nearest earlier row).
+  const expectFrac = await page.evaluate((sel) => {
+    return (sel - (Date.now() - 900000)) / 900000; // default range: 15 minutes
+  }, Date.parse(after));
   const mStats1 = await markerFrac(page, "avg-stats-canvas");
   const mKurt1 = await markerFrac(page, "avg-kurt");
-  console.log("marker fractions (after click):", mStats1, mKurt1);
-  assert(Math.abs(mStats1 - 0.25) < 0.06, "power marker moved to the clicked time");
-  assert(Math.abs(mKurt1 - 0.25) < 0.06, "kurtosis marker moved to the clicked time");
+  console.log("marker fractions (after click):", mStats1, mKurt1, "expected ~", expectFrac);
+  assert(Math.abs(mStats1 - expectFrac) < 0.06, "power marker moved to the selected time");
+  assert(Math.abs(mKurt1 - expectFrac) < 0.06, "kurtosis marker moved to the selected time");
+
+  // --- Manual display scale (per-chart header inputs, persisted in the DB) ---
+  const setScale = async (loId, hiId, lo, hi) => {
+    await page.evaluate(
+      (loId, hiId, lo, hi) => {
+        const loEl = document.getElementById(loId);
+        const hiEl = document.getElementById(hiId);
+        loEl.value = lo;
+        hiEl.value = hi;
+        hiEl.dispatchEvent(new Event("change"));
+      },
+      loId, hiId, lo, hi
+    );
+    // Wait until the server reflects the saved pair (the PUT round-trip is
+    // what applies the re-render; a fixed sleep races it over the network).
+    const key = loId.replace("avg-scale-", "").replace("-", "_");
+    const want = lo === "" ? null : Number(lo);
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      const got = await page.evaluate(async (key) => {
+        const r = await fetch("/api/ui-prefs");
+        const doc = await r.json();
+        return doc && doc.scale ? doc.scale[key] : undefined;
+      }, key);
+      if (got === want || (got != null && want != null && Math.abs(got - want) < 1e-9)) return;
+      if (Date.now() > deadline) return; // let the assertions report the mismatch
+      await sleep(150);
+    }
+  };
+
+  assert(
+    (await page.$eval("#avg-scale-wf-lo", (el) => el.value)) === ""
+      && (await page.$eval("#avg-scale-pwr-lo", (el) => el.value)) === "",
+    "scale inputs default to empty (auto)"
+  );
+  await setScale("avg-scale-wf-lo", "avg-scale-wf-hi", "-120", "-50");
+  const lmin = await page.$eval("#avg-legend-min", (el) => el.textContent);
+  const lmax = await page.$eval("#avg-legend-max", (el) => el.textContent);
+  console.log("manual legend:", lmin, lmax);
+  assert(lmin === "-120" && lmax === "-50", "waterfall legend uses the manual scale");
+
+  // Persisted server-side: a fresh page load restores the manual scale.
+  await page.reload({ waitUntil: "networkidle2" });
+  await waitStatus(page);
+  assert(
+    (await page.$eval("#avg-scale-wf-lo", (el) => el.value)) === "-120"
+      && (await page.$eval("#avg-scale-wf-hi", (el) => el.value)) === "-50",
+    "scale inputs repopulate across reload"
+  );
+  const lmin2 = await page.$eval("#avg-legend-min", (el) => el.textContent);
+  assert(lmin2 === "-120", "manual waterfall scale survives reload (got " + lmin2 + ")");
+
+  // Manual power scale re-scales the power chart (trace leaves the view).
+  const pxBefore = await nonDarkPixels(page, "avg-stats-canvas", 26, 26, 46);
+  await setScale("avg-scale-pwr-lo", "avg-scale-pwr-hi", "-1", "0");
+  const pxAfter = await nonDarkPixels(page, "avg-stats-canvas", 26, 26, 46);
+  console.log("power pixels before/after manual scale:", pxBefore, pxAfter);
+  assert(pxAfter < pxBefore, "manual power scale re-scales the power chart");
+
+  // Inverted bounds are rejected: inputs flagged, stored scale untouched.
+  await setScale("avg-scale-wf-lo", "avg-scale-wf-hi", "10", "-10");
+  assert(
+    await page.$eval("#avg-scale-wf-lo", (el) => el.classList.contains("avg-scale-invalid")),
+    "inverted bounds flag the waterfall inputs"
+  );
+  const lminInv = await page.$eval("#avg-legend-min", (el) => el.textContent);
+  assert(lminInv === "-120", "rejected scale leaves the stored range untouched");
+
+  // Back to auto: clearing the inputs saves nulls and re-scales from data.
+  await setScale("avg-scale-wf-lo", "avg-scale-wf-hi", "", "");
+  await setScale("avg-scale-pwr-lo", "avg-scale-pwr-hi", "", "");
+  assert(
+    !(await page.$eval("#avg-scale-wf-lo", (el) => el.classList.contains("avg-scale-invalid"))),
+    "invalid flag clears on a valid save"
+  );
+  const lmin3 = await page.$eval("#avg-legend-min", (el) => el.textContent);
+  assert(lmin3 !== "-120", "legend back to the data-driven range");
 
   // Absolute range via the picker: 60 s window, Now turns off, label flips
   // to the absolute form, raw mode (windows <= max_rows). Spinner cycles.

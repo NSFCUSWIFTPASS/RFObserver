@@ -66,7 +66,14 @@
 
 <div class="avg-grid">
     <div class="card avg-panel avg-grid-power">
-        <div class="card-header">Power Over Time</div>
+        <div class="card-header">
+            Power Over Time
+            <span class="avg-scale-inline" title="Display scale (dB). Empty = auto-scale from the data. Saved in the DB.">
+                Scale:
+                <input type="number" id="avg-scale-pwr-lo" placeholder="auto" step="any" aria-label="Power scale low">
+                <input type="number" id="avg-scale-pwr-hi" placeholder="auto" step="any" aria-label="Power scale high">
+            </span>
+        </div>
         <div class="card-body">
             <canvas id="avg-stats-canvas" class="avg-chart avg-chart-stats"></canvas>
             <div class="graph-legend">
@@ -78,7 +85,14 @@
     </div>
 
     <div class="card avg-panel avg-grid-psd">
-        <div class="card-header">PSD at Selected Time</div>
+        <div class="card-header">
+            PSD at Selected Time
+            <span class="avg-scale-inline" title="Display scale (dBFS). Empty = auto-scale from the data. Saved in the DB.">
+                Scale:
+                <input type="number" id="avg-scale-psd-lo" placeholder="auto" step="any" aria-label="PSD scale low">
+                <input type="number" id="avg-scale-psd-hi" placeholder="auto" step="any" aria-label="PSD scale high">
+            </span>
+        </div>
         <div class="card-body">
             <div style="position:relative;">
                 <canvas id="avg-psd" class="avg-chart avg-chart-psd"></canvas>
@@ -92,6 +106,11 @@
         <div class="card-header">
             Averaged PSD Waterfall
             <span id="avg-wf-label" class="card-header-label" style="opacity:0.5;"></span>
+            <span class="avg-scale-inline" title="Display scale (dBFS). Empty = auto-scale from the data. Saved in the DB.">
+                Scale:
+                <input type="number" id="avg-scale-wf-lo" placeholder="auto" step="any" aria-label="Waterfall scale low">
+                <input type="number" id="avg-scale-wf-hi" placeholder="auto" step="any" aria-label="Waterfall scale high">
+            </span>
         </div>
         <div class="card-body">
             <div class="avg-wf-wrap">
@@ -112,7 +131,14 @@
     </div>
 
     <div class="card avg-panel avg-grid-kurt avg-fill">
-        <div class="card-header">Kurtosis Over Time</div>
+        <div class="card-header">
+            Kurtosis Over Time
+            <span class="avg-scale-inline" title="Display scale. Empty = auto-scale from the data. Saved in the DB.">
+                Scale:
+                <input type="number" id="avg-scale-kurt-lo" placeholder="auto" step="any" aria-label="Kurtosis scale low">
+                <input type="number" id="avg-scale-kurt-hi" placeholder="auto" step="any" aria-label="Kurtosis scale high">
+            </span>
+        </div>
         <div class="card-body">
             <canvas id="avg-kurt" class="avg-chart avg-chart-kurt"></canvas>
         </div>

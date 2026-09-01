@@ -29,6 +29,11 @@
  * Stale indicator: whenever the user changes the range/tuning but the new
  * data has not loaded yet, a spinning circle shows next to the range button
  * and the chart panels dim until the load completes.
+ *
+ * Manual display scale: each chart header carries its own Scale low/high
+ * inputs (waterfall, PSD: dBFS; power: dB; kurtosis: unitless); empty
+ * bounds auto-scale from the data. The scale is persisted server-side in
+ * the DB config table (/api/ui-prefs), so it applies to every browser.
  */
 (function () {
     "use strict";
@@ -81,7 +86,30 @@
         detections: [],
         selRow: 0,
         crosshairBin: -1,
+        scale: {
+            wf_lo: null, wf_hi: null,
+            psd_lo: null, psd_hi: null,
+            pwr_lo: null, pwr_hi: null,
+            kurt_lo: null, kurt_hi: null,
+        },
     };
+
+    const SCALE_FIELDS = {
+        wf_lo: "avg-scale-wf-lo",
+        wf_hi: "avg-scale-wf-hi",
+        psd_lo: "avg-scale-psd-lo",
+        psd_hi: "avg-scale-psd-hi",
+        pwr_lo: "avg-scale-pwr-lo",
+        pwr_hi: "avg-scale-pwr-hi",
+        kurt_lo: "avg-scale-kurt-lo",
+        kurt_hi: "avg-scale-kurt-hi",
+    };
+    const SCALE_PAIRS = [
+        ["wf_lo", "wf_hi"],
+        ["psd_lo", "psd_hi"],
+        ["pwr_lo", "pwr_hi"],
+        ["kurt_lo", "kurt_hi"],
+    ];
 
     // --- date helpers ---
 
@@ -219,6 +247,99 @@
     function closePicker() {
         state.pickerOpen = false;
         $("avg-picker").hidden = true;
+    }
+
+    // --- display scale (per-chart low/high inputs, persisted in the DB) ---
+
+    // Reflect state.scale in the header inputs (boot, and reverting after a
+    // rejected edit).
+    function syncScaleInputs() {
+        for (const key in SCALE_FIELDS) {
+            const v = state.scale[key];
+            $(SCALE_FIELDS[key]).value = v != null ? String(v) : "";
+        }
+    }
+
+    function markScaleInvalid(keys, msg) {
+        for (const key in SCALE_FIELDS) {
+            const el = $(SCALE_FIELDS[key]);
+            const bad = keys.indexOf(key) >= 0;
+            el.classList.toggle("avg-scale-invalid", bad);
+            el.title = bad ? msg : "";
+        }
+    }
+
+    async function saveScale(scale) {
+        try {
+            const r = await fetch("/api/ui-prefs", {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ scale: scale }),
+            });
+            if (!r.ok) {
+                const body = await r.json().catch(function () { return {}; });
+                markScaleInvalid(Object.keys(SCALE_FIELDS), body.detail || ("Save failed (" + r.status + ")"));
+                return;
+            }
+            state.scale = scale;
+            markScaleInvalid([], "");
+            if (state.wf) renderAll();
+        } catch (_) {
+            markScaleInvalid(Object.keys(SCALE_FIELDS), "Save failed (network error).");
+        }
+    }
+
+    // A scale input changed (Enter/blur): validate the whole set and save.
+    // Empty means auto for that bound.
+    function applyScaleInputs() {
+        const scale = {};
+        for (const key in SCALE_FIELDS) {
+            const raw = $(SCALE_FIELDS[key]).value.trim();
+            if (raw === "") { scale[key] = null; continue; }
+            const v = Number(raw);
+            if (!isFinite(v)) {
+                markScaleInvalid([key], "Bounds must be numbers (or empty for auto).");
+                return;
+            }
+            scale[key] = v;
+        }
+        for (const pair of SCALE_PAIRS) {
+            const lo = scale[pair[0]], hi = scale[pair[1]];
+            if (lo != null && hi != null && lo >= hi) {
+                markScaleInvalid(pair, "Low must be less than high.");
+                return;
+            }
+        }
+        saveScale(scale);
+    }
+
+    // Effective waterfall color range: manual bounds override the
+    // data-driven meta range, per side.
+    function wfRange() {
+        const m = state.wf.meta;
+        return {
+            min: state.scale.wf_lo != null ? state.scale.wf_lo : m.min_db,
+            max: state.scale.wf_hi != null ? state.scale.wf_hi : m.max_db,
+        };
+    }
+
+    // Effective PSD Y range: same data-driven auto baseline as the waterfall,
+    // with its own independent manual bounds.
+    function psdRange() {
+        const m = state.wf.meta;
+        return {
+            min: state.scale.psd_lo != null ? state.scale.psd_lo : m.min_db,
+            max: state.scale.psd_hi != null ? state.scale.psd_hi : m.max_db,
+        };
+    }
+
+    // Manual bound override for the line charts: an unset side keeps the
+    // auto (data + padding) bound.
+    function chartRange(lo, hi, pad, loKey, hiKey) {
+        let outLo = state.scale[loKey] != null ? state.scale[loKey] : lo - pad;
+        let outHi = state.scale[hiKey] != null ? state.scale[hiKey] : hi + pad;
+        if (outHi <= outLo) outHi = outLo + 1; // never invert, even vs. data
+        return { lo: outLo, hi: outHi };
     }
 
     function setLive(on) {
@@ -400,9 +521,9 @@
             ctx.fillStyle = "rgb(" + c[0] + "," + c[1] + "," + c[2] + ")";
             ctx.fillRect(x, 0, 1, 12);
         }
-        const m = state.wf.meta;
-        $("avg-legend-min").textContent = m.min_db.toFixed(0);
-        $("avg-legend-max").textContent = m.max_db.toFixed(0);
+        const r = wfRange();
+        $("avg-legend-min").textContent = r.min.toFixed(0);
+        $("avg-legend-max").textContent = r.max.toFixed(0);
         $("avg-legend-unit").textContent = "dBFS";
     }
 
@@ -427,8 +548,8 @@
         const W = canvas.width;
         const H = canvas.height;
         const ctx = canvas.getContext("2d");
-        const m = state.wf.meta;
-        const min = m.min_db, max = m.max_db;
+        const range = wfRange();
+        const min = range.min, max = range.max;
         const N = state.wf.numBins;
         const img = ctx.createImageData(W, H);
         // Dark base (no data / gaps).
@@ -602,11 +723,14 @@
         const s = wf.stats[state.selRow];
         const x = ((s.start_epoch * 1000 - state.sinceMs) / spanMs) * W;
         if (x < 0 || x > W) return;
+        // Clamp so a selection at the extreme right edge still lands on the
+        // last pixel column instead of falling off the canvas.
+        const px = Math.max(0, Math.min(W - 1, Math.round(x))) + 0.5;
         ctx.strokeStyle = "rgba(255,255,255,0.75)";
         ctx.lineWidth = 1;
         ctx.beginPath();
-        ctx.moveTo(Math.round(x) + 0.5, 0);
-        ctx.lineTo(Math.round(x) + 0.5, H);
+        ctx.moveTo(px, 0);
+        ctx.lineTo(px, H);
         ctx.stroke();
     }
 
@@ -634,7 +758,8 @@
         }
         if (lo === Infinity) { lo = -120; hi = -40; }
         const pad = Math.max(2, (hi - lo) * 0.1);
-        lo -= pad; hi += pad;
+        const range = chartRange(lo, hi, pad, "pwr_lo", "pwr_hi");
+        lo = range.lo; hi = range.hi;
         const X = function (ms) { return ((ms - state.sinceMs) / spanMs) * W; };
         const Y = function (v) { return H - 2 - ((v - lo) / (hi - lo)) * (H - 4); };
         ctx.strokeStyle = "rgba(255,255,255,0.06)";
@@ -692,7 +817,8 @@
             return;
         }
         const pad = Math.max(0.5, (hi - lo) * 0.1);
-        lo -= pad; hi += pad;
+        const range = chartRange(lo, hi, pad, "kurt_lo", "kurt_hi");
+        lo = range.lo; hi = range.hi;
         const X = function (ms) { return ((ms - state.sinceMs) / spanMs) * W; };
         const Y = function (v) { return H - 2 - ((v - lo) / (hi - lo)) * (H - 4); };
         ctx.strokeStyle = "rgba(255,255,255,0.06)";
@@ -745,8 +871,8 @@
             ctx.fillText("No PSD in this bucket (empty or pruned by retention)", W / 2, H / 2);
             return;
         }
-        const m = wf.meta;
-        drawPSD(ctx, W, H, powers, wf.freqs, m.min_db, m.max_db, state.crosshairBin, null, "dBFS");
+        const range = psdRange();
+        drawPSD(ctx, W, H, powers, wf.freqs, range.min, range.max, state.crosshairBin, null, "dBFS");
     }
 
     function renderBucketStats() {
@@ -893,9 +1019,15 @@
             else openPicker();
         });
         $("avg-picker").addEventListener("click", function (e) { e.stopPropagation(); });
-        document.addEventListener("click", function () { if (state.pickerOpen) closePicker(); });
+        for (const key in SCALE_FIELDS) {
+            $(SCALE_FIELDS[key]).addEventListener("change", applyScaleInputs);
+        }
+        document.addEventListener("click", function () {
+            if (state.pickerOpen) closePicker();
+        });
         document.addEventListener("keydown", function (e) {
-            if (e.key === "Escape" && state.pickerOpen) closePicker();
+            if (e.key !== "Escape") return;
+            if (state.pickerOpen) closePicker();
         });
         document.querySelectorAll("[data-preset]").forEach(function (btn) {
             btn.addEventListener("click", function () {
@@ -954,6 +1086,17 @@
                 setSelectValue("avg-gain", latest.gain_db);
             }
         } catch (_) { /* configs are optional; defaults stay All */ }
+        try {
+            const pr = await fetch("/api/ui-prefs");
+            if (pr.ok) {
+                const doc = await pr.json();
+                const s = doc && doc.scale ? doc.scale : {};
+                for (const key in SCALE_FIELDS) {
+                    if (typeof s[key] === "number" && isFinite(s[key])) state.scale[key] = s[key];
+                }
+            }
+        } catch (_) { /* prefs are optional; defaults stay auto */ }
+        syncScaleInputs();
         markPresetButtons();
         setLive(true); // default: sliding "Now" window, polled every POLL_MS
     }

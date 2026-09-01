@@ -419,3 +419,67 @@ async def test_api_detections_json_since_until(app_with_db):
             },
         )
         assert [d["burst_id"] for d in r.json()["detections"]] == ["late"]
+
+
+@pytest.mark.asyncio
+async def test_ui_prefs_roundtrip(app_with_db):
+    from httpx import ASGITransport, AsyncClient
+
+    app, db = app_with_db
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.get("/api/ui-prefs")
+        assert r.status_code == 200
+        assert r.json() == {"scale": {}}
+
+        doc = {
+            "scale": {
+                "wf_lo": -110.5,
+                "wf_hi": -60.0,
+                "psd_lo": -100.0,
+                "psd_hi": -55.0,
+                "pwr_lo": None,
+            }
+        }
+        r = await c.put("/api/ui-prefs", json=doc)
+        assert r.status_code == 200
+        assert r.json()["scale"]["wf_lo"] == -110.5
+        assert r.json()["scale"]["psd_lo"] == -100.0
+        assert r.json()["scale"]["pwr_lo"] is None
+
+        # persisted in the config key/value table
+        stored = await db.get_config("ui_prefs")
+        assert stored is not None and "-110.5" in stored
+
+        r = await c.get("/api/ui-prefs")
+        assert r.status_code == 200
+        assert r.json()["scale"]["wf_hi"] == -60.0
+
+        # full replace: a new PUT drops previously stored keys
+        r = await c.put("/api/ui-prefs", json={"scale": {}})
+        assert r.status_code == 200
+        assert (await c.get("/api/ui-prefs")).json() == {"scale": {}}
+
+
+@pytest.mark.asyncio
+async def test_ui_prefs_rejects_bad_values(app_with_db):
+    from httpx import ASGITransport, AsyncClient
+
+    app, db = app_with_db
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        # unknown key
+        r = await c.put("/api/ui-prefs", json={"scale": {"bogus": 1}})
+        assert r.status_code == 400
+        # non-numeric value
+        r = await c.put("/api/ui-prefs", json={"scale": {"wf_lo": "low"}})
+        assert r.status_code == 400
+        # bool is not a valid number here
+        r = await c.put("/api/ui-prefs", json={"scale": {"wf_lo": True}})
+        assert r.status_code == 400
+        # inverted range
+        r = await c.put("/api/ui-prefs", json={"scale": {"pwr_lo": 10, "pwr_hi": -10}})
+        assert r.status_code == 400
+        # inverted PSD range (its own pair, separate from the waterfall's)
+        r = await c.put("/api/ui-prefs", json={"scale": {"psd_lo": 0, "psd_hi": -1}})
+        assert r.status_code == 400
+        # nothing was stored
+        assert (await c.get("/api/ui-prefs")).json() == {"scale": {}}

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import struct
 from collections import OrderedDict
 from datetime import datetime
@@ -993,6 +995,84 @@ async def averaged_configs(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail="Database not connected")
     result: dict[str, Any] = await db.avg_window_configs()
     return result
+
+
+# UI display preferences (manual chart scales), persisted as one JSON
+# document in the config key/value table so they survive restarts and are
+# shared across browsers.
+_UI_PREFS_KEY = "ui_prefs"
+_SCALE_KEYS = (
+    "wf_lo",
+    "wf_hi",
+    "psd_lo",
+    "psd_hi",
+    "pwr_lo",
+    "pwr_hi",
+    "kurt_lo",
+    "kurt_hi",
+)
+_SCALE_PAIRS = (
+    ("wf_lo", "wf_hi"),
+    ("psd_lo", "psd_hi"),
+    ("pwr_lo", "pwr_hi"),
+    ("kurt_lo", "kurt_hi"),
+)
+
+
+def _validate_scale(raw: Any) -> dict[str, float | None]:
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=400, detail="'scale' must be an object")
+    scale: dict[str, float | None] = {}
+    for key, value in raw.items():
+        if key not in _SCALE_KEYS:
+            raise HTTPException(status_code=400, detail=f"unknown scale key '{key}'")
+        if value is None:
+            scale[key] = None
+        elif (
+            isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+        ):
+            scale[key] = float(value)
+        else:
+            raise HTTPException(status_code=400, detail=f"scale '{key}' must be a number or null")
+    for lo_key, hi_key in _SCALE_PAIRS:
+        lo, hi = scale.get(lo_key), scale.get(hi_key)
+        if lo is not None and hi is not None and lo >= hi:
+            raise HTTPException(status_code=400, detail=f"'{lo_key}' must be less than '{hi_key}'")
+    return scale
+
+
+@router.get("/ui-prefs")
+async def get_ui_prefs(request: Request) -> dict[str, Any]:
+    """Stored UI display preferences; {"scale": {}} when never set."""
+    db = _get_db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    raw = await db.get_config(_UI_PREFS_KEY)
+    if raw is None:
+        return {"scale": {}}
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return {"scale": {}}
+    return doc if isinstance(doc, dict) else {"scale": {}}
+
+
+@router.put("/ui-prefs")
+async def put_ui_prefs(request: Request) -> dict[str, Any]:
+    """Replace the UI display preferences. Scale values are per-chart low/high
+    bounds (dBFS for waterfall/PSD, dB for power, unitless for kurtosis); null
+    or omitted means auto-scale from the data."""
+    db = _get_db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body") from None
+    scale = _validate_scale((body or {}).get("scale", {}))
+    doc: dict[str, Any] = {"scale": scale}
+    await db.set_config(_UI_PREFS_KEY, json.dumps(doc))
+    return doc
 
 
 @router.get("/averaged/{window_id}")

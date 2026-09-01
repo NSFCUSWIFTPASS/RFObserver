@@ -5,25 +5,74 @@
  * timeline, and the range's detections; renders the stats chart, a
  * time-bucketed PSD waterfall with a captures-style selector line, the
  * selected bucket's PSD spectrum, per-bucket stats, and a detections table +
- * overlay. Rendering reuses shared-charts.js (powerToColor,
- * renderWaterfallRow, drawPSD).
+ * overlay. Rendering reuses shared-charts.js (powerToColor, drawPSD).
+ *
+ * Layout is Grafana-inspired: the page uses the full window width and the
+ * charts size to their cards (the canvas backing store is matched to the
+ * displayed size on boot and on window resize).
+ *
+ * The waterfall is rotated so its X axis is TIME — identical span and width
+ * to the stats chart directly above it, so the two are time-correlated — and
+ * its Y axis is frequency (low frequencies at the bottom). Clicking selects
+ * a time column; the selector is a vertical line.
+ *
+ * "Now" mode (grafana-style, the default): the range end tracks the current
+ * time and the range is re-fetched every POLL_MS. The next poll is scheduled
+ * only after the previous load finishes, so slow long-range aggregates never
+ * stack up. The one-line bar holds the tuning selects and a time-picker
+ * button whose dropdown offers quick ranges (sliding windows, Now on) and an
+ * absolute From/To form (fixed range, Now off).
+ *
+ * Stale indicator: whenever the user changes the range/tuning but the new
+ * data has not loaded yet, a spinning circle shows next to the range button
+ * and the chart panels dim until the load completes.
  */
 (function () {
     "use strict";
 
-    const WF_W = 920;
-    const WF_H = 600;
-    const PSD_W = 920;
-    const PSD_H = 160;
     const MAX_ROWS = 600;
     const MAX_BINS = 512;
     const DAY_MS = 86400000;
+    const POLL_MS = 2000;
+    const PRESET_MS = {
+        "5m": 5 * 60000,
+        "15m": 15 * 60000,
+        "30m": 30 * 60000,
+        "1h": 3600000,
+        "3h": 3 * 3600000,
+        "6h": 6 * 3600000,
+        "12h": 12 * 3600000,
+        day: DAY_MS,
+        "2day": 2 * DAY_MS,
+        week: 7 * DAY_MS,
+    };
+    const PRESET_LABELS = {
+        "5m": "Last 5 minutes",
+        "15m": "Last 15 minutes",
+        "30m": "Last 30 minutes",
+        "1h": "Last 1 hour",
+        "3h": "Last 3 hours",
+        "6h": "Last 6 hours",
+        "12h": "Last 12 hours",
+        day: "Last 24 hours",
+        "2day": "Last 2 days",
+        week: "Last 7 days",
+    };
+    const DEFAULT_PRESET = "15m";
 
     const $ = function (id) { return document.getElementById(id); };
 
     const state = {
         sinceMs: 0,
         untilMs: 0,
+        spanMs: PRESET_MS[DEFAULT_PRESET],
+        live: false,
+        loading: false,
+        stale: true, // displayed data lags the selected range (spinner on)
+        pollTimer: null,
+        pickerOpen: false,
+        followLatest: true, // selection tracks the newest row across refreshes
+        activePreset: DEFAULT_PRESET,
         wf: null,        // parseWaterfall result: {bucketCount, numBins, meta, rows, stats, freqs}
         stats: null,     // /api/averaged/stats JSON
         detections: [],
@@ -45,6 +94,16 @@
         if (!v) return null;
         const d = new Date(v); // datetime-local is parsed as local time
         return isNaN(d.getTime()) ? null : d;
+    }
+
+    // Short clock for axis labels; seconds included for sub-10-minute ranges,
+    // date prefix for day-and-longer spans.
+    function fmtAxisTime(ms) {
+        const d = new Date(ms);
+        const hm = pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+        if (spanSec() >= 86400) return pad2(d.getMonth() + 1) + "/" + pad2(d.getDate()) + " " + hm;
+        if (spanSec() < 600) return hm + ":" + pad2(d.getSeconds());
+        return hm;
     }
 
     // --- select helpers ---
@@ -69,7 +128,7 @@
 
     // --- binary waterfall parsing ---
 
-    function parseWaterfall(buf, sinceMs, untilMs) {
+    function parseWaterfall(buf) {
         const dv = new DataView(buf);
         const rowCount = dv.getInt32(8, true);
         const numBins = dv.getInt32(12, true);
@@ -106,6 +165,110 @@
         return { bucketCount: rowCount, numBins: numBins, meta: meta, rows: rows, stats: stats, freqs: freqs };
     }
 
+    // --- live ("Now") mode ---
+
+    function schedulePoll() {
+        if (!state.live) return;
+        if (state.pollTimer) clearTimeout(state.pollTimer);
+        state.pollTimer = setTimeout(pollTick, POLL_MS);
+    }
+
+    function pollTick() {
+        if (!state.live) return;
+        if (document.hidden || state.loading) { schedulePoll(); return; }
+        state.untilMs = Date.now();
+        state.sinceMs = state.untilMs - state.spanMs;
+        loadAll(true).then(schedulePoll, schedulePoll);
+    }
+
+    // --- range label + picker ---
+
+    function spanLabel() {
+        if (state.activePreset) return PRESET_LABELS[state.activePreset];
+        const min = Math.max(1, Math.round(state.spanMs / 60000));
+        if (min < 60) return "Last " + min + " minutes";
+        const h = Math.round(min / 60);
+        if (h < 24) return "Last " + h + (h === 1 ? " hour" : " hours");
+        const d = Math.round(h / 24);
+        return "Last " + d + (d === 1 ? " day" : " days");
+    }
+
+    function fmtShort(ms) {
+        const d = new Date(ms);
+        return pad2(d.getMonth() + 1) + "/" + pad2(d.getDate()) + " "
+            + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+    }
+
+    function updateRangeLabel() {
+        $("avg-range-label").textContent = state.live
+            ? spanLabel()
+            : fmtShort(state.sinceMs) + " → " + fmtShort(state.untilMs);
+    }
+
+    function openPicker() {
+        state.pickerOpen = true;
+        // Snapshot of the current window; edits only take effect via Apply.
+        $("avg-since").value = toLocalInput(state.sinceMs);
+        $("avg-until").value = toLocalInput(state.untilMs);
+        $("avg-picker").hidden = false;
+    }
+
+    function closePicker() {
+        state.pickerOpen = false;
+        $("avg-picker").hidden = true;
+    }
+
+    function setLive(on) {
+        state.live = on;
+        $("avg-now").classList.toggle("on", on);
+        updateRangeLabel();
+        if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+        if (on) {
+            pollTick();
+        } else {
+            $("avg-updated").textContent = "";
+            const st = $("avg-status");
+            st.textContent = st.textContent.replace(/ - Live$/, "").replace(/ - retrying$/, "");
+        }
+    }
+
+    function markPresetButtons() {
+        document.querySelectorAll("[data-preset]").forEach(function (b) {
+            b.classList.toggle("active", b.dataset.preset === state.activePreset);
+        });
+    }
+
+    // --- stale indicator (spinner + dimmed panels) ---
+
+    function setStale(on) {
+        state.stale = on;
+        $("avg-spinner").classList.toggle("on", on);
+        document.querySelectorAll(".avg-panel").forEach(function (el) {
+            el.classList.toggle("stale", on);
+        });
+    }
+
+    // Reload after a user action that changed the range or tuning.
+    function reload() {
+        setStale(true);
+        if (state.live) pollTick(); // pollTick reloads immediately
+        else loadAll(false);
+    }
+
+    // --- canvas sizing ---
+
+    // Match each chart canvas's backing store to its displayed size so the
+    // charts are crisp at any window width. CSS controls the display size.
+    function fitCanvases() {
+        ["avg-stats-canvas", "avg-wf", "avg-wf-overlay", "avg-psd"].forEach(function (id) {
+            const c = $(id);
+            const w = Math.max(64, Math.round(c.clientWidth));
+            const h = Math.max(64, Math.round(c.clientHeight));
+            if (c.width !== w) c.width = w;
+            if (c.height !== h) c.height = h;
+        });
+    }
+
     // --- loading ---
 
     function tuningParams() {
@@ -124,60 +287,93 @@
         return p;
     }
 
-    async function loadAll() {
-        const sinceD = fromLocalInput($("avg-since").value);
-        const untilD = fromLocalInput($("avg-until").value);
-        if (!sinceD || !untilD || sinceD.getTime() >= untilD.getTime()) {
-            $("avg-status").textContent = "Invalid range: start must be before end";
-            return;
-        }
-        state.sinceMs = sinceD.getTime();
-        state.untilMs = untilD.getTime();
-        state.crosshairBin = -1;
-        $("avg-status").textContent = "Computing aggregate...";
-
-        const params = tuningParams();
-        let wfResp, statsResp, detResp;
+    async function loadAll(background) {
+        state.loading = true;
+        let ok = false;
         try {
-            [wfResp, statsResp, detResp] = await Promise.all([
-                fetch("/api/averaged/waterfall?" + params.toString()),
-                fetch("/api/averaged/stats?" + params.toString()),
-                fetch("/api/detections.json?" + params.toString()),
-            ]);
-        } catch (_) {
-            $("avg-status").textContent = "Load failed";
-            return;
+            if (!background) $("avg-status").textContent = "Computing aggregate...";
+            state.crosshairBin = -1;
+
+            // Remember what to re-select after the refresh: the newest row
+            // (follow mode) or the same window time the user picked.
+            const prevFollow = state.followLatest;
+            const prevEpoch = (state.wf && state.selRow >= 0 && state.selRow < state.wf.bucketCount)
+                ? state.wf.stats[state.selRow].start_epoch : null;
+
+            const params = tuningParams();
+            let wfResp, statsResp, detResp;
+            try {
+                [wfResp, statsResp, detResp] = await Promise.all([
+                    fetch("/api/averaged/waterfall?" + params.toString()),
+                    fetch("/api/averaged/stats?" + params.toString()),
+                    fetch("/api/detections.json?" + params.toString()),
+                ]);
+            } catch (_) {
+                $("avg-status").textContent = state.live ? "Update failed - retrying" : "Load failed";
+                return;
+            }
+            if (!wfResp.ok) {
+                $("avg-status").textContent = "Waterfall load failed (" + wfResp.status + ")"
+                    + (state.live ? " - retrying" : "");
+                return;
+            }
+            const buf = await wfResp.arrayBuffer();
+            state.wf = parseWaterfall(buf);
+            state.stats = statsResp.ok ? await statsResp.json() : null;
+            state.detections = detResp.ok ? (await detResp.json()).detections : [];
+            const slider = $("avg-slider");
+            slider.min = "0";
+            slider.max = String(Math.max(0, state.wf.bucketCount - 1));
+            if (!state.wf.bucketCount) {
+                $("avg-status").textContent = "No averaged windows in this range"
+                    + (state.live ? " - Live" : "");
+                $("avg-updated").textContent = "Updated " + new Date().toLocaleTimeString();
+                renderWaterfall();
+                renderStatsChart();
+                renderPSD();
+                renderBucketStats();
+                renderDetections();
+                updateWfLabel();
+                ok = true;
+                return;
+            }
+            if (prevFollow) {
+                // Track the newest bucket that actually has windows; the grid's
+                // last bucket can still be empty (its span is only just starting).
+                let last = state.wf.bucketCount - 1;
+                while (last > 0 && state.wf.stats[last].count === 0) last--;
+                state.selRow = last;
+            } else if (prevEpoch != null) {
+                let idx = -1;
+                for (let i = 0; i < state.wf.bucketCount; i++) {
+                    if (state.wf.stats[i].start_epoch === prevEpoch) { idx = i; break; }
+                }
+                state.selRow = idx >= 0 ? idx : Math.min(state.selRow, state.wf.bucketCount - 1);
+            } else {
+                state.selRow = Math.min(state.selRow, state.wf.bucketCount - 1);
+            }
+            slider.value = String(state.selRow);
+            $("avg-time").textContent =
+                new Date(state.wf.stats[state.selRow].start_epoch * 1000).toLocaleString();
+            const windows = Math.round(state.wf.meta.total_windows);
+            const isRaw = state.wf.bucketCount < MAX_ROWS;
+            $("avg-status").textContent = (isRaw
+                ? windows + " windows (no averaging needed)"
+                : windows + " windows in " + state.wf.bucketCount + " buckets"
+                    + (state.wf.meta.bucket_sec >= 60
+                        ? " (" + (state.wf.meta.bucket_sec / 60).toFixed(1) + " min/row)"
+                        : " (" + state.wf.meta.bucket_sec.toFixed(1) + " s/row)"))
+                + (state.live ? " - Live" : "");
+            $("avg-updated").textContent = "Updated " + new Date().toLocaleTimeString();
+            renderAll();
+            ok = true;
+        } finally {
+            state.loading = false;
+            // Successful loads always clear the stale flag. Failed loads clear
+            // it too when Now is off (the error is in the status line); in Now
+            // mode the flag stays on while the poll loop retries.
+            if (ok || !state.live) setStale(false);
         }
-        if (!wfResp.ok) {
-            $("avg-status").textContent = "Waterfall load failed (" + wfResp.status + ")";
-            return;
-        }
-        const buf = await wfResp.arrayBuffer();
-        state.wf = parseWaterfall(buf, state.sinceMs, state.untilMs);
-        state.stats = statsResp.ok ? await statsResp.json() : null;
-        state.detections = detResp.ok ? (await detResp.json()).detections : [];
-        const slider = $("avg-slider");
-        slider.min = "0";
-        slider.max = String(Math.max(0, state.wf.bucketCount - 1));
-        if (!state.wf.bucketCount) {
-            $("avg-status").textContent = "No averaged windows in this range";
-            renderWaterfall();
-            renderStatsChart();
-            renderDetections();
-            return;
-        }
-        state.selRow = Math.max(0, state.wf.bucketCount - 1);
-        slider.value = String(state.selRow);
-        $("avg-time").textContent = new Date(state.wf.stats[state.selRow].start_epoch * 1000).toLocaleString();
-        const windows = Math.round(state.wf.meta.total_windows);
-        const isRaw = state.wf.bucketCount < MAX_ROWS;
-        $("avg-status").textContent = isRaw
-            ? windows + " windows (no averaging needed)"
-            : windows + " windows in " + state.wf.bucketCount + " buckets"
-                + (state.wf.meta.bucket_sec >= 60
-                    ? " (" + (state.wf.meta.bucket_sec / 60).toFixed(1) + " min/row)"
-                    : " (" + state.wf.meta.bucket_sec.toFixed(1) + " s/row)");
-        renderAll();
     }
 
     // --- rendering ---
@@ -207,61 +403,92 @@
 
     function spanSec() { return (state.untilMs - state.sinceMs) / 1000; }
     function sinceSec() { return state.sinceMs / 1000; }
-    function yForSec(sec) { return Math.floor(((sec - sinceSec()) / spanSec()) * WF_H); }
+    function xForSec(sec, W) { return ((sec - sinceSec()) / spanSec()) * W; }
 
-    // Pixel rows covered by row i: [y0, y1] from its own start+duration. In
+    // Pixel columns covered by row i: [x0, x1) from its own start+duration. In
     // raw mode (few windows) each window stretches to its real time span; in
-    // aggregated mode buckets tile 1 px each.
-    function rowSpan(idx) {
+    // aggregated mode buckets tile the full width.
+    function colSpan(idx, W) {
         const s = state.wf.stats[idx];
-        const y0 = Math.max(0, Math.min(WF_H - 1, yForSec(s.start_epoch)));
-        const y1 = Math.max(0, Math.min(WF_H - 1, yForSec(s.start_epoch + s.duration_sec)));
-        return { y0: y0, y1: Math.max(y0 + 1, y1) };
+        const x0 = Math.max(0, Math.min(W - 1, Math.floor(xForSec(s.start_epoch, W))));
+        const x1 = Math.max(0, Math.min(W, Math.ceil(xForSec(s.start_epoch + s.duration_sec, W))));
+        return { x0: x0, x1: Math.max(x0 + 1, x1) };
     }
 
+    // Waterfall: X = time (aligned with the stats chart above), Y = frequency
+    // (low frequencies at the bottom, matching the PSD plot orientation).
     function renderWaterfall() {
         const canvas = $("avg-wf");
+        const W = canvas.width;
+        const H = canvas.height;
         const ctx = canvas.getContext("2d");
         const m = state.wf.meta;
         const min = m.min_db, max = m.max_db;
-        const img = ctx.createImageData(WF_W, WF_H);
+        const N = state.wf.numBins;
+        const img = ctx.createImageData(W, H);
         // Dark base (no data / gaps).
-        for (let y = 0; y < WF_H; y++) {
-            const base = y * WF_W * 4;
-            for (let x = 0; x < WF_W; x++) {
-                const i = base + x * 4;
-                img.data[i] = 18; img.data[i + 1] = 18; img.data[i + 2] = 30; img.data[i + 3] = 255;
-            }
+        for (let i = 0; i < img.data.length; i += 4) {
+            img.data[i] = 18; img.data[i + 1] = 18; img.data[i + 2] = 30; img.data[i + 3] = 255;
         }
         for (let i = 0; i < state.wf.bucketCount; i++) {
-            const span = rowSpan(i);
-            const powers = state.wf.rows[i].map(function (v) { return isNaN(v) ? min : v; });
-            for (let y = span.y0; y <= span.y1 && y < WF_H; y++) {
-                renderWaterfallRow(img, WF_W, y, powers, min, max);
+            if (state.wf.stats[i].count === 0) continue; // empty bucket: leave the dark gap
+            const span = colSpan(i, W);
+            const powers = state.wf.rows[i];
+            // Pre-render this bucket's frequency column once, then stamp it
+            // into every pixel column of the bucket's time span.
+            const col = new Uint8Array(H * 4);
+            for (let y = 0; y < H; y++) {
+                const bin = Math.min(N - 1, Math.floor(((H - 1 - y) / Math.max(1, H - 1)) * N));
+                let v = bin >= 0 ? powers[bin] : min;
+                if (isNaN(v)) v = min;
+                const c = powerToColor(v, min, max);
+                const o = y * 4;
+                col[o] = c[0]; col[o + 1] = c[1]; col[o + 2] = c[2]; col[o + 3] = 255;
+            }
+            for (let x = span.x0; x < span.x1; x++) {
+                for (let y = 0; y < H; y++) {
+                    const d = (y * W + x) * 4;
+                    const o = y * 4;
+                    img.data[d] = col[o];
+                    img.data[d + 1] = col[o + 1];
+                    img.data[d + 2] = col[o + 2];
+                    img.data[d + 3] = 255;
+                }
             }
         }
         ctx.putImageData(img, 0, 0);
         drawHighlight();
         drawDetectionOverlay();
+        drawWfFreqAxis();
+        drawWfTimeAxis();
     }
 
+    // Vertical selector band + line at the selected time column.
     function drawHighlight() {
-        const ctx = $("avg-wf").getContext("2d");
+        const canvas = $("avg-wf");
+        const W = canvas.width;
+        const H = canvas.height;
         if (state.selRow < 0 || state.selRow >= state.wf.bucketCount) return;
-        const span = rowSpan(state.selRow);
+        const ctx = canvas.getContext("2d");
+        const span = colSpan(state.selRow, W);
         ctx.fillStyle = "rgba(255,255,255,0.10)";
-        ctx.fillRect(0, span.y0, WF_W, span.y1 - span.y0 + 1);
+        ctx.fillRect(span.x0, 0, span.x1 - span.x0, H);
         ctx.strokeStyle = "rgba(255,255,255,0.75)";
         ctx.lineWidth = 1;
         ctx.beginPath();
-        ctx.moveTo(0, span.y0 + 0.5);
-        ctx.lineTo(WF_W, span.y0 + 0.5);
+        ctx.moveTo(span.x0 + 0.5, 0);
+        ctx.lineTo(span.x0 + 0.5, H);
         ctx.stroke();
     }
 
+    // Detections: vertical line at the detection's start time spanning its
+    // frequency band (drawn on the overlay canvas).
     function drawDetectionOverlay() {
-        const ctx = $("avg-wf-overlay").getContext("2d");
-        ctx.clearRect(0, 0, WF_W, WF_H);
+        const canvas = $("avg-wf-overlay");
+        const W = canvas.width;
+        const H = canvas.height;
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, W, H);
         const wf = state.wf;
         if (!wf || !state.detections.length || wf.freqs.length < 2) return;
         const fLow = wf.freqs[0];
@@ -270,23 +497,67 @@
         if (fSpan <= 0) return;
         for (const det of state.detections) {
             const startSec = new Date(det.start_time).getTime() / 1000;
-            const y = Math.max(0, Math.min(WF_H - 1, yForSec(startSec)));
-            const xLo = ((det.center_freq_hz - det.bandwidth_hz / 2) - fLow) / fSpan * WF_W;
-            const xHi = ((det.center_freq_hz + det.bandwidth_hz / 2) - fLow) / fSpan * WF_W;
-            const x = Math.max(0, Math.min(WF_W, Math.min(xLo, xHi)));
-            const w = Math.max(2, Math.abs(xHi - xLo));
-            ctx.strokeStyle = "rgba(255,60,60,0.9)";
-            ctx.lineWidth = 1.5;
-            ctx.strokeRect(x, y, w, 1);
+            const x = Math.max(0, Math.min(W - 1, Math.round(xForSec(startSec, W))));
+            const fLo = ((det.center_freq_hz - det.bandwidth_hz / 2) - fLow) / fSpan;
+            const fHi = ((det.center_freq_hz + det.bandwidth_hz / 2) - fLow) / fSpan;
+            const yTop = Math.max(0, Math.min(H, (H - 1) * (1 - Math.max(fLo, fHi))));
+            const yBot = Math.max(0, Math.min(H, (H - 1) * (1 - Math.min(fLo, fHi))));
+            ctx.strokeStyle = "rgba(255,60,60,0.45)"; // translucent: clusters brighten, singles stay subtle
+            ctx.lineWidth = 1;
+            ctx.strokeRect(x, yTop, 1, Math.max(3, yBot - yTop));
         }
     }
 
-    // Map a pixel row back to the row whose time span contains it (or the row
-    // that started just before it when clicking a data gap).
-    function rowForPixelY(y) {
+    // Pill-backed label on the overlay canvas (legible over data pixels).
+    function drawPillLabel(ctx, text, x, y, align) {
+        ctx.font = "10px -apple-system, sans-serif";
+        ctx.textAlign = align || "left";
+        const w = ctx.measureText(text).width;
+        const bx = align === "right" ? x - w - 3 : align === "center" ? x - w / 2 - 3 : x - 3;
+        ctx.fillStyle = "rgba(0,0,0,0.45)";
+        ctx.fillRect(bx, y - 9, w + 6, 12);
+        ctx.fillStyle = "rgba(255,255,255,0.75)";
+        ctx.fillText(text, x, y);
+    }
+
+    // Frequency labels along the left edge: max at the top, min at the bottom
+    // (leaves room for the time ticks at the very bottom).
+    function drawWfFreqAxis() {
+        const wf = state.wf;
+        const n = wf && wf.freqs ? wf.freqs.length : 0;
+        if (n < 2 || !isFinite(wf.freqs[0])) return;
+        const canvas = $("avg-wf-overlay");
+        const H = canvas.height;
+        const ctx = canvas.getContext("2d");
+        drawPillLabel(ctx, (wf.freqs[n - 1] / 1e6).toFixed(1) + " MHz", 4, 12);
+        drawPillLabel(ctx, (wf.freqs[Math.floor(n / 2)] / 1e6).toFixed(1) + " MHz", 4, Math.round(H / 2));
+        drawPillLabel(ctx, (wf.freqs[0] / 1e6).toFixed(1) + " MHz", 4, H - 16);
+    }
+
+    // Time ticks along the bottom edge, using the same X mapping as the stats
+    // chart above so the two line up.
+    function drawWfTimeAxis() {
+        if (!state.wf || spanSec() <= 0) return;
+        const canvas = $("avg-wf-overlay");
+        const W = canvas.width;
+        const H = canvas.height;
+        const ctx = canvas.getContext("2d");
+        const n = tickCount(W);
+        const span = state.untilMs - state.sinceMs;
+        for (let i = 1; i <= n; i++) {
+            const label = fmtAxisTime(state.sinceMs + span * (i / n));
+            const last = i === n;
+            drawPillLabel(ctx, label, last ? W - 4 : (W / n) * i, H - 4, last ? "right" : "center");
+        }
+    }
+
+    // Map a pixel column back to the row whose time span contains it (or the
+    // row that started just before it when clicking a data gap).
+    function rowForPixelX(x) {
         const wf = state.wf;
         if (!wf || !wf.bucketCount) return -1;
-        const tSec = sinceSec() + (y / WF_H) * spanSec();
+        const W = $("avg-wf").width;
+        const tSec = sinceSec() + (x / W) * spanSec();
         let best = 0;
         let bestStart = -Infinity;
         for (let i = 0; i < wf.bucketCount; i++) {
@@ -299,18 +570,24 @@
         return best;
     }
 
+    // Adaptive tick density for the time axes (wider charts get more ticks).
+    function tickCount(W) { return Math.max(4, Math.min(10, Math.round(W / 200))); }
+
     function renderStatsChart() {
-        const ctx = $("avg-stats-canvas").getContext("2d");
-        ctx.clearRect(0, 0, PSD_W, PSD_H);
+        const canvas = $("avg-stats-canvas");
+        const W = canvas.width;
+        const H = canvas.height;
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, W, H);
         ctx.fillStyle = "#1a1a2e";
-        ctx.fillRect(0, 0, PSD_W, PSD_H);
+        ctx.fillRect(0, 0, W, H);
         const points = state.stats && state.stats.points ? state.stats.points : [];
         const spanMs = state.untilMs - state.sinceMs;
         if (!points.length || spanMs <= 0) {
             ctx.fillStyle = "rgba(255,255,255,0.4)";
             ctx.font = "12px -apple-system, sans-serif";
             ctx.textAlign = "center";
-            ctx.fillText("No averaged windows in this range", PSD_W / 2, PSD_H / 2);
+            ctx.fillText("No averaged windows in this range", W / 2, H / 2);
             return;
         }
         let lo = Infinity, hi = -Infinity;
@@ -321,13 +598,13 @@
         if (lo === Infinity) { lo = -120; hi = -40; }
         const pad = Math.max(2, (hi - lo) * 0.1);
         lo -= pad; hi += pad;
-        const X = function (ms) { return ((ms - state.sinceMs) / spanMs) * PSD_W; };
-        const Y = function (v) { return PSD_H - ((v - lo) / (hi - lo)) * PSD_H; };
+        const X = function (ms) { return ((ms - state.sinceMs) / spanMs) * W; };
+        const Y = function (v) { return H - 2 - ((v - lo) / (hi - lo)) * (H - 4); };
         ctx.strokeStyle = "rgba(255,255,255,0.06)";
         ctx.lineWidth = 1;
         for (let i = 1; i < 5; i++) {
-            const y = (PSD_H / 5) * i;
-            ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(PSD_W, y); ctx.stroke();
+            const y = (H / 5) * i;
+            ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
         }
         const drawLine = function (getVal, color) {
             ctx.beginPath();
@@ -349,7 +626,15 @@
         ctx.font = "10px -apple-system, sans-serif";
         ctx.textAlign = "left";
         ctx.fillText(hi.toFixed(0) + " dB", 4, 12);
-        ctx.fillText(lo.toFixed(0) + " dB", 4, PSD_H - 4);
+        ctx.fillText(lo.toFixed(0) + " dB", 4, H - 4);
+        // x-axis time ticks (skip the left edge, which holds the dB label);
+        // same X mapping as the waterfall below, so the two line up.
+        const n = tickCount(W);
+        for (let i = 1; i <= n; i++) {
+            const label = fmtAxisTime(state.sinceMs + spanMs * (i / n));
+            ctx.textAlign = i === n ? "right" : "center";
+            ctx.fillText(label, i === n ? W - 4 : (W / n) * i, H - 4);
+        }
     }
 
     function selectedPowers() {
@@ -359,21 +644,24 @@
     }
 
     function renderPSD() {
-        const ctx = $("avg-psd").getContext("2d");
+        const canvas = $("avg-psd");
+        const W = canvas.width;
+        const H = canvas.height;
+        const ctx = canvas.getContext("2d");
         const wf = state.wf;
         const powers = selectedPowers();
         if (!wf || !powers || powers.every(isNaN)) {
-            ctx.clearRect(0, 0, PSD_W, PSD_H);
+            ctx.clearRect(0, 0, W, H);
             ctx.fillStyle = "#1a1a2e";
-            ctx.fillRect(0, 0, PSD_W, PSD_H);
+            ctx.fillRect(0, 0, W, H);
             ctx.fillStyle = "rgba(255,255,255,0.4)";
             ctx.font = "12px -apple-system, sans-serif";
             ctx.textAlign = "center";
-            ctx.fillText("No PSD in this bucket (empty or pruned by retention)", PSD_W / 2, PSD_H / 2);
+            ctx.fillText("No PSD in this bucket (empty or pruned by retention)", W / 2, H / 2);
             return;
         }
         const m = wf.meta;
-        drawPSD(ctx, PSD_W, PSD_H, powers, wf.freqs, m.min_db, m.max_db, state.crosshairBin, null, "dBFS");
+        drawPSD(ctx, W, H, powers, wf.freqs, m.min_db, m.max_db, state.crosshairBin, null, "dBFS");
     }
 
     function renderBucketStats() {
@@ -413,6 +701,8 @@
 
     function renderDetections() {
         const tbody = $("avg-det-tbody");
+        $("avg-det-count").textContent =
+            state.detections.length ? "(" + state.detections.length + ")" : "";
         if (!state.detections.length) {
             tbody.innerHTML = '<tr><td colspan="5" class="placeholder-text">No detections in range</td></tr>';
             return;
@@ -437,6 +727,7 @@
         if (!wf) return;
         idx = Math.max(0, Math.min(wf.bucketCount - 1, idx));
         state.selRow = idx;
+        state.followLatest = (idx === wf.bucketCount - 1);
         $("avg-slider").value = String(idx);
         const s = wf.stats[idx];
         $("avg-time").textContent = s ? new Date(s.start_epoch * 1000).toLocaleString() : "--";
@@ -450,9 +741,9 @@
         slider.addEventListener("input", function () { selectRow(parseInt(slider.value, 10)); });
         $("avg-wf").addEventListener("click", function (e) {
             const rect = e.currentTarget.getBoundingClientRect();
-            const scaleY = e.currentTarget.height / rect.height;
-            const y = Math.floor((e.clientY - rect.top) * scaleY);
-            const idx = rowForPixelY(y);
+            const scaleX = e.currentTarget.width / rect.width;
+            const x = Math.floor((e.clientX - rect.left) * scaleX);
+            const idx = rowForPixelX(x);
             if (idx >= 0) selectRow(idx);
         });
         const psd = $("avg-psd");
@@ -464,7 +755,7 @@
             const scaleX = psd.width / rect.width;
             const x = (e.clientX - rect.left) * scaleX;
             const N = wf.freqs.length;
-            state.crosshairBin = Math.min(N - 1, Math.max(0, Math.floor((x / PSD_W) * N)));
+            state.crosshairBin = Math.min(N - 1, Math.max(0, Math.floor((x / psd.width) * N)));
             const freq = wf.freqs[state.crosshairBin] || 0;
             const power = powers[state.crosshairBin] || 0;
             const tip = $("avg-psd-tooltip");
@@ -482,19 +773,67 @@
     }
 
     function setupControls() {
-        $("avg-apply").addEventListener("click", loadAll);
+        $("avg-apply").addEventListener("click", function () {
+            const s = fromLocalInput($("avg-since").value);
+            const u = fromLocalInput($("avg-until").value);
+            if (!s || !u || s.getTime() >= u.getTime()) {
+                $("avg-status").textContent = "Invalid range: start must be before end";
+                return;
+            }
+            state.sinceMs = s.getTime();
+            state.untilMs = u.getTime();
+            state.spanMs = state.untilMs - state.sinceMs;
+            state.activePreset = null;
+            markPresetButtons();
+            setLive(false);
+            closePicker();
+            setStale(true);
+            loadAll(false);
+        });
+        $("avg-now").addEventListener("click", function () {
+            if (state.live) { setLive(false); return; }
+            state.followLatest = true;
+            setStale(true);
+            setLive(true);
+        });
+        $("avg-refresh").addEventListener("click", function () {
+            if (state.live) { setStale(true); pollTick(); }
+            else reload();
+        });
+        $("avg-picker-btn").addEventListener("click", function (e) {
+            e.stopPropagation();
+            if (state.pickerOpen) closePicker();
+            else openPicker();
+        });
+        $("avg-picker").addEventListener("click", function (e) { e.stopPropagation(); });
+        document.addEventListener("click", function () { if (state.pickerOpen) closePicker(); });
+        document.addEventListener("keydown", function (e) {
+            if (e.key === "Escape" && state.pickerOpen) closePicker();
+        });
         document.querySelectorAll("[data-preset]").forEach(function (btn) {
             btn.addEventListener("click", function () {
-                const now = Date.now();
-                const span = { day: DAY_MS, "2day": 2 * DAY_MS, week: 7 * DAY_MS }[btn.dataset.preset] || DAY_MS;
-                $("avg-until").value = toLocalInput(now);
-                $("avg-since").value = toLocalInput(now - span);
-                loadAll();
+                state.activePreset = btn.dataset.preset;
+                state.spanMs = PRESET_MS[btn.dataset.preset] || DAY_MS;
+                state.followLatest = true;
+                markPresetButtons();
+                updateRangeLabel();
+                closePicker();
+                setStale(true);
+                if (state.live) pollTick(); // reload immediately on the new span
+                else setLive(true);         // setLive polls right away
             });
+        });
+        // Tuning filters apply immediately, grafana-style.
+        ["avg-center", "avg-samplerate", "avg-gain"].forEach(function (id) {
+            $(id).addEventListener("change", reload);
+        });
+        document.addEventListener("visibilitychange", function () {
+            if (!document.hidden && state.live) pollTick();
         });
         $("avg-hint").textContent =
             "PSD blobs are pruned after the configured retention window (DB_RETENTION_DAYS); "
-            + "stats and detections are kept indefinitely. Last Week is the maximum PSD range.";
+            + "stats and detections are kept indefinitely. Ranges beyond the retention window "
+            + "show stats and detections only.";
     }
 
     // --- boot ---
@@ -502,6 +841,15 @@
     async function boot() {
         setupControls();
         setupSlider();
+        fitCanvases();
+        let resizeTimer = null;
+        window.addEventListener("resize", function () {
+            if (resizeTimer) clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(function () {
+                fitCanvases();
+                if (state.wf) renderAll();
+            }, 150);
+        });
         try {
             const r = await fetch("/api/averaged/configs");
             const data = await r.json();
@@ -519,10 +867,8 @@
                 setSelectValue("avg-gain", latest.gain_db);
             }
         } catch (_) { /* configs are optional; defaults stay All */ }
-        const now = Date.now();
-        $("avg-since").value = toLocalInput(now - DAY_MS);
-        $("avg-until").value = toLocalInput(now);
-        loadAll();
+        markPresetButtons();
+        setLive(true); // default: sliding "Now" window, polled every POLL_MS
     }
 
     if (document.readyState === "loading") {

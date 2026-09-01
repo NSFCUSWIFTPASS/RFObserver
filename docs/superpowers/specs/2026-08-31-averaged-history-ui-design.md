@@ -218,3 +218,97 @@ bucket shows the dark/pruned state while the stats chart still renders.
 - Pipeline-maintained pre-aggregated per-minute table.
 - A history-page time-range viewer for *detections* (this cut is averaged
   windows; detections appear only as the range's table + overlay).
+
+## Addendum (2026-08-31, live/"Now" mode + usability pass)
+
+Locked with the user after the first cut shipped:
+
+- **Default is a Grafana-style "Now" mode**: the range end tracks the current
+  time and the range is re-fetched every 2 s. The next poll is scheduled only
+  after the previous load finishes, so a slow long-range aggregate never
+  stacks overlapping requests. Polling pauses while the tab is hidden and
+  resumes (with an immediate refresh) on return.
+- **Default range is Last 15 minutes**, not Last Day — a short sliding window
+  keeps per-poll blob reads small (the server-side LRU never hits on a sliding
+  window, so day/week polls are full re-aggregations; acceptable at the
+  load+2 s effective cadence but not something to default to).
+- **Selection survives refreshes**: the selected row follows the newest
+  window until the user clicks/drags to an older row, which is then kept by
+  `start_epoch` across polls. Follow mode picks the newest bucket **with
+  windows** — the grid's last bucket can still be empty while its span is
+  only starting.
+- **Axes added**: waterfall frequency labels (start/center/end, below the
+  canvas) and time labels (5 ticks down the left edge, drawn on the overlay
+  canvas), plus time ticks on the stats chart. Detections card header shows
+  the in-range count.
+
+## Addendum 2 (2026-08-31, Grafana-style one-line bar + time picker)
+
+Reworked the range controls after the user shared Grafana screenshots:
+
+- **One-line bar**: tuning selects (SDR center / sample rate / gain) on the
+  left; a time-picker button showing the current range label, a refresh
+  button, and the Now toggle on the right. No always-visible datetime inputs.
+- **The time-picker button opens a dropdown panel** (Grafana layout): left
+  column = "Absolute time range" with From/To `datetime-local` inputs and
+  "Apply time range" (fixed range, Now off, label becomes
+  `MM/DD HH:MM → MM/DD HH:MM`); right column = quick ranges 5m/15m/30m/1h/
+  3h/6h/12h/24h/2d/7d (sliding windows, Now on, label = "Last …"). The
+  retention hint moved into the panel. Closes on selection, outside click,
+  or Escape; opening snapshots the current window into the inputs (polls
+  never clobber edits).
+- Quick-range clicks while already live reload immediately on the new span;
+  the button label updates in the same handler (a stale-label bug the
+  puppeteer test caught).
+- The dropdown escapes its card via `overflow: visible` on the range card
+  (cards are `overflow: hidden` for header-radius clipping) and an explicit
+  `[hidden] { display: none }` rule, since `display: flex` on the panel
+  would otherwise override the `hidden` attribute.
+
+Puppeteer coverage (`tests/ui/puppeteer_avg_history.js`) asserts: Now on by
+default with the "Last 15 minutes" label, the Updated clock advancing across
+polls, picker open/close (button, outside click), populated snapshot inputs,
+active quick-range highlight, absolute Apply flipping the label to the
+absolute form and Now off, quick ranges re-enabling Now with the expected
+bucket granularity, live follow selecting a non-empty bucket, plus the
+waterfall/PSD pixel, axis-label, slider, and click-selection checks.
+
+## Addendum 3 (2026-08-31, loading spinner + full-width Grafana layout + rotated waterfall)
+
+After the user shared a full-dashboard Grafana screenshot:
+
+- **Stale indicator**: any user action that changes the range or tuning
+  (quick range, absolute Apply, refresh, Now on, tuning select) sets a
+  `stale` flag: a spinning circle appears next to the range button and the
+  three chart panels dim (`.avg-panel.stale`) until the load finishes. The
+  flag clears on success; a failed load clears it only when Now is off (the
+  error goes to the status line), so live mode keeps spinning while it
+  retries. The 2 s background polls never set it, so live updates don't
+  flash. The spinner uses `visibility` (space always reserved) so the bar
+  doesn't shift.
+- **Full-width page**: the averaged page opts out of the 960 px reading
+  column via `.content:has(.avg-picker-card) { max-width: none }`. Charts
+  size to their cards (CSS `clamp()` heights: stats/PSD ~26vh, waterfall
+  ~52vh); `fitCanvases()` matches each canvas's backing store to the
+  displayed size on boot and on window resize (debounced 150 ms) and
+  re-renders. Time-axis tick density adapts to width (W/200, clamped 4-10).
+- **Waterfall rotated 90°**: X is now TIME with exactly the stats chart's
+  span and pixel width, so the two are time-correlated (a gap or event lines
+  up vertically); Y is frequency, low at the bottom (PSD orientation). The
+  selector is a vertical band+line; clicking a time column selects it.
+  Frequency labels (max/mid/min) are pill-drawn on the overlay's left edge,
+  time ticks along the bottom; the old HTML freq-axis strip is gone. Axis
+  labels gain a date prefix for day-and-longer spans and seconds for
+  sub-10-minute spans. Empty buckets (`count == 0`) are left dark so data
+  gaps read as gaps instead of noise-floor blue. Detection markers are
+  vertical lines spanning the band at reduced alpha (0.45) so dense clusters
+  brighten without a solid smear.
+- **Tuning selects apply immediately** (change → spinner + reload);
+  previously they only took effect on the next range change.
+
+Puppeteer coverage grew: spinner off after first load, full-width assertion
+(`max-width: none`, waterfall > 1000 px at 1440 viewport), rotation
+assertion (canvas wider than tall), stats/waterfall width equality (shared
+time axis), overlay opacity sample (canvas-drawn axis labels), click
+selecting an *earlier* time column, spinner-on-then-off (with dimmed panels)
+around absolute Apply, each quick range, and a tuning-select change.

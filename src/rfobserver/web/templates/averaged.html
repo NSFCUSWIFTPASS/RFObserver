@@ -6,44 +6,70 @@
     <h1>Averaged History</h1>
 </div>
 
-<div class="card full-width">
-    <div class="card-header">Range</div>
-    <div class="card-body">
-        <form id="avg-range-form" class="detection-filters" onsubmit="return false;">
-            <label class="filter-field">
-                <span>Start</span>
-                <input type="datetime-local" id="avg-since">
-            </label>
-            <label class="filter-field">
-                <span>End</span>
-                <input type="datetime-local" id="avg-until">
-            </label>
-            <button type="button" class="btn-apply" data-preset="day">Last Day</button>
-            <button type="button" class="btn-apply" data-preset="2day">Last 2 Days</button>
-            <button type="button" class="btn-apply" data-preset="week">Last Week</button>
-            <label class="filter-field">
-                <span>SDR Center</span>
-                <select id="avg-center"></select>
-            </label>
-            <label class="filter-field">
-                <span>Sample Rate</span>
-                <select id="avg-samplerate"></select>
-            </label>
-            <label class="filter-field">
-                <span>Gain</span>
-                <select id="avg-gain"></select>
-            </label>
-            <button type="button" id="avg-apply" class="btn-apply">Apply</button>
-        </form>
-        <div class="avg-hint" id="avg-hint"></div>
-        <div class="avg-status" id="avg-status"></div>
+<div class="card full-width avg-picker-card">
+    <div class="card-body avg-bar-body">
+        <div class="avg-bar">
+            <div class="avg-tuning">
+                <select id="avg-center" title="SDR center frequency"></select>
+                <select id="avg-samplerate" title="Sample rate"></select>
+                <select id="avg-gain" title="Gain"></select>
+            </div>
+            <div class="avg-time">
+                <button type="button" id="avg-picker-btn" class="btn-preset avg-picker-btn"
+                        title="Change time range">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
+                         stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                        <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>
+                    </svg>
+                    <span id="avg-range-label">Last 15 minutes</span>
+                    <span class="avg-caret">&#9662;</span>
+                </button>
+                <span id="avg-spinner" class="avg-spinner" title="Loading the selected range..."></span>
+                <button type="button" id="avg-refresh" class="btn-preset" title="Reload this range">&#8635;</button>
+                <button type="button" id="avg-now" class="btn-preset btn-now"
+                        title="Track current time and refresh every 2 s">
+                    <span class="live-dot"></span>Now
+                </button>
+            </div>
+        </div>
+        <div id="avg-picker" class="avg-picker" hidden>
+            <div class="avg-picker-abs">
+                <div class="avg-picker-title">Absolute time range</div>
+                <label class="filter-field">
+                    <span>From</span>
+                    <input type="datetime-local" id="avg-since">
+                </label>
+                <label class="filter-field">
+                    <span>To</span>
+                    <input type="datetime-local" id="avg-until">
+                </label>
+                <button type="button" id="avg-apply" class="btn-apply">Apply time range</button>
+                <div class="avg-hint" id="avg-hint"></div>
+            </div>
+            <div class="avg-picker-quick" role="group" aria-label="Quick ranges">
+                <button type="button" data-preset="5m">Last 5 minutes</button>
+                <button type="button" data-preset="15m">Last 15 minutes</button>
+                <button type="button" data-preset="30m">Last 30 minutes</button>
+                <button type="button" data-preset="1h">Last 1 hour</button>
+                <button type="button" data-preset="3h">Last 3 hours</button>
+                <button type="button" data-preset="6h">Last 6 hours</button>
+                <button type="button" data-preset="12h">Last 12 hours</button>
+                <button type="button" data-preset="day">Last 24 hours</button>
+                <button type="button" data-preset="2day">Last 2 days</button>
+                <button type="button" data-preset="week">Last 7 days</button>
+            </div>
+        </div>
+        <div class="avg-status-row">
+            <span class="avg-status" id="avg-status"></span>
+            <span class="avg-updated" id="avg-updated"></span>
+        </div>
     </div>
 </div>
 
-<div class="card full-width">
+<div class="card full-width avg-panel">
     <div class="card-header">Stats Over Time</div>
     <div class="card-body">
-        <canvas id="avg-stats-canvas" width="920" height="160" style="width: 100%; height: 160px;"></canvas>
+        <canvas id="avg-stats-canvas" class="avg-chart avg-chart-stats"></canvas>
         <div class="graph-legend">
             <span class="legend-label" style="color:#0071e3;">avg</span>
             <span class="legend-label" style="color:#ff6b6b;">max</span>
@@ -52,16 +78,15 @@
     </div>
 </div>
 
-<div class="card full-width">
+<div class="card full-width avg-panel">
     <div class="card-header">
         Averaged PSD Waterfall
         <span id="avg-wf-label" class="card-header-label" style="opacity:0.5;"></span>
     </div>
     <div class="card-body">
-        <div style="position:relative;">
-            <canvas id="avg-wf" width="920" height="600" style="width:100%;height:600px;"></canvas>
-            <canvas id="avg-wf-overlay" width="920" height="600"
-                    style="position:absolute;top:0;left:0;width:100%;height:600px;pointer-events:none;"></canvas>
+        <div class="avg-wf-wrap">
+            <canvas id="avg-wf" class="avg-chart avg-chart-wf"></canvas>
+            <canvas id="avg-wf-overlay" class="avg-chart-wf-overlay"></canvas>
         </div>
         <div class="spectrogram-legend">
             <span class="legend-label" id="avg-legend-min">--</span>
@@ -76,11 +101,11 @@
     </div>
 </div>
 
-<div class="card full-width">
+<div class="card full-width avg-panel">
     <div class="card-header">PSD at Selected Time</div>
     <div class="card-body">
         <div style="position:relative;">
-            <canvas id="avg-psd" width="920" height="160" style="width:100%;height:160px;"></canvas>
+            <canvas id="avg-psd" class="avg-chart avg-chart-psd"></canvas>
             <div id="avg-psd-tooltip" class="graph-tooltip" style="display:none;"></div>
         </div>
         <div id="avg-bucket-stats" class="avg-bucket-stats"></div>
@@ -88,7 +113,7 @@
 </div>
 
 <div class="card full-width">
-    <div class="card-header">Detections in Range</div>
+    <div class="card-header">Detections in Range<span id="avg-det-count" class="card-header-label" style="opacity:0.5;"></span></div>
     <div class="card-body">
         <div class="card" style="padding:0;max-height:280px;overflow-y:auto;">
             <table class="data-table">

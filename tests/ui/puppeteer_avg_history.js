@@ -285,8 +285,7 @@ async function main() {
   console.log("non-dark sampled pixels:", colored);
   assert(colored > 0, "waterfall drew data pixels");
 
-  // Overlay drew axis labels / detection markers (opaque pixels on a
-  // transparent canvas).
+  // Overlay drew axis labels (opaque pixels on a transparent canvas).
   const overlayPx = await page.evaluate(() => {
     const c = document.getElementById("avg-wf-overlay");
     const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;

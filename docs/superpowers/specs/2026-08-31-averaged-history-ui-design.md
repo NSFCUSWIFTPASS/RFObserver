@@ -473,3 +473,17 @@ panel look in both themes (Grafana-style), so no chart JS is theme-aware.
 Puppeteer coverage: navbar order/labels, `/` landing page, `/live/` title,
 picker default, immediate apply, persistence across reload, scale doc
 preserved, Auto resolving to the OS theme.
+
+## Addendum 10 (2026-09-01, no detection boxes on the averaged waterfall)
+
+The averaged waterfall no longer draws detection markers. The original
+design painted a translucent red vertical band per detection
+(`drawDetectionOverlay`, alpha 0.45); with real capture rates that meant
+hundreds of red strokes over the averaged data — clutter that reads as a
+rendering bug, and semantically wrong here: a burst detection is a
+sub-second event, meaningless against multi-second averaged buckets. The
+Live (`/live/`) and Captures pages keep their burst/detection rectangles,
+where per-burst boxes do make sense. The averaged page still lists the
+range's detections in the table below the charts (`/api/detections.json`
+with `since`/`until`); `renderWfOverlay` now just clears the overlay canvas
+and draws the frequency/time axes.

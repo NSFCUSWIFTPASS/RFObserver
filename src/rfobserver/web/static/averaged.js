@@ -4,8 +4,10 @@
  * Fetches the aggregated waterfall (binary), the blob-independent stats
  * timeline, and the range's detections; renders the stats chart, a
  * time-bucketed PSD waterfall with a captures-style selector line, the
- * selected bucket's PSD spectrum, per-bucket stats, and a detections table +
- * overlay. Rendering reuses shared-charts.js (powerToColor, drawPSD).
+ * selected bucket's PSD spectrum, per-bucket stats, and a detections table.
+ * Rendering reuses shared-charts.js (powerToColor, drawPSD). Unlike the live
+ * and captures pages, no detection boxes are drawn over the waterfall here —
+ * averaged data has no per-burst meaning, and the table below lists them.
  *
  * Layout is Grafana-inspired: the page uses the full window width and the
  * charts size to their cards (the canvas backing store is matched to the
@@ -650,11 +652,12 @@
         renderWfOverlay();
     }
 
-    // Transparent overlay over the waterfall: detection markers, the
-    // frequency axis, and the time axis. Drawn after the data pixels, and
-    // redrawn on its own under a drag-zoom band (no data re-render needed).
+    // Transparent overlay over the waterfall: the frequency axis and the time
+    // axis. Drawn after the data pixels, and redrawn on its own under a
+    // drag-zoom band (no data re-render needed).
     function renderWfOverlay() {
-        drawDetectionOverlay(); // clears the overlay canvas first
+        const canvas = $("avg-wf-overlay");
+        canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
         drawWfFreqAxis();
         drawWfTimeAxis();
     }
@@ -677,32 +680,8 @@
         ctx.stroke();
     }
 
-    // Detections: vertical line at the detection's start time spanning its
-    // frequency band (drawn on the overlay canvas).
-    function drawDetectionOverlay() {
-        const canvas = $("avg-wf-overlay");
-        const W = canvas.width;
-        const H = canvas.height;
-        const ctx = canvas.getContext("2d");
-        ctx.clearRect(0, 0, W, H);
-        const wf = state.wf;
-        if (!wf || !state.detections.length || wf.freqs.length < 2) return;
-        const fLow = wf.freqs[0];
-        const fHigh = wf.freqs[wf.freqs.length - 1];
-        const fSpan = fHigh - fLow;
-        if (fSpan <= 0) return;
-        for (const det of state.detections) {
-            const startSec = new Date(det.start_time).getTime() / 1000;
-            const x = Math.max(0, Math.min(W - 1, Math.round(xForSec(startSec, W))));
-            const fLo = ((det.center_freq_hz - det.bandwidth_hz / 2) - fLow) / fSpan;
-            const fHi = ((det.center_freq_hz + det.bandwidth_hz / 2) - fLow) / fSpan;
-            const yTop = Math.max(0, Math.min(H, (H - 1) * (1 - Math.max(fLo, fHi))));
-            const yBot = Math.max(0, Math.min(H, (H - 1) * (1 - Math.min(fLo, fHi))));
-            ctx.strokeStyle = "rgba(255,60,60,0.45)"; // translucent: clusters brighten, singles stay subtle
-            ctx.lineWidth = 1;
-            ctx.strokeRect(x, yTop, 1, Math.max(3, yBot - yTop));
-        }
-    }
+    // Detections are intentionally not drawn on the waterfall (red boxes
+    // would clutter the averaged view); they are listed in the table below.
 
     // Pill-backed label on the overlay canvas (legible over data pixels).
     function drawPillLabel(ctx, text, x, y, align) {

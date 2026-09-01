@@ -1530,6 +1530,19 @@ body {
     color: var(--accent);
 }
 
+.btn-preset:disabled {
+    opacity: 0.35;
+    cursor: default;
+    pointer-events: none;
+}
+
+/* < > range-history nav buttons flanking the time-range button. */
+.avg-nav {
+    padding: 0 9px;
+    font-size: 15px;
+    line-height: 1;
+}
+
 .btn-now .live-dot {
     width: 7px;
     height: 7px;

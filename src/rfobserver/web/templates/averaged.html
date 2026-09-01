@@ -13,6 +13,8 @@
                 <select id="avg-gain" title="Gain"></select>
             </div>
             <div class="avg-time">
+                <button type="button" id="avg-back" class="btn-preset avg-nav"
+                        title="Back to the previous time range" disabled>&#8249;</button>
                 <button type="button" id="avg-picker-btn" class="btn-preset avg-picker-btn"
                         title="Change time range">
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
@@ -22,6 +24,8 @@
                     <span id="avg-range-label">Last 15 minutes</span>
                     <span class="avg-caret">&#9662;</span>
                 </button>
+                <button type="button" id="avg-fwd" class="btn-preset avg-nav"
+                        title="Forward to the next time range" disabled>&#8250;</button>
                 <span id="avg-spinner" class="avg-spinner" title="Loading the selected range..."></span>
                 <button type="button" id="avg-refresh" class="btn-preset" title="Reload this range">&#8635;</button>
                 <button type="button" id="avg-now" class="btn-preset btn-now"

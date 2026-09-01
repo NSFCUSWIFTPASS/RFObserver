@@ -427,3 +427,19 @@ detections + axes under it without re-rendering the data pixels). The PSD
 chart is frequency-domain and is excluded. Puppeteer coverage: the zoomed
 span matches the dragged fraction, Now turns off, a plain waterfall click
 still selects, and the power chart has a single trace.
+
+## Addendum 8 (2026-09-01, range back/forward history)
+
+`<` and `>` buttons flank the time-range button and walk an undo/redo stack
+of range selections, so a drag-zoom (or any range change) can be stepped
+back out of and redone. Every user range change — quick range, absolute
+Apply, drag-zoom, Now — pushes a snapshot of the previous range
+(`sinceMs/untilMs/spanMs/live/activePreset`) onto the back stack and clears
+the forward stack; the buttons pop one stack onto the other and are
+disabled when their stack is empty. Restoring a live snapshot re-anchors
+the sliding window on now (setLive/pollTick); restoring an absolute
+snapshot reapplies its exact frozen window. Stack depth is capped at 50.
+Tuning-select changes and manual refreshes reload but do not push history.
+Puppeteer coverage: buttons start disabled, a zoom enables back, back
+restores the live "Last 15 minutes" window with Now on, forward redoes the
+exact zoomed absolute window with Now off.

@@ -18,6 +18,8 @@
  *   - grafana-style drag-to-zoom: dragging a band on the power chart zooms
  *     the page to that absolute range (Now off); a plain waterfall click
  *     still selects a time column
+ *   - range back/forward buttons (< >) undo/redo range selections: a zoom
+ *     is undone back to the live window, then redone to the exact range
  *   - a spinning circle + dimmed panels appear when a new range/tuning is
  *     selected but not loaded yet, and clear when the load completes
  *   - the waterfall draws real data pixels and overlay axis labels
@@ -169,6 +171,11 @@ async function main() {
   );
   assert(!(await pickerOpen(page)), "picker closed on boot");
   assert(!(await spinnerOn(page)), "spinner off once the first load completed");
+  assert(
+    (await page.$eval("#avg-back", (el) => el.disabled))
+      && (await page.$eval("#avg-fwd", (el) => el.disabled)),
+    "range back/forward start disabled (no history yet)"
+  );
 
   // Grafana-style full-width layout: .content is uncapped, the title and the
   // Updated timestamp are in the one-line bar, and the charts form a
@@ -359,13 +366,43 @@ async function main() {
   console.log("waterfall click after zoom:", tPre, "->", tPost);
   assert(tPre !== tPost, "plain waterfall click still selects a time column");
 
-  // Back to the live 15-minute window for the remaining checks.
+  // Range back/forward: < undoes the zoom back to the pre-zoom live window,
+  // > redoes the zoomed absolute range (standard undo/redo semantics).
+  assert(await page.$eval("#avg-back", (el) => !el.disabled), "back enabled after a zoom");
+  await page.click("#avg-back");
+  await waitSpinnerCycle(page);
+  await waitStatusContains(page, "Live");
+  const labelUndo = await page.$eval("#avg-range-label", (el) => el.textContent);
+  assert(labelUndo === "Last 15 minutes",
+    "back restores the pre-zoom live window (got '" + labelUndo + "')");
+  assert(
+    await page.$eval("#avg-now", (el) => el.classList.contains("on")),
+    "back re-enables Now"
+  );
+  assert(await page.$eval("#avg-back", (el) => el.disabled), "back disables at the oldest range");
+  await page.click("#avg-fwd");
+  await waitSpinnerCycle(page);
+  const labelRedo = await page.$eval("#avg-range-label", (el) => el.textContent);
+  console.log("range label after redo:", labelRedo);
+  assert(/→/.test(labelRedo), "forward redoes the zoomed absolute range");
+  assert(
+    !(await page.$eval("#avg-now", (el) => el.classList.contains("on"))),
+    "forward keeps Now off"
+  );
+  assert(await page.$eval("#avg-fwd", (el) => el.disabled), "forward disables at the newest range");
+  // The redone range is exactly the zoomed one (picker mirrors the state).
   await page.click("#avg-picker-btn");
-  await page.click('[data-preset="15m"]');
+  const rSince = await page.$eval("#avg-since", (el) => el.value);
+  const rUntil = await page.$eval("#avg-until", (el) => el.value);
+  await page.keyboard.press("Escape");
+  assert(rSince === zSince && rUntil === zUntil, "redo restores the exact zoomed window");
+
+  // Back to the live 15-minute window for the remaining checks.
+  await page.click("#avg-back");
   await waitSpinnerCycle(page);
   await waitStatusContains(page, "Live");
   const labelBack = await page.$eval("#avg-range-label", (el) => el.textContent);
-  assert(labelBack === "Last 15 minutes", "15m preset restores the live window");
+  assert(labelBack === "Last 15 minutes", "back restores the live window again");
 
   // --- Manual display scale (per-chart header inputs, persisted in the DB) ---
   const setScale = async (loId, hiId, lo, hi) => {

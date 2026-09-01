@@ -35,6 +35,11 @@
  * (Now turns off). A sub-threshold drag is a plain click — on the waterfall
  * that selects the time column.
  *
+ * Range back/forward: every range change (quick range, absolute Apply,
+ * drag-zoom, Now) pushes the previous range on a back stack; the < and >
+ * buttons beside the range button walk the stacks (undo/redo), restoring
+ * live mode for live ranges and the exact window for absolute ones.
+ *
  * Manual display scale: each chart header carries its own Scale low/high
  * inputs (waterfall, PSD: dBFS; power: dB; kurtosis: unitless); empty
  * bounds auto-scale from the data. The scale is persisted server-side in
@@ -86,6 +91,8 @@
         pickerOpen: false,
         followLatest: true, // selection tracks the newest row across refreshes
         activePreset: DEFAULT_PRESET,
+        rangeBack: [],   // undo stack of range snapshots
+        rangeFwd: [],    // redo stack (cleared by each new range change)
         wf: null,        // parseWaterfall result: {bucketCount, numBins, meta, rows, stats, freqs}
         stats: null,     // /api/averaged/stats JSON
         detections: [],
@@ -252,6 +259,57 @@
     function closePicker() {
         state.pickerOpen = false;
         $("avg-picker").hidden = true;
+    }
+
+    // --- range back/forward history (undo/redo of range selections) ---
+
+    function rangeSnapshot() {
+        return {
+            sinceMs: state.sinceMs,
+            untilMs: state.untilMs,
+            spanMs: state.spanMs,
+            live: state.live,
+            activePreset: state.activePreset,
+        };
+    }
+
+    // Every user range change pushes the previous range; a new change clears
+    // the redo stack (standard undo/redo semantics).
+    function pushRangeHistory() {
+        state.rangeBack.push(rangeSnapshot());
+        if (state.rangeBack.length > 50) state.rangeBack.shift();
+        state.rangeFwd = [];
+        updateNavButtons();
+    }
+
+    function applyRangeSnapshot(s) {
+        state.activePreset = s.activePreset;
+        state.spanMs = s.spanMs;
+        markPresetButtons();
+        updateRangeLabel();
+        setStale(true);
+        if (s.live) {
+            if (state.live) pollTick(); // re-anchor the sliding window
+            else setLive(true);         // setLive polls right away
+        } else {
+            state.sinceMs = s.sinceMs;
+            state.untilMs = s.untilMs;
+            setLive(false);
+            loadAll(false);
+        }
+    }
+
+    function navRange(fromStack, toStack) {
+        const s = fromStack.pop();
+        if (!s) return;
+        toStack.push(rangeSnapshot());
+        applyRangeSnapshot(s);
+        updateNavButtons();
+    }
+
+    function updateNavButtons() {
+        $("avg-back").disabled = !state.rangeBack.length;
+        $("avg-fwd").disabled = !state.rangeFwd.length;
     }
 
     // --- display scale (per-chart low/high inputs, persisted in the DB) ---
@@ -989,6 +1047,7 @@
             const t0 = state.sinceMs + (x0 / listenEl.width) * spanMs;
             const t1 = state.sinceMs + (x1 / listenEl.width) * spanMs;
             if (t1 - t0 < 5000) { redraw(); return; } // ignore degenerate <5 s zooms
+            pushRangeHistory();
             state.sinceMs = t0;
             state.untilMs = t1;
             state.spanMs = t1 - t0;
@@ -1070,6 +1129,7 @@
                 $("avg-status").textContent = "Invalid range: start must be before end";
                 return;
             }
+            pushRangeHistory();
             state.sinceMs = s.getTime();
             state.untilMs = u.getTime();
             state.spanMs = state.untilMs - state.sinceMs;
@@ -1082,10 +1142,13 @@
         });
         $("avg-now").addEventListener("click", function () {
             if (state.live) { setLive(false); return; }
+            pushRangeHistory();
             state.followLatest = true;
             setStale(true);
             setLive(true);
         });
+        $("avg-back").addEventListener("click", function () { navRange(state.rangeBack, state.rangeFwd); });
+        $("avg-fwd").addEventListener("click", function () { navRange(state.rangeFwd, state.rangeBack); });
         $("avg-refresh").addEventListener("click", function () {
             if (state.live) { setStale(true); pollTick(); }
             else reload();
@@ -1108,6 +1171,7 @@
         });
         document.querySelectorAll("[data-preset]").forEach(function (btn) {
             btn.addEventListener("click", function () {
+                pushRangeHistory();
                 state.activePreset = btn.dataset.preset;
                 state.spanMs = PRESET_MS[btn.dataset.preset] || DAY_MS;
                 state.followLatest = true;
@@ -1175,6 +1239,7 @@
         } catch (_) { /* prefs are optional; defaults stay auto */ }
         syncScaleInputs();
         markPresetButtons();
+        updateNavButtons();
         setLive(true); // default: sliding "Now" window, polled every POLL_MS
     }
 

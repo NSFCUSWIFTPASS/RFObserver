@@ -312,3 +312,35 @@ assertion (canvas wider than tall), stats/waterfall width equality (shared
 time axis), overlay opacity sample (canvas-drawn axis labels), click
 selecting an *earlier* time column, spinner-on-then-off (with dimmed panels)
 around absolute Apply, each quick range, and a tuning-select change.
+
+## Addendum 4 (2026-08-31, two-column correlated layout + one-line title bar)
+
+- **Two-column chart grid** (`.avg-grid`, explicit `grid-template-areas`):
+  left column = Power Over Time + waterfall (time-correlated as before),
+  right column = PSD at Selected Time + Kurtosis Over Time. Both columns are
+  `1fr`, so all four charts share the same pixel width and every time axis
+  aligns. Below 900 px the grid stacks (power, waterfall, PSD, kurtosis).
+  The detections card stays full-width below. The page also gained real
+  16 px gaps (the cards were previously flush, separated only by shadow).
+- **Kurtosis chart**: same stats-points source as the power chart
+  (blob-independent, works beyond PSD retention), orange trace matching the
+  dashboard's kurtosis color (#ff9f0a), auto-scaled Y with 0.5 minimum pad.
+  The card uses flex fill so its canvas stretches to the waterfall row's
+  height instead of leaving whitespace.
+- **Selection marker everywhere**: the selected bucket's start time is drawn
+  as a vertical white line on the power and kurtosis charts too
+  (`drawSelectionMarker`), and `selectRow` re-renders all three time charts,
+  so clicking a waterfall column or dragging the slider moves the marker
+  across every panel.
+- **One-line title bar**: the big `page-header` block is gone; "Averaged
+  History" is a compact inline title at the left of the control bar, next to
+  the tuning selects. The "Updated …" timestamp moved from the status row
+  into the bar's right end. The status row now holds only the
+  windows/buckets status text.
+
+Puppeteer coverage grew: title/Updated in the bar (and no `.page-header`),
+half-column waterfall width, equal power/waterfall and PSD/kurtosis widths,
+kurtosis fill height, kurtosis trace pixels, and selection-marker tracking —
+a pixel scan finds the white marker column on the power/kurtosis charts and
+asserts its X fraction tracks follow-latest (~1.0) and a waterfall click at
+25 % width (~0.25 ± 0.06).

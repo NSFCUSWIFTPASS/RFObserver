@@ -9,12 +9,15 @@
  *
  * Layout is Grafana-inspired: the page uses the full window width and the
  * charts size to their cards (the canvas backing store is matched to the
- * displayed size on boot and on window resize).
+ * displayed size on boot and on window resize). The charts form a two-column
+ * grid: power + waterfall on the left, PSD + kurtosis on the right.
  *
  * The waterfall is rotated so its X axis is TIME — identical span and width
- * to the stats chart directly above it, so the two are time-correlated — and
+ * to the power chart directly above it, so the two are time-correlated — and
  * its Y axis is frequency (low frequencies at the bottom). Clicking selects
- * a time column; the selector is a vertical line.
+ * a time column; the selector is a vertical line on the waterfall, and the
+ * same time is marked with a vertical line on the power and kurtosis charts
+ * so the selection correlates across all panels.
  *
  * "Now" mode (grafana-style, the default): the range end tracks the current
  * time and the range is re-fetched every POLL_MS. The next poll is scheduled
@@ -260,7 +263,7 @@
     // Match each chart canvas's backing store to its displayed size so the
     // charts are crisp at any window width. CSS controls the display size.
     function fitCanvases() {
-        ["avg-stats-canvas", "avg-wf", "avg-wf-overlay", "avg-psd"].forEach(function (id) {
+        ["avg-stats-canvas", "avg-wf", "avg-wf-overlay", "avg-psd", "avg-kurt"].forEach(function (id) {
             const c = $(id);
             const w = Math.max(64, Math.round(c.clientWidth));
             const h = Math.max(64, Math.round(c.clientHeight));
@@ -330,6 +333,7 @@
                 $("avg-updated").textContent = "Updated " + new Date().toLocaleTimeString();
                 renderWaterfall();
                 renderStatsChart();
+                renderKurtosisChart();
                 renderPSD();
                 renderBucketStats();
                 renderDetections();
@@ -382,6 +386,7 @@
         renderLegend();
         renderWaterfall();
         renderStatsChart();
+        renderKurtosisChart();
         renderPSD();
         renderBucketStats();
         renderDetections();
@@ -573,6 +578,38 @@
     // Adaptive tick density for the time axes (wider charts get more ticks).
     function tickCount(W) { return Math.max(4, Math.min(10, Math.round(W / 200))); }
 
+    // Bottom-edge time ticks for the line charts (skip the left edge, which
+    // holds the Y-unit label). Same X mapping as the waterfall.
+    function drawTimeTicks(ctx, W, H) {
+        const spanMs = state.untilMs - state.sinceMs;
+        if (spanMs <= 0) return;
+        ctx.fillStyle = "rgba(255,255,255,0.5)";
+        ctx.font = "10px -apple-system, sans-serif";
+        const n = tickCount(W);
+        for (let i = 1; i <= n; i++) {
+            const label = fmtAxisTime(state.sinceMs + spanMs * (i / n));
+            ctx.textAlign = i === n ? "right" : "center";
+            ctx.fillText(label, i === n ? W - 4 : (W / n) * i, H - 4);
+        }
+    }
+
+    // Vertical white line at the selected bucket's start time, drawn on the
+    // power and kurtosis charts so the selection correlates across panels.
+    function drawSelectionMarker(ctx, W, H) {
+        const wf = state.wf;
+        const spanMs = state.untilMs - state.sinceMs;
+        if (!wf || spanMs <= 0 || state.selRow < 0 || state.selRow >= wf.bucketCount) return;
+        const s = wf.stats[state.selRow];
+        const x = ((s.start_epoch * 1000 - state.sinceMs) / spanMs) * W;
+        if (x < 0 || x > W) return;
+        ctx.strokeStyle = "rgba(255,255,255,0.75)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(Math.round(x) + 0.5, 0);
+        ctx.lineTo(Math.round(x) + 0.5, H);
+        ctx.stroke();
+    }
+
     function renderStatsChart() {
         const canvas = $("avg-stats-canvas");
         const W = canvas.width;
@@ -622,19 +659,67 @@
         };
         drawLine(function (p) { return p.pwr_avg; }, "#0071e3");
         drawLine(function (p) { return p.pwr_max; }, "#ff6b6b");
+        drawSelectionMarker(ctx, W, H);
         ctx.fillStyle = "rgba(255,255,255,0.5)";
         ctx.font = "10px -apple-system, sans-serif";
         ctx.textAlign = "left";
         ctx.fillText(hi.toFixed(0) + " dB", 4, 12);
         ctx.fillText(lo.toFixed(0) + " dB", 4, H - 4);
-        // x-axis time ticks (skip the left edge, which holds the dB label);
-        // same X mapping as the waterfall below, so the two line up.
-        const n = tickCount(W);
-        for (let i = 1; i <= n; i++) {
-            const label = fmtAxisTime(state.sinceMs + spanMs * (i / n));
-            ctx.textAlign = i === n ? "right" : "center";
-            ctx.fillText(label, i === n ? W - 4 : (W / n) * i, H - 4);
+        drawTimeTicks(ctx, W, H);
+    }
+
+    // Kurtosis timeline from the same stats points as the power chart
+    // (blob-independent, so it works beyond the PSD retention window).
+    function renderKurtosisChart() {
+        const canvas = $("avg-kurt");
+        const W = canvas.width;
+        const H = canvas.height;
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, W, H);
+        ctx.fillStyle = "#1a1a2e";
+        ctx.fillRect(0, 0, W, H);
+        const points = state.stats && state.stats.points ? state.stats.points : [];
+        const spanMs = state.untilMs - state.sinceMs;
+        let lo = Infinity, hi = -Infinity;
+        for (const p of points) {
+            if (p.kurtosis != null) { lo = Math.min(lo, p.kurtosis); hi = Math.max(hi, p.kurtosis); }
         }
+        if (lo === Infinity || spanMs <= 0) {
+            ctx.fillStyle = "rgba(255,255,255,0.4)";
+            ctx.font = "12px -apple-system, sans-serif";
+            ctx.textAlign = "center";
+            ctx.fillText("No averaged windows in this range", W / 2, H / 2);
+            return;
+        }
+        const pad = Math.max(0.5, (hi - lo) * 0.1);
+        lo -= pad; hi += pad;
+        const X = function (ms) { return ((ms - state.sinceMs) / spanMs) * W; };
+        const Y = function (v) { return H - 2 - ((v - lo) / (hi - lo)) * (H - 4); };
+        ctx.strokeStyle = "rgba(255,255,255,0.06)";
+        ctx.lineWidth = 1;
+        for (let i = 1; i < 5; i++) {
+            const y = (H / 5) * i;
+            ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+        }
+        ctx.beginPath();
+        let started = false;
+        for (const p of points) {
+            const v = p.kurtosis;
+            if (v == null) { started = false; continue; }
+            const x = X(new Date(p.start_time).getTime());
+            if (!started) { ctx.moveTo(x, Y(v)); started = true; }
+            else { ctx.lineTo(x, Y(v)); }
+        }
+        ctx.strokeStyle = "#ff9f0a"; // same orange as the dashboard kurtosis trace
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        drawSelectionMarker(ctx, W, H);
+        ctx.fillStyle = "rgba(255,255,255,0.5)";
+        ctx.font = "10px -apple-system, sans-serif";
+        ctx.textAlign = "left";
+        ctx.fillText(hi.toFixed(1), 4, 12);
+        ctx.fillText(lo.toFixed(1), 4, H - 4);
+        drawTimeTicks(ctx, W, H);
     }
 
     function selectedPowers() {
@@ -732,6 +817,8 @@
         const s = wf.stats[idx];
         $("avg-time").textContent = s ? new Date(s.start_epoch * 1000).toLocaleString() : "--";
         renderWaterfall();
+        renderStatsChart();
+        renderKurtosisChart();
         renderPSD();
         renderBucketStats();
     }

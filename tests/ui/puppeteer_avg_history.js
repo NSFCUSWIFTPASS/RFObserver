@@ -7,9 +7,13 @@
  *     minutes" and the "Updated" clock advances on its own (2 s polls)
  *   - the range button opens a Grafana-style picker: absolute From/To form
  *     plus quick ranges; it closes on selection and on outside click
- *   - the page uses the full window width (grafana-style) and the stats
- *     chart and waterfall share the same time axis (equal canvas widths)
- *   - the waterfall is rotated: time on X (wider than tall), frequency on Y
+ *   - the page uses the full window width (grafana-style), the title and the
+ *     Updated timestamp live in the one-line control bar (no header block)
+ *   - charts form a two-column grid: power + waterfall on the left (same
+ *     time axis), PSD + kurtosis on the right; kurtosis fills the waterfall
+ *     row's height
+ *   - the waterfall is rotated: time on X, frequency on Y; the selected time
+ *     shows as a vertical marker line on the power AND kurtosis charts too
  *   - a spinning circle + dimmed panels appear when a new range/tuning is
  *     selected but not loaded yet, and clear when the load completes
  *   - the waterfall draws real data pixels and overlay axis labels
@@ -84,6 +88,26 @@ async function pickerOpen(page) {
   return page.$eval("#avg-picker", (el) => !el.hidden);
 }
 
+// X fraction (0..1) of the white vertical selection marker on a line chart,
+// or -1 when no full-height white line is found.
+async function markerFrac(page, id) {
+  return page.evaluate((id) => {
+    const c = document.getElementById(id);
+    const W = c.width, H = c.height;
+    const d = c.getContext("2d").getImageData(0, 0, W, H).data;
+    for (let x = 0; x < W; x++) {
+      let n = 0;
+      for (let y = 0; y < H; y += 4) {
+        const i = (y * W + x) * 4;
+        // the marker is rgba(255,255,255,0.75) over dark -> ~198,198,203
+        if (d[i] > 180 && d[i + 1] > 180 && d[i + 2] > 180) n++;
+      }
+      if (n > (H / 4) * 0.5) return x / W;
+    }
+    return -1;
+  }, id);
+}
+
 async function spinnerOn(page) {
   return page.$eval("#avg-spinner", (el) => el.classList.contains("on"));
 }
@@ -138,33 +162,48 @@ async function main() {
   assert(!(await pickerOpen(page)), "picker closed on boot");
   assert(!(await spinnerOn(page)), "spinner off once the first load completed");
 
-  // Grafana-style full-width layout: .content is uncapped and the charts
-  // stretch to fill it.
+  // Grafana-style full-width layout: .content is uncapped, the title and the
+  // Updated timestamp are in the one-line bar, and the charts form a
+  // two-column grid (power+waterfall left, PSD+kurtosis right).
   const layout = await page.evaluate(() => {
     const cs = getComputedStyle(document.querySelector(".content"));
-    const wf = document.getElementById("avg-wf");
-    const stats = document.getElementById("avg-stats-canvas");
-    const psd = document.getElementById("avg-psd");
+    const g = (id) => {
+      const c = document.getElementById(id);
+      return { w: c.width, h: c.height };
+    };
     return {
       maxWidth: cs.maxWidth,
-      wfW: wf.width, wfH: wf.height,
-      statsW: stats.width, statsH: stats.height,
-      psdW: psd.width, psdH: psd.height,
+      wf: g("avg-wf"), stats: g("avg-stats-canvas"),
+      psd: g("avg-psd"), kurt: g("avg-kurt"),
+      titleInBar: !!document.querySelector(".avg-bar .avg-title"),
+      noPageHeader: !document.querySelector(".page-header"),
+      updatedInBar: !!document.querySelector(".avg-time #avg-updated"),
+      updatedText: document.getElementById("avg-updated").textContent,
     };
   });
   console.log("layout:", JSON.stringify(layout));
   assert(layout.maxWidth === "none", "content uses the full window width");
-  assert(layout.wfW > 1000, "waterfall stretches to the page width (got " + layout.wfW + ")");
-  assert(layout.wfW > layout.wfH, "waterfall is rotated: time on X (wider than tall)");
-  assert(
-    Math.abs(layout.statsW - layout.wfW) <= 1,
-    "stats chart and waterfall share the time axis (equal widths)"
-  );
-  assert(layout.statsH >= 170 && layout.psdH >= 160, "stats/PSD charts got taller");
+  assert(layout.titleInBar && layout.noPageHeader, "title lives in the one-line bar");
+  assert(layout.updatedInBar && /Updated/.test(layout.updatedText), "Updated timestamp in the top bar");
+  assert(layout.wf.w > 400 && layout.wf.w < 800,
+    "waterfall takes the left half column (got " + layout.wf.w + ")");
+  assert(Math.abs(layout.stats.w - layout.wf.w) <= 1,
+    "power chart and waterfall share the time axis (equal widths)");
+  assert(Math.abs(layout.kurt.w - layout.psd.w) <= 1,
+    "kurtosis and PSD share the right column (equal widths)");
+  assert(layout.kurt.h >= 400,
+    "kurtosis fills the waterfall row height (got " + layout.kurt.h + ")");
+  assert(layout.stats.h >= 170 && layout.psd.h >= 160, "power/PSD charts got taller");
 
-  // Polling: the Updated clock must advance within ~2 poll intervals.
+  // Polling: the Updated clock must advance on its own. Wait for the change
+  // rather than racing the aggregate duration (each poll re-reads the
+  // range's blobs, which can take several seconds on a big database).
   const updated0 = await page.$eval("#avg-updated", (el) => el.textContent);
-  await sleep(4500);
+  await page.waitForFunction(
+    (prev) => document.getElementById("avg-updated").textContent !== prev,
+    { timeout: 30000, polling: 200 },
+    updated0
+  );
   const updated1 = await page.$eval("#avg-updated", (el) => el.textContent);
   console.log("updated clock:", updated0, "->", updated1);
   assert(updated0 !== updated1, "Now mode polls (Updated clock advances)");
@@ -218,8 +257,21 @@ async function main() {
   console.log("non-background PSD pixels:", psdHasLine);
   assert(psdHasLine > 0, "PSD chart drew a spectrum");
 
+  // Kurtosis chart drew its trace.
+  const kurtHasLine = await nonDarkPixels(page, "avg-kurt", 26, 26, 46);
+  console.log("non-background kurtosis pixels:", kurtHasLine);
+  assert(kurtHasLine > 0, "kurtosis chart drew a trace");
+
+  // The selection marker shows on the power and kurtosis charts near the
+  // right edge (follow-latest selects the newest bucket).
+  const mStats0 = await markerFrac(page, "avg-stats-canvas");
+  const mKurt0 = await markerFrac(page, "avg-kurt");
+  console.log("marker fractions (initial):", mStats0, mKurt0);
+  assert(mStats0 > 0.9, "power chart shows the selection marker near now");
+  assert(mKurt0 > 0.9, "kurtosis chart shows the selection marker near now");
+
   // Clicking the waterfall at an earlier TIME COLUMN moves the selection
-  // (and it sticks across polls).
+  // (and it sticks across polls); the markers on the other charts follow.
   const before = await page.$eval("#avg-time", (el) => el.textContent);
   const box = await page.$eval("#avg-wf", (el) => {
     const r = el.getBoundingClientRect();
@@ -231,6 +283,11 @@ async function main() {
   console.log("time before/after click:", before, "->", after);
   assert(before !== after, "click changed the selected time column");
   assert(Date.parse(after) < Date.parse(before), "clicking left of the selector picks an earlier time");
+  const mStats1 = await markerFrac(page, "avg-stats-canvas");
+  const mKurt1 = await markerFrac(page, "avg-kurt");
+  console.log("marker fractions (after click):", mStats1, mKurt1);
+  assert(Math.abs(mStats1 - 0.25) < 0.06, "power marker moved to the clicked time");
+  assert(Math.abs(mKurt1 - 0.25) < 0.06, "kurtosis marker moved to the clicked time");
 
   // Absolute range via the picker: 60 s window, Now turns off, label flips
   // to the absolute form, raw mode (windows <= max_rows). Spinner cycles.

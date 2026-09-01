@@ -2,13 +2,11 @@
 {% block title %}Averaged History - RFObserver{% endblock %}
 {% block content %}
 <script src="/static/shared-charts.js"></script>
-<div class="page-header">
-    <h1>Averaged History</h1>
-</div>
 
 <div class="card full-width avg-picker-card">
     <div class="card-body avg-bar-body">
         <div class="avg-bar">
+            <span class="avg-title">Averaged History</span>
             <div class="avg-tuning">
                 <select id="avg-center" title="SDR center frequency"></select>
                 <select id="avg-samplerate" title="Sample rate"></select>
@@ -30,6 +28,7 @@
                         title="Track current time and refresh every 2 s">
                     <span class="live-dot"></span>Now
                 </button>
+                <span class="avg-updated" id="avg-updated"></span>
             </div>
         </div>
         <div id="avg-picker" class="avg-picker" hidden>
@@ -61,54 +60,62 @@
         </div>
         <div class="avg-status-row">
             <span class="avg-status" id="avg-status"></span>
-            <span class="avg-updated" id="avg-updated"></span>
         </div>
     </div>
 </div>
 
-<div class="card full-width avg-panel">
-    <div class="card-header">Stats Over Time</div>
-    <div class="card-body">
-        <canvas id="avg-stats-canvas" class="avg-chart avg-chart-stats"></canvas>
-        <div class="graph-legend">
-            <span class="legend-label" style="color:#0071e3;">avg</span>
-            <span class="legend-label" style="color:#ff6b6b;">max</span>
-            <span class="legend-label" id="avg-stats-unit" style="opacity:0.5;">dB</span>
+<div class="avg-grid">
+    <div class="card avg-panel avg-grid-power">
+        <div class="card-header">Power Over Time</div>
+        <div class="card-body">
+            <canvas id="avg-stats-canvas" class="avg-chart avg-chart-stats"></canvas>
+            <div class="graph-legend">
+                <span class="legend-label" style="color:#0071e3;">avg</span>
+                <span class="legend-label" style="color:#ff6b6b;">max</span>
+                <span class="legend-label" id="avg-stats-unit" style="opacity:0.5;">dB</span>
+            </div>
         </div>
     </div>
-</div>
 
-<div class="card full-width avg-panel">
-    <div class="card-header">
-        Averaged PSD Waterfall
-        <span id="avg-wf-label" class="card-header-label" style="opacity:0.5;"></span>
-    </div>
-    <div class="card-body">
-        <div class="avg-wf-wrap">
-            <canvas id="avg-wf" class="avg-chart avg-chart-wf"></canvas>
-            <canvas id="avg-wf-overlay" class="avg-chart-wf-overlay"></canvas>
-        </div>
-        <div class="spectrogram-legend">
-            <span class="legend-label" id="avg-legend-min">--</span>
-            <canvas id="avg-legend" width="200" height="12" style="width:200px;height:12px;border-radius:3px;"></canvas>
-            <span class="legend-label" id="avg-legend-max">--</span>
-            <span class="legend-label" id="avg-legend-unit" style="margin-left:2px;">dBFS</span>
-        </div>
-        <div class="viewer-slider-row">
-            <input type="range" id="avg-slider" min="0" max="0" value="0" class="viewer-slider" style="width:100%;">
-            <span id="avg-time" class="viewer-time">--</span>
+    <div class="card avg-panel avg-grid-psd">
+        <div class="card-header">PSD at Selected Time</div>
+        <div class="card-body">
+            <div style="position:relative;">
+                <canvas id="avg-psd" class="avg-chart avg-chart-psd"></canvas>
+                <div id="avg-psd-tooltip" class="graph-tooltip" style="display:none;"></div>
+            </div>
+            <div id="avg-bucket-stats" class="avg-bucket-stats"></div>
         </div>
     </div>
-</div>
 
-<div class="card full-width avg-panel">
-    <div class="card-header">PSD at Selected Time</div>
-    <div class="card-body">
-        <div style="position:relative;">
-            <canvas id="avg-psd" class="avg-chart avg-chart-psd"></canvas>
-            <div id="avg-psd-tooltip" class="graph-tooltip" style="display:none;"></div>
+    <div class="card avg-panel avg-grid-wf">
+        <div class="card-header">
+            Averaged PSD Waterfall
+            <span id="avg-wf-label" class="card-header-label" style="opacity:0.5;"></span>
         </div>
-        <div id="avg-bucket-stats" class="avg-bucket-stats"></div>
+        <div class="card-body">
+            <div class="avg-wf-wrap">
+                <canvas id="avg-wf" class="avg-chart avg-chart-wf"></canvas>
+                <canvas id="avg-wf-overlay" class="avg-chart-wf-overlay"></canvas>
+            </div>
+            <div class="spectrogram-legend">
+                <span class="legend-label" id="avg-legend-min">--</span>
+                <canvas id="avg-legend" width="200" height="12" style="width:200px;height:12px;border-radius:3px;"></canvas>
+                <span class="legend-label" id="avg-legend-max">--</span>
+                <span class="legend-label" id="avg-legend-unit" style="margin-left:2px;">dBFS</span>
+            </div>
+            <div class="viewer-slider-row">
+                <input type="range" id="avg-slider" min="0" max="0" value="0" class="viewer-slider" style="width:100%;">
+                <span id="avg-time" class="viewer-time">--</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="card avg-panel avg-grid-kurt avg-fill">
+        <div class="card-header">Kurtosis Over Time</div>
+        <div class="card-body">
+            <canvas id="avg-kurt" class="avg-chart avg-chart-kurt"></canvas>
+        </div>
     </div>
 </div>
 

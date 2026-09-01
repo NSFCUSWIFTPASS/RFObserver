@@ -1216,13 +1216,74 @@ body {
 
 /* Averaged-history page */
 /* Grafana-style: this page uses the full window width instead of the 960px
-   reading column. */
+   reading column, with real gaps between the bar, the chart grid, and the
+   detections card. */
 .content:has(.avg-picker-card) {
     max-width: none;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
 }
 
 .avg-picker-card {
     overflow: visible; /* let the time-picker dropdown escape the card */
+}
+
+/* Page title sits inline in the one-line control bar (no big header block). */
+.avg-title {
+    font-size: 15px;
+    font-weight: 600;
+    white-space: nowrap;
+    margin-right: 4px;
+}
+
+/* Two-column chart grid: power + waterfall on the left (time-correlated),
+   PSD + kurtosis on the right. */
+.avg-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-areas:
+        "power psd"
+        "wf kurt";
+    gap: 16px;
+}
+
+.avg-grid-power { grid-area: power; }
+.avg-grid-psd { grid-area: psd; }
+.avg-grid-wf { grid-area: wf; }
+.avg-grid-kurt { grid-area: kurt; }
+
+.avg-grid .avg-panel {
+    min-width: 0; /* let the grid tracks shrink below content width */
+}
+
+@media (max-width: 900px) {
+    .avg-grid {
+        grid-template-columns: 1fr;
+        grid-template-areas:
+            "power"
+            "wf"
+            "psd"
+            "kurt";
+    }
+}
+
+/* Fill card (kurtosis): stretch the canvas to the grid row's height, which
+   the tall waterfall card drives. */
+.avg-fill {
+    display: flex;
+    flex-direction: column;
+}
+
+.avg-fill .card-body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+}
+
+.avg-fill .avg-chart {
+    flex: 1;
+    min-height: 200px;
 }
 
 /* Charts size to their card; the JS matches the canvas backing store to the

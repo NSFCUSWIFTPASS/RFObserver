@@ -1294,6 +1294,11 @@ body {
     border-radius: 6px;
 }
 
+/* Time-domain charts support grafana-style drag-to-zoom. */
+.avg-chart-stats, .avg-chart-kurt, .avg-chart-wf {
+    cursor: crosshair;
+}
+
 .avg-chart-stats {
     height: clamp(180px, 26vh, 300px);
 }

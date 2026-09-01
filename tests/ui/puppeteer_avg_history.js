@@ -14,6 +14,10 @@
  *     row's height
  *   - the waterfall is rotated: time on X, frequency on Y; the selected time
  *     shows as a vertical marker line on the power AND kurtosis charts too
+ *   - the power chart draws a single avg trace (no max curve/legend entry)
+ *   - grafana-style drag-to-zoom: dragging a band on the power chart zooms
+ *     the page to that absolute range (Now off); a plain waterfall click
+ *     still selects a time column
  *   - a spinning circle + dimmed panels appear when a new range/tuning is
  *     selected but not loaded yet, and clear when the load completes
  *   - the waterfall draws real data pixels and overlay axis labels
@@ -266,6 +270,20 @@ async function main() {
   console.log("non-background kurtosis pixels:", kurtHasLine);
   assert(kurtHasLine > 0, "kurtosis chart drew a trace");
 
+  // Power chart shows a single avg trace: no max legend entry, no red pixels.
+  const legendText = await page.$eval(".avg-grid-power .graph-legend", (el) => el.textContent);
+  assert(!/max/.test(legendText), "power legend has no max entry (got '" + legendText.trim() + "')");
+  const redPx = await page.evaluate(() => {
+    const c = document.getElementById("avg-stats-canvas");
+    const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
+    let n = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i] > 180 && d[i + 1] < 160 && d[i + 2] < 160) n++;
+    }
+    return n;
+  });
+  assert(redPx === 0, "power chart draws no red (max) trace pixels (got " + redPx + ")");
+
   // The selection marker shows on the power and kurtosis charts near the
   // right edge (follow-latest selects the newest bucket).
   const mStats0 = await markerFrac(page, "avg-stats-canvas");
@@ -297,6 +315,57 @@ async function main() {
   console.log("marker fractions (after click):", mStats1, mKurt1, "expected ~", expectFrac);
   assert(Math.abs(mStats1 - expectFrac) < 0.06, "power marker moved to the selected time");
   assert(Math.abs(mKurt1 - expectFrac) < 0.06, "kurtosis marker moved to the selected time");
+
+  // Grafana-style drag-to-zoom: drag a band on the power chart and the whole
+  // page zooms to that absolute range (Now off, label flips to absolute form).
+  const pbox = await page.$eval("#avg-stats-canvas", (el) => {
+    const r = el.getBoundingClientRect();
+    return { x: r.left, y: r.top, w: r.width, h: r.height };
+  });
+  const py = pbox.y + pbox.h * 0.5;
+  await page.mouse.move(pbox.x + pbox.w * 0.25, py);
+  await page.mouse.down();
+  await page.mouse.move(pbox.x + pbox.w * 0.75, py, { steps: 8 });
+  await page.mouse.up();
+  await waitSpinnerCycle(page);
+  const zoomLabel = await page.$eval("#avg-range-label", (el) => el.textContent);
+  console.log("range label after drag-zoom:", zoomLabel);
+  assert(/→/.test(zoomLabel), "drag-zoom switches the range label to absolute form");
+  assert(
+    !(await page.$eval("#avg-now", (el) => el.classList.contains("on"))),
+    "drag-zoom turns Now off"
+  );
+  // The zoomed span must be about the dragged fraction (25%..75% = half of
+  // the 15-minute window). The picker inputs mirror the applied range.
+  await page.click("#avg-picker-btn");
+  const zSince = await page.$eval("#avg-since", (el) => el.value);
+  const zUntil = await page.$eval("#avg-until", (el) => el.value);
+  await page.keyboard.press("Escape");
+  const zoomMin = (new Date(zUntil) - new Date(zSince)) / 60000;
+  console.log("drag-zoomed span (min):", zoomMin);
+  assert(zoomMin > 5.5 && zoomMin < 9.5,
+    "drag-zoom spans ~half the 15-minute window (got " + zoomMin + " min)");
+
+  // A plain click on the waterfall still selects a time column (the drag
+  // threshold must not swallow clicks).
+  const tPre = await page.$eval("#avg-time", (el) => el.textContent);
+  const wfBox2 = await page.$eval("#avg-wf", (el) => {
+    const r = el.getBoundingClientRect();
+    return { x: r.left, y: r.top, w: r.width, h: r.height };
+  });
+  await page.mouse.click(wfBox2.x + wfBox2.w * 0.1, wfBox2.y + wfBox2.h * 0.5);
+  await sleep(250);
+  const tPost = await page.$eval("#avg-time", (el) => el.textContent);
+  console.log("waterfall click after zoom:", tPre, "->", tPost);
+  assert(tPre !== tPost, "plain waterfall click still selects a time column");
+
+  // Back to the live 15-minute window for the remaining checks.
+  await page.click("#avg-picker-btn");
+  await page.click('[data-preset="15m"]');
+  await waitSpinnerCycle(page);
+  await waitStatusContains(page, "Live");
+  const labelBack = await page.$eval("#avg-range-label", (el) => el.textContent);
+  assert(labelBack === "Last 15 minutes", "15m preset restores the live window");
 
   // --- Manual display scale (per-chart header inputs, persisted in the DB) ---
   const setScale = async (loId, hiId, lo, hi) => {

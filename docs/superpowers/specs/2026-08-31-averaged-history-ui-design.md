@@ -405,3 +405,25 @@ unchanged because it already maps every bucket by its absolute
 `start_epoch`. Regression tests: the same sliding range queried at two poll
 times yields identical boundaries and an identical peak bucket (waterfall
 and stats).
+
+## Addendum 7 (2026-09-01, single power trace + drag-to-zoom)
+
+The power-over-time chart drew two traces (window **avg** in blue, window
+**max** in red). Two curves read as two quantities; the chart now draws the
+avg trace only (the per-bucket max is still in the bucket-stats row). The
+auto-scale range follows the avg values.
+
+Grafana-style **drag-to-zoom** on the time-domain charts (power, kurtosis,
+waterfall): pressing the mouse and dragging a horizontal band paints a
+selection rect, and on release the whole page zooms to that absolute range —
+`activePreset` clears, Now turns off, and the range label flips to the
+absolute `from → to` form. Zoom chains compose (each zoom re-anchors on the
+current range); a quick range or the Now button returns to live polling. A
+sub-8 px drag is treated as a plain click, preserving the waterfall's
+click-to-select-a-time-column behavior; zooms under 5 s are ignored. The
+band is painted on the chart itself for the line charts and on the
+transparent overlay canvas for the waterfall (`renderWfOverlay` redraws the
+detections + axes under it without re-rendering the data pixels). The PSD
+chart is frequency-domain and is excluded. Puppeteer coverage: the zoomed
+span matches the dragged fraction, Now turns off, a plain waterfall click
+still selects, and the power chart has a single trace.

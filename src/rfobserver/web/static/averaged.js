@@ -30,6 +30,11 @@
  * data has not loaded yet, a spinning circle shows next to the range button
  * and the chart panels dim until the load completes.
  *
+ * Drag-to-zoom (grafana-style): dragging a horizontal band on the power,
+ * kurtosis, or waterfall chart zooms the whole page to that absolute range
+ * (Now turns off). A sub-threshold drag is a plain click — on the waterfall
+ * that selects the time column.
+ *
  * Manual display scale: each chart header carries its own Scale low/high
  * inputs (waterfall, PSD: dBFS; power: dB; kurtosis: unitless); empty
  * bounds auto-scale from the data. The scale is persisted server-side in
@@ -584,7 +589,14 @@
         }
         ctx.putImageData(img, 0, 0);
         drawHighlight();
-        drawDetectionOverlay();
+        renderWfOverlay();
+    }
+
+    // Transparent overlay over the waterfall: detection markers, the
+    // frequency axis, and the time axis. Drawn after the data pixels, and
+    // redrawn on its own under a drag-zoom band (no data re-render needed).
+    function renderWfOverlay() {
+        drawDetectionOverlay(); // clears the overlay canvas first
         drawWfFreqAxis();
         drawWfTimeAxis();
     }
@@ -754,7 +766,6 @@
         let lo = Infinity, hi = -Infinity;
         for (const p of points) {
             if (p.pwr_avg != null) { lo = Math.min(lo, p.pwr_avg); hi = Math.max(hi, p.pwr_avg); }
-            if (p.pwr_max != null) { lo = Math.min(lo, p.pwr_max); hi = Math.max(hi, p.pwr_max); }
         }
         if (lo === Infinity) { lo = -120; hi = -40; }
         const pad = Math.max(2, (hi - lo) * 0.1);
@@ -783,7 +794,6 @@
             ctx.stroke();
         };
         drawLine(function (p) { return p.pwr_avg; }, "#0071e3");
-        drawLine(function (p) { return p.pwr_max; }, "#ff6b6b");
         drawSelectionMarker(ctx, W, H);
         ctx.fillStyle = "rgba(255,255,255,0.5)";
         ctx.font = "10px -apple-system, sans-serif";
@@ -931,6 +941,72 @@
         tbody.innerHTML = h;
     }
 
+    // --- drag-to-zoom (grafana-style) ---
+
+    // Drag a horizontal band on a time-domain chart to zoom the whole page to
+    // that absolute range (Now turns off). A sub-threshold drag is a plain
+    // click: on the waterfall that selects a time column via onClick.
+    // listenEl receives the mouse events; paintEl is the canvas the selection
+    // band is drawn on (the transparent overlay for the waterfall).
+    function attachDragZoom(listenEl, paintEl, redraw, onClick) {
+        let drag = null;
+        const xOf = function (e) {
+            const r = listenEl.getBoundingClientRect();
+            const x = (e.clientX - r.left) * (listenEl.width / r.width);
+            return Math.max(0, Math.min(listenEl.width, x));
+        };
+        const paint = function () {
+            redraw();
+            const ctx = paintEl.getContext("2d");
+            const x0 = Math.min(drag.x0, drag.x1);
+            const x1 = Math.max(drag.x0, drag.x1);
+            ctx.fillStyle = "rgba(255,255,255,0.14)";
+            ctx.fillRect(x0, 0, x1 - x0, paintEl.height);
+            ctx.strokeStyle = "rgba(255,255,255,0.6)";
+            ctx.lineWidth = 1;
+            ctx.strokeRect(x0 + 0.5, 0.5, Math.max(1, x1 - x0 - 1), paintEl.height - 1);
+        };
+        const onMove = function (e) {
+            if (!drag) return;
+            drag.x1 = xOf(e);
+            paint();
+        };
+        const onUp = function () {
+            document.removeEventListener("mousemove", onMove);
+            document.removeEventListener("mouseup", onUp);
+            if (!drag) return;
+            const d = drag;
+            drag = null;
+            const x0 = Math.min(d.x0, d.x1);
+            const x1 = Math.max(d.x0, d.x1);
+            if (x1 - x0 < 8) { // sub-threshold drag: a plain click
+                redraw();
+                if (onClick) onClick(x0);
+                return;
+            }
+            const spanMs = state.untilMs - state.sinceMs;
+            if (spanMs <= 0) { redraw(); return; }
+            const t0 = state.sinceMs + (x0 / listenEl.width) * spanMs;
+            const t1 = state.sinceMs + (x1 / listenEl.width) * spanMs;
+            if (t1 - t0 < 5000) { redraw(); return; } // ignore degenerate <5 s zooms
+            state.sinceMs = t0;
+            state.untilMs = t1;
+            state.spanMs = t1 - t0;
+            state.activePreset = null;
+            markPresetButtons();
+            setLive(false);
+            setStale(true);
+            loadAll(false);
+        };
+        listenEl.addEventListener("mousedown", function (e) {
+            if (e.button !== 0 || !state.wf || spanSec() <= 0) return;
+            drag = { x0: xOf(e), x1: xOf(e) };
+            document.addEventListener("mousemove", onMove);
+            document.addEventListener("mouseup", onUp);
+            e.preventDefault();
+        });
+    }
+
     // --- interaction ---
 
     function selectRow(idx) {
@@ -952,10 +1028,11 @@
     function setupSlider() {
         const slider = $("avg-slider");
         slider.addEventListener("input", function () { selectRow(parseInt(slider.value, 10)); });
-        $("avg-wf").addEventListener("click", function (e) {
-            const rect = e.currentTarget.getBoundingClientRect();
-            const scaleX = e.currentTarget.width / rect.width;
-            const x = Math.floor((e.clientX - rect.left) * scaleX);
+        // Drag-to-zoom on the time-domain charts; a plain (sub-threshold)
+        // click on the waterfall keeps its select-a-time-column behavior.
+        attachDragZoom($("avg-stats-canvas"), $("avg-stats-canvas"), renderStatsChart, null);
+        attachDragZoom($("avg-kurt"), $("avg-kurt"), renderKurtosisChart, null);
+        attachDragZoom($("avg-wf"), $("avg-wf-overlay"), renderWfOverlay, function (x) {
             const idx = rowForPixelX(x);
             if (idx >= 0) selectRow(idx);
         });

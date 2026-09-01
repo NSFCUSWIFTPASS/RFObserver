@@ -1097,7 +1097,7 @@ class SensorDatabase:
             (cutoff,),
         )
         await self._db.commit()
-        pruned = cursor.rowcount
+        pruned: int = cursor.rowcount
         if pruned > 0:
             logger.info("Pruned PSD blobs for %d avg windows (cutoff: %s)", pruned, cutoff)
         return pruned

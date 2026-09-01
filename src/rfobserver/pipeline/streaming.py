@@ -649,12 +649,20 @@ class StreamingProcessor:
             self._write_recording_chunk(sc16_buf)
 
     def _check_power_above_threshold(self, sc16_buf: np.ndarray[Any, np.dtype[Any]]) -> bool:
-        """Fast subsampled power estimate from raw SC16 data."""
+        """Fast subsampled power estimate from raw SC16 data.
+
+        Returns power in dB re 50 ohm (|z|^2 / 50) — the same scale as
+        ``iq_utils.calculate_iq_statistics`` and the iq2ram reference
+        ``compute_mean_power_db``. That makes TRIGGER_THRESHOLD_DB compare
+        directly against the power values the dashboard/history UI shows;
+        without the /50 the threshold sat ~17 dB above the displayed power
+        and the trigger fired while the observed power looked below it.
+        """
         raw16 = sc16_buf.view(np.int16).reshape(-1, 2)
         step = max(1, len(raw16) // 4096)
         sub = raw16[::step].astype(np.float32) / 32768.0
         power_sq = sub[:, 0] ** 2 + sub[:, 1] ** 2
-        mean_power_db = float(10.0 * np.log10(np.mean(power_sq) + 1e-30))
+        mean_power_db = float(10.0 * np.log10(np.mean(power_sq) / 50.0 + 1e-30))
         return mean_power_db > self._settings.TRIGGER_THRESHOLD_DB
 
     def _write_recording_chunk(self, sc16_buf: np.ndarray[Any, np.dtype[Any]]) -> None:

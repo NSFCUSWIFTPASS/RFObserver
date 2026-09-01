@@ -244,9 +244,8 @@
         const scaleY = tsCanvas.height / rect.height;
         const my = (e.clientY - rect.top) * scaleY;
         const H = tsCanvas.height;
-        // Line is drawn at (triggerThresholdDb - 17) on the trace's axis.
-        const lineDb = triggerThresholdDb - IQ_STATS_OFFSET_DB;
-        const ty = H - ((lineDb - tsPMin) / (tsPMax - tsPMin)) * H;
+        // Line is drawn at triggerThresholdDb on the trace's axis.
+        const ty = H - ((triggerThresholdDb - tsPMin) / (tsPMax - tsPMin)) * H;
         if (Math.abs(my - ty) < 8) {
             draggingTrigger = true;
             e.preventDefault();
@@ -278,25 +277,23 @@
         const H = tsCanvas.height;
 
         if (draggingTrigger && tsPMin != null && tsPMax != null) {
-            // Drag updates the trace-axis line position, then we add the
-            // 17 dB offset back when saving to TRIGGER_THRESHOLD_DB.
-            const lineDb = tsPMax - (my / H) * (tsPMax - tsPMin);
-            triggerThresholdDb = lineDb + IQ_STATS_OFFSET_DB;
+            // Drag moves the line on the trace's axis; the threshold is on
+            // that same axis, so the line position is the value to save.
+            triggerThresholdDb = tsPMax - (my / H) * (tsPMax - tsPMin);
             tsCanvas.style.cursor = "ns-resize";
             drawTimeSeries();
             return;
         }
 
         if (tsPMin != null && tsPMax != null) {
-            const lineDb = triggerThresholdDb - IQ_STATS_OFFSET_DB;
-            const ty = H - ((lineDb - tsPMin) / (tsPMax - tsPMin)) * H;
+            const ty = H - ((triggerThresholdDb - tsPMin) / (tsPMax - tsPMin)) * H;
             tsCanvas.style.cursor = Math.abs(my - ty) < 8 ? "ns-resize" : "";
         }
 
         tsCrosshairIdx = Math.min(N - 1, Math.max(0, Math.round((x / tsCanvas.width) * (TS_MAX_POINTS - 1))));
         if (tsCrosshairIdx >= N) tsCrosshairIdx = N - 1;
 
-        let tip = "Avg " + tsAvgPower[tsCrosshairIdx].toFixed(1) + " dBFS";
+        let tip = "Avg " + tsAvgPower[tsCrosshairIdx].toFixed(1) + " dB";
         if (traceVisible.kurtosis) {
             tip += "  K " + tsKurtosis[tsCrosshairIdx].toFixed(2);
         }
@@ -345,7 +342,7 @@
             if (tsAvgPower[i] < pMin) pMin = tsAvgPower[i];
             if (tsAvgPower[i] > pMax) pMax = tsAvgPower[i];
         }
-        const triggerLineDb = triggerThresholdDb - IQ_STATS_OFFSET_DB;
+        const triggerLineDb = triggerThresholdDb;
         if (triggerLineDb < pMin) pMin = triggerLineDb;
         if (triggerLineDb > pMax) pMax = triggerLineDb;
         const pPad = Math.max((pMax - pMin) * 0.1, 2);
@@ -368,18 +365,17 @@
             tsCtx.font = "10px -apple-system, sans-serif";
             tsCtx.fillStyle = "#0071e3";
             tsCtx.textAlign = "left";
-            tsCtx.fillText("Power " + tsAvgPower[N-1].toFixed(1) + " dBFS", 4, 12);
+            tsCtx.fillText("Power " + tsAvgPower[N-1].toFixed(1) + " dB", 4, 12);
 
             tsCtx.fillStyle = "rgba(255,255,255,0.4)";
             tsCtx.textAlign = "right";
-            tsCtx.fillText(pMax.toFixed(0) + " dBFS", W - 4, 12);
-            tsCtx.fillText(pMin.toFixed(0) + " dBFS", W - 4, H - 4);
+            tsCtx.fillText(pMax.toFixed(0) + " dB", W - 4, 12);
+            tsCtx.fillText(pMin.toFixed(0) + " dB", W - 4, H - 4);
         }
 
-        // IQ-recording trigger line (broadband). Drawn at trigger - 17 to
-        // sit on the trace's axis (iq_stats has the 50-ohm offset applied).
-        // Label shows the underlying TRIGGER_THRESHOLD_DB so the user sees
-        // the value they're configuring.
+        // IQ-recording trigger line (broadband). The threshold and the
+        // power trace share the same dB re 50-ohm scale, so the line sits
+        // directly at TRIGGER_THRESHOLD_DB and the label shows that value.
         const triggerY = H - ((triggerLineDb - pMin) / (pMax - pMin)) * H;
         if (triggerY >= 0 && triggerY <= H) {
             tsCtx.strokeStyle = "rgba(255, 60, 60, 0.7)";
@@ -393,7 +389,7 @@
             tsCtx.fillStyle = "rgba(255, 60, 60, 0.9)";
             tsCtx.textAlign = "right";
             tsCtx.fillText(
-                "Trigger " + triggerThresholdDb.toFixed(1) + " dBFS",
+                "Trigger " + triggerThresholdDb.toFixed(1) + " dB",
                 W - 4, triggerY - 4,
             );
         }
@@ -491,13 +487,10 @@
     //   horizontal lines at burstThresholdHighDb and ratio*High.
     //
     // Time-series → IQ-recording trigger threshold.
-    //   Drawn at (trigger_threshold_db - 17). The -17 compensates for the
-    //   50-ohm normalization in iq_utils.calculate_iq_statistics; the trigger
-    //   itself is checked against broadband mean power without that offset
-    //   (streaming.py:_check_power_above_threshold). We keep the offset in
-    //   iq_stats so OpenZMS observation values stay on the historical scale.
-    //   Drag → save trigger_threshold_db as (line_y + 17).
-    const IQ_STATS_OFFSET_DB = 17.0;
+    //   Drawn directly at trigger_threshold_db: the trigger and the trace
+    //   share the same dB re 50-ohm scale (streaming.py checks |z|^2/50,
+    //   iq_stats applies the matching 50-ohm offset), so no compensation
+    //   is needed. Drag → save trigger_threshold_db as the line's dB.
 
     let burstThresholdHighDb = {{ settings.BURST_THRESHOLD_HIGH_DB }};
     let burstThresholdLowRatio = {{ settings.BURST_THRESHOLD_LOW_RATIO }};
@@ -983,8 +976,9 @@
                 // Display calibration: shift all absolute per-bin dB values
                 // by the user's cal offset so spectrum/waterfall show dBm/Hz.
                 // The burst-tuning panel plots powers minus noise floor, so
-                // the offset cancels there. Time-series and detection powers
-                // stay raw dBFS (the trigger drag writes back to settings).
+                // the offset cancels there. The time-series power keeps its
+                // dB re 50-ohm scale (the trigger threshold lives on that
+                // same scale) and detection powers stay raw dBFS.
                 const calSet = typeof data.cal_offset_db === "number";
                 displayUnit = calSet ? "dBm/Hz" : "dBFS";
                 scaleMinDb = (typeof data.scale_min_db === "number") ? data.scale_min_db : null;

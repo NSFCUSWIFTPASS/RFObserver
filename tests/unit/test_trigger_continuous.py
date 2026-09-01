@@ -129,3 +129,35 @@ def test_end_recording_syncs_cap_from_runtime_settings(tmp_path):
     proc._recording_state = "recording"
     proc._end_recording()
     assert proc._storage.max_bytes == int(0.02 * 1024**3)
+
+
+def _constant_power_buf(amplitude: int, n: int = 4096) -> np.ndarray:
+    """SC16 chunk with constant I=Q=amplitude (deterministic power).
+
+    amplitude=1000 -> 2*(1000/32768)^2 = -27.3 dBFS = -44.3 dB re 50 ohm.
+    """
+    raw16 = np.full((n, 2), amplitude, dtype=np.int16)
+    return raw16.view(np.int32).reshape(-1)
+
+
+def test_trigger_threshold_uses_displayed_power_scale(tmp_path):
+    """Regression: the trigger used to compare raw dBFS against the threshold,
+    ~17 dB above the dB re 50-ohm scale the dashboard/history power shows, so
+    continuous recordings fired while the observed power was below the
+    threshold. A chunk at -44.3 dB (displayed scale) must not fire a -40 dB
+    threshold even though its raw dBFS (-27.3) is above it."""
+    proc, _ = _make_proc(tmp_path, TRIGGER_CONTINUOUS=True, TRIGGER_THRESHOLD_DB=-40.0)
+    proc._check_trigger_and_record(_constant_power_buf(1000))
+    assert proc._recording_state == "armed"
+    assert not proc._trigger_initiated
+    assert not list(proc._storage.auto_dir.glob("*.sc16"))
+
+
+def test_trigger_fires_when_displayed_power_exceeds_threshold(tmp_path):
+    """Same chunk (-44.3 dB displayed) fires once the threshold is below it."""
+    proc, _ = _make_proc(tmp_path, TRIGGER_CONTINUOUS=True, TRIGGER_THRESHOLD_DB=-50.0)
+    proc._check_trigger_and_record(_constant_power_buf(1000))
+    assert proc._recording_state == "recording"
+    assert proc._trigger_initiated
+    proc._end_recording()
+    assert list(proc._storage.auto_dir.glob("*.sc16"))

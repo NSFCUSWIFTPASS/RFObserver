@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import threading
+from contextlib import contextmanager
+from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 from rfobserver.capture.mock_receiver import MockReceiver
 from rfobserver.capture.receiver import ReceiverConfig
@@ -161,3 +167,73 @@ def test_trigger_fires_when_displayed_power_exceeds_threshold(tmp_path):
     assert proc._trigger_initiated
     proc._end_recording()
     assert list(proc._storage.auto_dir.glob("*.sc16"))
+
+
+@contextmanager
+def _recctl_running(proc: StreamingProcessor) -> Iterator[None]:
+    """Run the recording-control thread (production mode: finalize jobs are
+    async). Without it, jobs execute inline on the caller (the default in
+    these tests)."""
+    t = threading.Thread(target=proc._recctl_loop, daemon=True)
+    proc._recctl_thread = t
+    t.start()
+    try:
+        yield
+    finally:
+        proc._recctl_queue.put(None)
+        t.join(timeout=5)
+        proc._recctl_thread = None
+
+
+def test_auto_stop_finalizes_off_the_caller(tmp_path):
+    """The receiver-thread auto-stop must not block on finalization: the
+    request flips recording -> finalizing and returns immediately; the
+    control thread completes the job and lands on idle."""
+    proc, _ = _make_proc(tmp_path, TRIGGER_THRESHOLD_DB=-400.0)
+    with _recctl_running(proc):
+        proc.arm_trigger()
+        proc._check_trigger_and_record(_low_power_buf())
+        assert proc._recording_state == "recording"
+
+        # Hold the control thread so the finalize job cannot complete yet.
+        blocker = threading.Event()
+        proc._recctl_queue.put(lambda: blocker.wait(timeout=5))
+        proc._request_end_recording(wait=False)
+        assert proc._recording_state == "finalizing"  # returned immediately
+
+        blocker.set()
+        assert proc._end_done.wait(timeout=5)
+        assert proc._recording_state == "idle"
+    assert list(proc._storage.auto_dir.glob("*.sc16"))
+
+
+def test_continuous_rearm_waits_for_finalizing(tmp_path):
+    """Continuous mode re-arms only from idle: while a capture is finalizing
+    the auto-arm must not fire (a new begin would clobber the finalize job)."""
+    proc, _ = _make_proc(tmp_path, TRIGGER_CONTINUOUS=True, TRIGGER_THRESHOLD_DB=100.0)
+    proc._recording_state = "finalizing"
+    proc._check_trigger_and_record(_low_power_buf())
+    assert proc._recording_state == "finalizing"
+    proc._recording_state = "idle"
+    proc._check_trigger_and_record(_low_power_buf())
+    assert proc._recording_state == "armed"
+
+
+def test_start_recording_refused_while_finalizing(tmp_path):
+    proc, _ = _make_proc(tmp_path)
+    proc._recording_state = "finalizing"
+    proc.start_recording()
+    assert proc._recording_state == "finalizing"
+    assert not list(proc._storage.manual_dir.glob("*.sc16"))
+
+
+def test_manual_stop_waits_for_finalization(tmp_path):
+    """A manual stop keeps synchronous API semantics: when it returns, the
+    capture file is finalized on disk and the state machine is idle."""
+    proc, _ = _make_proc(tmp_path)
+    with _recctl_running(proc):
+        proc.start_recording()
+        assert proc._recording_state == "recording"
+        proc.stop_recording()
+        assert proc._recording_state == "idle"
+        assert list(proc._storage.manual_dir.glob("*.sc16"))

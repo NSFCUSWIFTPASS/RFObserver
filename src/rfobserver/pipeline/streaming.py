@@ -48,6 +48,7 @@ from rfobserver.processing.spectral import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from rfobserver.capture.receiver import IReceiver
@@ -256,8 +257,13 @@ class StreamingProcessor:
         self._result_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=8)
         self._loop: asyncio.AbstractEventLoop | None = None
 
-        # Recording state machine: "idle" | "armed" | "recording"
+        # Recording state machine: "idle" | "armed" | "recording" | "finalizing".
+        # "finalizing" bridges an auto-stop and the (off-thread) finalize job so
+        # continuous mode cannot re-arm — and a new begin cannot clobber the
+        # fields the finalize job is still reading — while it runs.
         self._recording_state: str = "idle"
+        # Serializes begin/end decisions (receiver thread vs web workers).
+        self._rec_lock = threading.Lock()
         self._recording_file: str | None = None
         self._recording_bytes: int = 0
         self._recording_start: float = 0.0
@@ -269,9 +275,22 @@ class StreamingProcessor:
         # wait without disarming a deliberately manual arm.
         self._continuous_armed: bool = False
 
-        # Disk-streaming write queue (default mode)
+        # Disk-streaming write queue (default mode). Items are tagged:
+        # ("iq", bytes-like) for the .sc16 stream, ("grid", bytes) for the
+        # streamed .psd rows, None to stop the writer.
         self._recording_queue: queue.Queue[Any] = queue.Queue(maxsize=64)
         self._writer_thread: threading.Thread | None = None
+
+        # Recording-control thread: runs the blocking finalization work
+        # (writer drain, file close, metadata, disk-cap eviction) so the
+        # receiver and dispatch threads never stall on disk I/O — that stall
+        # showed up as black gaps in the PSD history at every capture stop.
+        # When the pipeline isn't running (unit tests), _schedule_recctl
+        # executes jobs inline on the caller instead.
+        self._recctl_queue: queue.Queue[Any] = queue.Queue()
+        self._recctl_thread: threading.Thread | None = None
+        self._end_done = threading.Event()
+        self._end_done.set()
 
         # RAM-buffered recording (when RECORDING_RAM_BUFFER=True)
         self._recording_buf: np.ndarray[Any, np.dtype[Any]] | None = None
@@ -284,12 +303,13 @@ class StreamingProcessor:
         # Display calibration snapshotted when recording begins, baked into the
         # .npz so the capture viewer can show the same dBm/Hz the live view did.
         self._recording_cal_offset: float | None = None
-        # New raw-grid streaming state. Disk mode writes rows to _grid_file
-        # (bounded RAM); RAM mode still uses _recording_grids but is bounded by
-        # the RAM-derived _effective_max_sec auto-stop.
-        self._grid_file: Any = None
+        # New raw-grid streaming state. Disk mode hands rows to the writer
+        # thread via the tagged queue (bounded RAM); RAM mode still uses
+        # _recording_grids but is bounded by the RAM-derived _effective_max_sec
+        # auto-stop.
         self._grid_raw_path: Any = None
         self._grid_rows: int = 0
+        self._grid_dropped: int = 0  # rows dropped when the writer queue was full
         self._grid_min: float = float("inf")
         self._grid_max: float = float("-inf")
         self._effective_max_sec: float = float("inf")
@@ -375,18 +395,24 @@ class StreamingProcessor:
         burst_thread = threading.Thread(
             target=self._burst_detection_loop, name="burst", daemon=True
         )
+        recctl_thread = threading.Thread(target=self._recctl_loop, name="recctl", daemon=True)
+        self._recctl_thread = recctl_thread
 
         recv_thread.start()
         dispatch_thread.start()
         burst_thread.start()
+        recctl_thread.start()
 
         try:
             await self._result_consumer_loop()
         finally:
             self._running = False
-            # Stop any active recording
+            # Stop any active recording, waiting for the finalize job so the
+            # capture files are properly closed before threads exit.
             if self._recording_state == "recording":
-                self._end_recording()
+                self._request_end_recording(wait=True)
+            elif self._recording_state == "finalizing":
+                self._end_done.wait(timeout=15)
             self._recording_state = "idle"
             # Unblock threads (drain-safe: a full queue in lossless mode must not
             # wedge shutdown now that the consumers have stopped).
@@ -395,6 +421,9 @@ class StreamingProcessor:
             recv_thread.join(timeout=5)
             dispatch_thread.join(timeout=5)
             burst_thread.join(timeout=5)
+            self._recctl_queue.put(None)
+            recctl_thread.join(timeout=5)
+            self._recctl_thread = None
             # Final drain: the burst thread may have enqueued completed bursts
             # (via call_soon_threadsafe) after the consumer loop's last drain --
             # i.e. a burst finishing right at shutdown. Let those scheduled
@@ -427,28 +456,74 @@ class StreamingProcessor:
         """Start recording IQ data immediately (manual mode)."""
         if self._replay_mode and not self._replay_record:
             return
-        if self._recording_state == "recording":
-            return
-        self._trigger_initiated = False
-        self._begin_recording()
+        with self._rec_lock:
+            # "finalizing" means a finalize job still reads the recording
+            # fields; beginning now would clobber them.
+            if self._recording_state in ("recording", "finalizing"):
+                return
+            self._trigger_initiated = False
+            self._begin_recording()
 
     def arm_trigger(self) -> None:
         """Arm the power trigger — recording starts when threshold is exceeded."""
         if self._replay_mode:
             return
-        if self._recording_state == "recording":
-            return
-        self._recording_state = "armed"
-        self._continuous_armed = False  # a deliberate manual arm, not continuous
-        logger.info("Trigger armed (threshold=%.1f dB)", self._settings.TRIGGER_THRESHOLD_DB)
+        with self._rec_lock:
+            if self._recording_state in ("recording", "finalizing"):
+                return
+            self._recording_state = "armed"
+            self._continuous_armed = False  # a deliberate manual arm, not continuous
+            logger.info("Trigger armed (threshold=%.1f dB)", self._settings.TRIGGER_THRESHOLD_DB)
 
     def stop_recording(self) -> None:
-        """Stop recording or disarm trigger, return to idle."""
+        """Stop recording or disarm trigger, return to idle.
+
+        Finalization runs on the recording-control thread; a manual stop waits
+        for it so the call keeps its synchronous API semantics (the web route
+        already wraps this in asyncio.to_thread).
+        """
         if self._recording_state == "recording":
-            self._end_recording()
+            self._request_end_recording(wait=True)
+        elif self._recording_state == "finalizing":
+            self._end_done.wait(timeout=15)
         self._recording_state = "idle"
         self._trigger_initiated = False
         logger.info("Recording stopped / trigger disarmed")
+
+    def _schedule_recctl(self, fn: Callable[[], None]) -> None:
+        """Run ``fn`` on the recording-control thread; inline when the pipeline
+        isn't running (unit tests drive begin/end directly)."""
+        t = self._recctl_thread
+        if t is not None and t.is_alive():
+            self._recctl_queue.put(fn)
+        else:
+            fn()
+
+    def _recctl_loop(self) -> None:
+        """Recording-control thread: serializes finalize jobs off the hot path."""
+        while True:
+            fn = self._recctl_queue.get()
+            if fn is None:
+                return
+            try:
+                fn()
+            except Exception:
+                logger.exception("Recording-control job failed")
+
+    def _request_end_recording(self, wait: bool) -> None:
+        """Flip recording -> finalizing and hand finalization to the control
+        thread. ``wait`` (manual stop, shutdown) blocks until the job finishes;
+        the receiver thread always passes wait=False and never stalls."""
+        with self._rec_lock:
+            if self._recording_state != "recording":
+                return
+            # Stops chunk writes (_check_trigger_and_record) and grid appends
+            # (_handle_chunk_result) — both gate on the exact "recording" state.
+            self._recording_state = "finalizing"
+            self._end_done.clear()
+        self._schedule_recctl(self._end_recording)
+        if wait:
+            self._end_done.wait(timeout=15)
 
     def recording_status(self) -> dict[str, object]:
         """Return current recording state for the API."""
@@ -614,7 +689,7 @@ class StreamingProcessor:
 
             # Auto-stop on the effective max duration (RAM-derived cap in RAM mode).
             if (time.monotonic() - self._recording_start) >= self._effective_max_sec:
-                self.stop_recording()
+                self._request_end_recording(wait=False)
                 return
 
             # Auto-stop for trigger-initiated recordings when power drops
@@ -622,31 +697,37 @@ class StreamingProcessor:
                 if not self._check_power_above_threshold(sc16_buf):
                     self._below_threshold_count += 1
                     if self._below_threshold_count >= self._settings.TRIGGER_HYSTERESIS:
-                        self.stop_recording()
+                        self._request_end_recording(wait=False)
                 else:
                     self._below_threshold_count = 0
             return
 
         continuous = self._settings.TRIGGER_CONTINUOUS
-        if state == "idle" and continuous and not self._replay_mode:
-            # Continuous trigger auto-arms whenever idle -- on sensor start, when
-            # the toggle is switched on, and (since a capture ends in the idle
-            # state) as the immediate re-arm after each capture.
-            self._recording_state = "armed"
-            self._continuous_armed = True
-            state = "armed"
-        elif state == "armed" and self._continuous_armed and not continuous:
-            # Toggling continuous off releases an auto-armed waiting state; a
-            # manual arm (_continuous_armed False) is left untouched.
-            self._recording_state = "idle"
-            self._continuous_armed = False
-            return
+        with self._rec_lock:
+            state = self._recording_state
+            if state == "idle" and continuous and not self._replay_mode:
+                # Continuous trigger auto-arms whenever idle -- on sensor start, when
+                # the toggle is switched on, and (since a capture's finalize job
+                # ends in the idle state) as the re-arm after each capture. While
+                # that job runs the state is "finalizing", so re-arming — and the
+                # next capture — waits for finalization to complete.
+                self._recording_state = "armed"
+                self._continuous_armed = True
+                state = "armed"
+            elif state == "armed" and self._continuous_armed and not continuous:
+                # Toggling continuous off releases an auto-armed waiting state; a
+                # manual arm (_continuous_armed False) is left untouched.
+                self._recording_state = "idle"
+                self._continuous_armed = False
+                return
 
-        # If armed, check threshold to start recording
-        if state == "armed" and self._check_power_above_threshold(sc16_buf):
-            self._trigger_initiated = True
-            self._begin_recording()
-            self._write_recording_chunk(sc16_buf)
+            # If armed, check threshold to start recording
+            if state == "armed" and self._check_power_above_threshold(sc16_buf):
+                self._trigger_initiated = True
+                self._begin_recording()
+                # No explicit write of this chunk: the pre-trigger read inside
+                # _begin_recording already includes it (it was ring-buffered
+                # before this check), so recording it here too would duplicate it.
 
     def _check_power_above_threshold(self, sc16_buf: np.ndarray[Any, np.dtype[Any]]) -> bool:
         """Fast subsampled power estimate from raw SC16 data.
@@ -683,14 +764,23 @@ class StreamingProcessor:
             # Disk-streaming mode — convert to bytes on receiver thread
             # (.tobytes() is a fast C-level copy that plays well with GIL)
             try:
-                self._recording_queue.put_nowait(sc16_buf.tobytes())
+                self._recording_queue.put_nowait(("iq", sc16_buf.tobytes()))
                 self._recording_bytes += n * 4
             except queue.Full:
                 self._recording_dropped += 1
                 logger.warning("Recording queue full — dropped chunk")
 
     def _begin_recording(self) -> None:
-        """Start recording: allocate RAM buffer or start disk writer."""
+        """Start recording: allocate the RAM buffer or start the disk writer.
+
+        Runs at the fire site (receiver thread for triggers, a web worker for
+        manual starts) under ``_rec_lock``. Only cheap, non-blocking work stays
+        here: in disk mode the capture files are opened inside the writer
+        thread and the pre-trigger samples are queued by reference (no
+        ``.tobytes()`` copy), so the receiver thread never stalls on capture
+        start. RAM-buffered mode still allocates its (RAM-bounded) buffer
+        synchronously.
+        """
         # The trigger path (arm_trigger / _check_trigger_and_record) already
         # gates itself before ever calling this, so this gate in practice only
         # guards the manual start_recording() call chain -- and must let it
@@ -707,12 +797,12 @@ class StreamingProcessor:
         self._recording_dropped = 0
         self._recording_start = time.monotonic()
         self._below_threshold_count = 0
-        self._recording_state = "recording"
         self._recording_grids = []
         self._recording_freq_axis = None
         self._recording_time_res = 0.0
         self._recording_cal_offset = self._settings.CAL_OFFSET_DB
         self._grid_rows = 0
+        self._grid_dropped = 0
         self._grid_min = float("inf")
         self._grid_max = float("-inf")
         self._effective_max_sec = _effective_max_recording_sec(
@@ -720,23 +810,13 @@ class StreamingProcessor:
         )
         if self._effective_max_sec != float("inf"):
             logger.info("Recording auto-stop cap: %.1fs", self._effective_max_sec)
-        # Disk mode streams grid rows to <base>.psd; RAM mode accumulates in list.
         from rfobserver.storage import psd_grid
-
-        if not self._settings.RECORDING_RAM_BUFFER:
-            raw_path, _ = psd_grid.grid_paths(self._recording_dir / self._recording_file)
-            self._grid_raw_path = raw_path
-            # Long-lived handle: written per-chunk during recording, closed in
-            # _end_recording — a context manager doesn't fit this lifecycle.
-            self._grid_file = open(raw_path, "wb")  # noqa: SIM115
-        else:
-            self._grid_file = None
-            self._grid_raw_path = None
 
         s = self._settings
         pre_data = self._pre_trigger_buf.read()
 
         if s.RECORDING_RAM_BUFFER:
+            self._grid_raw_path = None
             # Pre-allocate RAM for the (RAM-bounded) max recording duration.
             max_sec = self._effective_max_sec if self._effective_max_sec != float("inf") else 30.0
             total_samples = int((s.TRIGGER_PRE_SEC + max_sec) * s.BANDWIDTH)
@@ -749,6 +829,7 @@ class StreamingProcessor:
                 self._recording_buf_pos = n
                 self._recording_bytes = n * 4
 
+            self._recording_state = "recording"
             logger.info(
                 "Recording started (RAM): %s (%.1f MB allocated)",
                 self._recording_file,
@@ -757,6 +838,7 @@ class StreamingProcessor:
         else:
             self._recording_buf = None
             self._recording_buf_pos = 0
+            self._grid_raw_path = psd_grid.grid_paths(self._recording_dir / self._recording_file)[0]
 
             # Drain stale queue data
             while not self._recording_queue.empty():
@@ -765,9 +847,12 @@ class StreamingProcessor:
                 except queue.Empty:
                     break
 
+            # Queue the pre-trigger samples by reference — the writer's
+            # f.write() accepts any buffer-like object, so the old .tobytes()
+            # copy (hundreds of MB on the receiver thread) is unnecessary.
             if len(pre_data) > 0:
                 try:
-                    self._recording_queue.put_nowait(pre_data.tobytes())
+                    self._recording_queue.put_nowait(("iq", pre_data))
                     self._recording_bytes = len(pre_data) * 4
                 except queue.Full:
                     logger.warning("Recording queue full — pre-trigger dropped")
@@ -776,12 +861,27 @@ class StreamingProcessor:
                 target=self._file_writer_loop, name="writer", daemon=True
             )
             self._writer_thread.start()
+            # Flip last: chunk writes gate on this state, and they must enter
+            # the queue behind the pre-trigger samples seeded above.
+            self._recording_state = "recording"
             logger.info("Recording started (disk): %s", self._recording_file)
 
     def _end_recording(self) -> None:
+        """Finalize the recording (runs on the recording-control thread).
+
+        The requester has already flipped the state to "finalizing", which
+        stops chunk and grid writes; the job ends by setting "idle" (and the
+        done event) so continuous mode can re-arm. The state flip and event
+        live in a finally so a failure can never wedge the state machine.
+        """
+        try:
+            self._finalize_recording()
+        finally:
+            self._recording_state = "idle"
+            self._end_done.set()
+
+    def _finalize_recording(self) -> None:
         """Stop recording, flush to disk, write metadata."""
-        # Set state to idle FIRST so dispatch thread stops appending grids
-        self._recording_state = "idle"
         # Brief sleep lets any in-flight _handle_chunk_result finish its append
         time.sleep(0.05)
 
@@ -818,17 +918,16 @@ class StreamingProcessor:
                 if orig.exists():
                     orig.rename(dest)
 
-        # Finalize the PSD grid companion (<base>.psd + .psd.json). Disk mode has
-        # been streaming rows; RAM mode flushes its list here row-by-row (no
-        # np.concatenate). Either way, no whole-grid RAM copy.
+        # Finalize the PSD grid companion (<base>.psd + .psd.json). Disk mode
+        # streamed rows via the writer thread (which owns and has closed the
+        # file by the join above); RAM mode flushes its list here row-by-row
+        # (no np.concatenate). Either way, no whole-grid RAM copy.
         from rfobserver.storage import psd_grid
 
         raw_path, meta_path = psd_grid.grid_paths(self._recording_dir / base_name)
-        if self._grid_file is not None:
-            self._grid_file.close()
-            self._grid_file = None
+        if self._grid_raw_path is not None:
             # If the .sc16 was drop-renamed, move the streamed grid to match.
-            if self._grid_raw_path is not None and self._grid_raw_path != raw_path:
+            if self._grid_raw_path != raw_path:
                 with contextlib.suppress(OSError):
                     self._grid_raw_path.rename(raw_path)
             self._grid_raw_path = None
@@ -868,11 +967,12 @@ class StreamingProcessor:
             )
 
         logger.info(
-            "Recording saved: %s (%d bytes, %.1fs, %d dropped)",
+            "Recording saved: %s (%d bytes, %.1fs, %d dropped, %d grid rows dropped)",
             base_name,
             self._recording_bytes,
             duration,
             self._recording_dropped,
+            self._grid_dropped,
         )
 
         # Keep the capture archive bounded by ARCHIVE_MAX_GB via FIFO eviction of
@@ -952,7 +1052,11 @@ class StreamingProcessor:
     def _file_writer_loop(self) -> None:
         """Dedicated thread: drains recording queue and writes to disk.
 
-        Pinned to the last CPU core so PSD workers can't starve it.
+        Owns both capture files — the .sc16 IQ stream and the streamed .psd
+        grid — so no file open/write/close ever touches the receiver or
+        dispatch threads. Queue items are ("iq", data) / ("grid", data);
+        None stops the loop. Pinned to the last CPU core so PSD workers
+        can't starve it.
         """
         # Pin writer to dedicated core (last core) for guaranteed CPU time
         try:
@@ -965,14 +1069,21 @@ class StreamingProcessor:
 
         filepath = self._recording_dir / (self._recording_file or "recording.sc16")
         try:
-            with open(filepath, "wb", buffering=8 * 1024 * 1024) as f:
+            with (
+                open(filepath, "wb", buffering=8 * 1024 * 1024) as f,
+                open(self._grid_raw_path, "wb") as gf,
+            ):
                 while True:
-                    data = self._recording_queue.get()
-                    if data is None:
+                    item = self._recording_queue.get()
+                    if item is None:
                         break
-                    f.write(data)
+                    kind, data = item
+                    if kind == "iq":
+                        f.write(data)
+                    else:
+                        gf.write(data)
                     # No flush — let OS buffer writes for throughput.
-                    # Data is flushed on file close in _end_recording.
+                    # Data is flushed on file close at loop exit.
         except Exception:
             logger.exception("File writer crashed")
 
@@ -1131,8 +1242,11 @@ class StreamingProcessor:
         with contextlib.suppress(queue.Full):
             self._burst_queue.put_nowait((cr.psd_grid, cr.center_freq_hz, cr.capture_num))
 
-        # Persist PSD grids during recording. Disk mode streams rows straight to
-        # the raw .psd file (bounded RAM); RAM mode keeps them in the list, which
+        # Persist PSD grids during recording. Disk mode hands rows to the
+        # writer thread via the tagged queue (bounded RAM) — writing them
+        # synchronously here would back-pressure the dispatch loop into
+        # dropping PSD chunks (black waterfall rows) whenever the disk is
+        # saturated by the IQ stream. RAM mode keeps them in the list, which
         # is bounded by the RAM-derived _effective_max_sec auto-stop.
         if self._recording_state == "recording":
             grid = cr.psd_grid.grid
@@ -1144,9 +1258,14 @@ class StreamingProcessor:
             if grid.size:
                 self._grid_min = min(self._grid_min, float(grid.min()))
                 self._grid_max = max(self._grid_max, float(grid.max()))
-            if self._grid_file is not None:
-                self._grid_file.write(np.ascontiguousarray(grid, dtype=np.float32).tobytes())
-                self._grid_rows += grid.shape[0]
+            if self._grid_raw_path is not None:
+                data = np.ascontiguousarray(grid, dtype=np.float32).tobytes()
+                try:
+                    self._recording_queue.put_nowait(("grid", data))
+                    self._grid_rows += grid.shape[0]
+                except queue.Full:
+                    # Companion data — drop rather than stall the dispatch loop.
+                    self._grid_dropped += grid.shape[0]
             else:
                 self._recording_grids.append(grid.copy())
 

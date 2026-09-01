@@ -404,7 +404,8 @@ async def replay_record(request: Request) -> dict[str, Any]:
     on = bool(body.get("on", False))
     if on:
         proc.set_replay_recording(True)
-        proc.start_recording()
+        # begin() snapshots the pre-trigger buffer — keep it off the event loop.
+        await asyncio.to_thread(proc.start_recording)
     else:
         await asyncio.to_thread(proc.stop_recording)
         proc.set_replay_recording(False)
@@ -416,7 +417,7 @@ async def trigger_capture(request: Request) -> dict[str, str]:
     """Activate manual IQ capture trigger (backward compat)."""
     proc = _get_processor(request)
     if proc is not None and hasattr(proc, "manual_trigger"):
-        proc.manual_trigger()
+        await asyncio.to_thread(proc.manual_trigger)
         return {"status": "triggered"}
     return {"status": "not_supported", "detail": "Streaming mode not active"}
 
@@ -426,7 +427,9 @@ async def stop_trigger(request: Request) -> dict[str, str]:
     """Deactivate manual IQ capture trigger (backward compat)."""
     proc = _get_processor(request)
     if proc is not None and hasattr(proc, "stop_trigger"):
-        proc.stop_trigger()
+        # stop_recording waits for finalization — blocking file I/O, keep it
+        # off the event loop.
+        await asyncio.to_thread(proc.stop_trigger)
         return {"status": "stopped"}
     return {"status": "not_supported", "detail": "Streaming mode not active"}
 
@@ -457,7 +460,8 @@ async def recording_start(request: Request) -> dict[str, Any]:
     """Start recording IQ data immediately."""
     proc = _get_processor(request)
     if proc is not None and hasattr(proc, "start_recording"):
-        proc.start_recording()
+        # begin() snapshots the pre-trigger buffer — keep it off the event loop.
+        await asyncio.to_thread(proc.start_recording)
         return _rec_status(proc)
     return _idle_status()
 

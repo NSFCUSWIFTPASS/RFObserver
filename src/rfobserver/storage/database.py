@@ -494,10 +494,16 @@ class SensorDatabase:
         ``max_rows`` or fewer windows in the range (``mode == 0``, raw) each
         window is returned as its own row (its real ``start_epoch`` +
         ``duration_sec`` and its own PSD). With more (``mode == 1``,
-        aggregated) the windows are folded into ``max_rows`` time buckets of
+        aggregated) the windows are folded into time buckets of
         ``bucket_sec = span / max_rows`` each (per-bin mean PSD, scalar stats
         mean-of-means except ``pwr_max`` = max-of-maxes so transient bursts
-        stay visible).
+        stay visible). Bucket boundaries are anchored to absolute time
+        (epoch multiples of ``bucket_sec``), not to the range start: in live
+        "Now" mode the range slides every poll, and a since-anchored grid
+        would shift with it, making narrow peaks flicker as they keep
+        changing buckets. Anchoring keeps each peak in one stable bucket;
+        edge buckets partial, so the grid is ``max_rows`` or
+        ``max_rows + 1`` buckets.
 
         Windows whose blob was pruned by retention contribute stats but no PSD
         (their row is all-NaN). Native bins are downsampled to ``max_bins`` by
@@ -537,7 +543,7 @@ class SensorDatabase:
         if window_count <= max_rows:
             return await self._waterfall_raw(where, params, bucket_sec, max_bins)
         return await self._waterfall_aggregated(
-            where, params, since, bucket_sec, max_rows, max_bins
+            where, params, since, until, bucket_sec, max_rows, max_bins
         )
 
     @staticmethod
@@ -637,11 +643,17 @@ class SensorDatabase:
         where: str,
         params: list[Any],
         since: datetime,
+        until: datetime,
         bucket_sec: float,
         max_rows: int,
         max_bins: int,
     ) -> dict[str, Any]:
-        """Aggregated mode: fold the range's windows into max_rows time buckets."""
+        """Aggregated mode: fold the range's windows into time buckets.
+
+        The grid is anchored to absolute epoch multiples of ``bucket_sec``
+        (see the public docstring), so it has ``max_rows`` or
+        ``max_rows + 1`` buckets and stays put while the range slides.
+        """
         assert self._db is not None
         query = (
             "SELECT start_time, num_bins, freq_start_hz, freq_step_hz, psd_powers, "
@@ -649,16 +661,19 @@ class SensorDatabase:
             f"FROM avg_windows {where} ORDER BY start_time"
         )
         since_epoch = since.timestamp()
+        until_epoch = until.timestamp()
+        anchor = math.floor(since_epoch / bucket_sec) * bucket_sec
+        n_buckets = max(1, math.ceil((until_epoch - anchor) / bucket_sec))
         # Per-bucket accumulators. PSD uses per-bin sums + per-bin counts so a
         # NaN-padded (short) row never poisons a bucket's mean.
-        psd_sum = np.zeros((max_rows, max_bins), dtype=np.float64)
-        psd_cnt = np.zeros((max_rows, max_bins), dtype=np.int64)
-        stat_avg = [0.0] * max_rows
-        stat_max = [-float("inf")] * max_rows
-        stat_med = [0.0] * max_rows
-        stat_std = [0.0] * max_rows
-        stat_kurt = [0.0] * max_rows
-        stat_n = [0] * max_rows
+        psd_sum = np.zeros((n_buckets, max_bins), dtype=np.float64)
+        psd_cnt = np.zeros((n_buckets, max_bins), dtype=np.int64)
+        stat_avg = [0.0] * n_buckets
+        stat_max = [-float("inf")] * n_buckets
+        stat_med = [0.0] * n_buckets
+        stat_std = [0.0] * n_buckets
+        stat_kurt = [0.0] * n_buckets
+        stat_n = [0] * n_buckets
         total_windows = 0
         gmin, gmax = float("inf"), float("-inf")
         freq_start_hz = 0.0
@@ -672,8 +687,8 @@ class SensorDatabase:
                     break
                 for r in rows:
                     t = datetime.fromisoformat(r[0]).timestamp()
-                    idx = int((t - since_epoch) / bucket_sec)
-                    idx = max(0, min(idx, max_rows - 1))
+                    idx = int((t - anchor) / bucket_sec)
+                    idx = max(0, min(idx, n_buckets - 1))
                     num_bins = int(r[1])
                     if first_axis:
                         first_axis = False
@@ -716,7 +731,7 @@ class SensorDatabase:
             freq_start_hz = freq_start_hz + (factor - 1) * freq_step_hz / 2.0
             freq_step_hz = factor * freq_step_hz
         psd_rows: list[list[float]] = []
-        for i in range(max_rows):
+        for i in range(n_buckets):
             if psd_cnt[i].any():
                 with np.errstate(invalid="ignore"):
                     mean_row = psd_sum[i] / psd_cnt[i]
@@ -725,7 +740,7 @@ class SensorDatabase:
                 psd_rows.append([float("nan")] * max_bins)
         buckets = [
             {
-                "start_epoch": since_epoch + i * bucket_sec,
+                "start_epoch": anchor + i * bucket_sec,
                 "duration_sec": bucket_sec,
                 "count": stat_n[i],
                 "pwr_avg": stat_avg[i] / stat_n[i] if stat_n[i] else 0.0,
@@ -734,7 +749,7 @@ class SensorDatabase:
                 "pwr_std": stat_std[i] / stat_n[i] if stat_n[i] else 0.0,
                 "kurtosis": stat_kurt[i] / stat_n[i] if stat_n[i] else 0.0,
             }
-            for i in range(max_rows)
+            for i in range(n_buckets)
         ]
         return {
             "bucket_sec": bucket_sec,
@@ -764,7 +779,9 @@ class SensorDatabase:
 
         Adaptive like the waterfall: with ``max_points`` or fewer windows each
         is returned as its own point (no averaging); with more, the windows are
-        folded into ``max_points`` buckets (mean-of-means, pwr_max max-of-maxes).
+        folded into time buckets (mean-of-means, pwr_max max-of-maxes) anchored
+        to absolute epoch multiples of ``bucket_sec`` so the timeline stays
+        stable while a live range slides.
         """
         assert self._db is not None
         span = (until - since).total_seconds()
@@ -784,7 +801,7 @@ class SensorDatabase:
             return {"bucket_sec": bucket_sec, "min_pwr": 0.0, "max_pwr": 0.0, "points": []}
         if window_count <= max_points:
             return await self._stats_raw(where, params, bucket_sec)
-        return await self._stats_aggregated(where, params, since, bucket_sec, max_points)
+        return await self._stats_aggregated(where, params, since, until, bucket_sec, max_points)
 
     async def _stats_raw(self, where: str, params: list[Any], bucket_sec: float) -> dict[str, Any]:
         """Raw stats: one point per window (no averaging)."""
@@ -823,21 +840,34 @@ class SensorDatabase:
         }
 
     async def _stats_aggregated(
-        self, where: str, params: list[Any], since: datetime, bucket_sec: float, max_points: int
+        self,
+        where: str,
+        params: list[Any],
+        since: datetime,
+        until: datetime,
+        bucket_sec: float,
+        max_points: int,
     ) -> dict[str, Any]:
-        """Aggregated stats: fold the range's windows into max_points buckets."""
+        """Aggregated stats: fold the range's windows into time buckets.
+
+        Buckets are anchored to absolute epoch multiples of ``bucket_sec``
+        (same grid as the waterfall), so the power/kurtosis timelines stay
+        stable while a live range slides. ``max_points`` or
+        ``max_points + 1`` points.
+        """
         assert self._db is not None
         query = (
             "SELECT start_time, pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis "
             f"FROM avg_windows {where} ORDER BY start_time"
         )
-        since_epoch = since.timestamp()
-        n = [0] * max_points
-        avg = [0.0] * max_points
-        mx = [-float("inf")] * max_points
-        med = [0.0] * max_points
-        std = [0.0] * max_points
-        kurt = [0.0] * max_points
+        anchor = math.floor(since.timestamp() / bucket_sec) * bucket_sec
+        n_points = max(1, math.ceil((until.timestamp() - anchor) / bucket_sec))
+        n = [0] * n_points
+        avg = [0.0] * n_points
+        mx = [-float("inf")] * n_points
+        med = [0.0] * n_points
+        std = [0.0] * n_points
+        kurt = [0.0] * n_points
         gmin, gmax = float("inf"), float("-inf")
         async with self._db.execute(query, params) as cursor:
             while True:
@@ -845,8 +875,8 @@ class SensorDatabase:
                 if not rows:
                     break
                 for r in rows:
-                    idx = int((datetime.fromisoformat(r[0]).timestamp() - since_epoch) / bucket_sec)
-                    idx = max(0, min(idx, max_points - 1))
+                    idx = int((datetime.fromisoformat(r[0]).timestamp() - anchor) / bucket_sec)
+                    idx = max(0, min(idx, n_points - 1))
                     n[idx] += 1
                     avg[idx] += float(r[1])
                     med[idx] += float(r[3])
@@ -858,7 +888,9 @@ class SensorDatabase:
                         gmax = max(gmax, float(r[2]))
         points = [
             {
-                "start_time": (since + timedelta(seconds=i * bucket_sec)).isoformat(),
+                "start_time": datetime.fromtimestamp(
+                    anchor + i * bucket_sec, tz=since.tzinfo
+                ).isoformat(),
                 "count": n[i],
                 "pwr_avg": avg[i] / n[i] if n[i] else None,
                 "pwr_max": mx[i] if n[i] and mx[i] != -float("inf") else None,
@@ -866,7 +898,7 @@ class SensorDatabase:
                 "pwr_std": std[i] / n[i] if n[i] else None,
                 "kurtosis": kurt[i] / n[i] if n[i] else None,
             }
-            for i in range(max_points)
+            for i in range(n_points)
         ]
         return {
             "bucket_sec": bucket_sec,

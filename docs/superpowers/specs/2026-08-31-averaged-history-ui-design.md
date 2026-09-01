@@ -385,3 +385,23 @@ re-scale (pixel-count drop with an out-of-data range), inverted-bounds
 rejection (panel stays open with an error), and reset to Auto. Python
 integration tests cover the endpoint roundtrip (including the config-table
 write and full-replace semantics) and the 400 validations.
+
+## Addendum 6 (2026-09-01, absolute-anchored bucket grid)
+
+Live "Now" ranges slide every poll, but aggregated buckets were anchored to
+the range's `since`: `bucket_sec = span / max_rows`, bucket *i* covering
+`[since + i*bucket_sec, ...)`. Each poll shifted the whole grid, so a narrow
+peak kept changing buckets — sharing its bucket with a varying set of noise
+windows, or straddling a boundary one poll and sitting centered the next —
+and visibly flickered in and out on the waterfall and power/kurtosis
+timelines (most noticeable on the 3 h+ presets where buckets are wide).
+
+Both aggregations (`_waterfall_aggregated`, `_stats_aggregated`) now anchor
+the grid to absolute epoch multiples of `bucket_sec` (grafana-style). A peak
+stays in the same absolute bucket until it ages out of the range; only the
+partial edge buckets change membership as the window slides. The grid is
+`max_rows` or `max_rows + 1` buckets (edge buckets partial); the client is
+unchanged because it already maps every bucket by its absolute
+`start_epoch`. Regression tests: the same sliding range queried at two poll
+times yields identical boundaries and an identical peak bucket (waterfall
+and stats).

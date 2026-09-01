@@ -799,6 +799,81 @@ async def test_query_avg_waterfall_buckets_by_time(db):
     assert result["total_windows"] == 8
 
 
+async def test_query_avg_waterfall_buckets_anchored_while_range_slides(db):
+    """Live "Now" ranges slide every poll; a since-anchored bucket grid shifts
+    with them, so a narrow peak keeps changing buckets and visibly flickers.
+    The grid must anchor to absolute epoch multiples of bucket_sec instead:
+    the same sliding window at two poll times yields identical boundaries and
+    an identical peak bucket."""
+    base = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    # 2 s buckets (8 s span, max_rows=4); noise windows at 1 s spacing...
+    for i in range(12):
+        await db.insert_avg_window(start_time=base + timedelta(seconds=i), **_avg_common())
+    # ...plus one narrow peak at t=4.5, 30 dB above the noise.
+    await db.insert_avg_window(
+        start_time=base + timedelta(seconds=4, milliseconds=500),
+        **_avg_common(pwr_avg=-40.0, pwr_max=-38.0, powers=[-40.0, -40.0, -40.0, -40.0]),
+    )
+
+    def peak_bucket(result):
+        starts = [b["start_epoch"] for b in result["buckets"]]
+        for i, b in enumerate(result["buckets"]):
+            if b["count"] > 0 and b["pwr_avg"] > -65.0:  # the peak's bucket stands out
+                return starts, i, result["psd_rows"][i]
+        raise AssertionError("peak bucket not found")
+
+    a = await db.query_avg_waterfall(
+        since=base + timedelta(milliseconds=250),
+        until=base + timedelta(seconds=8, milliseconds=250),
+        max_rows=4,
+        max_bins=4,
+    )
+    b = await db.query_avg_waterfall(
+        since=base + timedelta(seconds=1, milliseconds=250),
+        until=base + timedelta(seconds=9, milliseconds=250),
+        max_rows=4,
+        max_bins=4,
+    )
+    assert a["mode"] == 1 and b["mode"] == 1
+    starts_a, idx_a, row_a = peak_bucket(a)
+    starts_b, idx_b, row_b = peak_bucket(b)
+    # Both grids anchor to epoch multiples of 2 s: identical boundaries,
+    # identical peak bucket, identical averaged PSD — the peak cannot flicker.
+    assert starts_a == starts_b
+    assert starts_a[0] == pytest.approx(base.timestamp())  # anchored, not since
+    assert idx_a == idx_b
+    assert row_a == pytest.approx(row_b, abs=1e-3)
+
+
+async def test_query_avg_stats_anchored_while_range_slides(db):
+    """Same absolute anchoring for the stats timeline (power/kurtosis charts)."""
+    base = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    for i in range(12):
+        await db.insert_avg_window(start_time=base + timedelta(seconds=i), **_avg_common())
+    await db.insert_avg_window(
+        start_time=base + timedelta(seconds=4, milliseconds=500),
+        **_avg_common(pwr_avg=-40.0, pwr_max=-38.0),
+    )
+    a = await db.query_avg_stats(
+        since=base + timedelta(milliseconds=250),
+        until=base + timedelta(seconds=8, milliseconds=250),
+        max_points=4,
+    )
+    b = await db.query_avg_stats(
+        since=base + timedelta(seconds=1, milliseconds=250),
+        until=base + timedelta(seconds=9, milliseconds=250),
+        max_points=4,
+    )
+    starts_a = [p["start_time"] for p in a["points"]]
+    starts_b = [p["start_time"] for p in b["points"]]
+    assert starts_a == starts_b
+    peak_a = [p for p in a["points"] if p["pwr_avg"] is not None and p["pwr_avg"] > -65.0]
+    peak_b = [p for p in b["points"] if p["pwr_avg"] is not None and p["pwr_avg"] > -65.0]
+    assert len(peak_a) == 1 and len(peak_b) == 1
+    assert peak_a[0]["start_time"] == peak_b[0]["start_time"]
+    assert peak_a[0]["pwr_avg"] == pytest.approx(peak_b[0]["pwr_avg"])
+
+
 async def test_query_avg_waterfall_raw_mode_below_max_rows(db):
     base = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
     # 3 windows over a 60s span, max_rows=600 -> raw (each window is a row).

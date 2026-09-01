@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from fastapi.responses import HTMLResponse
 
 from rfobserver.storage import psd_grid
+from rfobserver.web.uiprefs import ui_theme
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,9 @@ def _validate_filename(filename: str, storage: Path) -> Path:
 @router.get("/", response_class=HTMLResponse)
 async def captures_page(request: Request) -> Any:
     templates = request.app.state.templates
-    return templates.TemplateResponse(request, "captures.html")
+    return templates.TemplateResponse(
+        request, "captures.html", {"ui_theme": await ui_theme(request)}
+    )
 
 
 @router.get("/list")

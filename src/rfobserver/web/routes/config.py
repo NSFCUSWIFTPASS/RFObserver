@@ -10,6 +10,8 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import SecretStr
 
+from rfobserver.web.uiprefs import ui_theme
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -40,6 +42,7 @@ async def config_page(request: Request) -> Any:
         request,
         "config.html",
         {
+            "ui_theme": await ui_theme(request),
             "settings": settings,
             "sensor_available": sensor_available,
             "sensor_active": sensor_active,

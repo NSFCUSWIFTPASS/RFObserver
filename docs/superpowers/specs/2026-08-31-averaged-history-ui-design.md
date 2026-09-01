@@ -443,3 +443,33 @@ Tuning-select changes and manual refreshes reload but do not push history.
 Puppeteer coverage: buttons start disabled, a zoom enables back, back
 restores the live "Last 15 minutes" window with Now on, forward redoes the
 exact zoomed absolute window with Now off.
+
+## Addendum 9 (2026-09-01, landing Dashboard rename + color themes)
+
+The averaged-history page is now the landing **Dashboard**: it is served at
+`/` (the legacy `/averaged/` URL keeps working, same handler) and leads the
+navbar. The former dashboard (live spectrogram) moved to `/live/` and is
+labeled **Live**, second in the navbar. File names were deliberately kept —
+`averaged.js`/`averaged.html`/`averaged.py` match the `/api/averaged/*`
+endpoints and `avg_windows` tables, and `dashboard.*` stays the live view's
+group; renaming files would diverge them from the API/DB naming for no
+clarity gain.
+
+**Color theme (Auto/Light/Dark, default Auto).** A picker at the right end
+of the navbar selects the theme. The choice lives in the same `ui_prefs`
+config document as the chart scales (`{"scale": {...}, "theme": "..."}`) —
+`PUT /api/ui-prefs` now *merges* the provided keys instead of replacing the
+document, so a theme change keeps the stored scale and vice versa (unknown
+theme values are rejected with 400). Page routes resolve the stored theme
+per render (`web/uiprefs.py::ui_theme`) and stamp it into
+`<html data-theme>` plus the picker's `selected` option, so the first paint
+is already correct with no client-side flash. `theme.js` applies a change
+instantly via the attribute and PUTs it for persistence. CSS keys off the
+attribute: `:root` holds the light variables, `:root[data-theme="dark"]`
+pins the dark set, and a `prefers-color-scheme: dark` media query applies
+the same set to `data-theme="auto"`; `color-scheme` is set per theme so
+native inputs/selects/scrollbars match. The chart canvases keep their dark
+panel look in both themes (Grafana-style), so no chart JS is theme-aware.
+Puppeteer coverage: navbar order/labels, `/` landing page, `/live/` title,
+picker default, immediate apply, persistence across reload, scale doc
+preserved, Auto resolving to the OS theme.

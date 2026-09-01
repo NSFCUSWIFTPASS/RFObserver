@@ -1,5 +1,5 @@
 /**
- * Averaged-history UI (page /averaged/).
+ * Averaged-history UI (the landing Dashboard, page /; also /averaged/).
  *
  * Fetches the aggregated waterfall (binary), the blob-independent stats
  * timeline, and the range's detections; renders the stats chart, a

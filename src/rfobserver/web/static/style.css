@@ -1,6 +1,14 @@
-/* RFObserver -- Apple-style minimal UI */
+/* RFObserver -- Apple-style minimal UI, light + dark themes.
+
+   Theme selection: <html data-theme="auto|light|dark">. "light"/"dark" pin the
+   theme; "auto" follows the OS via prefers-color-scheme. The attribute is
+   stamped server-side from the stored ui_prefs (see uiprefs.py), and color-
+   scheme is set per theme so native controls (inputs, selects, scrollbars)
+   match. The dark overrides are duplicated for the explicit and the media-
+   query cases -- no build step, so no shared mixin. */
 
 :root {
+    color-scheme: light;
     --bg: #f5f5f7;
     --card-bg: #ffffff;
     --text-primary: #1d1d1f;
@@ -10,6 +18,38 @@
     --nav-bg: rgba(255, 255, 255, 0.72);
     --radius: 12px;
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+    --divider: rgba(0, 0, 0, 0.04);
+    --dashed-border: rgba(0, 0, 0, 0.2);
+}
+
+:root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #000000;
+    --card-bg: #1c1c1e;
+    --text-primary: #f5f5f7;
+    --text-secondary: #98989d;
+    --border: #3a3a3c;
+    --accent: #0a84ff;
+    --nav-bg: rgba(28, 28, 30, 0.72);
+    --shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+    --divider: rgba(255, 255, 255, 0.06);
+    --dashed-border: rgba(255, 255, 255, 0.3);
+}
+
+@media (prefers-color-scheme: dark) {
+    :root[data-theme="auto"] {
+        color-scheme: dark;
+        --bg: #000000;
+        --card-bg: #1c1c1e;
+        --text-primary: #f5f5f7;
+        --text-secondary: #98989d;
+        --border: #3a3a3c;
+        --accent: #0a84ff;
+        --nav-bg: rgba(28, 28, 30, 0.72);
+        --shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+        --divider: rgba(255, 255, 255, 0.06);
+        --dashed-border: rgba(255, 255, 255, 0.3);
+    }
 }
 
 * {
@@ -63,6 +103,17 @@ body {
 
 .nav-link:hover {
     color: var(--accent);
+}
+
+/* Theme picker (Auto/Light/Dark) at the right end of the navbar */
+.theme-select {
+    padding: 3px 6px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 12px;
+    font-family: inherit;
+    background: var(--bg);
+    color: var(--text-secondary);
 }
 
 /* Content */
@@ -523,7 +574,7 @@ body {
 /* Inline editable values in status bar */
 .editable-val {
     cursor: pointer;
-    border-bottom: 1px dashed rgba(0, 0, 0, 0.2);
+    border-bottom: 1px dashed var(--dashed-border);
     transition: all 0.2s;
 }
 
@@ -741,7 +792,7 @@ body {
 }
 
 .detail-table tr {
-    border-bottom: 1px solid rgba(0, 0, 0, 0.04);
+    border-bottom: 1px solid var(--divider);
 }
 
 .detail-label {

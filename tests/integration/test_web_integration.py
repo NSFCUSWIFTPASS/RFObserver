@@ -31,9 +31,24 @@ async def test_dashboard_renders(app_with_db):
 
     app, db = app_with_db
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # The landing page / is the averaged-history Dashboard.
         r = await client.get("/")
         assert r.status_code == 200
         assert "RFObserver" in r.text
+        assert "Averaged PSD Waterfall" in r.text
+        # Navbar order: Dashboard first, Live second.
+        assert r.text.index('href="/"') < r.text.index('href="/live/"')
+
+
+@pytest.mark.asyncio
+async def test_live_page_renders(app_with_db):
+    from httpx import ASGITransport, AsyncClient
+
+    app, db = app_with_db
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.get("/live/")
+        assert r.status_code == 200
+        assert "Live - RFObserver" in r.text
 
 
 @pytest.mark.asyncio
@@ -67,6 +82,8 @@ async def test_averaged_page_renders(app_with_db):
         r = await client.get("/averaged/")
         assert r.status_code == 200
         assert "Averaged PSD Waterfall" in r.text
+        # The legacy URL serves the same page as the landing Dashboard.
+        assert r.text == (await client.get("/")).text
 
 
 @pytest.fixture
@@ -429,7 +446,7 @@ async def test_ui_prefs_roundtrip(app_with_db):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         r = await c.get("/api/ui-prefs")
         assert r.status_code == 200
-        assert r.json() == {"scale": {}}
+        assert r.json() == {"scale": {}, "theme": "auto"}
 
         doc = {
             "scale": {
@@ -445,19 +462,23 @@ async def test_ui_prefs_roundtrip(app_with_db):
         assert r.json()["scale"]["wf_lo"] == -110.5
         assert r.json()["scale"]["psd_lo"] == -100.0
         assert r.json()["scale"]["pwr_lo"] is None
+        assert r.json()["theme"] == "auto"  # untouched keys keep their default
 
         # persisted in the config key/value table
         stored = await db.get_config("ui_prefs")
         assert stored is not None and "-110.5" in stored
 
-        r = await c.get("/api/ui-prefs")
+        # a theme update merges: the stored scale is kept
+        r = await c.put("/api/ui-prefs", json={"theme": "dark"})
         assert r.status_code == 200
-        assert r.json()["scale"]["wf_hi"] == -60.0
+        r = await c.get("/api/ui-prefs")
+        assert r.json()["theme"] == "dark"
+        assert r.json()["scale"]["wf_lo"] == -110.5
 
-        # full replace: a new PUT drops previously stored keys
+        # and a scale update keeps the stored theme
         r = await c.put("/api/ui-prefs", json={"scale": {}})
         assert r.status_code == 200
-        assert (await c.get("/api/ui-prefs")).json() == {"scale": {}}
+        assert (await c.get("/api/ui-prefs")).json() == {"scale": {}, "theme": "dark"}
 
 
 @pytest.mark.asyncio
@@ -481,5 +502,31 @@ async def test_ui_prefs_rejects_bad_values(app_with_db):
         # inverted PSD range (its own pair, separate from the waterfall's)
         r = await c.put("/api/ui-prefs", json={"scale": {"psd_lo": 0, "psd_hi": -1}})
         assert r.status_code == 400
+        # unknown theme value
+        r = await c.put("/api/ui-prefs", json={"theme": "midnight"})
+        assert r.status_code == 400
+        # non-string theme
+        r = await c.put("/api/ui-prefs", json={"theme": 42})
+        assert r.status_code == 400
         # nothing was stored
-        assert (await c.get("/api/ui-prefs")).json() == {"scale": {}}
+        assert (await c.get("/api/ui-prefs")).json() == {"scale": {}, "theme": "auto"}
+
+
+@pytest.mark.asyncio
+async def test_pages_render_stored_theme(app_with_db):
+    from httpx import ASGITransport, AsyncClient
+
+    app, db = app_with_db
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        # default: auto, rendered into <html data-theme> and the picker
+        r = await c.get("/")
+        assert 'data-theme="auto"' in r.text
+        assert '<option value="auto" selected>' in r.text
+
+        await c.put("/api/ui-prefs", json={"theme": "dark"})
+        r = await c.get("/")
+        assert 'data-theme="dark"' in r.text
+        assert '<option value="dark" selected>' in r.text
+        # the picker carries the theme on every page, not just the Dashboard
+        r = await c.get("/live/")
+        assert 'data-theme="dark"' in r.text

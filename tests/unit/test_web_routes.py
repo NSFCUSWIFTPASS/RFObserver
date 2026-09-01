@@ -518,8 +518,8 @@ class TestRecordingAPI:
         assert resp.json()["state"] == "idle"
 
     def test_recording_dashboard_has_controls(self, client):
-        """Dashboard page should have record/arm/stop buttons."""
-        resp = client.get("/")
+        """Live page should have record/arm/stop buttons."""
+        resp = client.get("/live/")
         assert resp.status_code == 200
         assert "rec-btn" in resp.text
         assert "arm-btn" in resp.text

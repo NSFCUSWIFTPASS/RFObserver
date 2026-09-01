@@ -17,6 +17,7 @@ from fastapi.responses import HTMLResponse, Response
 
 from rfobserver.__about__ import __version__
 from rfobserver.web.routes.config import _persist_settings
+from rfobserver.web.uiprefs import THEME_VALUES, UI_PREFS_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -997,10 +998,9 @@ async def averaged_configs(request: Request) -> dict[str, Any]:
     return result
 
 
-# UI display preferences (manual chart scales), persisted as one JSON
-# document in the config key/value table so they survive restarts and are
+# UI display preferences (manual chart scales + color theme), persisted as one
+# JSON document in the config key/value table so they survive restarts and are
 # shared across browsers.
-_UI_PREFS_KEY = "ui_prefs"
 _SCALE_KEYS = (
     "wf_lo",
     "wf_hi",
@@ -1041,27 +1041,43 @@ def _validate_scale(raw: Any) -> dict[str, float | None]:
     return scale
 
 
+def _validate_theme(raw: Any) -> str:
+    if not isinstance(raw, str) or raw not in THEME_VALUES:
+        raise HTTPException(
+            status_code=400, detail="'theme' must be one of 'auto', 'light', 'dark'"
+        )
+    return raw
+
+
+def _normalize_prefs(doc: Any) -> dict[str, Any]:
+    """Shape a stored ui_prefs document into its full form with defaults."""
+    out: dict[str, Any] = doc if isinstance(doc, dict) else {}
+    out.setdefault("scale", {})
+    out.setdefault("theme", "auto")
+    return out
+
+
 @router.get("/ui-prefs")
 async def get_ui_prefs(request: Request) -> dict[str, Any]:
-    """Stored UI display preferences; {"scale": {}} when never set."""
+    """Stored UI display preferences; {"scale": {}, "theme": "auto"} when never set."""
     db = _get_db(request)
     if db is None:
         raise HTTPException(status_code=503, detail="Database not connected")
-    raw = await db.get_config(_UI_PREFS_KEY)
-    if raw is None:
-        return {"scale": {}}
+    raw = await db.get_config(UI_PREFS_KEY)
     try:
-        doc = json.loads(raw)
+        doc = json.loads(raw) if raw is not None else {}
     except ValueError:
-        return {"scale": {}}
-    return doc if isinstance(doc, dict) else {"scale": {}}
+        doc = {}
+    return _normalize_prefs(doc)
 
 
 @router.put("/ui-prefs")
 async def put_ui_prefs(request: Request) -> dict[str, Any]:
-    """Replace the UI display preferences. Scale values are per-chart low/high
+    """Update the UI display preferences. Only the provided keys are merged
+    into the stored document, so a scale change keeps the stored theme and a
+    theme change keeps the stored scale. Scale values are per-chart low/high
     bounds (dBFS for waterfall/PSD, dB for power, unitless for kurtosis); null
-    or omitted means auto-scale from the data."""
+    or omitted means auto-scale from the data. Theme is auto/light/dark."""
     db = _get_db(request)
     if db is None:
         raise HTTPException(status_code=503, detail="Database not connected")
@@ -1069,9 +1085,21 @@ async def put_ui_prefs(request: Request) -> dict[str, Any]:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="invalid JSON body") from None
-    scale = _validate_scale((body or {}).get("scale", {}))
-    doc: dict[str, Any] = {"scale": scale}
-    await db.set_config(_UI_PREFS_KEY, json.dumps(doc))
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="body must be an object")
+    raw = await db.get_config(UI_PREFS_KEY)
+    try:
+        doc: dict[str, Any] = json.loads(raw) if raw is not None else {}
+    except ValueError:
+        doc = {}
+    if not isinstance(doc, dict):
+        doc = {}
+    if "scale" in body:
+        doc["scale"] = _validate_scale(body["scale"])
+    if "theme" in body:
+        doc["theme"] = _validate_theme(body["theme"])
+    doc = _normalize_prefs(doc)
+    await db.set_config(UI_PREFS_KEY, json.dumps(doc))
     return doc
 
 

@@ -7,6 +7,8 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
+from rfobserver.web.uiprefs import ui_theme
+
 router = APIRouter()
 
 
@@ -32,6 +34,7 @@ async def history_page(request: Request) -> Any:
         request,
         "history.html",
         {
+            "ui_theme": await ui_theme(request),
             "centers": centers,
             "sample_rates": sample_rates,
             "gains": gains,

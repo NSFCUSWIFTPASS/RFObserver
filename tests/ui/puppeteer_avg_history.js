@@ -1,8 +1,15 @@
 /**
- * Puppeteer UI test for the averaged-history page (/averaged/).
+ * Puppeteer UI test for the averaged-history Dashboard (page /, legacy
+ * /averaged/).
  *
  * Drives a real headless Chrome against a running RFObserver instance and
  * asserts the interactive behaviors that unit/integration tests cannot:
+ *   - the navbar leads with Dashboard (href /) then Live (href /live/), and
+ *     the landing page / is the averaged Dashboard; the live spectrogram
+ *     page renders at /live/
+ *   - the navbar theme picker offers Auto/Light/Dark, defaults to Auto,
+ *     applies immediately (<html data-theme> + page colors), persists in the
+ *     DB across reloads, and leaves the stored scale untouched
  *   - the page boots into "Now" mode: the range button reads "Last 15
  *     minutes" and the "Updated" clock advances on its own (2 s polls)
  *   - the range button opens a Grafana-style picker: absolute From/To form
@@ -152,6 +159,40 @@ async function main() {
   await page.setViewport({ width: 1440, height: 1600 });
   page.on("pageerror", (e) => console.log("[pageerror]", e.message));
 
+  console.log("opening", BASE + "/");
+  await page.goto(BASE + "/", { waitUntil: "networkidle2", timeout: 30000 });
+  assert(await page.$("#avg-wf"), "landing page / is the averaged Dashboard");
+  assert((await page.title()) === "Dashboard - RFObserver", "Dashboard page title");
+
+  // Navbar: Dashboard first (href /), Live second (href /live/), then the
+  // rest; the theme picker sits at the right end, defaulting to Auto.
+  const nav = await page.$$eval(".nav-bar .nav-link", (els) =>
+    els.map((el) => ({ text: el.textContent.trim(), href: el.getAttribute("href") }))
+  );
+  console.log("navbar:", JSON.stringify(nav));
+  assert(nav.length === 5, "navbar has 5 links (got " + nav.length + ")");
+  assert(nav[0].text === "Dashboard" && nav[0].href === "/", "Dashboard first, href /");
+  assert(nav[1].text === "Live" && nav[1].href === "/live/", "Live second, href /live/");
+  assert(
+    nav[2].text === "Captures" && nav[3].text === "Config" && nav[4].text === "History",
+    "Captures/Config/History keep their order after Live"
+  );
+  assert(await page.$("#theme-select"), "theme picker present in the navbar");
+  assert(
+    (await page.$eval("#theme-select", (el) => el.value)) === "auto",
+    "theme picker defaults to Auto"
+  );
+  assert(
+    (await page.evaluate(() => document.documentElement.dataset.theme)) === "auto",
+    "<html data-theme> defaults to auto"
+  );
+
+  // The live spectrogram page moved to /live/.
+  await page.goto(BASE + "/live/", { waitUntil: "networkidle2", timeout: 30000 });
+  assert(await page.$("#timeseries-canvas"), "Live page renders at /live/");
+  assert((await page.title()) === "Live - RFObserver", "Live page title");
+
+  // The remaining checks run against the Dashboard via the legacy URL.
   console.log("opening", BASE + "/averaged/");
   await page.goto(BASE + "/averaged/", { waitUntil: "networkidle2", timeout: 30000 });
   assert(await page.$("#avg-wf"), "waterfall canvas present");
@@ -540,6 +581,73 @@ async function main() {
   await page.select("#avg-gain", "");
   await waitSpinnerCycle(page);
   console.log("tuning select change triggered a reload");
+
+  // --- Color theme (navbar picker, persisted in the DB ui_prefs doc) ---
+  // The stored scale must survive a theme change (both live in one doc).
+  const scaleBefore = await page.evaluate(async () => {
+    const r = await fetch("/api/ui-prefs");
+    return (await r.json()).scale;
+  });
+  const waitThemeStored = async (want) => {
+    await page.waitForFunction(
+      async (w) => {
+        const r = await fetch("/api/ui-prefs");
+        return (await r.json()).theme === w;
+      },
+      { timeout: 10000, polling: 150 },
+      want
+    );
+  };
+
+  await page.select("#theme-select", "dark");
+  await waitThemeStored("dark");
+  let th = await page.evaluate(() => ({
+    attr: document.documentElement.dataset.theme,
+    bg: getComputedStyle(document.body).backgroundColor,
+    scheme: getComputedStyle(document.documentElement).colorScheme,
+  }));
+  console.log("dark theme applied:", JSON.stringify(th));
+  assert(th.attr === "dark", "data-theme flips to dark immediately");
+  assert(th.bg === "rgb(0, 0, 0)", "dark page background (got " + th.bg + ")");
+  assert(th.scheme === "dark", "color-scheme dark");
+  const scaleAfterDark = await page.evaluate(async () => {
+    const r = await fetch("/api/ui-prefs");
+    return (await r.json()).scale;
+  });
+  assert(
+    JSON.stringify(scaleAfterDark) === JSON.stringify(scaleBefore),
+    "theme change keeps the stored scale"
+  );
+
+  // Persisted: a fresh page load is server-rendered in dark.
+  await page.reload({ waitUntil: "networkidle2" });
+  th = await page.evaluate(() => ({
+    attr: document.documentElement.dataset.theme,
+    sel: document.getElementById("theme-select").value,
+    bg: getComputedStyle(document.body).backgroundColor,
+  }));
+  assert(th.attr === "dark" && th.sel === "dark", "dark theme survives reload");
+  assert(th.bg === "rgb(0, 0, 0)", "dark background after reload");
+
+  await page.select("#theme-select", "light");
+  await waitThemeStored("light");
+  th = await page.evaluate(() => ({
+    attr: document.documentElement.dataset.theme,
+    bg: getComputedStyle(document.body).backgroundColor,
+  }));
+  assert(th.attr === "light" && th.bg === "rgb(245, 245, 247)", "light theme applies");
+
+  // Back to Auto (headless Chrome prefers light, so Auto resolves to light).
+  await page.select("#theme-select", "auto");
+  await waitThemeStored("auto");
+  await page.reload({ waitUntil: "networkidle2" });
+  th = await page.evaluate(() => ({
+    attr: document.documentElement.dataset.theme,
+    sel: document.getElementById("theme-select").value,
+    bg: getComputedStyle(document.body).backgroundColor,
+  }));
+  assert(th.attr === "auto" && th.sel === "auto", "theme back to Auto after reload");
+  assert(th.bg === "rgb(245, 245, 247)", "Auto resolves to the OS theme (light here)");
 
   await page.screenshot({ path: SHOT });
   console.log("screenshot saved to", SHOT);

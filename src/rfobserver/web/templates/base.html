@@ -1,22 +1,29 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="{{ ui_theme or 'auto' }}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}RFObserver{% endblock %}</title>
     <link rel="stylesheet" href="/static/style.css">
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <script src="/static/theme.js" defer></script>
 </head>
 <body>
     <nav class="nav-bar">
         <div class="nav-title">RFObserver</div>
         <div class="nav-links">
             <a href="/" class="nav-link">Dashboard</a>
+            <a href="/live/" class="nav-link">Live</a>
             <a href="/captures" class="nav-link">Captures</a>
             <a href="/config" class="nav-link">Config</a>
             <a href="/history" class="nav-link">History</a>
-            <a href="/averaged" class="nav-link">Averaged</a>
         </div>
+        {% set theme = ui_theme or 'auto' %}
+        <select id="theme-select" class="theme-select" title="Color theme" aria-label="Color theme">
+            <option value="auto"{% if theme == 'auto' %} selected{% endif %}>Auto</option>
+            <option value="light"{% if theme == 'light' %} selected{% endif %}>Light</option>
+            <option value="dark"{% if theme == 'dark' %} selected{% endif %}>Dark</option>
+        </select>
     </nav>
     <main class="content">
         {% block content %}{% endblock %}

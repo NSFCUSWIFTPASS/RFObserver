@@ -69,6 +69,81 @@ async def _record_briefly(settings: AppSettings, db: SensorDatabase) -> Path:
     return Path(settings.STORAGE_PATH) / "manual"
 
 
+async def _record_with_preroll(
+    settings: AppSettings, db: SensorDatabase, *, preroll_to: int, record_to: int
+) -> Path:
+    """Let ``preroll_to`` chunks accumulate (filling the pre-trigger buffers)
+    BEFORE starting the recording, then record only up to ``record_to`` — so the
+    pre-roll dominates and a missing pre-roll PSD is obvious."""
+    receiver = MockReceiver(
+        ReceiverConfig(
+            gain_db=settings.GAIN,
+            bandwidth_hz=settings.BANDWIDTH,
+            duration_sec=settings.DURATION_SEC,
+        )
+    )
+    receiver.initialize()
+    storage = LocalStorage(storage_path=settings.STORAGE_PATH, max_gb=settings.ARCHIVE_MAX_GB)
+    proc = StreamingProcessor(
+        receiver=receiver, database=db, local_storage=storage, settings=settings
+    )
+
+    async def driver() -> None:
+        for _ in range(2000):
+            if proc._capture_count >= preroll_to:
+                break
+            await asyncio.sleep(0.01)
+        proc.start_recording()
+        while proc._capture_count < record_to:
+            await asyncio.sleep(0.01)
+        proc.stop_recording()
+        await asyncio.sleep(0.1)
+        proc.stop()
+
+    await asyncio.wait_for(asyncio.gather(proc.run(), driver()), timeout=30.0)
+    return Path(settings.STORAGE_PATH) / "manual"
+
+
+def _assert_psd_covers_iq(storage_dir: Path, bandwidth_hz: int) -> None:
+    """The .psd grid time span should cover ~all of the recorded IQ, pre-roll
+    included. Without the pre-trigger PSD buffer the grid would start only at
+    the recording trigger and be far shorter than the (pre-roll + recorded) IQ."""
+    sc16 = next(storage_dir.glob("*.sc16"))
+    loaded = psd_grid.load_grid(sc16)
+    assert loaded is not None
+    mm, meta = loaded
+    grid_span = mm.shape[0] * float(meta["time_resolution_s"])
+    iq_span = (sc16.stat().st_size // 4) / bandwidth_hz
+    assert mm.shape[0] == meta["rows"] > 0
+    assert grid_span >= 0.85 * iq_span, f"grid {grid_span:.4f}s vs IQ {iq_span:.4f}s (pre-roll gap)"
+
+
+@pytest.mark.asyncio
+async def test_disk_mode_psd_covers_pretrigger(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, RECORDING_RAM_BUFFER=False, TRIGGER_PRE_SEC=1.0)
+    db = SensorDatabase(settings.DB_PATH)
+    await db.connect()
+    try:
+        storage_dir = await _record_with_preroll(settings, db, preroll_to=20, record_to=25)
+    finally:
+        await db.close()
+    _assert_psd_covers_iq(storage_dir, settings.BANDWIDTH)
+
+
+@pytest.mark.asyncio
+async def test_ram_mode_psd_covers_pretrigger(tmp_path: Path) -> None:
+    settings = _settings(
+        tmp_path, RECORDING_RAM_BUFFER=True, RECORDING_MAX_SEC=30.0, TRIGGER_PRE_SEC=1.0
+    )
+    db = SensorDatabase(settings.DB_PATH)
+    await db.connect()
+    try:
+        storage_dir = await _record_with_preroll(settings, db, preroll_to=20, record_to=25)
+    finally:
+        await db.close()
+    _assert_psd_covers_iq(storage_dir, settings.BANDWIDTH)
+
+
 @pytest.mark.asyncio
 async def test_disk_mode_writes_psd_not_npz(tmp_path: Path) -> None:
     settings = _settings(tmp_path, RECORDING_RAM_BUFFER=False)

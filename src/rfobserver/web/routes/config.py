@@ -161,6 +161,32 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "PSD_SCALE_MAX_DB",
     }
 
+    # Reject an inverted display scale (Min >= Max) up front, before any
+    # mutation. The dashboard silently drops such pins and auto-scales, so
+    # without this the change looks accepted but has no effect. Resolve each
+    # bound to what it would BECOME: the submitted value if present, else the
+    # bound already stored. A cleared/absent bound is None (auto) and can never
+    # be inverted.
+    def _prospective_scale(form_key: str, attr: str) -> float | None:
+        if form_key not in body:
+            cur = getattr(settings, attr)
+            return float(cur) if isinstance(cur, (int, float)) else None
+        raw = body[form_key]
+        if raw is None or raw == "":
+            return None
+        try:
+            return float(raw)
+        except (ValueError, TypeError):
+            return None  # main loop raises the per-field "invalid value" error
+
+    scale_min = _prospective_scale("psd_scale_min_db", "PSD_SCALE_MIN_DB")
+    scale_max = _prospective_scale("psd_scale_max_db", "PSD_SCALE_MAX_DB")
+    if scale_min is not None and scale_max is not None and scale_min >= scale_max:
+        raise HTTPException(
+            status_code=400,
+            detail="Scale Min must be less than Scale Max",
+        )
+
     changed = []
     for form_key, (attr, cast) in field_map.items():
         if form_key not in body:

@@ -2,10 +2,22 @@
 
 Uses aiosqlite for async access. Stores recent detections, burst fingerprints,
 and sensor configuration. Rolling window cleanup removes old data.
+
+Write resilience: NVMe/SD capture disks occasionally stall an I/O completion
+for tens of seconds (dmesg: "I/O timeout, completion polled"). A single
+SQLite write caught in such a hiccup used to wedge the writer forever — the
+aiosqlite worker never returned, its WAL write lock blocked every other
+writer, and avg_windows history silently stopped until the process was
+restarted. Every write method here is therefore wrapped in a timeout:
+on a stuck write the connection is abandoned (a fresh one reconnects behind
+it) and the write retried once. A hiccup now costs at most a few dropped
+rows instead of the whole history.
 """
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import logging
 import math
@@ -17,6 +29,9 @@ import aiosqlite
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# A healthy write is single-digit ms; 30 s means the storage device wedged.
+_DB_WRITE_TIMEOUT_SEC = 30.0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS detections (
@@ -145,12 +160,66 @@ class SensorDatabase:
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
         self._db: aiosqlite.Connection | None = None
+        self._write_timeout = _DB_WRITE_TIMEOUT_SEC
+        self._reconnect_lock = asyncio.Lock()
+
+    async def _reconnect(self, expect: aiosqlite.Connection | None) -> None:
+        """Abandon a connection whose write stuck, and open a fresh one.
+
+        The corpse is leaked deliberately: closing it awaits its worker
+        thread, which is the thing that is stuck. WAL locks are tracked
+        per-process via the shared wal-index, so the corpse cannot corrupt
+        the fresh connection — a write attempted while the corpse still
+        holds the WAL write lock fails fast (busy_timeout) instead of
+        hanging. Serialized so concurrent stuck writers reconnect once.
+        """
+        async with self._reconnect_lock:
+            if self._db is not expect:
+                return  # another coroutine already reconnected
+            self._db = None
+            conn = await aiosqlite.connect(self._db_path)
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA synchronous=NORMAL")
+            await conn.execute("PRAGMA busy_timeout=2000")
+            self._db = conn
+            logger.error("Database reconnected after stuck write")
+
+    @staticmethod
+    def _guarded_write(fn: Any) -> Any:
+        """Wrap a write method: time out a stuck write, reconnect, retry once.
+
+        Without the timeout a device hiccup wedges the writer permanently
+        (see module docstring). The retry runs unguarded on the fresh
+        connection: while the hiccup persists it fails fast via busy_timeout
+        and the exception propagates to the caller (which logs and continues),
+        so the pipeline keeps running and recovers on its own.
+        """
+
+        @functools.wraps(fn)
+        async def wrapper(self: SensorDatabase, *args: Any, **kwargs: Any) -> Any:
+            conn = self._db
+            try:
+                # wait_for (not asyncio.timeout): the Jetson runs Python 3.10.
+                return await asyncio.wait_for(
+                    fn(self, *args, **kwargs), timeout=self._write_timeout
+                )
+            except asyncio.TimeoutError:  # noqa: UP041 — NOT the builtin on 3.10
+                logger.error(
+                    "DB write %s stuck >%.0fs — abandoning connection",
+                    fn.__name__,
+                    self._write_timeout,
+                )
+            await asyncio.wait_for(self._reconnect(expect=conn), timeout=self._write_timeout)
+            return await fn(self, *args, **kwargs)
+
+        return wrapper
 
     async def connect(self) -> None:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self._db_path)
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")
+        await self._db.execute("PRAGMA busy_timeout=2000")
         await self._db.executescript(SCHEMA)
         await self._migrate_detection_columns()
         await self._migrate_avg_windows_psd_nullable()
@@ -246,6 +315,7 @@ class SensorDatabase:
         if self._db:
             await self._db.close()
 
+    @_guarded_write
     async def insert_detection(
         self,
         burst_id: str,
@@ -294,6 +364,7 @@ class SensorDatabase:
         )
         await self._db.commit()
 
+    @_guarded_write
     async def insert_tone_check(
         self,
         *,
@@ -339,6 +410,7 @@ class SensorDatabase:
             rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    @_guarded_write
     async def insert_avg_window(
         self,
         *,
@@ -1089,6 +1161,7 @@ class SensorDatabase:
             row = await cursor.fetchone()
             return int(row[0]) if row and row[0] is not None else 0
 
+    @_guarded_write
     async def set_config(self, key: str, value: str) -> None:
         assert self._db is not None
         await self._db.execute(
@@ -1103,6 +1176,7 @@ class SensorDatabase:
             row = await cursor.fetchone()
             return row[0] if row else None
 
+    @_guarded_write
     async def insert_stats(self, timestamp: datetime, data: dict[str, Any]) -> None:
         assert self._db is not None
         await self._db.execute(
@@ -1111,6 +1185,7 @@ class SensorDatabase:
         )
         await self._db.commit()
 
+    @_guarded_write
     async def prune_avg_psd_blobs(self, days: int = 7) -> int:
         """Evict the PSD blobs of averaged windows older than ``days`` days.
 

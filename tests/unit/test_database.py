@@ -1,5 +1,6 @@
 """Tests for rfobserver.storage.database."""
 
+import asyncio
 import math
 from datetime import datetime, timedelta, timezone
 
@@ -971,3 +972,66 @@ async def test_avg_window_configs_distinct_and_latest(db):
     result = await db.avg_window_configs()
     assert {c["sdr_center_freq_hz"] for c in result["configs"]} == {100e6, 200e6}
     assert result["latest"]["sdr_center_freq_hz"] == 200e6
+
+
+# -- Stuck-write resilience (device hiccup wedge) --
+
+
+def _sabotage_execute_hang(conn, hang: asyncio.Event) -> None:
+    """Replace a connection's execute with one that never returns — simulates
+    a storage-device hiccup wedging the aiosqlite worker thread mid-write."""
+
+    def fake_execute(*args, **kwargs):
+        async def _coro():
+            await hang.wait()
+            raise AssertionError("should never complete")
+
+        return _coro()
+
+    conn.execute = fake_execute
+
+
+async def test_stuck_write_abandons_connection_and_retries(db):
+    """A write that never returns must time out, abandon the connection, and
+    complete on a fresh one — the device hiccup then costs one timeout
+    instead of the whole avg_windows history."""
+    corpse = db._db
+    db._write_timeout = 0.05
+    _sabotage_execute_hang(corpse, asyncio.Event())
+
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    await db.insert_avg_window(start_time=base, **_avg_common())
+
+    assert db._db is not corpse, "stuck connection must be abandoned"
+    rows = await db.query_avg_windows(since=base - timedelta(seconds=1), limit=10)
+    assert len(rows) == 1, "retried insert lands on the fresh connection"
+    await corpse.close()  # sabotage bypassed aiosqlite internals; close is clean
+
+
+async def test_concurrent_stuck_writes_reconnect_once(db):
+    """Two writers timing out on the same corpse must share one reconnect —
+    the second sees the fresh connection and retries on it directly."""
+    corpse = db._db
+    db._write_timeout = 0.05
+    _sabotage_execute_hang(corpse, asyncio.Event())
+
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    await asyncio.gather(
+        db.insert_avg_window(start_time=base, **_avg_common()),
+        db.insert_stats(timestamp=base, data={"k": 1}),
+    )
+    fresh = db._db
+    assert fresh is not corpse
+    # Both retries landed on the same fresh connection.
+    rows = await db.query_avg_windows(since=base - timedelta(seconds=1), limit=10)
+    assert len(rows) == 1
+    await corpse.close()
+
+
+async def test_reconnect_is_noop_when_already_replaced(db):
+    """_reconnect(expect=stale) must not clobber a connection that another
+    coroutine already refreshed."""
+    fresh = db._db
+    other = object()
+    await db._reconnect(expect=other)
+    assert db._db is fresh

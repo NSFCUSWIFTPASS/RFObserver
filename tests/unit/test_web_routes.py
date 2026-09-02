@@ -1073,3 +1073,54 @@ def test_tone_check_post_updates_and_get_echoes(client, monkeypatch):
     assert g["enabled"] is True
     assert g["freq_hz"] == 915_500_000
     assert isinstance(g["results"], list)
+
+
+async def test_iq_captures_endpoint(settings, tmp_path):
+    """GET /api/iq-captures returns overlapping captures, filtered by tuning."""
+    from datetime import datetime, timedelta, timezone
+
+    import httpx
+
+    from rfobserver.storage.database import SensorDatabase
+
+    app = create_app(settings)
+    database = SensorDatabase(str(tmp_path / "iq.db"))
+    await database.connect()
+    app.state.database = database
+    try:
+        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        common = dict(
+            duration_sec=0.5,
+            sample_rate_hz=2e6,
+            gain_db=30.0,
+            total_samples=1_000_000,
+            start_time=base,
+            stop_time=base + timedelta(seconds=0.5),
+        )
+        await database.insert_iq_capture(
+            filename="a.sc16",
+            origin="manual",
+            sdr_center_freq_hz=915e6,
+            trigger_initiated=False,
+            **common,
+        )
+        await database.insert_iq_capture(
+            filename="b.sc16",
+            origin="auto",
+            sdr_center_freq_hz=433e6,
+            trigger_initiated=True,
+            **common,
+        )
+        rng = {
+            "since": (base - timedelta(seconds=1)).isoformat(),
+            "until": (base + timedelta(seconds=5)).isoformat(),
+        }
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.get("/api/iq-captures", params=rng)
+            assert r.status_code == 200
+            assert {c["filename"] for c in r.json()["captures"]} == {"a.sc16", "b.sc16"}
+            r2 = await ac.get("/api/iq-captures", params={**rng, "sdr_center": "915000000"})
+            assert {c["filename"] for c in r2.json()["captures"]} == {"a.sc16"}
+    finally:
+        await database.close()

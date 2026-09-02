@@ -1069,6 +1069,7 @@ class StreamingProcessor:
         # unknown.
         total_samples = self._recording_bytes // 4
         signal_duration = (total_samples / sample_rate_hz) if sample_rate_hz > 0 else duration
+        start_dt = datetime.fromtimestamp(time.time() - signal_duration, tz=timezone.utc)
         meta = {
             "file": filename,
             "format": "sc16",
@@ -1076,9 +1077,7 @@ class StreamingProcessor:
             "center_freq_hz": s.FREQUENCY_START,
             "bandwidth_hz": sample_rate_hz,
             "gain_db": gain_db,
-            "start_time": datetime.fromtimestamp(
-                time.time() - signal_duration, tz=timezone.utc
-            ).isoformat(),
+            "start_time": start_dt.isoformat(),
             "duration_sec": round(signal_duration, 3),
             "total_bytes": self._recording_bytes,
             "total_samples": total_samples,
@@ -1091,6 +1090,32 @@ class StreamingProcessor:
         }
         json_path = self._recording_dir / filename.replace(".sc16", ".json")
         json_path.write_text(_json.dumps(meta, indent=2))
+
+        # Record the capture's span in the DB so the Dashboard can highlight
+        # where IQ is available and link straight to it. Uses the settings-
+        # derived tuning (the same values avg_windows carry, which populate the
+        # Dashboard's tuning selectors) so the highlight matches the tuning
+        # filter. Scheduled on the loop because this runs on the recording-
+        # control thread; skipped in replay mode like the rest of persistence.
+        if not self._replay_mode and self._loop is not None and self._db is not None:
+            origin = "auto" if self._trigger_initiated else "manual"
+            stop_dt = start_dt + timedelta(seconds=signal_duration)
+            self._loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(
+                    self._db.insert_iq_capture(
+                        filename=filename,
+                        origin=origin,
+                        start_time=start_dt,
+                        stop_time=stop_dt,
+                        duration_sec=round(signal_duration, 3),
+                        sdr_center_freq_hz=float(s.FREQUENCY_START),
+                        sample_rate_hz=float(s.BANDWIDTH),
+                        gain_db=float(s.GAIN),
+                        total_samples=total_samples,
+                        trigger_initiated=self._trigger_initiated,
+                    )
+                )
+            )
 
     def _file_writer_loop(self) -> None:
         """Dedicated thread: drains recording queue and writes to disk.

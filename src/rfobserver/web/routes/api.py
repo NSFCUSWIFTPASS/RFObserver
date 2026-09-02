@@ -992,6 +992,31 @@ async def averaged_stats(
     return result
 
 
+@router.get("/iq-captures")
+async def iq_captures(
+    request: Request,
+    since: str,
+    until: str,
+    sdr_center: str | None = None,
+    sample_rate: str | None = None,
+    gain: str | None = None,
+) -> dict[str, Any]:
+    """IQ capture spans overlapping a range, for the Dashboard's availability
+    highlights. Filtered by tuning to match the stats/detections on the plot."""
+    db = _get_db(request)
+    if db is None:
+        return {"captures": []}
+    since_dt, until_dt = _parse_range(since, until)
+    captures = await db.query_iq_captures(
+        since=since_dt,
+        until=until_dt,
+        sdr_center_freq=_opt_float(sdr_center),
+        sample_rate=_opt_float(sample_rate),
+        gain=_opt_float(gain),
+    )
+    return {"captures": captures}
+
+
 @router.get("/averaged/configs")
 async def averaged_configs(request: Request) -> dict[str, Any]:
     """Distinct SDR tuning configs in avg_windows + the most recent one."""

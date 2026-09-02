@@ -100,6 +100,8 @@
         wf: null,        // parseWaterfall result: {bucketCount, numBins, meta, rows, stats, freqs}
         stats: null,     // /api/averaged/stats JSON
         detections: [],
+        iqCaptures: [],  // IQ capture spans overlapping the range (availability highlights)
+        iqBands: [],     // pixel rects of the drawn highlights, for click/hover hit-testing
         selRow: 0,
         crosshairBin: -1,
         scale: {
@@ -504,12 +506,13 @@
                 ? state.wf.stats[state.selRow].start_epoch : null;
 
             const params = tuningParams();
-            let wfResp, statsResp, detResp;
+            let wfResp, statsResp, detResp, iqResp;
             try {
-                [wfResp, statsResp, detResp] = await Promise.all([
+                [wfResp, statsResp, detResp, iqResp] = await Promise.all([
                     fetch("/api/averaged/waterfall?" + params.toString(), { signal: abort.signal }),
                     fetch("/api/averaged/stats?" + params.toString(), { signal: abort.signal }),
                     fetch("/api/detections.json?" + params.toString(), { signal: abort.signal }),
+                    fetch("/api/iq-captures?" + params.toString(), { signal: abort.signal }),
                 ]);
             } catch (_) {
                 // Superseded (our own abort) or a genuine network error: only the
@@ -533,9 +536,12 @@
             if (seq !== state.loadSeq) return;
             const detList = detResp.ok ? (await detResp.json()).detections : [];
             if (seq !== state.loadSeq) return;
+            const iqList = iqResp && iqResp.ok ? (await iqResp.json()).captures : [];
+            if (seq !== state.loadSeq) return;
             state.wf = wf;
             state.stats = statsJson;
             state.detections = detList;
+            state.iqCaptures = iqList || [];
             const slider = $("avg-slider");
             slider.min = "0";
             slider.max = String(Math.max(0, state.wf.bucketCount - 1));
@@ -813,6 +819,50 @@
         ctx.stroke();
     }
 
+    // Shaded bands on the power chart marking where raw IQ was recorded. Each
+    // spans the capture's [start, stop]; captures shorter than MIN_IQ_PX are
+    // widened (kept centered) so a sub-300 ms file is still visible and
+    // clickable. Records pixel rects in state.iqBands for click/hover hit-tests.
+    const MIN_IQ_PX = 4;
+
+    function drawIqBands(ctx, W, H) {
+        state.iqBands = [];
+        const spanMs = state.untilMs - state.sinceMs;
+        if (spanMs <= 0 || !state.iqCaptures || !state.iqCaptures.length) return;
+        for (const cap of state.iqCaptures) {
+            const s = new Date(cap.start_time).getTime();
+            const e = new Date(cap.stop_time).getTime();
+            if (!isFinite(s) || !isFinite(e)) continue;
+            let x0 = ((s - state.sinceMs) / spanMs) * W;
+            let x1 = ((e - state.sinceMs) / spanMs) * W;
+            if (x1 < 0 || x0 > W) continue; // fully outside the visible range
+            x0 = Math.max(0, x0);
+            x1 = Math.min(W, x1);
+            if (x1 - x0 < MIN_IQ_PX) {
+                const mid = (x0 + x1) / 2;
+                x0 = Math.max(0, Math.min(W - MIN_IQ_PX, mid - MIN_IQ_PX / 2));
+                x1 = x0 + MIN_IQ_PX;
+            }
+            ctx.fillStyle = "rgba(48,209,88,0.14)"; // system green: "IQ available"
+            ctx.fillRect(x0, 0, x1 - x0, H);
+            ctx.fillStyle = "rgba(48,209,88,0.75)"; // stronger bottom marker bar
+            ctx.fillRect(x0, H - 3, x1 - x0, 3);
+            state.iqBands.push({ x0: x0, x1: x1, cap: cap });
+        }
+    }
+
+    // The IQ band under a canvas x (with a small tolerance), or null. Narrowest
+    // match wins so overlapping/adjacent captures stay individually selectable.
+    function iqBandAt(x) {
+        let best = null;
+        for (const b of state.iqBands) {
+            if (x >= b.x0 - 2 && x <= b.x1 + 2) {
+                if (!best || (b.x1 - b.x0) < (best.x1 - best.x0)) best = b;
+            }
+        }
+        return best;
+    }
+
     function renderStatsChart() {
         const canvas = $("avg-stats-canvas");
         const W = canvas.width;
@@ -821,6 +871,9 @@
         ctx.clearRect(0, 0, W, H);
         ctx.fillStyle = "#1a1a2e";
         ctx.fillRect(0, 0, W, H);
+        // IQ-availability highlights, drawn behind the grid/line so they read as
+        // a background band. Recomputes the clickable pixel rects each render.
+        drawIqBands(ctx, W, H);
         const points = state.stats && state.stats.points ? state.stats.points : [];
         const spanMs = state.untilMs - state.sinceMs;
         if (!points.length || spanMs <= 0) {
@@ -1098,7 +1151,37 @@
         slider.addEventListener("input", function () { selectRow(parseInt(slider.value, 10)); });
         // Drag-to-zoom on the time-domain charts; a plain (sub-threshold)
         // click on the waterfall keeps its select-a-time-column behavior.
-        attachDragZoom($("avg-stats-canvas"), $("avg-stats-canvas"), renderStatsChart, null);
+        // On the power chart a plain click over an IQ-availability band opens
+        // that capture in the Captures page.
+        const statsCanvas = $("avg-stats-canvas");
+        attachDragZoom(statsCanvas, statsCanvas, renderStatsChart, function (x) {
+            const b = iqBandAt(x);
+            if (b) window.location.href = "/captures/?file=" + encodeURIComponent(b.cap.filename);
+        });
+        statsCanvas.addEventListener("mousemove", function (e) {
+            const tip = $("avg-iq-tooltip");
+            if (!tip) return;
+            const rect = statsCanvas.getBoundingClientRect();
+            const x = (e.clientX - rect.left) * (statsCanvas.width / rect.width);
+            const b = iqBandAt(x);
+            if (b) {
+                statsCanvas.style.cursor = "pointer";
+                const d = b.cap.duration_sec;
+                const dur = d == null ? "" : (d >= 1 ? d.toFixed(1) + " s" : Math.round(d * 1000) + " ms");
+                tip.style.display = "block";
+                tip.textContent = "IQ " + b.cap.filename + (dur ? " (" + dur + ")" : "") + " - click to open";
+                tip.style.left = Math.min(x + 10, rect.width - 260) + "px";
+                tip.style.top = "4px";
+            } else {
+                statsCanvas.style.cursor = "crosshair";
+                tip.style.display = "none";
+            }
+        });
+        statsCanvas.addEventListener("mouseleave", function () {
+            const tip = $("avg-iq-tooltip");
+            if (tip) tip.style.display = "none";
+            statsCanvas.style.cursor = "crosshair";
+        });
         attachDragZoom($("avg-kurt"), $("avg-kurt"), renderKurtosisChart, null);
         attachDragZoom($("avg-wf"), $("avg-wf-overlay"), renderWfOverlay, function (x) {
             const idx = rowForPixelX(x);

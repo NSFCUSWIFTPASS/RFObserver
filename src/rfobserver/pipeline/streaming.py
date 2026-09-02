@@ -1060,6 +1060,15 @@ class StreamingProcessor:
         rx_config = getattr(self._receiver, "config", None)
         sample_rate_hz = float(getattr(rx_config, "bandwidth_hz", None) or s.BANDWIDTH)
         gain_db = float(getattr(rx_config, "gain_db", None) or s.GAIN)
+        # Report the duration of the actual recorded signal, derived from the
+        # sample count so it matches the .sc16/.psd length. The wall-clock
+        # `duration` argument covers only the post-trigger span; the pre-trigger
+        # pre-roll prepended at _begin_recording is real recorded signal and
+        # belongs in the reported duration (and pushes start_time back to the
+        # first pre-roll sample). Falls back to the wall clock if the rate is
+        # unknown.
+        total_samples = self._recording_bytes // 4
+        signal_duration = (total_samples / sample_rate_hz) if sample_rate_hz > 0 else duration
         meta = {
             "file": filename,
             "format": "sc16",
@@ -1068,11 +1077,11 @@ class StreamingProcessor:
             "bandwidth_hz": sample_rate_hz,
             "gain_db": gain_db,
             "start_time": datetime.fromtimestamp(
-                time.time() - duration, tz=timezone.utc
+                time.time() - signal_duration, tz=timezone.utc
             ).isoformat(),
-            "duration_sec": round(duration, 3),
+            "duration_sec": round(signal_duration, 3),
             "total_bytes": self._recording_bytes,
-            "total_samples": self._recording_bytes // 4,
+            "total_samples": total_samples,
             "dropped_chunks": self._recording_dropped,
             "pre_trigger_sec": s.TRIGGER_PRE_SEC,
             "trigger_initiated": self._trigger_initiated,

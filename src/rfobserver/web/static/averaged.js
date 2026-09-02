@@ -88,6 +88,8 @@
         spanMs: PRESET_MS[DEFAULT_PRESET],
         live: false,
         loading: false,
+        loadSeq: 0,      // monotonic token: only the latest load may commit/render
+        loadAbort: null, // AbortController for the in-flight load's fetches
         stale: true, // displayed data lags the selected range (spinner on)
         pollTimer: null,
         pickerOpen: false,
@@ -477,6 +479,18 @@
     }
 
     async function loadAll(background) {
+        // Request-sequencing guard: a range change (drag-zoom, preset, Apply) can
+        // fire a new load while a previous one — most often a "Now" poll for the
+        // wider range — is still in flight. That older request often resolves
+        // LAST (its wider aggregate is a larger, slower response), so without a
+        // guard it overwrites state.wf and re-renders the coarse pre-zoom data
+        // under the newly zoomed axis (looks like "zoom didn't recompute"). Each
+        // load takes a token; a response may only commit while it is still the
+        // latest. We also abort the previous load's fetches so they don't linger.
+        const seq = ++state.loadSeq;
+        if (state.loadAbort) state.loadAbort.abort();
+        const abort = new AbortController();
+        state.loadAbort = abort;
         state.loading = true;
         let ok = false;
         try {
@@ -493,23 +507,35 @@
             let wfResp, statsResp, detResp;
             try {
                 [wfResp, statsResp, detResp] = await Promise.all([
-                    fetch("/api/averaged/waterfall?" + params.toString()),
-                    fetch("/api/averaged/stats?" + params.toString()),
-                    fetch("/api/detections.json?" + params.toString()),
+                    fetch("/api/averaged/waterfall?" + params.toString(), { signal: abort.signal }),
+                    fetch("/api/averaged/stats?" + params.toString(), { signal: abort.signal }),
+                    fetch("/api/detections.json?" + params.toString(), { signal: abort.signal }),
                 ]);
             } catch (_) {
+                // Superseded (our own abort) or a genuine network error: only the
+                // current load may report; a stale one stays silent.
+                if (seq !== state.loadSeq) return;
                 $("avg-status").textContent = state.live ? "Update failed - retrying" : "Load failed";
                 return;
             }
+            if (seq !== state.loadSeq) return; // a newer load started: discard this response
             if (!wfResp.ok) {
                 $("avg-status").textContent = "Waterfall load failed (" + wfResp.status + ")"
                     + (state.live ? " - retrying" : "");
                 return;
             }
+            // Read every body before committing anything, re-checking the token
+            // after each await so a stale response can never render or mutate state.
             const buf = await wfResp.arrayBuffer();
-            state.wf = parseWaterfall(buf);
-            state.stats = statsResp.ok ? await statsResp.json() : null;
-            state.detections = detResp.ok ? (await detResp.json()).detections : [];
+            if (seq !== state.loadSeq) return;
+            const wf = parseWaterfall(buf);
+            const statsJson = statsResp.ok ? await statsResp.json() : null;
+            if (seq !== state.loadSeq) return;
+            const detList = detResp.ok ? (await detResp.json()).detections : [];
+            if (seq !== state.loadSeq) return;
+            state.wf = wf;
+            state.stats = statsJson;
+            state.detections = detList;
             const slider = $("avg-slider");
             slider.min = "0";
             slider.max = String(Math.max(0, state.wf.bucketCount - 1));
@@ -558,11 +584,15 @@
             renderAll();
             ok = true;
         } finally {
-            state.loading = false;
-            // Successful loads always clear the stale flag. Failed loads clear
-            // it too when Now is off (the error is in the status line); in Now
-            // mode the flag stays on while the poll loop retries.
-            if (ok || !state.live) setStale(false);
+            // Only the latest load owns the shared flags; a superseded load must
+            // not clear loading/stale out from under the newer one still running.
+            if (seq === state.loadSeq) {
+                state.loading = false;
+                // Successful loads always clear the stale flag. Failed loads clear
+                // it too when Now is off (the error is in the status line); in Now
+                // mode the flag stays on while the poll loop retries.
+                if (ok || !state.live) setStale(false);
+            }
         }
     }
 

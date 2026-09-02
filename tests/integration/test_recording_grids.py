@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -116,6 +117,14 @@ def _assert_psd_covers_iq(storage_dir: Path, bandwidth_hz: int) -> None:
     iq_span = (sc16.stat().st_size // 4) / bandwidth_hz
     assert mm.shape[0] == meta["rows"] > 0
     assert grid_span >= 0.85 * iq_span, f"grid {grid_span:.4f}s vs IQ {iq_span:.4f}s (pre-roll gap)"
+
+    # The reported capture duration spans the full recorded signal (pre-trigger
+    # pre-roll + post-trigger), so it matches the .sc16 length rather than only
+    # the post-trigger wall-clock.
+    cap_meta = json.loads(sc16.with_suffix(".json").read_text())
+    reported = float(cap_meta["duration_sec"])
+    file_span = float(cap_meta["total_samples"]) / float(cap_meta["sample_rate_hz"])
+    assert abs(reported - file_span) < 0.02, f"duration {reported:.4f}s vs file {file_span:.4f}s"
 
 
 @pytest.mark.asyncio

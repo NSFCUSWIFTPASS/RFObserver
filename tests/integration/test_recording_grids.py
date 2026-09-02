@@ -154,6 +154,34 @@ async def test_ram_mode_psd_covers_pretrigger(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_recording_inserts_iq_capture_row(tmp_path: Path) -> None:
+    from datetime import datetime, timedelta
+
+    settings = _settings(tmp_path, RECORDING_RAM_BUFFER=False, TRIGGER_PRE_SEC=0.5)
+    db = SensorDatabase(settings.DB_PATH)
+    await db.connect()
+    try:
+        storage_dir = await _record_with_preroll(settings, db, preroll_to=15, record_to=25)
+        await asyncio.sleep(0.3)  # let the loop-scheduled insert run
+        sc16 = next(storage_dir.glob("*.sc16"))
+        cap_meta = json.loads(sc16.with_suffix(".json").read_text())
+        start = datetime.fromisoformat(cap_meta["start_time"])
+        rows = await db.query_iq_captures(
+            since=start - timedelta(seconds=5), until=start + timedelta(seconds=10)
+        )
+        assert len(rows) == 1, "recording must insert exactly one iq_captures row"
+        r = rows[0]
+        assert r["filename"] == sc16.name
+        assert r["origin"] == "manual"  # start_recording() is a manual capture
+        assert abs(r["duration_sec"] - float(cap_meta["duration_sec"])) < 0.01
+        # Tuning matches the settings-derived values avg_windows carry.
+        assert r["sample_rate_hz"] == float(settings.BANDWIDTH)
+        assert r["gain_db"] == float(settings.GAIN)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_disk_mode_writes_psd_not_npz(tmp_path: Path) -> None:
     settings = _settings(tmp_path, RECORDING_RAM_BUFFER=False)
     db = SensorDatabase(settings.DB_PATH)

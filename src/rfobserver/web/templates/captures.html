@@ -870,6 +870,28 @@
         if (item) showDetail(item.dataset.file, item.dataset.hasPsd === "1");
     });
 
+    // Deep link: /captures/?file=<name> (e.g. from a Dashboard IQ highlight)
+    // auto-opens that capture once the list has loaded. If it is not in the
+    // list (deleted by the archive cap), show a brief "no longer available".
+    function openFromQuery() {
+        const file = new URLSearchParams(location.search).get("file");
+        if (!file) return;
+        let item = null;
+        listEl.querySelectorAll(".capture-item").forEach(function(el) {
+            if (el.dataset.file === file) item = el;
+        });
+        if (item) {
+            item.scrollIntoView({ block: "nearest" });
+            showDetail(item.dataset.file, item.dataset.hasPsd === "1");
+        } else {
+            const notice = document.createElement("div");
+            notice.className = "placeholder-text";
+            notice.style.color = "#ff9f0a";
+            notice.textContent = "Capture " + file + " is no longer available.";
+            listEl.insertBefore(notice, listEl.firstChild);
+        }
+    }
+
     // --- Replay a raw file (arbitrary path outside the managed capture store) ---
     (function() {
         const pathInput = document.getElementById("replay-path");
@@ -942,7 +964,7 @@
         });
     })();
 
-    loadList();
+    loadList().then(openFromQuery);
 
     // Re-list when capture_count ticks up on the /ws/live heartbeat — that's
     // the signal a recording finished and dropped a new file in storage.

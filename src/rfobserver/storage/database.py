@@ -107,10 +107,30 @@ CREATE TABLE IF NOT EXISTS avg_windows (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+-- One row per recorded IQ capture file, so the Dashboard can highlight the
+-- time spans where raw IQ is available and link straight to the capture.
+-- start_time/stop_time bound the full recorded signal (pre-trigger pre-roll
+-- included). filename is UNIQUE so re-inserting the same capture upserts.
+CREATE TABLE IF NOT EXISTS iq_captures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename TEXT NOT NULL UNIQUE,
+    origin TEXT NOT NULL,
+    start_time TEXT NOT NULL,
+    stop_time TEXT NOT NULL,
+    duration_sec REAL NOT NULL,
+    sdr_center_freq_hz REAL,
+    sample_rate_hz REAL,
+    gain_db REAL,
+    total_samples INTEGER,
+    trigger_initiated INTEGER,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_detections_time ON detections(start_time);
 CREATE INDEX IF NOT EXISTS idx_detections_freq ON detections(center_freq_hz);
 CREATE INDEX IF NOT EXISTS idx_stats_time ON stats(timestamp);
 CREATE INDEX IF NOT EXISTS idx_tone_checks_time ON tone_checks(timestamp);
+CREATE INDEX IF NOT EXISTS idx_iq_captures_time ON iq_captures(start_time);
 CREATE INDEX IF NOT EXISTS idx_avg_windows_time ON avg_windows(start_time);
 CREATE INDEX IF NOT EXISTS idx_avg_windows_center_time
     ON avg_windows(sdr_center_freq_hz, start_time);
@@ -461,6 +481,99 @@ class SensorDatabase:
             ),
         )
         await self._db.commit()
+
+    @_guarded_write
+    async def insert_iq_capture(
+        self,
+        *,
+        filename: str,
+        origin: str,
+        start_time: datetime,
+        stop_time: datetime,
+        duration_sec: float,
+        sdr_center_freq_hz: float | None,
+        sample_rate_hz: float | None,
+        gain_db: float | None,
+        total_samples: int | None,
+        trigger_initiated: bool,
+    ) -> None:
+        """Record one IQ capture file's span so the Dashboard can highlight it.
+
+        Upserts on ``filename`` (INSERT OR REPLACE), so re-finalizing or a
+        rename-driven re-insert never duplicates a capture. ``start_time`` /
+        ``stop_time`` bound the full recorded signal (pre-trigger pre-roll
+        included), matching the .sc16/.json.
+        """
+        assert self._db is not None
+        await self._db.execute(
+            """INSERT OR REPLACE INTO iq_captures
+               (filename, origin, start_time, stop_time, duration_sec,
+                sdr_center_freq_hz, sample_rate_hz, gain_db, total_samples,
+                trigger_initiated)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                filename,
+                origin,
+                start_time.isoformat(),
+                stop_time.isoformat(),
+                duration_sec,
+                sdr_center_freq_hz,
+                sample_rate_hz,
+                gain_db,
+                total_samples,
+                int(trigger_initiated),
+            ),
+        )
+        await self._db.commit()
+
+    async def query_iq_captures(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        sdr_center_freq: float | None = None,
+        sample_rate: float | None = None,
+        gain: float | None = None,
+        limit: int = 2000,
+    ) -> list[dict[str, Any]]:
+        """IQ captures overlapping [since, until), scoped by tuning config.
+
+        A capture overlaps the range when it starts before ``until`` and stops
+        after ``since`` (so a capture straddling either edge is included). The
+        tuning filter mirrors the averaged/detection queries so the Dashboard's
+        highlights match the stats and detections drawn on the same plot.
+        """
+        assert self._db is not None
+        where = "WHERE start_time < ? AND stop_time > ?"
+        params: list[Any] = [until.isoformat(), since.isoformat()]
+        conditions, sdr_params = self._sdr_conditions(sdr_center_freq, sample_rate, gain)
+        if conditions:
+            where += " AND " + " AND ".join(conditions)
+        params.extend(sdr_params)
+        query = (
+            "SELECT filename, origin, start_time, stop_time, duration_sec, "
+            "sdr_center_freq_hz, sample_rate_hz, gain_db, total_samples, trigger_initiated "
+            f"FROM iq_captures {where} ORDER BY start_time LIMIT ?"
+        )
+        params.append(limit)
+        out: list[dict[str, Any]] = []
+        async with self._db.execute(query, params) as cursor:
+            async for r in cursor:
+                out.append(
+                    {
+                        "filename": r[0],
+                        "origin": r[1],
+                        "start_time": r[2],
+                        "stop_time": r[3],
+                        "duration_sec": r[4],
+                        "sdr_center_freq_hz": r[5],
+                        "sample_rate_hz": r[6],
+                        "gain_db": r[7],
+                        "total_samples": r[8],
+                        "trigger_initiated": bool(r[9]) if r[9] is not None else None,
+                    }
+                )
+        return out
 
     # Columns returned by the light range query -- everything except the heavy blobs.
     _AVG_LIGHT_COLUMNS = (

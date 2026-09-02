@@ -1035,3 +1035,114 @@ async def test_reconnect_is_noop_when_already_replaced(db):
     other = object()
     await db._reconnect(expect=other)
     assert db._db is fresh
+
+
+# --- iq_captures (Dashboard IQ-availability highlights) ---
+
+
+def _cap_common():
+    return dict(
+        duration_sec=0.5,
+        sdr_center_freq_hz=915e6,
+        sample_rate_hz=2e6,
+        gain_db=30.0,
+        total_samples=1_000_000,
+        trigger_initiated=False,
+    )
+
+
+async def test_insert_and_query_iq_capture(db):
+    start = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    stop = start + timedelta(seconds=0.5)
+    await db.insert_iq_capture(
+        filename="cap-001.sc16", origin="manual", start_time=start, stop_time=stop, **_cap_common()
+    )
+    rows = await db.query_iq_captures(
+        since=start - timedelta(seconds=10), until=start + timedelta(seconds=10)
+    )
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["filename"] == "cap-001.sc16"
+    assert r["origin"] == "manual"
+    assert r["duration_sec"] == 0.5
+    assert r["trigger_initiated"] is False
+
+
+async def test_iq_capture_range_overlap(db):
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    # inside the window
+    await db.insert_iq_capture(
+        filename="in.sc16",
+        origin="auto",
+        start_time=base + timedelta(seconds=30),
+        stop_time=base + timedelta(seconds=30.5),
+        **_cap_common(),
+    )
+    # entirely before the window
+    await db.insert_iq_capture(
+        filename="before.sc16",
+        origin="auto",
+        start_time=base - timedelta(seconds=100),
+        stop_time=base - timedelta(seconds=99.5),
+        **_cap_common(),
+    )
+    # straddles the "since" edge (starts before, stops inside) -> overlaps
+    await db.insert_iq_capture(
+        filename="straddle.sc16",
+        origin="auto",
+        start_time=base - timedelta(seconds=1),
+        stop_time=base + timedelta(seconds=1),
+        **_cap_common(),
+    )
+    rows = await db.query_iq_captures(since=base, until=base + timedelta(seconds=60))
+    names = {r["filename"] for r in rows}
+    assert names == {"in.sc16", "straddle.sc16"}
+
+
+async def test_iq_capture_tuning_filter(db):
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    common = _cap_common()
+    await db.insert_iq_capture(
+        filename="a.sc16",
+        origin="auto",
+        start_time=base,
+        stop_time=base + timedelta(seconds=0.5),
+        **common,
+    )
+    common_other = {**common, "sdr_center_freq_hz": 433e6}
+    await db.insert_iq_capture(
+        filename="b.sc16",
+        origin="auto",
+        start_time=base,
+        stop_time=base + timedelta(seconds=0.5),
+        **common_other,
+    )
+    rows = await db.query_iq_captures(
+        since=base - timedelta(seconds=1), until=base + timedelta(seconds=1), sdr_center_freq=915e6
+    )
+    assert {r["filename"] for r in rows} == {"a.sc16"}
+
+
+async def test_iq_capture_upsert_by_filename(db):
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    await db.insert_iq_capture(
+        filename="dup.sc16",
+        origin="manual",
+        start_time=base,
+        stop_time=base + timedelta(seconds=0.5),
+        **_cap_common(),
+    )
+    # Same filename again with a different duration -> replaced, not duplicated.
+    common = {**_cap_common(), "duration_sec": 1.0}
+    await db.insert_iq_capture(
+        filename="dup.sc16",
+        origin="manual",
+        start_time=base,
+        stop_time=base + timedelta(seconds=1),
+        **common,
+    )
+    rows = await db.query_iq_captures(
+        since=base - timedelta(seconds=1), until=base + timedelta(seconds=5)
+    )
+    assert len(rows) == 1
+    assert rows[0]["duration_sec"] == 1.0

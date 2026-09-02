@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from rfobserver.capture.buffer import CircularBuffer
+from rfobserver.capture.buffer import CircularBuffer, GridPreBuffer
 from rfobserver.processing.burst import BurstDetectionConfig
 from rfobserver.processing.iq_utils import (
     IQMoments,
@@ -371,6 +371,12 @@ class StreamingProcessor:
         # Pre-trigger circular buffer (int32 = SC16)
         pre_trigger_samples = int(s.TRIGGER_PRE_SEC * s.BANDWIDTH)
         self._pre_trigger_buf = CircularBuffer(max(1, pre_trigger_samples), dtype=np.int32)
+
+        # Parallel pre-trigger PSD-grid buffer: the same TRIGGER_PRE_SEC window
+        # of already-computed grids, so a recording's .psd covers the pre-roll
+        # IQ. Recreated here (not cleared) so a reconfigured bin count can never
+        # mix grid widths.
+        self._grid_prebuf = GridPreBuffer(s.TRIGGER_PRE_SEC)
 
         logger.info(
             "StreamingProcessor: chunk=%d samples (%.1f ms), %d PSD workers "
@@ -814,6 +820,16 @@ class StreamingProcessor:
 
         s = self._settings
         pre_data = self._pre_trigger_buf.read()
+        # Drain the matching pre-trigger PSD grids so the .psd companion starts
+        # with rows covering the same pre-roll span as the IQ prepended below.
+        # Seed the grid meta from them so it is correct even if no live chunk
+        # is captured before the recording stops.
+        pre_roll = self._grid_prebuf.drain()
+        if pre_roll is not None:
+            self._recording_freq_axis = pre_roll.freq_axis
+            self._recording_time_res = pre_roll.time_res
+            self._grid_min = pre_roll.grid_min
+            self._grid_max = pre_roll.grid_max
 
         if s.RECORDING_RAM_BUFFER:
             self._grid_raw_path = None
@@ -828,6 +844,10 @@ class StreamingProcessor:
                 self._recording_buf[:n] = pre_data[:n]
                 self._recording_buf_pos = n
                 self._recording_bytes = n * 4
+
+            # Seed the grid list with the pre-roll grids; live grids append after.
+            if pre_roll is not None:
+                self._recording_grids = list(pre_roll.grids)
 
             self._recording_state = "recording"
             logger.info(
@@ -856,6 +876,20 @@ class StreamingProcessor:
                     self._recording_bytes = len(pre_data) * 4
                 except queue.Full:
                     logger.warning("Recording queue full — pre-trigger dropped")
+
+            # Seed the pre-roll grids ahead of any live grid so the .psd starts
+            # at the pre-trigger head. Queued before the writer thread starts, so
+            # they are the first rows it writes; live grids follow after the
+            # state flip below.
+            if pre_roll is not None:
+                for g in pre_roll.grids:
+                    try:
+                        self._recording_queue.put_nowait(
+                            ("grid", np.ascontiguousarray(g, dtype=np.float32).tobytes())
+                        )
+                        self._grid_rows += int(g.shape[0])
+                    except queue.Full:
+                        self._grid_dropped += int(g.shape[0])
 
             self._writer_thread = threading.Thread(
                 target=self._file_writer_loop, name="writer", daemon=True
@@ -1268,6 +1302,14 @@ class StreamingProcessor:
                     self._grid_dropped += grid.shape[0]
             else:
                 self._recording_grids.append(grid.copy())
+        else:
+            # Not recording: keep a rolling pre-trigger window of computed grids
+            # so a recording that fires can prepend PSD rows covering the same
+            # pre-roll span as the IQ pre-trigger buffer.
+            pre_time_res = 0.0
+            if len(cr.psd_grid.time_axis) > 1:
+                pre_time_res = float(cr.psd_grid.time_axis[1] - cr.psd_grid.time_axis[0])
+            self._grid_prebuf.write(cr.psd_grid.grid, cr.psd_grid.freq_axis, pre_time_res)
 
         self._capture_count = cr.capture_num
         latency_ms = (time.monotonic() - cr.recv_time) * 1000.0

@@ -1146,3 +1146,25 @@ async def test_iq_capture_upsert_by_filename(db):
     )
     assert len(rows) == 1
     assert rows[0]["duration_sec"] == 1.0
+
+
+async def test_iq_capture_cap_keeps_newest(db):
+    """When a window holds more captures than the limit, the query keeps the
+    newest and drops the oldest (newest-first order). Regression for the 24 h
+    Dashboard view silently dropping its most recent IQ highlights."""
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    for i in range(5):
+        start = base + timedelta(seconds=i)
+        await db.insert_iq_capture(
+            filename=f"c{i}.sc16",
+            origin="auto",
+            start_time=start,
+            stop_time=start + timedelta(seconds=0.5),
+            **_cap_common(),
+        )
+    rows = await db.query_iq_captures(
+        since=base - timedelta(seconds=1), until=base + timedelta(seconds=10), limit=3
+    )
+    # Newest-first, and the two OLDEST (c0, c1) are the ones dropped -- not the
+    # newest, which is what the Dashboard is looking at in a wide range.
+    assert [r["filename"] for r in rows] == ["c4.sc16", "c3.sc16", "c2.sc16"]

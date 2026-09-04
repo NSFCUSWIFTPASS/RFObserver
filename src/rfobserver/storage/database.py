@@ -534,7 +534,7 @@ class SensorDatabase:
         sdr_center_freq: float | None = None,
         sample_rate: float | None = None,
         gain: float | None = None,
-        limit: int = 2000,
+        limit: int = 20000,
     ) -> list[dict[str, Any]]:
         """IQ captures overlapping [since, until), scoped by tuning config.
 
@@ -542,6 +542,11 @@ class SensorDatabase:
         after ``since`` (so a capture straddling either edge is included). The
         tuning filter mirrors the averaged/detection queries so the Dashboard's
         highlights match the stats and detections drawn on the same plot.
+
+        Rows come back newest-first and the cap is high enough to cover a full
+        busy day; if a window ever exceeds it, the oldest captures drop rather
+        than the newest, so a wide (e.g. 24 h) view never silently loses its
+        most recent highlights.
         """
         assert self._db is not None
         where = "WHERE start_time < ? AND stop_time > ?"
@@ -553,7 +558,7 @@ class SensorDatabase:
         query = (
             "SELECT filename, origin, start_time, stop_time, duration_sec, "
             "sdr_center_freq_hz, sample_rate_hz, gain_db, total_samples, trigger_initiated "
-            f"FROM iq_captures {where} ORDER BY start_time LIMIT ?"
+            f"FROM iq_captures {where} ORDER BY start_time DESC LIMIT ?"
         )
         params.append(limit)
         out: list[dict[str, Any]] = []

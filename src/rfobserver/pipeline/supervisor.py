@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -21,6 +22,15 @@ logger = logging.getLogger(__name__)
 # Bound on how long to wait for a stopped processor's run() to drain before
 # cancelling it, so a wedged pipeline can't hang the toggle forever.
 _STOP_TIMEOUT_SEC = 15.0
+
+# Crash-restart flap protection: without this, a persistent processor.run()
+# crash would thrash receiver.initialize()/close() on the real SDR in a tight
+# loop. A crash streak that goes quiet for _CRASH_RESET_WINDOW_SEC resets;
+# otherwise each restart backs off (capped) and the streak gives up entirely
+# past _MAX_CONSECUTIVE_CRASH_RESTARTS, leaving the sensor inactive.
+_CRASH_RESET_WINDOW_SEC = 120.0
+_MAX_CONSECUTIVE_CRASH_RESTARTS = 5
+_CRASH_BACKOFF_CAP_SEC = 30.0
 
 
 class PipelineSupervisor:
@@ -43,6 +53,8 @@ class PipelineSupervisor:
         self._receiver_override: IReceiver | None = None
         self._replay = False
         self._stopping = False
+        self._consecutive_crashes = 0
+        self._last_crash_ts = 0.0
 
     @property
     def active(self) -> bool:
@@ -64,6 +76,8 @@ class PipelineSupervisor:
         """
         async with self._lock:
             if active and not self._active:
+                # A deliberate manual activation clears any prior crash streak.
+                self._consecutive_crashes = 0
                 await self._start()
             elif not active and self._active:
                 await self._stop()
@@ -170,6 +184,34 @@ class PipelineSupervisor:
             asyncio.get_running_loop().create_task(self._restart_after_crash())
 
     async def _restart_after_crash(self) -> None:
+        now = time.monotonic()
+        if now - self._last_crash_ts > _CRASH_RESET_WINDOW_SEC:
+            self._consecutive_crashes = 0
+        self._last_crash_ts = now
+        self._consecutive_crashes += 1
+
+        if self._consecutive_crashes > _MAX_CONSECUTIVE_CRASH_RESTARTS:
+            logger.error(
+                "Pipeline crashed %d times within %.0fs; giving up auto-restart, "
+                "leaving sensor inactive",
+                self._consecutive_crashes,
+                _CRASH_RESET_WINDOW_SEC,
+            )
+            async with self._lock:
+                if self._active and not self._replay:
+                    await self._stop()
+            return
+
+        backoff = min(2.0 ** (self._consecutive_crashes - 1), _CRASH_BACKOFF_CAP_SEC)
+        logger.warning(
+            "Restarting pipeline after crash in %.1fs (attempt %d)",
+            backoff,
+            self._consecutive_crashes,
+        )
+        # Sleep BEFORE acquiring the lock so a concurrent deliberate stop can
+        # win the race: it stops the sensor while we wait, and when we wake we
+        # see _active False (or _replay True) and no-op instead of restarting.
+        await asyncio.sleep(backoff)
         async with self._lock:
             if not self._active or self._replay:
                 return

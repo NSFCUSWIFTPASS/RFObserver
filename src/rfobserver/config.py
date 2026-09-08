@@ -168,6 +168,13 @@ class AppSettings(BaseSettings):
     METRICS_ENABLED: bool = False
     METRICS_PORT: int = 9090
 
+    # rtl_433 per-burst attribution (off by default)
+    ATTRIBUTION_ENABLED: bool = False
+    ATTRIBUTION_RTL433_PATH: str = ""  # "" -> auto-discover via find_rtl433
+    ATTRIBUTION_SNR_DB: float = 13.0  # skip bursts below this many dB over noise
+    ATTRIBUTION_MAX_PER_CHUNK: int = 40  # top-N strongest bursts per chunk
+    ATTRIBUTION_QUEUE_MAX: int = 64
+
     # Development
     MOCK_RECEIVER: bool = False
     LOG_LEVEL: str = "INFO"

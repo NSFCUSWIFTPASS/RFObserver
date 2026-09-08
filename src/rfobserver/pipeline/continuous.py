@@ -10,6 +10,7 @@ Double-buffer pipeline:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
     from rfobserver.capture.receiver import CaptureResult, IReceiver
     from rfobserver.config import AppSettings
     from rfobserver.models import BurstFingerprint, IQStatistics, ProcessedDataEnvelope, PSDData
+    from rfobserver.pipeline.attribution import AttributionWorker
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.storage.local import LocalStorage
     from rfobserver.transport.nats_producer import NatsProducer
@@ -32,6 +34,19 @@ if TYPE_CHECKING:
     from rfobserver.zms.monitor import ZmsMonitor
 
 logger = logging.getLogger(__name__)
+
+
+def select_bursts_for_attribution(
+    bursts: list[BurstFingerprint],
+    noise_floor_db: float,
+    snr_db: float,
+    max_n: int,
+) -> list[BurstFingerprint]:
+    """SNR gate + top-N-by-power. Returns the strongest bursts that clear the
+    gate, most-powerful first, capped at max_n."""
+    gated = [b for b in bursts if (b.peak_power_db - noise_floor_db) >= snr_db]
+    gated.sort(key=lambda b: b.peak_power_db, reverse=True)
+    return gated[:max_n]
 
 
 class ContinuousProcessor:
@@ -72,6 +87,22 @@ class ContinuousProcessor:
         self._running = False
         self._excess_ms: float = 0.0
 
+        self._attrib_worker: AttributionWorker | None = None
+        self._attrib_task: asyncio.Task[None] | None = None
+        if settings.ATTRIBUTION_ENABLED:
+            from rfobserver.pipeline.attribution import (
+                AttributionWorker,
+                StrongestQueue,
+                find_rtl433,
+            )
+
+            rtl = find_rtl433(settings.ATTRIBUTION_RTL433_PATH or None)
+            if rtl is None:
+                logger.warning("ATTRIBUTION_ENABLED but rtl_433 not found; attribution disabled")
+            else:
+                q = StrongestQueue(maxsize=settings.ATTRIBUTION_QUEUE_MAX)
+                self._attrib_worker = AttributionWorker(database, rtl, queue=q)
+
         logger.info(
             "Pipeline: 1 capture thread, %d PSD worker threads (%d cores, 2 reserved)",
             self._process_workers,
@@ -92,6 +123,9 @@ class ContinuousProcessor:
 
         process_future: asyncio.Future[_ProcessResult] | None = None
         broadcast_task: asyncio.Task[None] | None = None
+
+        if self._attrib_worker is not None:
+            self._attrib_task = asyncio.create_task(self._attrib_worker.run())
 
         while self._running:
             for center_freq in freqs:
@@ -156,6 +190,15 @@ class ContinuousProcessor:
         if broadcast_task is not None:
             await broadcast_task
 
+        # Shut down the attribution worker (its queue.get() only unblocks on
+        # cancel, so stop() alone is not enough).
+        if self._attrib_worker is not None:
+            self._attrib_worker.stop()
+        if self._attrib_task is not None:
+            self._attrib_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._attrib_task
+
     def stop(self) -> None:
         self._running = False
 
@@ -187,6 +230,37 @@ class ContinuousProcessor:
                 pr.center_freq_hz,
                 pr.capture_num,
             )
+
+        # rtl_433 attribution: gate + channelize + enqueue (never blocks).
+        if self._attrib_worker is not None and pr.bursts:
+            from rfobserver.pipeline.attribution import AttributionItem
+            from rfobserver.processing.channelize import (
+                channelize_to_cs16,
+                select_rate_and_protocols,
+            )
+
+            picked = select_bursts_for_attribution(
+                pr.bursts,
+                pr.noise_floor_db,
+                self._settings.ATTRIBUTION_SNR_DB,
+                self._settings.ATTRIBUTION_MAX_PER_CHUNK,
+            )
+            if picked:
+                data = convert_bytes_to_complex(pr.iq_bytes)
+                fs = float(self._settings.BANDWIDTH)
+                for burst in picked:
+                    offset = burst.peak_freq_hz - float(pr.center_freq_hz)
+                    rate, passes = select_rate_and_protocols(burst.bandwidth_hz)
+                    cs16 = channelize_to_cs16(data, fs, offset, rate)
+                    self._attrib_worker.queue.put_nowait(
+                        AttributionItem(
+                            burst_id=burst.burst_id,
+                            cs16=cs16,
+                            target_rate_hz=rate,
+                            passes=passes,
+                            power_db=burst.peak_power_db,
+                        )
+                    )
 
         # Build the processed envelope once; fan out to ZMS + NATS.
         if self._zms_monitor is not None or self._nats_producer is not None:
@@ -287,6 +361,7 @@ class _ProcessResult:
         "process_ms",
         "filename",
         "iq_bytes",
+        "noise_floor_db",
     )
 
     def __init__(
@@ -299,6 +374,7 @@ class _ProcessResult:
         process_ms: float,
         filename: str,
         iq_bytes: bytes,
+        noise_floor_db: float = 0.0,
     ) -> None:
         self.iq_stats = iq_stats
         self.summary_psd = summary_psd
@@ -308,6 +384,7 @@ class _ProcessResult:
         self.process_ms = process_ms
         self.filename = filename
         self.iq_bytes = iq_bytes
+        self.noise_floor_db = noise_floor_db
 
 
 def _process_capture_blocking(
@@ -371,4 +448,5 @@ def _process_capture_blocking(
         process_ms=process_ms,
         filename=filename,
         iq_bytes=iq_bytes,
+        noise_floor_db=detection_result.noise_floor_db,
     )

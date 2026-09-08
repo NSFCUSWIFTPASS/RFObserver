@@ -42,6 +42,7 @@ class PipelineSupervisor:
         self._lock = asyncio.Lock()
         self._receiver_override: IReceiver | None = None
         self._replay = False
+        self._stopping = False
 
     @property
     def active(self) -> bool:
@@ -104,38 +105,78 @@ class PipelineSupervisor:
         self._receiver = receiver
         self._processor = processor
         self._task = asyncio.create_task(processor.run())
+        self._task.add_done_callback(self._on_task_done)
         self._active = True
         logger.info("Sensor activated")
         self._notify(processor)
 
     async def _stop(self) -> None:
-        loop = asyncio.get_running_loop()
-        processor, task, receiver = self._processor, self._task, self._receiver
-        if processor is not None:
-            processor.stop()
-        if task is not None:
-            try:
-                await asyncio.wait_for(task, timeout=_STOP_TIMEOUT_SEC)
-            except TimeoutError:
-                logger.warning("Processor did not stop in time; cancelling")
-                task.cancel()
+        self._stopping = True
+        try:
+            loop = asyncio.get_running_loop()
+            processor, task, receiver = self._processor, self._task, self._receiver
+            if processor is not None:
+                processor.stop()
+            if task is not None:
                 try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+                    await asyncio.wait_for(task, timeout=_STOP_TIMEOUT_SEC)
+                except TimeoutError:
+                    logger.warning("Processor did not stop in time; cancelling")
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        logger.exception("Processor raised during cancellation")
                 except Exception:
-                    logger.exception("Processor raised during cancellation")
-        if receiver is not None:
-            await loop.run_in_executor(None, receiver.close)
-        self._processor = None
-        self._receiver = None
-        self._task = None
-        self._active = False
-        self._receiver_override = None
-        self._replay = False
-        logger.info("Sensor deactivated (SDR released)")
-        self._notify(None)
+                    # The task may already be done-with-exception (e.g. we are
+                    # stopping it after a crash, from _restart_after_crash) --
+                    # already logged by _on_task_done, so don't let it escape.
+                    pass
+            if receiver is not None:
+                await loop.run_in_executor(None, receiver.close)
+            self._processor = None
+            self._receiver = None
+            self._task = None
+            self._active = False
+            self._receiver_override = None
+            self._replay = False
+            logger.info("Sensor deactivated (SDR released)")
+            self._notify(None)
+        finally:
+            self._stopping = False
 
     def _notify(self, processor: Any | None) -> None:
         if self._on_processor_change is not None:
             self._on_processor_change(processor)
+
+    def _on_task_done(self, task: asyncio.Task[Any]) -> None:
+        """Detect an unexpected pipeline-task death and schedule a restart.
+
+        Runs for every task completion, including the deliberate cancel/await
+        inside `_stop()` -- `_stopping` is what tells those apart from a crash.
+        """
+        if task.cancelled() or self._stopping:
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        logger.error("Pipeline task died unexpectedly; restarting", exc_info=exc)
+        if self._active:
+            asyncio.get_running_loop().create_task(self._restart_after_crash())
+
+    async def _restart_after_crash(self) -> None:
+        async with self._lock:
+            if not self._active:
+                return
+            await self._stop()
+            await self._start()
+
+    async def restart(self) -> None:
+        """Stop then start the live pipeline. No-op if inactive or replaying."""
+        async with self._lock:
+            if not self._active or self._replay:
+                return
+            await self._stop()
+            await self._start()

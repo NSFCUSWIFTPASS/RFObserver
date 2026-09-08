@@ -24,11 +24,14 @@ async def run(settings: AppSettings) -> None:
     """Start the full sensor pipeline."""
     from rfobserver.capture.mock_receiver import MockReceiver
     from rfobserver.capture.receiver import ReceiverConfig
+    from rfobserver.pipeline.beacon import ProgressBeacon
     from rfobserver.pipeline.supervisor import PipelineSupervisor
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.storage.local import LocalStorage
 
     logger.info("RFObserver pipeline starting (hostname=%s)", settings.HOSTNAME)
+
+    beacon = ProgressBeacon()
 
     receiver_config = ReceiverConfig(
         gain_db=settings.GAIN,
@@ -95,6 +98,7 @@ async def run(settings: AppSettings) -> None:
                 zms_monitor=zms_monitor,
                 nats_producer=nats_producer,
                 replay_mode=replay_mode,
+                beacon=beacon,
             )
             # Attach module manager for upstream signal processing
             proc._module_manager = ModuleManager()
@@ -111,6 +115,7 @@ async def run(settings: AppSettings) -> None:
             broadcast=broadcast,
             zms_monitor=zms_monitor,
             nats_producer=nats_producer,
+            beacon=beacon,
         )
 
     supervisor = PipelineSupervisor(
@@ -121,6 +126,21 @@ async def run(settings: AppSettings) -> None:
         await supervisor.set_active(True)
     else:
         logger.info("Sensor starting in Standby (SENSOR_ACTIVE=false)")
+
+    watchdog = None
+    if settings.WATCHDOG_ENABLED:
+        from rfobserver.utils.watchdog import PipelineWatchdog
+
+        watchdog = PipelineWatchdog(
+            beacon,
+            is_active=lambda: supervisor.active,
+            restart=supervisor.restart,
+            loop=asyncio.get_running_loop(),
+            timeout_sec=settings.WATCHDOG_TIMEOUT_SEC,
+            restart_deadline_sec=settings.WATCHDOG_RESTART_DEADLINE_SEC,
+        )
+        watchdog.start()
+        logger.info("Pipeline watchdog enabled (timeout=%.0fs)", settings.WATCHDOG_TIMEOUT_SEC)
 
     tasks: list[Any] = []
     if zms_monitor is not None:
@@ -137,6 +157,8 @@ async def run(settings: AppSettings) -> None:
     try:
         await asyncio.gather(*tasks)
     finally:
+        if watchdog is not None:
+            watchdog.stop()
         await supervisor.set_active(False)
         if zms_monitor is not None:
             await zms_monitor.stop()

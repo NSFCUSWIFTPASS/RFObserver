@@ -15,6 +15,7 @@ import pytest
 from rfobserver.capture.mock_receiver import MockReceiver
 from rfobserver.capture.receiver import ReceiverConfig
 from rfobserver.config import AppSettings
+from rfobserver.pipeline.beacon import ProgressBeacon
 from rfobserver.pipeline.continuous import ContinuousProcessor
 from rfobserver.pipeline.streaming import StreamingProcessor
 from rfobserver.storage.database import SensorDatabase
@@ -206,17 +207,24 @@ async def test_batch_pipeline_db_query_works(
 
 
 @pytest.fixture
+def beacon() -> ProgressBeacon:
+    return ProgressBeacon()
+
+
+@pytest.fixture
 def streaming_processor(
     receiver: MockReceiver,
     db: SensorDatabase,
     local_storage: LocalStorage,
     settings: AppSettings,
+    beacon: ProgressBeacon,
 ) -> StreamingProcessor:
     return StreamingProcessor(
         receiver=receiver,
         database=db,
         local_storage=local_storage,
         settings=settings,
+        beacon=beacon,
     )
 
 
@@ -257,6 +265,26 @@ async def test_streaming_pipeline_db_query_works(
 
     detections = await db.query_detections(limit=100)
     assert isinstance(detections, list)
+
+
+@pytest.mark.asyncio
+async def test_streaming_pipeline_marks_beacon(
+    streaming_processor: StreamingProcessor,
+    beacon: ProgressBeacon,
+) -> None:
+    """Progress beacon should reflect real forward progress while running."""
+
+    async def stop_after_chunks() -> None:
+        while streaming_processor._capture_count < 5:
+            await asyncio.sleep(0.02)
+        streaming_processor.stop()
+
+    await asyncio.wait_for(
+        asyncio.gather(streaming_processor.run(), stop_after_chunks()),
+        timeout=10.0,
+    )
+
+    assert beacon.age() < 1.0
 
 
 @pytest.mark.asyncio

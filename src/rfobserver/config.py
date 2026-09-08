@@ -168,6 +168,14 @@ class AppSettings(BaseSettings):
     METRICS_ENABLED: bool = False
     METRICS_PORT: int = 9090
 
+    # Pipeline liveness watchdog (thread-based; restarts a stalled pipeline).
+    # Off by default; when enabled, a daemon thread restarts the pipeline (or,
+    # if the loop is wedged, exits the process for systemd) after no forward
+    # progress for WATCHDOG_TIMEOUT_SEC.
+    WATCHDOG_ENABLED: bool = False
+    WATCHDOG_TIMEOUT_SEC: float = 30.0
+    WATCHDOG_RESTART_DEADLINE_SEC: float = 10.0
+
     # Development
     MOCK_RECEIVER: bool = False
     LOG_LEVEL: str = "INFO"

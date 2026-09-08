@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from rfobserver.capture.receiver import CaptureResult, IReceiver
     from rfobserver.config import AppSettings
     from rfobserver.models import BurstFingerprint, IQStatistics, ProcessedDataEnvelope, PSDData
+    from rfobserver.pipeline.beacon import ProgressBeacon
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.storage.local import LocalStorage
     from rfobserver.transport.nats_producer import NatsProducer
@@ -54,6 +55,7 @@ class ContinuousProcessor:
         broadcast: LiveBroadcast | None = None,
         zms_monitor: ZmsMonitor | None = None,
         nats_producer: NatsProducer | None = None,
+        beacon: ProgressBeacon | None = None,
     ) -> None:
         self._receiver = receiver
         self._db = database
@@ -62,6 +64,7 @@ class ContinuousProcessor:
         self._broadcast = broadcast
         self._zms_monitor = zms_monitor
         self._nats_producer = nats_producer
+        self._beacon = beacon
 
         # 1 thread for capture, N-3 cores for processing, 2 cores left free for OS/web
         total_cores = os.cpu_count() or 4
@@ -125,6 +128,8 @@ class ContinuousProcessor:
 
                     # -- Kick off processing for this capture immediately --
                     self._capture_count += 1
+                    if self._beacon is not None:
+                        self._beacon.mark()
                     logger.debug(
                         "Capture #%d at %d Hz (%.1f ms, %d bytes)",
                         self._capture_count,

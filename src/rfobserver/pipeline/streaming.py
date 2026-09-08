@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from rfobserver.capture.receiver import IReceiver
     from rfobserver.config import AppSettings
     from rfobserver.models import BurstFingerprint, IQStatistics, ProcessedDataEnvelope, PSDData
+    from rfobserver.pipeline.beacon import ProgressBeacon
     from rfobserver.processing.spectral import PSDGridResult
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.storage.local import LocalStorage
@@ -217,6 +218,7 @@ class StreamingProcessor:
         nats_producer: NatsProducer | None = None,
         drop_on_overflow: bool = True,
         replay_mode: bool = False,
+        beacon: ProgressBeacon | None = None,
     ) -> None:
         self._receiver = receiver
         self._db = database
@@ -225,6 +227,7 @@ class StreamingProcessor:
         self._broadcast = broadcast
         self._zms_monitor = zms_monitor
         self._nats_producer = nats_producer
+        self._beacon = beacon
         self._running = False
         # Live capture must never block the receiver thread, so chunks are
         # dropped when processing falls behind (the default). Offline replay of
@@ -395,6 +398,8 @@ class StreamingProcessor:
         """Start the streaming pipeline."""
         self._running = True
         self._loop = asyncio.get_running_loop()
+        if self._beacon is not None:
+            self._beacon.mark()
 
         recv_thread = threading.Thread(target=self._receiver_loop, name="recv", daemon=True)
         dispatch_thread = threading.Thread(target=self._dispatch_loop, name="dispatch", daemon=True)
@@ -1540,6 +1545,9 @@ class StreamingProcessor:
 
             if result is _STOP:
                 break
+
+            if self._beacon is not None:
+                self._beacon.mark()
 
             # --- Accumulate for normal-mode UI + downstream publishing ---
             # On reconfigure, NUM_FFT_BINS may change. In-flight results from

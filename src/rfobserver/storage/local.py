@@ -73,11 +73,18 @@ class LocalStorage:
         return total
 
     def _delete_capture(self, sc16_path: Path) -> int:
-        """Delete a capture and all its companions. Returns bytes freed."""
+        """Delete a capture and all its companions. Returns bytes freed.
+
+        Tolerant of unlink failures (e.g. a read-only-remounted or busy volume):
+        a file that cannot be removed is logged and skipped rather than aborting
+        eviction, so one bad file cannot silently stop FIFO rotation.
+        """
         freed = self._capture_size(sc16_path)
-        sc16_path.unlink(missing_ok=True)
-        for comp in self._companion_paths(sc16_path):
-            comp.unlink(missing_ok=True)
+        for p in [sc16_path, *self._companion_paths(sc16_path)]:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Could not unlink %s during eviction", p)
         logger.info("Rotated old capture: %s (freed %d bytes)", sc16_path.name, freed)
         return freed
 

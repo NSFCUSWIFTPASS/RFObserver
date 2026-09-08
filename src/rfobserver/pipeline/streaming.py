@@ -938,8 +938,14 @@ class StreamingProcessor:
             self._recording_buf = None
             self._recording_buf_pos = 0
         else:
-            # Disk mode: stop writer thread
-            self._recording_queue.put(None)
+            # Disk mode: stop writer thread. Bounded put: if the writer already
+            # died (disk full / EROFS), the queue may be full and no consumer
+            # will ever drain it, so a plain blocking put would wedge recctl in
+            # "finalizing" forever. Time-bounded, then proceed regardless.
+            try:
+                self._recording_queue.put(None, timeout=10.0)
+            except queue.Full:
+                logger.error("Recording writer not draining; abandoning writer thread")
             if self._writer_thread is not None:
                 self._writer_thread.join(timeout=10)
                 self._writer_thread = None

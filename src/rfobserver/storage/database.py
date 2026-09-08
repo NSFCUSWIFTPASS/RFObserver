@@ -209,10 +209,11 @@ class SensorDatabase:
         """Wrap a write method: time out a stuck write, reconnect, retry once.
 
         Without the timeout a device hiccup wedges the writer permanently
-        (see module docstring). The retry runs unguarded on the fresh
-        connection: while the hiccup persists it fails fast via busy_timeout
-        and the exception propagates to the caller (which logs and continues),
-        so the pipeline keeps running and recovers on its own.
+        (see module docstring). The retry on the fresh connection is bounded
+        by the same write timeout so it cannot hang forever either: while the
+        hiccup persists it fails fast via busy_timeout and the exception
+        propagates to the caller (which logs and continues), so the pipeline
+        keeps running and recovers on its own.
         """
 
         @functools.wraps(fn)
@@ -230,7 +231,7 @@ class SensorDatabase:
                     self._write_timeout,
                 )
             await asyncio.wait_for(self._reconnect(expect=conn), timeout=self._write_timeout)
-            return await fn(self, *args, **kwargs)
+            return await asyncio.wait_for(fn(self, *args, **kwargs), timeout=self._write_timeout)
 
         return wrapper
 

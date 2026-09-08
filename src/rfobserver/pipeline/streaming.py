@@ -1843,24 +1843,29 @@ class StreamingProcessor:
             for burst in bursts:
                 if self._replay_mode:
                     continue
-                await self._db.insert_detection(
-                    burst_id=burst.burst_id,
-                    start_time=burst.start_time,
-                    stop_time=burst.stop_time,
-                    center_freq_hz=burst.center_freq_hz,
-                    bandwidth_hz=burst.bandwidth_hz,
-                    peak_power_db=burst.peak_power_db,
-                    duration_ms=burst.duration_ms,
-                    detection_timestamp=burst.detection_timestamp,
-                    peak_freq_hz=burst.peak_freq_hz,
-                    sdr_center_freq_hz=float(sdr_center_freq_hz),
-                    sample_rate_hz=sample_rate_hz,
-                    lo_offset_hz=0.0,
-                    analog_bw_hz=None,
-                    gain_db=gain_db,
-                    antenna="RX2",
-                    device_serial=device_serial,
-                )
+                try:
+                    await self._db.insert_detection(
+                        burst_id=burst.burst_id,
+                        start_time=burst.start_time,
+                        stop_time=burst.stop_time,
+                        center_freq_hz=burst.center_freq_hz,
+                        bandwidth_hz=burst.bandwidth_hz,
+                        peak_power_db=burst.peak_power_db,
+                        duration_ms=burst.duration_ms,
+                        detection_timestamp=burst.detection_timestamp,
+                        peak_freq_hz=burst.peak_freq_hz,
+                        sdr_center_freq_hz=float(sdr_center_freq_hz),
+                        sample_rate_hz=sample_rate_hz,
+                        lo_offset_hz=0.0,
+                        analog_bw_hz=None,
+                        gain_db=gain_db,
+                        antenna="RX2",
+                        device_serial=device_serial,
+                    )
+                except Exception:
+                    logger.exception(
+                        "insert_detection failed for burst %s; skipping", burst.burst_id
+                    )
 
             if bursts:
                 logger.info("Detected %d bursts", len(bursts))

@@ -5,12 +5,14 @@ decode step is synchronous (subprocess); the worker calls it off the event loop.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -52,3 +54,52 @@ def decode_cs16(
             if frames:
                 return frames
     return []
+
+
+@dataclass
+class AttributionItem:
+    burst_id: str
+    cs16: bytes
+    target_rate_hz: int
+    passes: list[list[str]]
+    power_db: float
+
+
+class StrongestQueue:
+    """Bounded queue that keeps the strongest items. On overflow the weakest
+    (lowest power_db) is evicted; get() returns the strongest first. The live
+    producer never blocks - put_nowait always returns immediately."""
+
+    def __init__(self, maxsize: int) -> None:
+        self._maxsize = maxsize
+        self._items: list[AttributionItem] = []
+        self._not_empty = asyncio.Event()
+        self.dropped = 0
+
+    def qsize(self) -> int:
+        return len(self._items)
+
+    def put_nowait(self, item: AttributionItem) -> bool:
+        if len(self._items) < self._maxsize:
+            self._items.append(item)
+            self._not_empty.set()
+            return True
+        weakest_idx = min(range(len(self._items)), key=lambda i: self._items[i].power_db)
+        if item.power_db <= self._items[weakest_idx].power_db:
+            self.dropped += 1
+            return False
+        self._items.pop(weakest_idx)
+        self._items.append(item)
+        self.dropped += 1
+        self._not_empty.set()
+        return True
+
+    async def get(self) -> AttributionItem:
+        while not self._items:
+            self._not_empty.clear()
+            await self._not_empty.wait()
+        idx = max(range(len(self._items)), key=lambda i: self._items[i].power_db)
+        item = self._items.pop(idx)
+        if not self._items:
+            self._not_empty.clear()
+        return item

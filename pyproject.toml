@@ -121,6 +121,7 @@ module = [
     "rfobserver.processing.spectral",
     "rfobserver.processing.iq_utils",
     "rfobserver.processing.burst",
+    "rfobserver.processing.channelize",
     "rfobserver.capture.trigger",
     "rfobserver.capture.receiver",
     "rfobserver.capture.buffer",

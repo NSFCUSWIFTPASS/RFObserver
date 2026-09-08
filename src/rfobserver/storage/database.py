@@ -152,8 +152,8 @@ _DETECTION_SDR_COLUMNS: dict[str, str] = {
 }
 
 # rtl_433 burst-attribution columns: which device model / protocol (if any)
-# rtl_433 decoded from a burst's IQ, plus the raw decode payload. Nullable —
-# most detections are never attempted or never decode.
+# rtl_433 decoded from a burst's IQ, plus the raw decode payload. Nullable,
+# since most detections are never attempted or never decode.
 _DETECTION_ATTRIBUTION_COLUMNS: dict[str, str] = {
     "model": "TEXT",
     "protocol_id": "INTEGER",

@@ -13,6 +13,8 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -103,3 +105,49 @@ class StrongestQueue:
         if not self._items:
             self._not_empty.clear()
         return item
+
+
+class AttributionWorker:
+    """Drains the queue, decodes each burst off the event loop, and merges the
+    result onto its detections row (three-state: decoded / attempted-not-decoded)."""
+
+    def __init__(self, database: Any, rtl_path: str, queue: StrongestQueue | None = None) -> None:
+        self._db = database
+        self._rtl = rtl_path
+        self.queue = queue if queue is not None else StrongestQueue(maxsize=64)
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    async def run(self) -> None:
+        while not self._stop:
+            item = await self.queue.get()
+            try:
+                frames = await asyncio.to_thread(
+                    decode_cs16, self._rtl, item.cs16, item.target_rate_hz, item.passes
+                )
+            except Exception:
+                logger.exception("rtl_433 decode failed for burst %s", item.burst_id)
+                continue
+            now_iso = datetime.now(timezone.utc).isoformat()
+            if frames:
+                model = frames[0].get("model")
+                proto = _protocol_id_for(model)
+                attribution = json.dumps({"decoded": True, "at": now_iso, "frames": frames})
+            else:
+                model, proto = None, None
+                attribution = json.dumps({"attempted": True, "decoded": False, "at": now_iso})
+            try:
+                await self._db.update_detection_attribution(
+                    burst_id=item.burst_id, model=model, protocol_id=proto, attribution=attribution
+                )
+            except Exception:
+                logger.exception("attribution merge failed for burst %s", item.burst_id)
+
+
+def _protocol_id_for(model: str | None) -> int | None:
+    """Map a decoded model string to its rtl_433 protocol id where known."""
+    if model == "SilverSpring-Mesh":
+        return 383
+    return None

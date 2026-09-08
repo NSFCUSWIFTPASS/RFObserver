@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from rfobserver.capture.receiver import CaptureResult, IReceiver
     from rfobserver.config import AppSettings
     from rfobserver.models import BurstFingerprint, IQStatistics, ProcessedDataEnvelope, PSDData
-    from rfobserver.pipeline.attribution import AttributionWorker
+    from rfobserver.pipeline.attribution import AttributionItem, AttributionWorker
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.storage.local import LocalStorage
     from rfobserver.transport.nats_producer import NatsProducer
@@ -47,6 +47,36 @@ def select_bursts_for_attribution(
     gated = [b for b in bursts if (b.peak_power_db - noise_floor_db) >= snr_db]
     gated.sort(key=lambda b: b.peak_power_db, reverse=True)
     return gated[:max_n]
+
+
+def _build_attribution_items(
+    iq_bytes: bytes,
+    sample_rate_hz: float,
+    center_freq_hz: float,
+    picked: list[BurstFingerprint],
+) -> list[AttributionItem]:
+    """CPU-bound: IQ conversion + per-burst channelize. No asyncio in here --
+    run this off the event loop (asyncio.to_thread) since it can take seconds
+    for a wideband chunk with several picked bursts."""
+    from rfobserver.pipeline.attribution import AttributionItem
+    from rfobserver.processing.channelize import channelize_to_cs16, select_rate_and_protocols
+
+    data = convert_bytes_to_complex(iq_bytes)
+    items: list[AttributionItem] = []
+    for burst in picked:
+        offset = burst.peak_freq_hz - float(center_freq_hz)
+        rate, passes = select_rate_and_protocols(burst.bandwidth_hz)
+        cs16 = channelize_to_cs16(data, float(sample_rate_hz), offset, rate)
+        items.append(
+            AttributionItem(
+                burst_id=burst.burst_id,
+                cs16=cs16,
+                target_rate_hz=rate,
+                passes=passes,
+                power_db=burst.peak_power_db,
+            )
+        )
+    return items
 
 
 class ContinuousProcessor:
@@ -231,14 +261,11 @@ class ContinuousProcessor:
                 pr.capture_num,
             )
 
-        # rtl_433 attribution: gate + channelize + enqueue (never blocks).
+        # rtl_433 attribution: gate (cheap, stays on the loop), then channelize
+        # off-loop (CPU-bound: full-chunk IQ conversion + per-burst mixer/
+        # resample, up to ATTRIBUTION_MAX_PER_CHUNK times), then enqueue
+        # (never blocks) back on the loop.
         if self._attrib_worker is not None and pr.bursts:
-            from rfobserver.pipeline.attribution import AttributionItem
-            from rfobserver.processing.channelize import (
-                channelize_to_cs16,
-                select_rate_and_protocols,
-            )
-
             picked = select_bursts_for_attribution(
                 pr.bursts,
                 pr.noise_floor_db,
@@ -246,21 +273,15 @@ class ContinuousProcessor:
                 self._settings.ATTRIBUTION_MAX_PER_CHUNK,
             )
             if picked:
-                data = convert_bytes_to_complex(pr.iq_bytes)
-                fs = float(self._settings.BANDWIDTH)
-                for burst in picked:
-                    offset = burst.peak_freq_hz - float(pr.center_freq_hz)
-                    rate, passes = select_rate_and_protocols(burst.bandwidth_hz)
-                    cs16 = channelize_to_cs16(data, fs, offset, rate)
-                    self._attrib_worker.queue.put_nowait(
-                        AttributionItem(
-                            burst_id=burst.burst_id,
-                            cs16=cs16,
-                            target_rate_hz=rate,
-                            passes=passes,
-                            power_db=burst.peak_power_db,
-                        )
-                    )
+                items = await asyncio.to_thread(
+                    _build_attribution_items,
+                    pr.iq_bytes,
+                    float(self._settings.BANDWIDTH),
+                    float(pr.center_freq_hz),
+                    picked,
+                )
+                for item in items:
+                    self._attrib_worker.queue.put_nowait(item)
 
         # Build the processed envelope once; fan out to ZMS + NATS.
         if self._zms_monitor is not None or self._nats_producer is not None:

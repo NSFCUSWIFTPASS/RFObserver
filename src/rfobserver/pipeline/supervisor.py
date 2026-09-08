@@ -133,7 +133,10 @@ class PipelineSupervisor:
                     # The task may already be done-with-exception (e.g. we are
                     # stopping it after a crash, from _restart_after_crash) --
                     # already logged by _on_task_done, so don't let it escape.
-                    pass
+                    logger.debug(
+                        "Stop observed an already-raised task exception (already reported)",
+                        exc_info=True,
+                    )
             if receiver is not None:
                 await loop.run_in_executor(None, receiver.close)
             self._processor = None
@@ -168,7 +171,7 @@ class PipelineSupervisor:
 
     async def _restart_after_crash(self) -> None:
         async with self._lock:
-            if not self._active:
+            if not self._active or self._replay:
                 return
             await self._stop()
             await self._start()

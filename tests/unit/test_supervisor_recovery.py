@@ -48,3 +48,22 @@ async def test_restart_noop_when_inactive() -> None:
     sup = PipelineSupervisor(build_receiver=_FakeReceiver, build_processor=lambda r, **k: None)
     await sup.restart()  # not active -> no raise, no start
     assert not sup.active
+
+
+@pytest.mark.asyncio
+async def test_replay_crash_does_not_auto_restart() -> None:
+    """A processor crash while replaying must not auto-restart into live SDR mode."""
+    procs: list[_CrashProcessor] = []
+
+    def build_proc(receiver: object, *, replay_mode: bool = False) -> _CrashProcessor:
+        p = _CrashProcessor()
+        procs.append(p)
+        return p
+
+    sup = PipelineSupervisor(build_receiver=_FakeReceiver, build_processor=build_proc)
+    await sup.start_replay(_FakeReceiver())
+    # The replay processor crashes; the done-callback must see self._replay and no-op.
+    await asyncio.sleep(0.2)
+    assert len(procs) == 1, "a crash during replay must not trigger an auto-restart"
+    await sup.stop_replay()
+    assert not sup.active

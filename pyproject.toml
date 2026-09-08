@@ -126,6 +126,7 @@ module = [
     "rfobserver.capture.receiver",
     "rfobserver.capture.buffer",
     "rfobserver.modules.*",
+    "rfobserver.pipeline.attribution",
 ]
 disallow_any_generics = false
 

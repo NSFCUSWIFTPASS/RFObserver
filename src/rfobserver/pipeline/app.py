@@ -33,7 +33,7 @@ _STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 _WEB_SHUTDOWN_TIMEOUT_SEC = 5.0
 # uvicorn cancels its own request and websocket tasks (e.g. a quiet /ws/audio
 # that never calls receive) before our 5s bound above, which stays as a backstop.
-_WEB_GRACEFUL_SHUTDOWN_SEC = 3.0
+_WEB_GRACEFUL_SHUTDOWN_SEC = 3  # int: uvicorn types it as int | None
 
 
 def make_give_up_handler(
@@ -485,7 +485,7 @@ async def _run_web_server(
         host=settings.WEB_HOST,
         port=settings.WEB_PORT,
         log_level=settings.LOG_LEVEL.lower(),
-        timeout_graceful_shutdown=int(_WEB_GRACEFUL_SHUTDOWN_SEC),
+        timeout_graceful_shutdown=_WEB_GRACEFUL_SHUTDOWN_SEC,
     )
     server = _build_web_server(config)
 

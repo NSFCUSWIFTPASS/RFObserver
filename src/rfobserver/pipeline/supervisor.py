@@ -103,6 +103,9 @@ class PipelineSupervisor:
         async with self._lock:
             self._receiver_override = receiver
             self._replay = True
+            # A deliberate replay start is an operator action, like manual
+            # activation, so it clears any prior crash-restart give-up.
+            self._gave_up = False
             await self._start()
 
     async def stop_replay(self) -> None:
@@ -211,11 +214,16 @@ class PipelineSupervisor:
                 self._consecutive_crashes,
                 _CRASH_RESET_WINDOW_SEC,
             )
+            # Per-call local flag: only fire the hook if THIS call actually
+            # stopped the sensor, so a stale or concurrent _gave_up (e.g. set
+            # by another give-up path) never re-fires it.
+            stopped = False
             async with self._lock:
                 if self._active and not self._replay:
                     await self._stop()
                     self._gave_up = True
-            if self._gave_up and self._on_give_up is not None:
+                    stopped = True
+            if stopped and self._on_give_up is not None:
                 self._on_give_up()
             return
 
@@ -229,11 +237,24 @@ class PipelineSupervisor:
         # win the race: it stops the sensor while we wait, and when we wake we
         # see _active False (or _replay True) and no-op instead of restarting.
         await asyncio.sleep(backoff)
+        stopped = False
         async with self._lock:
             if not self._active or self._replay:
                 return
             await self._stop()
-            await self._start()
+            try:
+                await self._start()
+            except Exception:
+                # _start() failed (e.g. receiver.initialize() on USB
+                # re-enumeration) -- the sensor is already stopped above, so
+                # without this it would escape as an unretrieved task
+                # exception, leaving _active False, _gave_up False, the
+                # give-up hook never fired, and health reporting ok.
+                logger.exception("Pipeline restart failed to re-initialize; giving up")
+                self._gave_up = True
+                stopped = True
+        if stopped and self._on_give_up is not None:
+            self._on_give_up()
 
     async def restart(self, stop_timeout: float | None = None) -> None:
         """Stop then start the live pipeline. No-op if inactive or replaying.

@@ -189,3 +189,34 @@ async def test_stop_timeout_warns_and_cancels(
     assert procs[0].cancelled, "the hung task must be cancelled"
     assert "did not stop in time" in caplog.text, "the timeout must be reported as one"
     assert not sup.active
+
+
+@pytest.mark.asyncio
+async def test_restart_with_short_stop_timeout_replaces_hung_processor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A watchdog restart must not wait the full manual-stop timeout on a hang.
+
+    The watchdog gives restart() a 10 s deadline; the manual stop timeout is
+    15 s, so without a shorter stop timeout a hung-but-cancellable task always
+    escalated to process exit.
+    """
+    procs: list[_HungProcessor] = []
+
+    def build_proc(receiver: object, *, replay_mode: bool = False) -> _HungProcessor:
+        p = _HungProcessor()
+        procs.append(p)
+        return p
+
+    sup = PipelineSupervisor(build_receiver=_FakeReceiver, build_processor=build_proc)
+    await sup.set_active(True)
+    # Runs with the real 15 s _STOP_TIMEOUT_SEC: finishing within 2 s proves
+    # stop_timeout is honoured.
+    await asyncio.wait_for(sup.restart(stop_timeout=0.1), timeout=2.0)
+
+    assert procs[0].cancelled, "the hung processor must be cancelled"
+    assert len(procs) == 2 and sup.active, "a fresh processor must be running"
+
+    # Only for teardown speed: the second processor is hung too.
+    monkeypatch.setattr(supervisor_mod, "_STOP_TIMEOUT_SEC", 0.1)
+    await asyncio.wait_for(sup.set_active(False), timeout=2.0)

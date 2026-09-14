@@ -175,6 +175,10 @@ class AppSettings(BaseSettings):
     WATCHDOG_ENABLED: bool = False
     WATCHDOG_TIMEOUT_SEC: float = 30.0
     WATCHDOG_RESTART_DEADLINE_SEC: float = 10.0
+    # How long a watchdog-driven restart waits for the stalled task before
+    # cancelling it. Must leave room inside WATCHDOG_RESTART_DEADLINE_SEC for
+    # teardown + SDR re-init (~2.3 s on a B200mini) or the restart escalates to exit.
+    WATCHDOG_STOP_TIMEOUT_SEC: float = 5.0
 
     # Development
     MOCK_RECEIVER: bool = False

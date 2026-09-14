@@ -124,16 +124,17 @@ class PipelineSupervisor:
         logger.info("Sensor activated")
         self._notify(processor)
 
-    async def _stop(self) -> None:
+    async def _stop(self, timeout: float | None = None) -> None:
         self._stopping = True
         try:
+            stop_timeout = _STOP_TIMEOUT_SEC if timeout is None else timeout
             loop = asyncio.get_running_loop()
             processor, task, receiver = self._processor, self._task, self._receiver
             if processor is not None:
                 processor.stop()
             if task is not None:
                 try:
-                    await asyncio.wait_for(task, timeout=_STOP_TIMEOUT_SEC)
+                    await asyncio.wait_for(task, timeout=stop_timeout)
                 except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041 - not the builtin on 3.10
                     logger.warning("Processor did not stop in time; cancelling")
                     task.cancel()
@@ -218,10 +219,15 @@ class PipelineSupervisor:
             await self._stop()
             await self._start()
 
-    async def restart(self) -> None:
-        """Stop then start the live pipeline. No-op if inactive or replaying."""
+    async def restart(self, stop_timeout: float | None = None) -> None:
+        """Stop then start the live pipeline. No-op if inactive or replaying.
+
+        ``stop_timeout`` bounds how long to wait for the old task before
+        cancelling it; the watchdog passes a value well inside its restart
+        deadline so a hung-but-cancellable pipeline restarts in-process.
+        """
         async with self._lock:
             if not self._active or self._replay:
                 return
-            await self._stop()
+            await self._stop(timeout=stop_timeout)
             await self._start()

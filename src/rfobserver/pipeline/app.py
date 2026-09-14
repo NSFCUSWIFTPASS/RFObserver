@@ -134,7 +134,7 @@ async def run(settings: AppSettings) -> None:
         watchdog = PipelineWatchdog(
             beacon,
             is_active=lambda: supervisor.active,
-            restart=supervisor.restart,
+            restart=lambda: supervisor.restart(stop_timeout=settings.WATCHDOG_STOP_TIMEOUT_SEC),
             loop=asyncio.get_running_loop(),
             timeout_sec=settings.WATCHDOG_TIMEOUT_SEC,
             restart_deadline_sec=settings.WATCHDOG_RESTART_DEADLINE_SEC,

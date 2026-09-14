@@ -970,19 +970,25 @@ async def averaged_waterfall(
     cached = _WATERFALL_CACHE.get(key)
     if cached is not None:
         return Response(content=cached, media_type="application/octet-stream")
-    result = await db.query_avg_waterfall(
-        since=since_dt,
-        until=until_dt,
-        sdr_center_freq=_opt_float(sdr_center),
-        sample_rate=_opt_float(sample_rate),
-        gain=_opt_float(gain),
-        max_rows=mr,
-        max_bins=mb,
-    )
+    async with request.app.state.waterfall_sem:
+        if await request.is_disconnected():
+            return Response(status_code=499)
+        cached = _WATERFALL_CACHE.get(key)
+        if cached is not None:
+            return Response(content=cached, media_type="application/octet-stream")
+        result = await db.query_avg_waterfall(
+            since=since_dt,
+            until=until_dt,
+            sdr_center_freq=_opt_float(sdr_center),
+            sample_rate=_opt_float(sample_rate),
+            gain=_opt_float(gain),
+            max_rows=mr,
+            max_bins=mb,
+        )
     return Response(content=_waterfall_cached(key, result), media_type="application/octet-stream")
 
 
-@router.get("/averaged/stats")
+@router.get("/averaged/stats", response_model=None)
 async def averaged_stats(
     request: Request,
     since: str,
@@ -991,21 +997,24 @@ async def averaged_stats(
     sample_rate: str | None = None,
     gain: str | None = None,
     max_points: str | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | Response:
     """Scalar stats timeline for a range (blob-independent, works after PSD
     retention prunes the blobs)."""
     db = _get_db(request)
     if db is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     since_dt, until_dt = _parse_range(since, until)
-    result: dict[str, Any] = await db.query_avg_stats(
-        since=since_dt,
-        until=until_dt,
-        sdr_center_freq=_opt_float(sdr_center),
-        sample_rate=_opt_float(sample_rate),
-        gain=_opt_float(gain),
-        max_points=int(max_points) if max_points else 600,
-    )
+    async with request.app.state.stats_sem:
+        if await request.is_disconnected():
+            return Response(status_code=499)
+        result: dict[str, Any] = await db.query_avg_stats(
+            since=since_dt,
+            until=until_dt,
+            sdr_center_freq=_opt_float(sdr_center),
+            sample_rate=_opt_float(sample_rate),
+            gain=_opt_float(gain),
+            max_points=int(max_points) if max_points else 600,
+        )
     return result
 
 

@@ -11,6 +11,10 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     restart: on-failure
+    # Ordered stop can take up to about 20s: 5s for the web server plus up to
+    # 15s for the pipeline stop, including the recording finalize. Docker's
+    # default of 10s would SIGKILL it partway.
+    stop_grace_period: 30s
     ports:
       - "8080:8080"
       - "9090:9090"

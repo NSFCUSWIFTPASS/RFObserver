@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
 from typing import Any
@@ -23,6 +24,7 @@ class _Registry:
         self.web_stopped_by_event = False
         self.set_active_calls: list[bool] = []
         self.fail_set_active_false = False
+        self.cancel_set_active_false = False
 
 
 @pytest.fixture
@@ -60,6 +62,8 @@ def reg(monkeypatch: pytest.MonkeyPatch) -> _Registry:
 
     async def fake_set_active(self: Any, active: bool) -> None:
         registry.set_active_calls.append(active)
+        if not active and registry.cancel_set_active_false:
+            raise asyncio.CancelledError()
         if not active and registry.fail_set_active_false:
             raise RuntimeError("pipeline stop failed")
 
@@ -158,8 +162,13 @@ async def _start(settings: AppSettings) -> asyncio.Task[None]:
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
 @pytest.mark.parametrize("web_port", [0, 8888])
 async def test_signal_stops_run_in_order(
-    reg: _Registry, tmp_path: Any, sig: signal.Signals, web_port: int
+    reg: _Registry,
+    tmp_path: Any,
+    sig: signal.Signals,
+    web_port: int,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO, logger="rfobserver.pipeline.app")
     task = await _start(_settings(tmp_path, web_port=web_port))
     os.kill(os.getpid(), sig)
     await asyncio.wait_for(task, timeout=5)  # returns normally: exit code 0
@@ -167,6 +176,7 @@ async def test_signal_stops_run_in_order(
     assert all(db.closed for db in reg.instances)
     if web_port:
         assert reg.web_stopped_by_event, "the web server exits on the stop event"
+    assert "Shutdown complete" in caplog.text
     _assert_handlers_restored()
 
 
@@ -180,6 +190,7 @@ async def test_web_server_that_ignores_stop_is_cancelled(
     await asyncio.wait_for(task, timeout=5)
     assert reg.set_active_calls == [False]
     assert all(db.closed for db in reg.instances)
+    _assert_handlers_restored()
 
 
 async def test_pipeline_stop_failure_still_closes_the_dbs(reg: _Registry, tmp_path: Any) -> None:
@@ -187,6 +198,16 @@ async def test_pipeline_stop_failure_still_closes_the_dbs(reg: _Registry, tmp_pa
     task = await _start(_settings(tmp_path, web_port=8888))
     os.kill(os.getpid(), signal.SIGTERM)
     await asyncio.wait_for(task, timeout=5)
+    assert all(db.closed for db in reg.instances)
+    _assert_handlers_restored()
+
+
+async def test_cancelled_pipeline_stop_still_closes_the_dbs(reg: _Registry, tmp_path: Any) -> None:
+    reg.cancel_set_active_false = True
+    task = await _start(_settings(tmp_path, web_port=8888))
+    os.kill(os.getpid(), signal.SIGTERM)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
     assert all(db.closed for db in reg.instances)
     _assert_handlers_restored()
 

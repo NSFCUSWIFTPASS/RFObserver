@@ -31,6 +31,9 @@ _GIVE_UP_EXIT_CODE = 91
 _GIVE_UP_EXIT_DELAY_SEC = 5.0
 _STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 _WEB_SHUTDOWN_TIMEOUT_SEC = 5.0
+# uvicorn cancels its own request and websocket tasks (e.g. a quiet /ws/audio
+# that never calls receive) before our 5s bound above, which stays as a backstop.
+_WEB_GRACEFUL_SHUTDOWN_SEC = 3.0
 
 
 def make_give_up_handler(
@@ -294,33 +297,41 @@ async def run(settings: AppSettings) -> None:
                 if exc is not None:
                     raise exc
     finally:
-        if watchdog is not None:
-            watchdog.stop()
-        await _stop_workers(stop, stop_task, web_task, workers)
-        # Each step is isolated so one failure cannot skip the DB close.
+        # The DB closes and remove_stop_signals() must run even if a step
+        # below raises a BaseException (e.g. CancelledError): otherwise the
+        # non-daemon aiosqlite thread hangs interpreter exit forever. Each
+        # step inside this try is still isolated with except Exception so one
+        # failure cannot skip the next; CancelledError is not caught here and
+        # propagates after the closes below run.
         try:
-            await supervisor.set_active(False)
-        except Exception:
-            logger.exception("Shutdown: stopping the pipeline failed; continuing")
-        if zms_monitor is not None:
+            if watchdog is not None:
+                watchdog.stop()
+            await _stop_workers(stop, stop_task, web_task, workers)
+            # Each step is isolated so one failure cannot skip the DB close.
             try:
-                await zms_monitor.stop()
+                await supervisor.set_active(False)
             except Exception:
-                logger.exception("Shutdown: stopping the ZMS monitor failed; continuing")
-        if nats_producer is not None:
-            try:
-                await nats_producer.close()
-            except Exception:
-                logger.exception("Shutdown: closing NATS failed; continuing")
-        try:
-            try:
-                if read_db is not None:
-                    await read_db.close()
-            finally:
-                await db.close()
-            logger.info("Shutdown complete")
+                logger.exception("Shutdown: stopping the pipeline failed; continuing")
+            if zms_monitor is not None:
+                try:
+                    await zms_monitor.stop()
+                except Exception:
+                    logger.exception("Shutdown: stopping the ZMS monitor failed; continuing")
+            if nats_producer is not None:
+                try:
+                    await nats_producer.close()
+                except Exception:
+                    logger.exception("Shutdown: closing NATS failed; continuing")
         finally:
-            remove_stop_signals()
+            try:
+                try:
+                    if read_db is not None:
+                        await read_db.close()
+                finally:
+                    await db.close()
+                logger.info("Shutdown complete")
+            finally:
+                remove_stop_signals()
 
 
 async def _stop_workers(
@@ -339,7 +350,10 @@ async def _stop_workers(
             )
     for task in (stop_task, *workers):
         task.cancel()
-    await asyncio.gather(stop_task, *workers, return_exceptions=True)
+    results = await asyncio.gather(stop_task, *workers, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+            logger.warning("Worker ended with an error during shutdown: %r", result)
 
 
 async def _heartbeat_loop(
@@ -471,6 +485,7 @@ async def _run_web_server(
         host=settings.WEB_HOST,
         port=settings.WEB_PORT,
         log_level=settings.LOG_LEVEL.lower(),
+        timeout_graceful_shutdown=int(_WEB_GRACEFUL_SHUTDOWN_SEC),
     )
     server = _build_web_server(config)
 

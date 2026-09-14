@@ -1211,3 +1211,44 @@ async def test_ui_prefs_put_uses_write_connection_when_split(settings, tmp_path)
     finally:
         await reader.close()
         await writer.close()
+
+
+class _ConfigStore:
+    """Minimal get_config/set_config double for the ui-prefs routes."""
+
+    def __init__(self, stored: dict[str, str]) -> None:
+        self.stored = dict(stored)
+
+    async def get_config(self, key: str) -> str | None:
+        return self.stored.get(key)
+
+    async def set_config(self, key: str, value: str) -> None:
+        self.stored[key] = value
+
+
+def test_ui_prefs_put_merges_into_the_writers_current_document(settings):
+    """The merge must read the writer's current document, not the reader's: a
+    reader on an older snapshot would otherwise merge a stale document and
+    write it back, silently undoing the other preference (lost update)."""
+    import json
+
+    from rfobserver.web.uiprefs import UI_PREFS_KEY
+
+    current = json.dumps({"scale": {}, "theme": "dark"})
+    stale = json.dumps({"scale": {}, "theme": "light"})
+    writer = _ConfigStore({UI_PREFS_KEY: current})
+    app = create_app(settings)
+    app.state.database = _ConfigStore({UI_PREFS_KEY: stale})
+    app.state.write_database = writer
+    r = TestClient(app).put("/api/ui-prefs", json={"scale": {"wf_lo": -100, "wf_hi": -20}})
+    assert r.status_code == 200, r.text
+    assert r.json()["theme"] == "dark", "stale reader document was merged"
+    assert json.loads(writer.stored[UI_PREFS_KEY]) == {
+        "scale": {"wf_lo": -100.0, "wf_hi": -20.0},
+        "theme": "dark",
+    }
+
+
+def test_ui_prefs_put_503_without_a_database(settings):
+    r = TestClient(create_app(settings)).put("/api/ui-prefs", json={"theme": "dark"})
+    assert r.status_code == 503

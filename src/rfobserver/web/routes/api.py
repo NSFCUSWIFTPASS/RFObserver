@@ -1132,8 +1132,12 @@ async def put_ui_prefs(request: Request) -> dict[str, Any]:
     into the stored document, so a scale change keeps the stored theme and a
     theme change keeps the stored scale. Scale values are per-chart low/high
     bounds (dBFS for waterfall/PSD, dB for power, unitless for kurtosis); null
-    or omitted means auto-scale from the data. Theme is auto/light/dark."""
-    db = _get_db(request)
+    or omitted means auto-scale from the data. Theme is auto/light/dark.
+
+    The read and the write both go through the writer: merging a document read
+    from the reader (possibly an older snapshot) and writing it back would
+    silently undo a newer change to the other key."""
+    db = _get_write_db(request)
     if db is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     try:
@@ -1154,7 +1158,7 @@ async def put_ui_prefs(request: Request) -> dict[str, Any]:
     if "theme" in body:
         doc["theme"] = _validate_theme(body["theme"])
     doc = _normalize_prefs(doc)
-    await _get_write_db(request).set_config(UI_PREFS_KEY, json.dumps(doc))
+    await db.set_config(UI_PREFS_KEY, json.dumps(doc))
     return doc
 
 

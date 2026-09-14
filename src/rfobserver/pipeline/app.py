@@ -7,14 +7,18 @@ with concurrent web server operation.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+import signal
 from typing import TYPE_CHECKING, Any
 
 from rfobserver.web.websocket import LiveBroadcast
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator
+
+    import uvicorn
 
     from rfobserver.capture.receiver import IReceiver
     from rfobserver.config import AppSettings
@@ -25,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 _GIVE_UP_EXIT_CODE = 91
 _GIVE_UP_EXIT_DELAY_SEC = 5.0
+_STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
 def make_give_up_handler(
@@ -50,6 +55,64 @@ def make_give_up_handler(
         asyncio.get_running_loop().call_later(delay_sec, exit_fn, _GIVE_UP_EXIT_CODE)
 
     return handler
+
+
+def install_stop_signals(
+    loop: asyncio.AbstractEventLoop,
+    stop: asyncio.Event,
+    force_exit: Callable[[int], object] = os._exit,
+) -> Callable[[], None]:
+    """Route SIGINT and SIGTERM to ``stop`` so run() can tear down in order.
+
+    Left to the defaults, uvicorn re-raises SIGTERM with SIG_DFL after serving
+    (the process dies before run()'s cleanup), and on Python 3.10 a SIGINT's
+    KeyboardInterrupt makes asyncio.run cancel every task, which aborts the
+    cleanup before the DB close and hangs exit on aiosqlite's non-daemon
+    thread. See docs/debugging/2026-09-14_shutdown-signals.md.
+
+    The first signal sets ``stop``; a second one exits at once with
+    128 + signal number. Returns a function that removes the handlers. Signal
+    handlers can only be installed from the main thread: elsewhere this logs a
+    warning and returns a no-op.
+    """
+    received: list[signal.Signals] = []
+
+    def on_signal(sig: signal.Signals) -> None:
+        if received:
+            logger.error("Second %s during shutdown; exiting now", sig.name)
+            force_exit(128 + sig.value)
+            return
+        received.append(sig)
+        logger.info("Received %s; shutting down", sig.name)
+        stop.set()
+
+    def remove() -> None:
+        for sig in _STOP_SIGNALS:
+            loop.remove_signal_handler(sig)
+
+    try:
+        for sig in _STOP_SIGNALS:
+            loop.add_signal_handler(sig, on_signal, sig)
+    except (RuntimeError, ValueError):
+        remove()
+        logger.warning("Cannot install SIGINT/SIGTERM handlers outside the main thread")
+        return lambda: None
+    return remove
+
+
+def _build_web_server(config: uvicorn.Config) -> uvicorn.Server:
+    """A uvicorn server that leaves SIGINT and SIGTERM to run()."""
+    import uvicorn
+
+    class _AppSignalsServer(uvicorn.Server):
+        @contextlib.contextmanager
+        def capture_signals(self) -> Generator[None, None, None]:
+            # The stock version re-raises the captured signal after serving;
+            # for SIGTERM that is SIG_DFL, which kills the process before
+            # run()'s cleanup. run() owns the signals (install_stop_signals).
+            yield
+
+    return _AppSignalsServer(config)
 
 
 async def run(settings: AppSettings) -> None:

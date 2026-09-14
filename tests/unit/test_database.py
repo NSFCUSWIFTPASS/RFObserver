@@ -2,7 +2,10 @@
 
 import asyncio
 import math
+import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
@@ -11,6 +14,19 @@ from rfobserver.storage.database import SensorDatabase
 
 def _dt(i: int) -> datetime:
     return datetime(2026, 1, 1, 0, 0, i)
+
+
+def _det_kwargs(i: int) -> dict[str, Any]:
+    return dict(
+        burst_id=f"burst-{i}",
+        start_time=_dt(i),
+        stop_time=_dt(i) + timedelta(seconds=1),
+        center_freq_hz=915e6,
+        bandwidth_hz=1e6,
+        peak_power_db=-30.0,
+        duration_ms=1000.0,
+        detection_timestamp=_dt(i),
+    )
 
 
 @pytest.fixture
@@ -1168,3 +1184,48 @@ async def test_iq_capture_cap_keeps_newest(db):
     # Newest-first, and the two OLDEST (c0, c1) are the ones dropped -- not the
     # newest, which is what the Dashboard is looking at in a wide range.
     assert [r["filename"] for r in rows] == ["c4.sc16", "c3.sc16", "c2.sc16"]
+
+
+@pytest.mark.asyncio
+async def test_read_only_connection_reads_but_rejects_writes(tmp_path):
+    path = str(tmp_path / "ro.sqlite")
+    writer = SensorDatabase(path)
+    await writer.connect()
+    reader = SensorDatabase(path, read_only=True)
+    await reader.connect()
+    try:
+        assert reader.read_only and not writer.read_only
+        await writer.insert_detection(**_det_kwargs(0))
+        assert await reader.count_detections() >= 1
+        with pytest.raises(sqlite3.OperationalError):
+            await reader.set_config("k", "v")
+    finally:
+        await reader.close()
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_busy_reader_does_not_delay_writer(tmp_path):
+    """The whole point of the split: a long web read must not queue pipeline writes."""
+    path = str(tmp_path / "split.sqlite")
+    writer = SensorDatabase(path)
+    await writer.connect()
+    reader = SensorDatabase(path, read_only=True)
+    await reader.connect()
+    try:
+        assert reader._db is not None
+
+        def _slow(seconds: float) -> int:
+            time.sleep(seconds)
+            return 0
+
+        await reader._db.create_function("slow", 1, _slow)
+        slow_read = asyncio.ensure_future(reader._db.execute("SELECT slow(1.0)"))
+        await asyncio.sleep(0.1)  # the reader's worker thread is now busy
+        t0 = time.monotonic()
+        await writer.insert_detection(**_det_kwargs(1))
+        assert time.monotonic() - t0 < 0.5, "a busy reader must not delay the writer"
+        await slow_read
+    finally:
+        await reader.close()
+        await writer.close()

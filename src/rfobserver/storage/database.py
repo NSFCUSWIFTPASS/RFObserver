@@ -177,11 +177,17 @@ def _nice_bin_width(span: float) -> float:
 class SensorDatabase:
     """Async SQLite database for local sensor state."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, *, read_only: bool = False) -> None:
         self._db_path = db_path
+        self._read_only = read_only
         self._db: aiosqlite.Connection | None = None
         self._write_timeout = _DB_WRITE_TIMEOUT_SEC
         self._reconnect_lock = asyncio.Lock()
+
+    @property
+    def read_only(self) -> bool:
+        """True for the web layer's reader: query_only, no schema/migrations."""
+        return self._read_only
 
     async def _reconnect(self, expect: aiosqlite.Connection | None) -> None:
         """Abandon a connection whose write stuck, and open a fresh one.
@@ -237,6 +243,17 @@ class SensorDatabase:
 
     async def connect(self) -> None:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+        if self._read_only:
+            # Web-layer reader (spec Cut 3b): its own connection and worker
+            # thread, so long Dashboard reads never queue pipeline writes. WAL
+            # (set by the writer) gives concurrent read/write. query_only makes
+            # any accidental write fail instead of contending with the pipeline.
+            # The writer must connect first: it owns schema and migrations.
+            self._db = await aiosqlite.connect(self._db_path)
+            await self._db.execute("PRAGMA busy_timeout=2000")
+            await self._db.execute("PRAGMA query_only=ON")
+            logger.info("Database connected read-only: %s", self._db_path)
+            return
         self._db = await aiosqlite.connect(self._db_path)
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")

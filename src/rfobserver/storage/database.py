@@ -29,7 +29,7 @@ import aiosqlite
 import numpy as np
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import AsyncIterator, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -637,24 +637,24 @@ class SensorDatabase:
             f"FROM iq_captures {where} ORDER BY start_time DESC LIMIT ?"
         )
         params.append(limit)
-        out: list[dict[str, Any]] = []
-        async with self._db.execute(query, params) as cursor:
-            async for r in cursor:
-                out.append(
-                    {
-                        "filename": r[0],
-                        "origin": r[1],
-                        "start_time": r[2],
-                        "stop_time": r[3],
-                        "duration_sec": r[4],
-                        "sdr_center_freq_hz": r[5],
-                        "sample_rate_hz": r[6],
-                        "gain_db": r[7],
-                        "total_samples": r[8],
-                        "trigger_initiated": bool(r[9]) if r[9] is not None else None,
-                    }
-                )
-        return out
+        # Drained in one fetchall (LIMITed, light columns): iterating the cursor
+        # would hold the statement, and the reader's snapshot, across awaits.
+        rows = await self._db.execute_fetchall(query, params)
+        return [
+            {
+                "filename": r[0],
+                "origin": r[1],
+                "start_time": r[2],
+                "stop_time": r[3],
+                "duration_sec": r[4],
+                "sdr_center_freq_hz": r[5],
+                "sample_rate_hz": r[6],
+                "gain_db": r[7],
+                "total_samples": r[8],
+                "trigger_initiated": bool(r[9]) if r[9] is not None else None,
+            }
+            for r in rows
+        ]
 
     # Columns returned by the light range query -- everything except the heavy blobs.
     _AVG_LIGHT_COLUMNS = (
@@ -831,6 +831,38 @@ class SensorDatabase:
         gmax = float(np.nanmax(powers))
         return [float(x) for x in powers], gmin, gmax
 
+    async def _scan_avg_windows(
+        self, columns: str, where: str, params: list[Any], chunk: int = 5000
+    ) -> AsyncIterator[list[Any]]:
+        """Yield avg_windows rows in (start_time, id) order, one statement per chunk.
+
+        Each chunk is its own SELECT fully drained with fetchall, so no statement
+        (and no read transaction / WAL snapshot) stays open across the awaits
+        between chunks. A statement held open across awaits pins the reader's
+        snapshot for every other read on this connection and, with back-to-back
+        Dashboard scans, stops the WAL from ever rewinding.
+        The last two columns of every yielded row are start_time and id (the key).
+        """
+        assert self._db is not None
+        # From the second chunk on, the caller's range start (its first
+        # placeholder) is advanced to the last key, rather than ANDing a second
+        # `start_time >= ?`: given two lower bounds on start_time, SQLite 3.37
+        # seeks the index on the first one, so every chunk would rescan the
+        # index from the range start. One lower bound always seeks to the key.
+        assert where.startswith("WHERE start_time >= ?"), where
+        select = f"SELECT {columns}, start_time, id FROM avg_windows {where}"
+        order = " ORDER BY start_time, id LIMIT ?"
+        query, args = select + order, [*params, chunk]
+        while True:
+            rows = list(await self._db.execute_fetchall(query, args))
+            if rows:
+                yield rows
+            if len(rows) < chunk:
+                return
+            last_start, last_id = rows[-1][-2], rows[-1][-1]
+            query = f"{select} AND (start_time > ? OR id > ?){order}"
+            args = [last_start, *params[1:], last_start, last_id, chunk]
+
     async def _waterfall_raw(
         self,
         where: str,
@@ -840,10 +872,9 @@ class SensorDatabase:
     ) -> dict[str, Any]:
         """Raw mode: one row per window (no averaging)."""
         assert self._db is not None
-        query = (
-            "SELECT start_time, duration_sec, num_bins, freq_start_hz, freq_step_hz, "
-            "psd_powers, pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis "
-            f"FROM avg_windows {where} ORDER BY start_time"
+        columns = (
+            "start_time, duration_sec, num_bins, freq_start_hz, freq_step_hz, "
+            "psd_powers, pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis"
         )
         buckets: list[dict[str, Any]] = []
         psd_rows: list[list[float]] = []
@@ -853,40 +884,36 @@ class SensorDatabase:
         freq_step_hz = 0.0
         first_axis_num_bins = 0
         first_axis = True
-        async with self._db.execute(query, params) as cursor:
-            while True:
-                rows = await cursor.fetchmany(5000)
-                if not rows:
-                    break
-                for r in rows:
-                    t = datetime.fromisoformat(r[0]).timestamp()
-                    num_bins = int(r[2])
-                    if first_axis:
-                        first_axis = False
-                        first_axis_num_bins = num_bins
-                        freq_start_hz = float(r[3])
-                        freq_step_hz = float(r[4])
-                    buckets.append(
-                        {
-                            "start_epoch": t,
-                            "duration_sec": float(r[1]),
-                            "count": 1,
-                            "pwr_avg": float(r[6]),
-                            "pwr_max": float(r[7]) if r[7] is not None else 0.0,
-                            "pwr_median": float(r[8]),
-                            "pwr_std": float(r[9]),
-                            "kurtosis": float(r[10]),
-                        }
-                    )
-                    blob = r[5]
-                    if blob is None:
-                        psd_rows.append([float("nan")] * max_bins)
-                    else:
-                        total_windows += 1
-                        powers, pmin, pmax = self._ds_psd(blob, num_bins, max_bins)
-                        gmin = min(gmin, pmin)
-                        gmax = max(gmax, pmax)
-                        psd_rows.append(powers)
+        async for rows in self._scan_avg_windows(columns, where, params, chunk=5000):
+            for r in rows:
+                t = datetime.fromisoformat(r[0]).timestamp()
+                num_bins = int(r[2])
+                if first_axis:
+                    first_axis = False
+                    first_axis_num_bins = num_bins
+                    freq_start_hz = float(r[3])
+                    freq_step_hz = float(r[4])
+                buckets.append(
+                    {
+                        "start_epoch": t,
+                        "duration_sec": float(r[1]),
+                        "count": 1,
+                        "pwr_avg": float(r[6]),
+                        "pwr_max": float(r[7]) if r[7] is not None else 0.0,
+                        "pwr_median": float(r[8]),
+                        "pwr_std": float(r[9]),
+                        "kurtosis": float(r[10]),
+                    }
+                )
+                blob = r[5]
+                if blob is None:
+                    psd_rows.append([float("nan")] * max_bins)
+                else:
+                    total_windows += 1
+                    powers, pmin, pmax = self._ds_psd(blob, num_bins, max_bins)
+                    gmin = min(gmin, pmin)
+                    gmax = max(gmax, pmax)
+                    psd_rows.append(powers)
         if first_axis_num_bins > max_bins and freq_step_hz > 0:
             factor = first_axis_num_bins // max_bins
             freq_start_hz = freq_start_hz + (factor - 1) * freq_step_hz / 2.0
@@ -921,10 +948,9 @@ class SensorDatabase:
         ``max_rows + 1`` buckets and stays put while the range slides.
         """
         assert self._db is not None
-        query = (
-            "SELECT start_time, num_bins, freq_start_hz, freq_step_hz, psd_powers, "
-            "pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis "
-            f"FROM avg_windows {where} ORDER BY start_time"
+        columns = (
+            "start_time, num_bins, freq_start_hz, freq_step_hz, psd_powers, "
+            "pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis"
         )
         since_epoch = since.timestamp()
         until_epoch = until.timestamp()
@@ -946,50 +972,44 @@ class SensorDatabase:
         freq_step_hz = 0.0
         first_axis_num_bins = 0
         first_axis = True
-        async with self._db.execute(query, params) as cursor:
-            while True:
-                rows = await cursor.fetchmany(5000)
-                if not rows:
-                    break
-                for r in rows:
-                    t = datetime.fromisoformat(r[0]).timestamp()
-                    idx = int((t - anchor) / bucket_sec)
-                    idx = max(0, min(idx, n_buckets - 1))
-                    num_bins = int(r[1])
-                    if first_axis:
-                        first_axis = False
-                        first_axis_num_bins = num_bins
-                        freq_start_hz = float(r[2])
-                        freq_step_hz = float(r[3])
-                    stat_n[idx] += 1
-                    stat_avg[idx] += float(r[5])
-                    if r[6] is not None:
-                        stat_max[idx] = max(stat_max[idx], float(r[6]))
-                    stat_med[idx] += float(r[7])
-                    stat_std[idx] += float(r[8])
-                    stat_kurt[idx] += float(r[9])
-                    blob = r[4]
-                    if blob is None:
-                        continue
-                    total_windows += 1
-                    powers = np.frombuffer(blob, dtype="<f4")
-                    if powers.size != num_bins:
-                        num_bins = int(powers.size)
-                    if num_bins > max_bins:
-                        factor = num_bins // max_bins
-                        trim = factor * max_bins
-                        powers = powers[:trim].reshape(max_bins, factor).mean(axis=1)
-                    else:
-                        pad = max_bins - num_bins
-                        if pad > 0:
-                            powers = np.concatenate(
-                                [powers, np.full(pad, np.nan, dtype=np.float32)]
-                            )
-                    gmin = min(gmin, float(np.nanmin(powers)))
-                    gmax = max(gmax, float(np.nanmax(powers)))
-                    valid = ~np.isnan(powers)
-                    psd_sum[idx] += np.where(valid, powers, 0.0)
-                    psd_cnt[idx] += valid
+        async for rows in self._scan_avg_windows(columns, where, params, chunk=5000):
+            for r in rows:
+                t = datetime.fromisoformat(r[0]).timestamp()
+                idx = int((t - anchor) / bucket_sec)
+                idx = max(0, min(idx, n_buckets - 1))
+                num_bins = int(r[1])
+                if first_axis:
+                    first_axis = False
+                    first_axis_num_bins = num_bins
+                    freq_start_hz = float(r[2])
+                    freq_step_hz = float(r[3])
+                stat_n[idx] += 1
+                stat_avg[idx] += float(r[5])
+                if r[6] is not None:
+                    stat_max[idx] = max(stat_max[idx], float(r[6]))
+                stat_med[idx] += float(r[7])
+                stat_std[idx] += float(r[8])
+                stat_kurt[idx] += float(r[9])
+                blob = r[4]
+                if blob is None:
+                    continue
+                total_windows += 1
+                powers = np.frombuffer(blob, dtype="<f4")
+                if powers.size != num_bins:
+                    num_bins = int(powers.size)
+                if num_bins > max_bins:
+                    factor = num_bins // max_bins
+                    trim = factor * max_bins
+                    powers = powers[:trim].reshape(max_bins, factor).mean(axis=1)
+                else:
+                    pad = max_bins - num_bins
+                    if pad > 0:
+                        powers = np.concatenate([powers, np.full(pad, np.nan, dtype=np.float32)])
+                gmin = min(gmin, float(np.nanmin(powers)))
+                gmax = max(gmax, float(np.nanmax(powers)))
+                valid = ~np.isnan(powers)
+                psd_sum[idx] += np.where(valid, powers, 0.0)
+                psd_cnt[idx] += valid
         # The downsampled axis is still uniform: group-mean of a uniform axis
         # shifts the start by (factor-1)*step/2 and multiplies the step.
         if first_axis_num_bins > max_bins and freq_step_hz > 0:
@@ -1072,32 +1092,25 @@ class SensorDatabase:
     async def _stats_raw(self, where: str, params: list[Any], bucket_sec: float) -> dict[str, Any]:
         """Raw stats: one point per window (no averaging)."""
         assert self._db is not None
-        query = (
-            "SELECT start_time, pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis "
-            f"FROM avg_windows {where} ORDER BY start_time"
-        )
+        columns = "start_time, pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis"
         points: list[dict[str, Any]] = []
         gmin, gmax = float("inf"), float("-inf")
-        async with self._db.execute(query, params) as cursor:
-            while True:
-                rows = await cursor.fetchmany(10000)
-                if not rows:
-                    break
-                for r in rows:
-                    points.append(
-                        {
-                            "start_time": r[0],
-                            "count": 1,
-                            "pwr_avg": float(r[1]),
-                            "pwr_max": float(r[2]) if r[2] is not None else None,
-                            "pwr_median": float(r[3]),
-                            "pwr_std": float(r[4]),
-                            "kurtosis": float(r[5]),
-                        }
-                    )
-                    if r[2] is not None:
-                        gmin = min(gmin, float(r[1]))
-                        gmax = max(gmax, float(r[2]))
+        async for rows in self._scan_avg_windows(columns, where, params, chunk=10000):
+            for r in rows:
+                points.append(
+                    {
+                        "start_time": r[0],
+                        "count": 1,
+                        "pwr_avg": float(r[1]),
+                        "pwr_max": float(r[2]) if r[2] is not None else None,
+                        "pwr_median": float(r[3]),
+                        "pwr_std": float(r[4]),
+                        "kurtosis": float(r[5]),
+                    }
+                )
+                if r[2] is not None:
+                    gmin = min(gmin, float(r[1]))
+                    gmax = max(gmax, float(r[2]))
         return {
             "bucket_sec": bucket_sec,
             "min_pwr": gmin if gmin != float("inf") else 0.0,
@@ -1122,10 +1135,7 @@ class SensorDatabase:
         ``max_points + 1`` points.
         """
         assert self._db is not None
-        query = (
-            "SELECT start_time, pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis "
-            f"FROM avg_windows {where} ORDER BY start_time"
-        )
+        columns = "start_time, pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis"
         anchor = math.floor(since.timestamp() / bucket_sec) * bucket_sec
         n_points = max(1, math.ceil((until.timestamp() - anchor) / bucket_sec))
         n = [0] * n_points
@@ -1135,23 +1145,19 @@ class SensorDatabase:
         std = [0.0] * n_points
         kurt = [0.0] * n_points
         gmin, gmax = float("inf"), float("-inf")
-        async with self._db.execute(query, params) as cursor:
-            while True:
-                rows = await cursor.fetchmany(10000)
-                if not rows:
-                    break
-                for r in rows:
-                    idx = int((datetime.fromisoformat(r[0]).timestamp() - anchor) / bucket_sec)
-                    idx = max(0, min(idx, n_points - 1))
-                    n[idx] += 1
-                    avg[idx] += float(r[1])
-                    med[idx] += float(r[3])
-                    std[idx] += float(r[4])
-                    kurt[idx] += float(r[5])
-                    if r[2] is not None:
-                        mx[idx] = max(mx[idx], float(r[2]))
-                        gmin = min(gmin, float(r[1]))
-                        gmax = max(gmax, float(r[2]))
+        async for rows in self._scan_avg_windows(columns, where, params, chunk=10000):
+            for r in rows:
+                idx = int((datetime.fromisoformat(r[0]).timestamp() - anchor) / bucket_sec)
+                idx = max(0, min(idx, n_points - 1))
+                n[idx] += 1
+                avg[idx] += float(r[1])
+                med[idx] += float(r[3])
+                std[idx] += float(r[4])
+                kurt[idx] += float(r[5])
+                if r[2] is not None:
+                    mx[idx] = max(mx[idx], float(r[2]))
+                    gmin = min(gmin, float(r[1]))
+                    gmax = max(gmax, float(r[2]))
         points = [
             {
                 "start_time": datetime.fromtimestamp(

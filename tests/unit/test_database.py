@@ -1260,3 +1260,109 @@ async def test_insert_detections_batch_inserts_all_rows_in_one_commit(tmp_path):
         assert await db.insert_detections([]) == 0
     finally:
         await db.close()
+
+
+# -- Keyset-paged avg_windows scans (no reader statement spans an await) --
+
+
+@pytest.mark.parametrize("chunk", [2, 3, 7, 50])
+async def test_scan_avg_windows_pages_by_key_across_tied_start_times(db, chunk):
+    """Every in-range row comes back exactly once, in (start_time, id) order,
+    even when a chunk boundary falls inside a run of identical start_times."""
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    t_tie = base + timedelta(seconds=1)
+    # Inserted out of time order so id order differs from (start_time, id) order:
+    # the late window gets id 1, the five tied windows ids 2-6, the early one id 7.
+    await db.insert_avg_window(start_time=base + timedelta(seconds=2), **_avg_common(pwr_avg=-1.0))
+    for k in range(5):
+        await db.insert_avg_window(start_time=t_tie, **_avg_common(pwr_avg=-10.0 - k))
+    await db.insert_avg_window(start_time=base, **_avg_common(pwr_avg=-20.0))
+    # Out of scope: other tuning at the tied time, before the range, at `until`.
+    await db.insert_avg_window(start_time=t_tie, **_avg_common(sdr_center_freq_hz=200e6))
+    await db.insert_avg_window(start_time=base - timedelta(seconds=1), **_avg_common())
+    await db.insert_avg_window(start_time=base + timedelta(seconds=3), **_avg_common())
+
+    where = "WHERE start_time >= ? AND start_time < ? AND sdr_center_freq_hz = ?"
+    params = [base.isoformat(), (base + timedelta(seconds=3)).isoformat(), 100e6]
+    chunks = [c async for c in db._scan_avg_windows("pwr_avg", where, params, chunk=chunk)]
+
+    assert all(0 < len(c) <= chunk for c in chunks)
+    rows = [r for c in chunks for r in c]
+    ids = [r[-1] for r in rows]
+    assert ids == [7, 2, 3, 4, 5, 6, 1], "each row once, in (start_time, id) order"
+    assert [r[0] for r in rows] == [-20.0, -10.0, -11.0, -12.0, -13.0, -14.0, -1.0]
+    assert [r[-2] for r in rows] == sorted(r[-2] for r in rows)
+
+
+def _query_waterfall_raw(db, base):
+    return db.query_avg_waterfall(
+        since=base, until=base + timedelta(seconds=8), max_rows=600, max_bins=4
+    )
+
+
+def _query_waterfall_aggregated(db, base):
+    return db.query_avg_waterfall(
+        since=base, until=base + timedelta(seconds=8), max_rows=2, max_bins=4
+    )
+
+
+def _query_stats_raw(db, base):
+    return db.query_avg_stats(since=base, until=base + timedelta(seconds=8), max_points=600)
+
+
+def _query_stats_aggregated(db, base):
+    return db.query_avg_stats(since=base, until=base + timedelta(seconds=8), max_points=2)
+
+
+@pytest.mark.parametrize(
+    "run_query",
+    [
+        _query_waterfall_raw,
+        _query_waterfall_aggregated,
+        _query_stats_raw,
+        _query_stats_aggregated,
+    ],
+)
+async def test_reader_snapshot_stays_fresh_between_scan_chunks(tmp_path, monkeypatch, run_query):
+    """A Dashboard scan must not pin the reader's WAL snapshot. Between two of
+    its chunks, a writer commit is visible to another read on the same reader
+    connection (the heartbeat's count_detections) before the scan finishes.
+    A statement held open across those awaits would keep every read on the
+    reader on the scan's stale snapshot and stop the WAL from rewinding."""
+    path = str(tmp_path / "fresh.sqlite")
+    writer = SensorDatabase(path)
+    await writer.connect()
+    reader: SensorDatabase | None = None
+    try:
+        reader = SensorDatabase(path, read_only=True)
+        await reader.connect()
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for i in range(7):
+            await writer.insert_avg_window(start_time=base + timedelta(seconds=i), **_avg_common())
+        await writer.insert_detection(**_det_kwargs(0))
+
+        real_scan = reader._scan_avg_windows
+        observed: list[tuple[int, int]] = []
+
+        async def interleaved_scan(columns, where, params, chunk=5000):
+            n = 0
+            async for rows in real_scan(columns, where, params, chunk=2):
+                yield rows
+                # The real scan is suspended between two chunks right here.
+                n += 1
+                await writer.insert_detection(**_det_kwargs(n))
+                observed.append((await reader.count_detections(), await writer.count_detections()))
+
+        monkeypatch.setattr(reader, "_scan_avg_windows", interleaved_scan)
+        result = await run_query(reader, base)
+
+        total = sum(b["count"] for b in result.get("buckets", result.get("points", [])))
+        assert total == 7, "every window scanned exactly once"
+        assert len(observed) >= 3, "the scan ran in several chunks"
+        assert all(seen == latest for seen, latest in observed), (
+            f"reader stuck on a stale snapshot mid-scan: (reader, writer) = {observed}"
+        )
+    finally:
+        if reader is not None:
+            await reader.close()
+        await writer.close()

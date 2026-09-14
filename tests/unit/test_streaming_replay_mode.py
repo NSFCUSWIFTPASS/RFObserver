@@ -18,7 +18,7 @@ def _proc(replay_mode: bool, tmp_path):
         _env_file=None, STORAGE_PATH=str(tmp_path), DB_PATH=str(tmp_path / "d.db")
     )
     db = MagicMock()
-    db.insert_detection = AsyncMock()
+    db.insert_detections = AsyncMock()
     storage = MagicMock()
     storage.storage_path = tmp_path
     # Honor the LocalStorage contract: real auto/ and manual/ subdirs so the
@@ -52,7 +52,7 @@ async def test_replay_mode_skips_insert(tmp_path):
     proc._burst_result_queue.put_nowait(([_fake_burst()], 915e6))
     proc._burst_result_queue.put_nowait(None)
     await proc._drain_burst_results()
-    db.insert_detection.assert_not_called()
+    db.insert_detections.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -61,7 +61,7 @@ async def test_normal_mode_inserts(tmp_path):
     proc._burst_result_queue.put_nowait(([_fake_burst()], 915e6))
     proc._burst_result_queue.put_nowait(None)
     await proc._drain_burst_results()
-    db.insert_detection.assert_called()
+    db.insert_detections.assert_called()
 
 
 def test_replay_mode_begin_recording_is_noop(tmp_path):

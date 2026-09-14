@@ -1873,6 +1873,7 @@ class StreamingProcessor:
 
     async def _drain_burst_results(self) -> None:
         """Process all pending burst results from the burst detection thread."""
+        rows: list[dict[str, Any]] = []
         while True:
             try:
                 item = self._burst_result_queue.get_nowait()
@@ -1898,32 +1899,35 @@ class StreamingProcessor:
             for burst in bursts:
                 if self._replay_mode:
                     continue
-                try:
-                    await self._db.insert_detection(
-                        burst_id=burst.burst_id,
-                        start_time=burst.start_time,
-                        stop_time=burst.stop_time,
-                        center_freq_hz=burst.center_freq_hz,
-                        bandwidth_hz=burst.bandwidth_hz,
-                        peak_power_db=burst.peak_power_db,
-                        duration_ms=burst.duration_ms,
-                        detection_timestamp=burst.detection_timestamp,
-                        peak_freq_hz=burst.peak_freq_hz,
-                        sdr_center_freq_hz=float(sdr_center_freq_hz),
-                        sample_rate_hz=sample_rate_hz,
-                        lo_offset_hz=0.0,
-                        analog_bw_hz=None,
-                        gain_db=gain_db,
-                        antenna="RX2",
-                        device_serial=device_serial,
-                    )
-                except Exception:
-                    logger.exception(
-                        "insert_detection failed for burst %s; skipping", burst.burst_id
-                    )
+                rows.append(
+                    {
+                        "burst_id": burst.burst_id,
+                        "start_time": burst.start_time,
+                        "stop_time": burst.stop_time,
+                        "center_freq_hz": burst.center_freq_hz,
+                        "bandwidth_hz": burst.bandwidth_hz,
+                        "peak_power_db": burst.peak_power_db,
+                        "duration_ms": burst.duration_ms,
+                        "detection_timestamp": burst.detection_timestamp,
+                        "peak_freq_hz": burst.peak_freq_hz,
+                        "sdr_center_freq_hz": float(sdr_center_freq_hz),
+                        "sample_rate_hz": sample_rate_hz,
+                        "lo_offset_hz": 0.0,
+                        "analog_bw_hz": None,
+                        "gain_db": gain_db,
+                        "antenna": "RX2",
+                        "device_serial": device_serial,
+                    }
+                )
 
             if bursts:
                 logger.info("Detected %d bursts", len(bursts))
+
+        if rows:
+            try:
+                await self._db.insert_detections(rows)
+            except Exception:
+                logger.exception("insert_detections failed for %d bursts; skipping", len(rows))
 
     # -- Helpers --
 

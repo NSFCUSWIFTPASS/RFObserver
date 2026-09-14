@@ -8,12 +8,12 @@ from rfobserver.pipeline.streaming import StreamingProcessor
 
 
 class _BoomDB:
-    """Stands in for SensorDatabase: insert_detection always raises."""
+    """Stands in for SensorDatabase: insert_detections always raises."""
 
     def __init__(self) -> None:
         self.calls = 0
 
-    async def insert_detection(self, **kwargs) -> None:
+    async def insert_detections(self, detections) -> None:
         self.calls += 1
         raise RuntimeError("simulated disk-full")
 

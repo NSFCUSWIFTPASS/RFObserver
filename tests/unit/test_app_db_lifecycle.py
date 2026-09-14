@@ -1,8 +1,11 @@
-"""run() opens the web reader only with the web server and always closes the writer."""
+"""run() lifecycle: DB connections, and an ordered stop on SIGINT/SIGTERM."""
 
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
+import signal
 from typing import Any
 
 import pytest
@@ -17,6 +20,11 @@ class _Registry:
         self.fail_reader_connect = False
         self.fail_reader_close = False
         self.web_args: tuple[Any, ...] | None = None
+        self.web_ignores_stop = False
+        self.web_stopped_by_event = False
+        self.set_active_calls: list[bool] = []
+        self.fail_set_active_false = False
+        self.cancel_set_active_false = False
 
 
 @pytest.fixture
@@ -42,14 +50,29 @@ def reg(monkeypatch: pytest.MonkeyPatch) -> _Registry:
 
     async def fake_web_server(*args: Any) -> None:
         registry.web_args = args
-        await asyncio.Event().wait()
+        stop = args[-1]
+        assert isinstance(stop, asyncio.Event)
+        if registry.web_ignores_stop:
+            await asyncio.Event().wait()
+        await stop.wait()
+        registry.web_stopped_by_event = True
 
     async def fake_heartbeat(*args: Any) -> None:
         await asyncio.Event().wait()
 
+    async def fake_set_active(self: Any, active: bool) -> None:
+        registry.set_active_calls.append(active)
+        if not active and registry.cancel_set_active_false:
+            raise asyncio.CancelledError()
+        if not active and registry.fail_set_active_false:
+            raise RuntimeError("pipeline stop failed")
+
     monkeypatch.setattr("rfobserver.storage.database.SensorDatabase", FakeDB)
     monkeypatch.setattr(app_mod, "_run_web_server", fake_web_server)
     monkeypatch.setattr(app_mod, "_heartbeat_loop", fake_heartbeat)
+    monkeypatch.setattr(
+        "rfobserver.pipeline.supervisor.PipelineSupervisor.set_active", fake_set_active
+    )
     return registry
 
 
@@ -96,6 +119,7 @@ async def test_web_run_serves_reader_and_closes_both(reg: _Registry, tmp_path: A
     assert reg.web_args is not None
     assert reg.web_args[2] is reader and reg.web_args[3] is writer
     assert writer.closed and reader.closed
+    _assert_handlers_restored()
 
 
 async def test_reader_connect_failure_closes_the_writer(reg: _Registry, tmp_path: Any) -> None:
@@ -113,3 +137,90 @@ async def test_reader_close_failure_still_closes_the_writer(reg: _Registry, tmp_
     writer, reader = reg.instances
     assert reader.closed
     assert writer.closed, "a failed reader close must not skip the writer close"
+
+
+def _assert_handlers_installed() -> None:
+    # Guard: a real SIGINT/SIGTERM with the default handler would end pytest.
+    assert signal.getsignal(signal.SIGINT) is not signal.default_int_handler
+    assert signal.getsignal(signal.SIGTERM) not in (signal.SIG_DFL, signal.SIG_IGN, None)
+
+
+def _assert_handlers_restored() -> None:
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+
+
+async def _start(settings: AppSettings) -> asyncio.Task[None]:
+    task = asyncio.create_task(app_mod.run(settings))
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert not task.done(), "run() should still be serving"
+    _assert_handlers_installed()
+    return task
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+@pytest.mark.parametrize("web_port", [0, 8888])
+async def test_signal_stops_run_in_order(
+    reg: _Registry,
+    tmp_path: Any,
+    sig: signal.Signals,
+    web_port: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="rfobserver.pipeline.app")
+    task = await _start(_settings(tmp_path, web_port=web_port))
+    os.kill(os.getpid(), sig)
+    await asyncio.wait_for(task, timeout=5)  # returns normally: exit code 0
+    assert reg.set_active_calls == [False], "the pipeline is stopped once"
+    assert all(db.closed for db in reg.instances)
+    if web_port:
+        assert reg.web_stopped_by_event, "the web server exits on the stop event"
+    assert "Shutdown complete" in caplog.text
+    _assert_handlers_restored()
+
+
+async def test_web_server_that_ignores_stop_is_cancelled(
+    reg: _Registry, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reg.web_ignores_stop = True
+    monkeypatch.setattr(app_mod, "_WEB_SHUTDOWN_TIMEOUT_SEC", 0.1)
+    task = await _start(_settings(tmp_path, web_port=8888))
+    os.kill(os.getpid(), signal.SIGTERM)
+    await asyncio.wait_for(task, timeout=5)
+    assert reg.set_active_calls == [False]
+    assert all(db.closed for db in reg.instances)
+    _assert_handlers_restored()
+
+
+async def test_pipeline_stop_failure_still_closes_the_dbs(reg: _Registry, tmp_path: Any) -> None:
+    reg.fail_set_active_false = True
+    task = await _start(_settings(tmp_path, web_port=8888))
+    os.kill(os.getpid(), signal.SIGTERM)
+    await asyncio.wait_for(task, timeout=5)
+    assert all(db.closed for db in reg.instances)
+    _assert_handlers_restored()
+
+
+async def test_cancelled_pipeline_stop_still_closes_the_dbs(reg: _Registry, tmp_path: Any) -> None:
+    reg.cancel_set_active_false = True
+    task = await _start(_settings(tmp_path, web_port=8888))
+    os.kill(os.getpid(), signal.SIGTERM)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+    assert all(db.closed for db in reg.instances)
+    _assert_handlers_restored()
+
+
+async def test_worker_failure_propagates_after_cleanup(
+    reg: _Registry, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def dying_heartbeat(*args: Any) -> None:
+        raise RuntimeError("heartbeat died")
+
+    monkeypatch.setattr(app_mod, "_heartbeat_loop", dying_heartbeat)
+    with pytest.raises(RuntimeError, match="heartbeat died"):
+        await asyncio.wait_for(app_mod.run(_settings(tmp_path, web_port=8888)), timeout=5)
+    assert reg.set_active_calls == [False]
+    assert all(db.closed for db in reg.instances)
+    _assert_handlers_restored()

@@ -176,8 +176,10 @@ class AppSettings(BaseSettings):
     WATCHDOG_TIMEOUT_SEC: float = 30.0
     WATCHDOG_RESTART_DEADLINE_SEC: float = 10.0
     # How long a watchdog-driven restart waits for the stalled task before
-    # cancelling it. Must leave room inside WATCHDOG_RESTART_DEADLINE_SEC for
-    # teardown + SDR re-init (~2.3 s on a B200mini) or the restart escalates to exit.
+    # cancelling it. This bounds only that wait -- the cancelled pipeline's own
+    # teardown (recording finalize, thread joins, final DB drain) is NOT bounded
+    # by it, so a restart with a recording in progress or a DB backlog can still
+    # exceed WATCHDOG_RESTART_DEADLINE_SEC and escalate to exit 90.
     WATCHDOG_STOP_TIMEOUT_SEC: float = 5.0
 
     # After crash auto-restart gives up, exit (code 91) a few seconds later so

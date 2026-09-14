@@ -45,7 +45,7 @@ jobs:
         run: pip install hatch
 
       - name: Run unit tests
-        run: hatch run test:unit
+        run: hatch run +py=${{ matrix.python-version }} test:unit
 
   test-integration:
     needs: [lint, test-unit]

@@ -164,6 +164,15 @@ async def run(settings: AppSettings) -> None:
     if settings.WATCHDOG_ENABLED:
         from rfobserver.utils.watchdog import PipelineWatchdog
 
+        if settings.WATCHDOG_STOP_TIMEOUT_SEC + 3.0 >= settings.WATCHDOG_RESTART_DEADLINE_SEC:
+            logger.warning(
+                "WATCHDOG_STOP_TIMEOUT_SEC (%.1fs) + SDR re-init (~2.3s) leaves no "
+                "room inside WATCHDOG_RESTART_DEADLINE_SEC (%.1fs); watchdog restarts "
+                "will likely escalate to process exit",
+                settings.WATCHDOG_STOP_TIMEOUT_SEC,
+                settings.WATCHDOG_RESTART_DEADLINE_SEC,
+            )
+
         watchdog = PipelineWatchdog(
             beacon,
             is_active=lambda: supervisor.active,

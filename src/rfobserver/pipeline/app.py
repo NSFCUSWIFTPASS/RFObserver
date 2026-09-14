@@ -76,8 +76,15 @@ async def run(settings: AppSettings) -> None:
 
     # Web-layer reader (spec Cut 3b): Dashboard reads get their own connection so
     # they never queue pipeline writes. Connect after the writer (schema owner).
-    read_db = SensorDatabase(settings.DB_PATH, read_only=True)
-    await read_db.connect()
+    # Only the web server and its heartbeat use it, so headless runs skip it.
+    read_db: SensorDatabase | None = None
+    if settings.WEB_PORT > 0:
+        read_db = SensorDatabase(settings.DB_PATH, read_only=True)
+        try:
+            await read_db.connect()
+        except BaseException:
+            await db.close()
+            raise
 
     local_storage = LocalStorage(settings.STORAGE_PATH, max_gb=settings.ARCHIVE_MAX_GB)
     broadcast = LiveBroadcast()
@@ -192,7 +199,7 @@ async def run(settings: AppSettings) -> None:
     tasks: list[Any] = []
     if zms_monitor is not None:
         tasks.append(zms_monitor.run())
-    if settings.WEB_PORT > 0:
+    if read_db is not None:
         tasks.append(_run_web_server(settings, supervisor, read_db, db, broadcast, beacon))
         tasks.append(_heartbeat_loop(settings, supervisor, read_db, local_storage, broadcast))
     if settings.DB_RETENTION_DAYS > 0:
@@ -211,8 +218,11 @@ async def run(settings: AppSettings) -> None:
             await zms_monitor.stop()
         if nats_producer is not None:
             await nats_producer.close()
-        await read_db.close()
-        await db.close()
+        try:
+            if read_db is not None:
+                await read_db.close()
+        finally:
+            await db.close()
 
 
 async def _heartbeat_loop(

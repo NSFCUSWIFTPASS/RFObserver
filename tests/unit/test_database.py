@@ -1191,16 +1191,18 @@ async def test_read_only_connection_reads_but_rejects_writes(tmp_path):
     path = str(tmp_path / "ro.sqlite")
     writer = SensorDatabase(path)
     await writer.connect()
-    reader = SensorDatabase(path, read_only=True)
-    await reader.connect()
+    reader: SensorDatabase | None = None
     try:
+        reader = SensorDatabase(path, read_only=True)
+        await reader.connect()
         assert reader.read_only and not writer.read_only
         await writer.insert_detection(**_det_kwargs(0))
         assert await reader.count_detections() >= 1
         with pytest.raises(sqlite3.OperationalError):
             await reader.set_config("k", "v")
     finally:
-        await reader.close()
+        if reader is not None:
+            await reader.close()
         await writer.close()
 
 
@@ -1210,9 +1212,10 @@ async def test_busy_reader_does_not_delay_writer(tmp_path):
     path = str(tmp_path / "split.sqlite")
     writer = SensorDatabase(path)
     await writer.connect()
-    reader = SensorDatabase(path, read_only=True)
-    await reader.connect()
+    reader: SensorDatabase | None = None
     try:
+        reader = SensorDatabase(path, read_only=True)
+        await reader.connect()
         assert reader._db is not None
 
         def _slow(seconds: float) -> int:
@@ -1227,5 +1230,6 @@ async def test_busy_reader_does_not_delay_writer(tmp_path):
         assert time.monotonic() - t0 < 0.5, "a busy reader must not delay the writer"
         await slow_read
     finally:
-        await reader.close()
+        if reader is not None:
+            await reader.close()
         await writer.close()

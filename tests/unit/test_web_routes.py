@@ -37,6 +37,41 @@ def test_health_endpoint(client):
     assert "version" in data
 
 
+def test_health_without_supervisor_has_no_pipeline_block(client):
+    data = client.get("/api/health").json()
+    assert data["status"] == "ok"
+    assert "pipeline" not in data
+
+
+def test_health_reports_pipeline_and_degrades_on_give_up(settings):
+    app = create_app(settings)
+    sup = MagicMock(active=False, gave_up=True, consecutive_crashes=6)
+    app.state.supervisor = sup
+    app.state.beacon = None
+    data = TestClient(app).get("/api/health").json()
+    assert data["status"] == "degraded"
+    assert data["pipeline"] == {
+        "active": False,
+        "gave_up": True,
+        "consecutive_crashes": 6,
+        "beacon_age_sec": None,
+    }
+
+
+def test_health_active_and_fresh_beacon_reports_ok(settings):
+    from rfobserver.pipeline.beacon import ProgressBeacon
+
+    app = create_app(settings)
+    sup = MagicMock(active=True, gave_up=False, consecutive_crashes=0)
+    app.state.supervisor = sup
+    beacon = ProgressBeacon()
+    beacon.mark()
+    app.state.beacon = beacon
+    data = TestClient(app).get("/api/health").json()
+    assert data["status"] == "ok"
+    assert 0.0 <= data["pipeline"]["beacon_age_sec"] < 1.0
+
+
 def test_api_status(client):
     response = client.get("/api/status")
     assert response.status_code == 200
@@ -974,6 +1009,36 @@ def test_post_sensor_toggles_and_confirms(settings, monkeypatch):
     assert resp.json()["active"] is False
     assert sup.calls == [False]
     assert settings.SENSOR_ACTIVE is False
+
+
+def test_post_sensor_stop_persists_before_awaiting_set_active(settings, monkeypatch):
+    """The stop intent must be persisted BEFORE set_active(False) is awaited,
+    so a watchdog exit mid-stop can't leave the persisted state stale/active."""
+    import rfobserver.web.routes.config as config_mod
+
+    persist_calls: list[bool] = []
+    monkeypatch.setattr(config_mod, "_persist_settings", lambda s: persist_calls.append(True))
+
+    app = create_app(settings)
+    observed = {}
+
+    class _RecordingSupervisor:
+        active = True
+
+        async def set_active(self, active: bool) -> bool:
+            observed["sensor_active_at_entry"] = app.state.settings.SENSOR_ACTIVE
+            observed["persisted_before_entry"] = bool(persist_calls)
+            self.active = active
+            return active
+
+    app.state.supervisor = _RecordingSupervisor()
+    client = TestClient(app)
+
+    resp = client.post("/api/sensor", json={"active": False})
+
+    assert resp.status_code == 200
+    assert observed["sensor_active_at_entry"] is False
+    assert observed["persisted_before_entry"] is True
 
 
 def test_post_sensor_without_supervisor_is_409(settings):

@@ -175,6 +175,17 @@ class AppSettings(BaseSettings):
     WATCHDOG_ENABLED: bool = False
     WATCHDOG_TIMEOUT_SEC: float = 30.0
     WATCHDOG_RESTART_DEADLINE_SEC: float = 10.0
+    # How long a watchdog-driven restart waits for the stalled task before
+    # cancelling it. This bounds only that wait -- the cancelled pipeline's own
+    # teardown (recording finalize, thread joins, final DB drain) is NOT bounded
+    # by it, so a restart with a recording in progress or a DB backlog can still
+    # exceed WATCHDOG_RESTART_DEADLINE_SEC and escalate to exit 90.
+    WATCHDOG_STOP_TIMEOUT_SEC: float = 5.0
+
+    # After crash auto-restart gives up, exit (code 91) a few seconds later so
+    # systemd's Restart=on-failure starts a fresh process (fresh USB/SDR state)
+    # instead of leaving a live process with the sensor silently inactive.
+    EXIT_ON_CRASH_GIVE_UP: bool = True
 
     # Development
     MOCK_RECEIVER: bool = False

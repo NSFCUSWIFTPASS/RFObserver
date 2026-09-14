@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, WebSocket
 from fastapi.staticfiles import StaticFiles
@@ -50,8 +51,23 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.include_router(modules.router, prefix="/api")
 
     @app.get("/api/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok", "version": __version__}
+    async def health() -> dict[str, Any]:
+        body: dict[str, Any] = {"status": "ok", "version": __version__}
+        sup = getattr(app.state, "supervisor", None)
+        if sup is not None:
+            beacon = getattr(app.state, "beacon", None)
+            body["pipeline"] = {
+                "active": sup.active,
+                "gave_up": sup.gave_up,
+                "consecutive_crashes": sup.consecutive_crashes,
+                # Only meaningful while running; a stale age while active is a stall.
+                "beacon_age_sec": round(beacon.age(), 1)
+                if beacon is not None and sup.active
+                else None,
+            }
+            if sup.gave_up:
+                body["status"] = "degraded"
+        return body
 
     @app.websocket("/ws/live")
     async def ws_live(websocket: WebSocket) -> None:

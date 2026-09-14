@@ -221,6 +221,15 @@ async def sensor_set(request: Request) -> dict[str, Any]:
     if not isinstance(body, dict) or "active" not in body:
         raise HTTPException(status_code=400, detail="Missing 'active'")
     want = bool(body["active"])
+    settings = request.app.state.settings
+
+    if not want:
+        # Persist the stop intent BEFORE awaiting set_active: if a manual stop
+        # of a hung pipeline takes long enough for the watchdog to exit the
+        # process (code 90), systemd must still restart into Standby rather
+        # than override this stop with the last-persisted active state.
+        settings.SENSOR_ACTIVE = False
+        _persist_settings(settings)
 
     try:
         confirmed = await supervisor.set_active(want)
@@ -228,7 +237,7 @@ async def sensor_set(request: Request) -> dict[str, Any]:
         logger.exception("Sensor toggle failed")
         raise HTTPException(status_code=500, detail=f"toggle failed: {exc}") from exc
 
-    settings = request.app.state.settings
+    # Idempotent for both directions: reconfirms the final state either way.
     settings.SENSOR_ACTIVE = confirmed
     _persist_settings(settings)
     logger.info("Sensor set active=%s via API (persisted)", confirmed)

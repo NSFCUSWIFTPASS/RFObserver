@@ -163,8 +163,10 @@ class _LoopHandoff:
     """
 
     def __init__(self, q: asyncio.Queue[Any]) -> None:
+        if q.maxsize <= 0:
+            raise ValueError("_LoopHandoff needs a bounded queue")
         self._q = q
-        self._limit = max(1, q.maxsize)
+        self._limit = q.maxsize
         self._pending = 0
         self._lock = threading.Lock()
         self.dropped = 0
@@ -715,11 +717,14 @@ class StreamingProcessor:
                         if recv_count % 50 == 0:
                             recv_ms = (t_recv_done - recv_time) * 1000
                             logger.info(
-                                "TIMING recv#%d: recv=%.1fms dropped=%d (IQ=%.1fms)",
+                                "TIMING recv#%d: recv=%.1fms dropped=%d (IQ=%.1fms) "
+                                "handoff_dropped=%d/%d",
                                 recv_count,
                                 recv_ms,
                                 self._dropped_chunks,
                                 self._chunk_duration * 1000,
+                                self._result_handoff.dropped,
+                                self._burst_handoff.dropped,
                             )
 
         except Exception:

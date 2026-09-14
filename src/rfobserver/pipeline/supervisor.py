@@ -41,10 +41,12 @@ class PipelineSupervisor:
         build_receiver: Callable[[], IReceiver],
         build_processor: Callable[..., Any],
         on_processor_change: Callable[[Any | None], None] | None = None,
+        on_give_up: Callable[[], None] | None = None,
     ) -> None:
         self._build_receiver = build_receiver
         self._build_processor = build_processor
         self._on_processor_change = on_processor_change
+        self._on_give_up = on_give_up
         self._receiver: IReceiver | None = None
         self._processor: Any | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -55,6 +57,7 @@ class PipelineSupervisor:
         self._stopping = False
         self._consecutive_crashes = 0
         self._last_crash_ts = 0.0
+        self._gave_up = False
 
     @property
     def active(self) -> bool:
@@ -68,6 +71,15 @@ class PipelineSupervisor:
     def receiver(self) -> IReceiver | None:
         return self._receiver
 
+    @property
+    def gave_up(self) -> bool:
+        """True once crash auto-restart gave up; cleared by a manual activation."""
+        return self._gave_up
+
+    @property
+    def consecutive_crashes(self) -> int:
+        return self._consecutive_crashes
+
     async def set_active(self, active: bool) -> bool:
         """Transition to ``active`` and return the actual resulting state.
 
@@ -78,6 +90,7 @@ class PipelineSupervisor:
             if active and not self._active:
                 # A deliberate manual activation clears any prior crash streak.
                 self._consecutive_crashes = 0
+                self._gave_up = False
                 await self._start()
             elif not active and self._active:
                 await self._stop()
@@ -201,6 +214,9 @@ class PipelineSupervisor:
             async with self._lock:
                 if self._active and not self._replay:
                     await self._stop()
+                    self._gave_up = True
+            if self._gave_up and self._on_give_up is not None:
+                self._on_give_up()
             return
 
         backoff = min(2.0 ** (self._consecutive_crashes - 1), _CRASH_BACKOFF_CAP_SEC)

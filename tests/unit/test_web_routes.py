@@ -37,6 +37,27 @@ def test_health_endpoint(client):
     assert "version" in data
 
 
+def test_health_without_supervisor_has_no_pipeline_block(client):
+    data = client.get("/api/health").json()
+    assert data["status"] == "ok"
+    assert "pipeline" not in data
+
+
+def test_health_reports_pipeline_and_degrades_on_give_up(settings):
+    app = create_app(settings)
+    sup = MagicMock(active=False, gave_up=True, consecutive_crashes=6)
+    app.state.supervisor = sup
+    app.state.beacon = None
+    data = TestClient(app).get("/api/health").json()
+    assert data["status"] == "degraded"
+    assert data["pipeline"] == {
+        "active": False,
+        "gave_up": True,
+        "consecutive_crashes": 6,
+        "beacon_age_sec": None,
+    }
+
+
 def test_api_status(client):
     response = client.get("/api/status")
     assert response.status_code == 200

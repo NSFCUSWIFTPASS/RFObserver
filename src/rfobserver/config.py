@@ -180,6 +180,11 @@ class AppSettings(BaseSettings):
     # teardown + SDR re-init (~2.3 s on a B200mini) or the restart escalates to exit.
     WATCHDOG_STOP_TIMEOUT_SEC: float = 5.0
 
+    # After crash auto-restart gives up, exit (code 91) a few seconds later so
+    # systemd's Restart=on-failure starts a fresh process (fresh USB/SDR state)
+    # instead of leaving a live process with the sensor silently inactive.
+    EXIT_ON_CRASH_GIVE_UP: bool = True
+
     # Development
     MOCK_RECEIVER: bool = False
     LOG_LEVEL: str = "INFO"

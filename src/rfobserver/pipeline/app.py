@@ -8,16 +8,48 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import TYPE_CHECKING, Any
 
 from rfobserver.web.websocket import LiveBroadcast
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from rfobserver.capture.receiver import IReceiver
     from rfobserver.config import AppSettings
+    from rfobserver.pipeline.beacon import ProgressBeacon
     from rfobserver.pipeline.supervisor import PipelineSupervisor
 
 logger = logging.getLogger(__name__)
+
+_GIVE_UP_EXIT_CODE = 91
+_GIVE_UP_EXIT_DELAY_SEC = 5.0
+
+
+def make_give_up_handler(
+    enabled: bool,
+    exit_fn: Callable[[int], object] = os._exit,
+    delay_sec: float = _GIVE_UP_EXIT_DELAY_SEC,
+) -> Callable[[], None]:
+    """Build the supervisor's give-up hook: exit for systemd after a short delay.
+
+    The delay lets /api/health report the give-up and the log flush first. The
+    SDR is already released by the supervisor's stop before this runs.
+    """
+
+    def handler() -> None:
+        if not enabled:
+            return
+        logger.error(
+            "Pipeline auto-restart gave up; exiting (code %d) in %.0fs so systemd "
+            "starts a fresh process",
+            _GIVE_UP_EXIT_CODE,
+            delay_sec,
+        )
+        asyncio.get_running_loop().call_later(delay_sec, exit_fn, _GIVE_UP_EXIT_CODE)
+
+    return handler
 
 
 async def run(settings: AppSettings) -> None:
@@ -121,6 +153,7 @@ async def run(settings: AppSettings) -> None:
     supervisor = PipelineSupervisor(
         build_receiver=build_receiver,
         build_processor=build_processor,
+        on_give_up=make_give_up_handler(settings.EXIT_ON_CRASH_GIVE_UP),
     )
     if settings.SENSOR_ACTIVE:
         await supervisor.set_active(True)
@@ -146,7 +179,7 @@ async def run(settings: AppSettings) -> None:
     if zms_monitor is not None:
         tasks.append(zms_monitor.run())
     if settings.WEB_PORT > 0:
-        tasks.append(_run_web_server(settings, supervisor, db, broadcast))
+        tasks.append(_run_web_server(settings, supervisor, db, broadcast, beacon))
         tasks.append(_heartbeat_loop(settings, supervisor, db, local_storage, broadcast))
     if settings.DB_RETENTION_DAYS > 0:
         tasks.append(_cleanup_loop(settings, db))
@@ -267,6 +300,7 @@ async def _run_web_server(
     supervisor: PipelineSupervisor,
     database: object,
     broadcast: LiveBroadcast,
+    beacon: ProgressBeacon,
 ) -> None:
     """Run the FastAPI web server as an async task."""
     import uvicorn
@@ -275,6 +309,7 @@ async def _run_web_server(
 
     app = create_app(settings)
     app.state.supervisor = supervisor
+    app.state.beacon = beacon
     app.state.database = database
     app.state.broadcast = broadcast
     app.state.processor = supervisor.processor

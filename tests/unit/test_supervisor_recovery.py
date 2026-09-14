@@ -147,6 +147,36 @@ async def test_crash_outside_reset_window_resets_counter(monkeypatch: pytest.Mon
     await sup.set_active(False)
 
 
+@pytest.mark.asyncio
+async def test_give_up_sets_flag_and_calls_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(supervisor_mod, "_CRASH_BACKOFF_CAP_SEC", 0.0)
+    calls: list[int] = []
+    crash = {"on": True}
+
+    def build_proc(
+        receiver: object, *, replay_mode: bool = False
+    ) -> _CrashProcessor | _LongRunningProcessor:
+        return _CrashProcessor() if crash["on"] else _LongRunningProcessor()
+
+    sup = PipelineSupervisor(
+        build_receiver=_FakeReceiver,
+        build_processor=build_proc,
+        on_give_up=lambda: calls.append(1),
+    )
+    assert not sup.gave_up and sup.consecutive_crashes == 0
+    await sup.set_active(True)
+    await asyncio.sleep(1.0)
+
+    assert sup.gave_up and not sup.active
+    assert calls == [1], "the give-up hook must fire exactly once"
+
+    # A deliberate re-activation (with a healthy processor) clears the state.
+    crash["on"] = False
+    await sup.set_active(True)
+    assert not sup.gave_up and sup.consecutive_crashes == 0 and sup.active
+    await sup.set_active(False)
+
+
 class _HungProcessor:
     """run() ignores stop() and only ends when cancelled."""
 

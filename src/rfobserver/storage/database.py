@@ -23,15 +23,64 @@ import logging
 import math
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 import numpy as np
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
 # A healthy write is single-digit ms; 30 s means the storage device wedged.
 _DB_WRITE_TIMEOUT_SEC = 30.0
+
+_INSERT_DETECTION_SQL = """INSERT OR IGNORE INTO detections
+   (burst_id, start_time, stop_time, center_freq_hz, bandwidth_hz,
+    peak_power_db, duration_ms, detection_timestamp,
+    sdr_center_freq_hz, sample_rate_hz, lo_offset_hz, analog_bw_hz,
+    gain_db, antenna, device_serial, peak_freq_hz)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+
+
+def _detection_row(
+    burst_id: str,
+    start_time: datetime,
+    stop_time: datetime,
+    center_freq_hz: float,
+    bandwidth_hz: float,
+    peak_power_db: float,
+    duration_ms: float,
+    detection_timestamp: datetime,
+    sdr_center_freq_hz: float | None = None,
+    sample_rate_hz: float | None = None,
+    lo_offset_hz: float | None = None,
+    analog_bw_hz: float | None = None,
+    gain_db: float | None = None,
+    antenna: str | None = None,
+    device_serial: str | None = None,
+    peak_freq_hz: float = 0.0,
+) -> tuple[Any, ...]:
+    return (
+        burst_id,
+        start_time.isoformat(),
+        stop_time.isoformat(),
+        center_freq_hz,
+        bandwidth_hz,
+        peak_power_db,
+        duration_ms,
+        detection_timestamp.isoformat(),
+        sdr_center_freq_hz,
+        sample_rate_hz,
+        lo_offset_hz,
+        analog_bw_hz,
+        gain_db,
+        antenna,
+        device_serial,
+        peak_freq_hz,
+    )
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS detections (
@@ -375,21 +424,16 @@ class SensorDatabase:
     ) -> None:
         assert self._db is not None
         await self._db.execute(
-            """INSERT OR IGNORE INTO detections
-               (burst_id, start_time, stop_time, center_freq_hz, bandwidth_hz,
-                peak_power_db, duration_ms, detection_timestamp,
-                sdr_center_freq_hz, sample_rate_hz, lo_offset_hz, analog_bw_hz,
-                gain_db, antenna, device_serial, peak_freq_hz)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
+            _INSERT_DETECTION_SQL,
+            _detection_row(
                 burst_id,
-                start_time.isoformat(),
-                stop_time.isoformat(),
+                start_time,
+                stop_time,
                 center_freq_hz,
                 bandwidth_hz,
                 peak_power_db,
                 duration_ms,
-                detection_timestamp.isoformat(),
+                detection_timestamp,
                 sdr_center_freq_hz,
                 sample_rate_hz,
                 lo_offset_hz,
@@ -401,6 +445,20 @@ class SensorDatabase:
             ),
         )
         await self._db.commit()
+
+    @_guarded_write
+    async def insert_detections(self, detections: Sequence[Mapping[str, Any]]) -> int:
+        """Insert many detections with one executemany and one commit.
+
+        The pipeline persists a whole drain's bursts in one call: one trip
+        through the connection's worker queue instead of two per burst.
+        """
+        if not detections:
+            return 0
+        assert self._db is not None
+        await self._db.executemany(_INSERT_DETECTION_SQL, [_detection_row(**d) for d in detections])
+        await self._db.commit()
+        return len(detections)
 
     @_guarded_write
     async def insert_tone_check(

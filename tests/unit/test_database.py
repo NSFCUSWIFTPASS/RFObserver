@@ -1233,3 +1233,30 @@ async def test_busy_reader_does_not_delay_writer(tmp_path):
         if reader is not None:
             await reader.close()
         await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_insert_detections_batch_inserts_all_rows_in_one_commit(tmp_path):
+    db = SensorDatabase(str(tmp_path / "batch.sqlite"))
+    await db.connect()
+    try:
+        assert db._db is not None
+        commits = 0
+        real_commit = db._db.commit
+
+        async def counting_commit() -> None:
+            nonlocal commits
+            commits += 1
+            await real_commit()
+
+        db._db.commit = counting_commit  # type: ignore[method-assign]
+        n = await db.insert_detections([_det_kwargs(i) for i in range(25)])
+        assert n == 25
+        assert commits == 1, "one commit per batch, not per row"
+        assert len(await db.query_detections(limit=100)) == 25
+        # INSERT OR IGNORE semantics preserved: re-inserting the same burst_ids is a no-op.
+        await db.insert_detections([_det_kwargs(i) for i in range(25)])
+        assert len(await db.query_detections(limit=100)) == 25
+        assert await db.insert_detections([]) == 0
+    finally:
+        await db.close()

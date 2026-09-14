@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 import pytest
@@ -64,3 +65,55 @@ async def test_heavy_aggregations_capped_one_per_kind() -> None:
     assert db.max_active["wf"] == 1, "waterfall aggregations must not overlap"
     assert db.max_active["stats"] == 1, "stats aggregations must not overlap"
     assert db.max_active["total"] == 2, "one waterfall and one stats may run together"
+
+
+class _RecordingDB:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def query_avg_waterfall(self, **_: Any) -> dict[str, Any]:
+        self.calls.append("query_avg_waterfall")
+        raise AssertionError("aggregation ran for a disconnected client")
+
+    async def query_avg_stats(self, **_: Any) -> dict[str, Any]:
+        self.calls.append("query_avg_stats")
+        raise AssertionError("aggregation ran for a disconnected client")
+
+
+@pytest.mark.parametrize("path", ["/api/averaged/waterfall", "/api/averaged/stats"])
+@pytest.mark.asyncio
+async def test_disconnected_client_gets_499_without_running_the_aggregation(path: str) -> None:
+    """A request whose client already left (e.g. the Dashboard moved on while it
+    queued behind the semaphore) must not run the heavy scan at all."""
+    app = create_app(AppSettings(_env_file=None))
+    db = _RecordingDB()
+    app.state.database = db
+    # A range no other test uses, so the waterfall cache cannot answer first.
+    query = urlencode({"since": "2026-09-12T00:00:00Z", "until": "2026-09-12T06:00:00Z"})
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "root_path": "",
+        "query_string": query.encode(),
+        "headers": [(b"host", b"t")],
+        "client": ("127.0.0.1", 50000),
+        "server": ("t", 80),
+    }
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    await app(scope, receive, send)
+
+    starts = [m for m in sent if m["type"] == "http.response.start"]
+    assert [m["status"] for m in starts] == [499]
+    assert db.calls == [], "the DB query must never be called for a gone client"

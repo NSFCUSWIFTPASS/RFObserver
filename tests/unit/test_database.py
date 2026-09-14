@@ -1262,12 +1262,17 @@ async def test_busy_reader_does_not_delay_writer(tmp_path):
             return 0
 
         await reader._db.create_function("slow", 1, _slow)
-        slow_read = asyncio.ensure_future(reader._db.execute("SELECT slow(1.0)"))
+        # The slow read must touch a table so it holds a real WAL read snapshot
+        # (a table-less SELECT opens no read transaction); the row makes slow() run.
+        await writer.insert_detection(**_det_kwargs(0))
+        slow_read = asyncio.ensure_future(
+            reader._db.execute_fetchall("SELECT slow(1.0) FROM detections LIMIT 1")
+        )
         await asyncio.sleep(0.1)  # the reader's worker thread is now busy
         t0 = time.monotonic()
         await writer.insert_detection(**_det_kwargs(1))
         assert time.monotonic() - t0 < 0.5, "a busy reader must not delay the writer"
-        await slow_read
+        assert list(await slow_read) == [(0,)], "the slow read ran against the table"
     finally:
         if reader is not None:
             await reader.close()

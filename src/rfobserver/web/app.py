@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +36,15 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     app.state.processor = None
     app.state.database = None
+    app.state.write_database = None
     app.state.broadcast = None
+
+    # One heavy Dashboard aggregation of each kind at a time. On a field-size DB a
+    # 24 h waterfall decodes ~74k PSD blobs on the shared event loop; four at once
+    # pegged the loop and tripped the pipeline watchdog on nano-super. Extra tabs
+    # wait their turn instead of starving the pipeline.
+    app.state.waterfall_sem = asyncio.Semaphore(1)
+    app.state.stats_sem = asyncio.Semaphore(1)
 
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

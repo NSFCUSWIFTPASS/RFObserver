@@ -48,6 +48,14 @@ def _get_db(request: Request) -> Any:
     return getattr(request.app.state, "database", None)
 
 
+def _get_write_db(request: Request) -> Any:
+    """The pipeline's write connection; the web layer's reader is query_only.
+
+    Falls back to ``database`` when no split is configured (tests, tools).
+    """
+    return getattr(request.app.state, "write_database", None) or _get_db(request)
+
+
 @router.get("/status")
 async def status(request: Request) -> dict[str, Any]:
     proc = _get_processor(request)
@@ -962,19 +970,25 @@ async def averaged_waterfall(
     cached = _WATERFALL_CACHE.get(key)
     if cached is not None:
         return Response(content=cached, media_type="application/octet-stream")
-    result = await db.query_avg_waterfall(
-        since=since_dt,
-        until=until_dt,
-        sdr_center_freq=_opt_float(sdr_center),
-        sample_rate=_opt_float(sample_rate),
-        gain=_opt_float(gain),
-        max_rows=mr,
-        max_bins=mb,
-    )
+    async with request.app.state.waterfall_sem:
+        if await request.is_disconnected():
+            return Response(status_code=499)
+        cached = _WATERFALL_CACHE.get(key)
+        if cached is not None:
+            return Response(content=cached, media_type="application/octet-stream")
+        result = await db.query_avg_waterfall(
+            since=since_dt,
+            until=until_dt,
+            sdr_center_freq=_opt_float(sdr_center),
+            sample_rate=_opt_float(sample_rate),
+            gain=_opt_float(gain),
+            max_rows=mr,
+            max_bins=mb,
+        )
     return Response(content=_waterfall_cached(key, result), media_type="application/octet-stream")
 
 
-@router.get("/averaged/stats")
+@router.get("/averaged/stats", response_model=None)
 async def averaged_stats(
     request: Request,
     since: str,
@@ -983,21 +997,24 @@ async def averaged_stats(
     sample_rate: str | None = None,
     gain: str | None = None,
     max_points: str | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | Response:
     """Scalar stats timeline for a range (blob-independent, works after PSD
     retention prunes the blobs)."""
     db = _get_db(request)
     if db is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     since_dt, until_dt = _parse_range(since, until)
-    result: dict[str, Any] = await db.query_avg_stats(
-        since=since_dt,
-        until=until_dt,
-        sdr_center_freq=_opt_float(sdr_center),
-        sample_rate=_opt_float(sample_rate),
-        gain=_opt_float(gain),
-        max_points=int(max_points) if max_points else 600,
-    )
+    async with request.app.state.stats_sem:
+        if await request.is_disconnected():
+            return Response(status_code=499)
+        result: dict[str, Any] = await db.query_avg_stats(
+            since=since_dt,
+            until=until_dt,
+            sdr_center_freq=_opt_float(sdr_center),
+            sample_rate=_opt_float(sample_rate),
+            gain=_opt_float(gain),
+            max_points=int(max_points) if max_points else 600,
+        )
     return result
 
 
@@ -1115,8 +1132,12 @@ async def put_ui_prefs(request: Request) -> dict[str, Any]:
     into the stored document, so a scale change keeps the stored theme and a
     theme change keeps the stored scale. Scale values are per-chart low/high
     bounds (dBFS for waterfall/PSD, dB for power, unitless for kurtosis); null
-    or omitted means auto-scale from the data. Theme is auto/light/dark."""
-    db = _get_db(request)
+    or omitted means auto-scale from the data. Theme is auto/light/dark.
+
+    The read and the write both go through the writer: merging a document read
+    from the reader (possibly an older snapshot) and writing it back would
+    silently undo a newer change to the other key."""
+    db = _get_write_db(request)
     if db is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     try:

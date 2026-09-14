@@ -151,6 +151,44 @@ def _put_nowait_drop_full(q: asyncio.Queue[Any], item: Any) -> None:
         q.put_nowait(item)
 
 
+class _LoopHandoff:
+    """Thread-to-loop handoff into an asyncio.Queue that stays bounded.
+
+    call_soon_threadsafe alone queues one loop callback per item; while the
+    loop is blocked those callbacks, and the results they hold, pile up without
+    limit because the queue's own bound only applies once a callback runs
+    (measured: RSS +30 MB/s during a 60 s loop wedge on nano-super). This caps
+    callbacks in flight at the queue's maxsize and drops at the producer
+    beyond that, which is the same drop-on-overflow outcome as before.
+    """
+
+    def __init__(self, q: asyncio.Queue[Any]) -> None:
+        self._q = q
+        self._limit = max(1, q.maxsize)
+        self._pending = 0
+        self._lock = threading.Lock()
+        self.dropped = 0
+
+    def submit(self, loop: asyncio.AbstractEventLoop, item: Any) -> bool:
+        with self._lock:
+            if self._pending >= self._limit:
+                self.dropped += 1
+                return False
+            self._pending += 1
+        try:
+            loop.call_soon_threadsafe(self._deliver, item)
+        except RuntimeError:  # loop closed during shutdown
+            with self._lock:
+                self._pending -= 1
+            return False
+        return True
+
+    def _deliver(self, item: Any) -> None:
+        with self._lock:
+            self._pending -= 1
+        _put_nowait_drop_full(self._q, item)
+
+
 def _signal_stop(q: queue.Queue[Any]) -> None:
     """Enqueue the ``_STOP`` sentinel without ever blocking.
 
@@ -258,6 +296,7 @@ class StreamingProcessor:
         self._burst_queue: queue.Queue[Any] = queue.Queue(maxsize=16)
         self._dropped_chunks = 0
         self._result_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=8)
+        self._result_handoff = _LoopHandoff(self._result_queue)
         self._loop: asyncio.AbstractEventLoop | None = None
 
         # Recording state machine: "idle" | "armed" | "recording" | "finalizing".
@@ -337,6 +376,7 @@ class StreamingProcessor:
         self._burst_result_queue: asyncio.Queue[tuple[list[BurstFingerprint], int] | None] = (
             asyncio.Queue(maxsize=32)
         )
+        self._burst_handoff = _LoopHandoff(self._burst_result_queue)
 
         # Module manager — attached externally by pipeline/app.py (optional)
         self._module_manager: Any = None
@@ -1381,7 +1421,7 @@ class StreamingProcessor:
         )
 
         if self._loop is not None:
-            self._loop.call_soon_threadsafe(_put_nowait_drop_full, self._result_queue, result)
+            self._result_handoff.submit(self._loop, result)
 
     # -- Burst detection thread --
 
@@ -1446,11 +1486,7 @@ class StreamingProcessor:
                         self._noise_floor_per_bin = last_det.noise_floor_per_bin.tolist()
 
                 if completed_bursts and self._loop is not None:
-                    self._loop.call_soon_threadsafe(
-                        _put_nowait_drop_full,
-                        self._burst_result_queue,
-                        (completed_bursts, int(freq_hz)),
-                    )
+                    self._burst_handoff.submit(self._loop, (completed_bursts, int(freq_hz)))
 
                 # Build active burst overlay data for WebSocket.
                 # Each burst carries absolute frequency bounds plus real

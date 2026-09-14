@@ -95,3 +95,29 @@ def test_web_server_leaves_signal_handlers_alone() -> None:
     with server.capture_signals():
         assert _handlers() == before, "uvicorn must not install its own handlers"
     assert _handlers() == before
+
+
+async def test_run_web_server_exits_on_stop_without_touching_signals() -> None:
+    from types import SimpleNamespace
+
+    from rfobserver.config import AppSettings
+    from rfobserver.pipeline.beacon import ProgressBeacon
+    from rfobserver.web.websocket import LiveBroadcast
+
+    settings = AppSettings(_env_file=None)
+    settings.WEB_HOST = "127.0.0.1"
+    settings.WEB_PORT = 0  # ephemeral port
+    supervisor = SimpleNamespace(processor=None, _on_processor_change=None)
+    stop = asyncio.Event()
+    before = _handlers()
+    task = asyncio.create_task(
+        app_mod._run_web_server(
+            settings, supervisor, None, None, LiveBroadcast(), ProgressBeacon(), stop
+        )
+    )
+    await asyncio.sleep(0.3)  # let uvicorn start serving
+    assert not task.done(), "the server should still be serving"
+    assert _handlers() == before, "uvicorn must not install its own handlers"
+    stop.set()
+    await asyncio.wait_for(task, timeout=5)
+    assert _handlers() == before

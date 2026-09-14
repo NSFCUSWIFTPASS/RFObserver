@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 _GIVE_UP_EXIT_CODE = 91
 _GIVE_UP_EXIT_DELAY_SEC = 5.0
 _STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+_WEB_SHUTDOWN_TIMEOUT_SEC = 5.0
 
 
 def make_give_up_handler(
@@ -259,33 +260,86 @@ async def run(settings: AppSettings) -> None:
         watchdog.start()
         logger.info("Pipeline watchdog enabled (timeout=%.0fs)", settings.WATCHDOG_TIMEOUT_SEC)
 
-    tasks: list[Any] = []
+    stop = asyncio.Event()
+    remove_stop_signals = install_stop_signals(asyncio.get_running_loop(), stop)
+
+    web_task: asyncio.Task[None] | None = None
+    workers: list[asyncio.Task[Any]] = []
     if zms_monitor is not None:
-        tasks.append(zms_monitor.run())
+        workers.append(asyncio.create_task(zms_monitor.run()))
     if read_db is not None:
-        tasks.append(_run_web_server(settings, supervisor, read_db, db, broadcast, beacon))
-        tasks.append(_heartbeat_loop(settings, supervisor, read_db, local_storage, broadcast))
+        web_task = asyncio.create_task(
+            _run_web_server(settings, supervisor, read_db, db, broadcast, beacon, stop)
+        )
+        workers.append(web_task)
+        workers.append(
+            asyncio.create_task(
+                _heartbeat_loop(settings, supervisor, read_db, local_storage, broadcast)
+            )
+        )
     if settings.DB_RETENTION_DAYS > 0:
-        tasks.append(_cleanup_loop(settings, db))
-    # Keep the process alive even in Standby / headless (no web) mode; the
-    # supervisor owns the processor task independently of this gather.
-    tasks.append(asyncio.Event().wait())
+        workers.append(asyncio.create_task(_cleanup_loop(settings, db)))
+    # Serve until a stop signal. The supervisor owns the processor task
+    # independently of these, so a Standby or headless run waits here too.
+    stop_task = asyncio.create_task(stop.wait())
 
     try:
-        await asyncio.gather(*tasks)
+        pending: set[asyncio.Task[Any]] = {stop_task, *workers}
+        while not stop.is_set():
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for finished in done:
+                if finished is stop_task or finished.cancelled():
+                    continue
+                exc = finished.exception()
+                if exc is not None:
+                    raise exc
     finally:
         if watchdog is not None:
             watchdog.stop()
-        await supervisor.set_active(False)
-        if zms_monitor is not None:
-            await zms_monitor.stop()
-        if nats_producer is not None:
-            await nats_producer.close()
+        await _stop_workers(stop, stop_task, web_task, workers)
+        # Each step is isolated so one failure cannot skip the DB close.
         try:
-            if read_db is not None:
-                await read_db.close()
+            await supervisor.set_active(False)
+        except Exception:
+            logger.exception("Shutdown: stopping the pipeline failed; continuing")
+        if zms_monitor is not None:
+            try:
+                await zms_monitor.stop()
+            except Exception:
+                logger.exception("Shutdown: stopping the ZMS monitor failed; continuing")
+        if nats_producer is not None:
+            try:
+                await nats_producer.close()
+            except Exception:
+                logger.exception("Shutdown: closing NATS failed; continuing")
+        try:
+            try:
+                if read_db is not None:
+                    await read_db.close()
+            finally:
+                await db.close()
+            logger.info("Shutdown complete")
         finally:
-            await db.close()
+            remove_stop_signals()
+
+
+async def _stop_workers(
+    stop: asyncio.Event,
+    stop_task: asyncio.Task[Any],
+    web_task: asyncio.Task[None] | None,
+    workers: list[asyncio.Task[Any]],
+) -> None:
+    """Let the web server finish (bounded), then cancel the other loops."""
+    stop.set()  # _run_web_server turns this into uvicorn's should_exit
+    if web_task is not None and not web_task.done():
+        _, still_running = await asyncio.wait({web_task}, timeout=_WEB_SHUTDOWN_TIMEOUT_SEC)
+        if still_running:
+            logger.warning(
+                "Web server did not stop within %.0fs; cancelling", _WEB_SHUTDOWN_TIMEOUT_SEC
+            )
+    for task in (stop_task, *workers):
+        task.cancel()
+    await asyncio.gather(stop_task, *workers, return_exceptions=True)
 
 
 async def _heartbeat_loop(
@@ -390,6 +444,7 @@ async def _run_web_server(
     write_database: object,
     broadcast: LiveBroadcast,
     beacon: ProgressBeacon,
+    stop: asyncio.Event,
 ) -> None:
     """Run the FastAPI web server as an async task."""
     import uvicorn
@@ -417,5 +472,14 @@ async def _run_web_server(
         port=settings.WEB_PORT,
         log_level=settings.LOG_LEVEL.lower(),
     )
-    server = uvicorn.Server(config)
-    await server.serve()
+    server = _build_web_server(config)
+
+    async def _exit_on_stop() -> None:
+        await stop.wait()
+        server.should_exit = True
+
+    watcher = asyncio.create_task(_exit_on_stop())
+    try:
+        await server.serve()
+    finally:
+        watcher.cancel()

@@ -1,6 +1,7 @@
 """Tests for PipelineSupervisor crash recovery -- restart() and the task done-callback."""
 
 import asyncio
+import logging
 import time
 
 import pytest
@@ -144,3 +145,47 @@ async def test_crash_outside_reset_window_resets_counter(monkeypatch: pytest.Mon
     assert sup.active, "the pipeline must actually restart, not give up"
     assert len(procs) == 2, "a fresh processor must have been built"
     await sup.set_active(False)
+
+
+class _HungProcessor:
+    """run() ignores stop() and only ends when cancelled."""
+
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    async def run(self) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+    def stop(self) -> None: ...
+
+
+@pytest.mark.asyncio
+async def test_stop_timeout_warns_and_cancels(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A processor that ignores stop() must be cancelled AND reported as a timeout.
+
+    On Python 3.10 asyncio.wait_for raises asyncio.TimeoutError, which is not
+    the builtin TimeoutError, so a bare `except TimeoutError` misses it and the
+    timeout was mislabelled as an already-raised task exception at DEBUG.
+    """
+    monkeypatch.setattr(supervisor_mod, "_STOP_TIMEOUT_SEC", 0.1)
+    procs: list[_HungProcessor] = []
+
+    def build_proc(receiver: object, *, replay_mode: bool = False) -> _HungProcessor:
+        p = _HungProcessor()
+        procs.append(p)
+        return p
+
+    sup = PipelineSupervisor(build_receiver=_FakeReceiver, build_processor=build_proc)
+    await sup.set_active(True)
+    with caplog.at_level(logging.WARNING, logger="rfobserver.pipeline.supervisor"):
+        await asyncio.wait_for(sup.set_active(False), timeout=2.0)
+
+    assert procs[0].cancelled, "the hung task must be cancelled"
+    assert "did not stop in time" in caplog.text, "the timeout must be reported as one"
+    assert not sup.active

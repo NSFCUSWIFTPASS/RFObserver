@@ -134,7 +134,7 @@ class PipelineSupervisor:
             if task is not None:
                 try:
                     await asyncio.wait_for(task, timeout=_STOP_TIMEOUT_SEC)
-                except TimeoutError:
+                except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041 - not the builtin on 3.10
                     logger.warning("Processor did not stop in time; cancelling")
                     task.cancel()
                     try:

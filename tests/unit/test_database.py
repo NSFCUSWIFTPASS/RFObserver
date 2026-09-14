@@ -1044,6 +1044,45 @@ async def test_concurrent_stuck_writes_reconnect_once(db):
     await corpse.close()
 
 
+async def _journal_pragmas(db: SensorDatabase) -> tuple[str, int]:
+    assert db._db is not None
+    async with db._db.execute("PRAGMA journal_mode") as cur:
+        mode = (await cur.fetchone())[0]
+    async with db._db.execute("PRAGMA journal_size_limit") as cur:
+        limit = (await cur.fetchone())[0]
+    return mode, limit
+
+
+async def test_writer_connect_caps_wal_and_is_in_wal_mode(db):
+    """WAL is what lets the web reader and the pipeline writer run concurrently;
+    the size limit truncates the WAL back to 64 MB after a checkpoint resets it,
+    so one long reader stall cannot leave a huge WAL file behind for good."""
+    assert await _journal_pragmas(db) == ("wal", 67108864)
+
+
+async def test_writer_reconnect_caps_wal_and_is_in_wal_mode(db):
+    corpse = db._db
+    assert corpse is not None
+    try:
+        await db._reconnect(expect=corpse)
+        assert db._db is not corpse
+        assert await _journal_pragmas(db) == ("wal", 67108864)
+    finally:
+        await corpse.close()
+
+
+async def test_writer_logs_error_when_wal_is_unavailable(tmp_path, monkeypatch, caplog):
+    """An in-memory database cannot use WAL: connect must say so, not raise."""
+    monkeypatch.chdir(tmp_path)
+    db = SensorDatabase(":memory:")
+    try:
+        with caplog.at_level("ERROR", logger="rfobserver.storage.database"):
+            await db.connect()
+        assert any("WAL" in r.getMessage() for r in caplog.records), caplog.text
+    finally:
+        await db.close()
+
+
 async def test_reconnect_is_noop_when_already_replaced(db):
     """_reconnect(expect=stale) must not clobber a connection that another
     coroutine already refreshed."""

@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 # A healthy write is single-digit ms; 30 s means the storage device wedged.
 _DB_WRITE_TIMEOUT_SEC = 30.0
 
+# The WAL is truncated back to this size whenever a checkpoint lets it rewind,
+# so a burst of growth (e.g. behind a long reader snapshot) is not kept forever.
+_WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024  # 67108864
+
 _INSERT_DETECTION_SQL = """INSERT OR IGNORE INTO detections
    (burst_id, start_time, stop_time, center_freq_hz, bandwidth_hz,
     peak_power_db, duration_ms, detection_timestamp,
@@ -253,11 +257,27 @@ class SensorDatabase:
                 return  # another coroutine already reconnected
             self._db = None
             conn = await aiosqlite.connect(self._db_path)
-            await conn.execute("PRAGMA journal_mode=WAL")
-            await conn.execute("PRAGMA synchronous=NORMAL")
-            await conn.execute("PRAGMA busy_timeout=2000")
+            await self._configure_writer(conn)
             self._db = conn
             logger.error("Database reconnected after stuck write")
+
+    async def _configure_writer(self, conn: aiosqlite.Connection) -> None:
+        """Journal/sync pragmas for a writer connection (connect and reconnect)."""
+        async with conn.execute("PRAGMA journal_mode=WAL") as cur:
+            row = await cur.fetchone()
+        mode = str(row[0]).lower() if row else ""
+        if mode != "wal":
+            logger.error(
+                "SQLite journal_mode is %r, not WAL, for %s. The web layer's read-only "
+                "connection and the pipeline writer need WAL to run concurrently: "
+                "without it a long web read blocks pipeline writes with "
+                "'database is locked'.",
+                mode,
+                self._db_path,
+            )
+        await conn.execute(f"PRAGMA journal_size_limit={_WAL_SIZE_LIMIT_BYTES}")
+        await conn.execute("PRAGMA synchronous=NORMAL")
+        await conn.execute("PRAGMA busy_timeout=2000")
 
     @staticmethod
     def _guarded_write(fn: Any) -> Any:
@@ -304,9 +324,7 @@ class SensorDatabase:
             logger.info("Database connected read-only: %s", self._db_path)
             return
         self._db = await aiosqlite.connect(self._db_path)
-        await self._db.execute("PRAGMA journal_mode=WAL")
-        await self._db.execute("PRAGMA synchronous=NORMAL")
-        await self._db.execute("PRAGMA busy_timeout=2000")
+        await self._configure_writer(self._db)
         await self._db.executescript(SCHEMA)
         await self._migrate_detection_columns()
         await self._migrate_avg_windows_psd_nullable()

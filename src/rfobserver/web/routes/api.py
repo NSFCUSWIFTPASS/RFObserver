@@ -48,6 +48,14 @@ def _get_db(request: Request) -> Any:
     return getattr(request.app.state, "database", None)
 
 
+def _get_write_db(request: Request) -> Any:
+    """The pipeline's write connection; the web layer's reader is query_only.
+
+    Falls back to ``database`` when no split is configured (tests, tools).
+    """
+    return getattr(request.app.state, "write_database", None) or _get_db(request)
+
+
 @router.get("/status")
 async def status(request: Request) -> dict[str, Any]:
     proc = _get_processor(request)
@@ -1137,7 +1145,7 @@ async def put_ui_prefs(request: Request) -> dict[str, Any]:
     if "theme" in body:
         doc["theme"] = _validate_theme(body["theme"])
     doc = _normalize_prefs(doc)
-    await db.set_config(UI_PREFS_KEY, json.dumps(doc))
+    await _get_write_db(request).set_config(UI_PREFS_KEY, json.dumps(doc))
     return doc
 
 

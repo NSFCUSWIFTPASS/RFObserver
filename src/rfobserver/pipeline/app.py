@@ -74,6 +74,11 @@ async def run(settings: AppSettings) -> None:
     db = SensorDatabase(settings.DB_PATH)
     await db.connect()
 
+    # Web-layer reader (spec Cut 3b): Dashboard reads get their own connection so
+    # they never queue pipeline writes. Connect after the writer (schema owner).
+    read_db = SensorDatabase(settings.DB_PATH, read_only=True)
+    await read_db.connect()
+
     local_storage = LocalStorage(settings.STORAGE_PATH, max_gb=settings.ARCHIVE_MAX_GB)
     broadcast = LiveBroadcast()
 
@@ -188,8 +193,8 @@ async def run(settings: AppSettings) -> None:
     if zms_monitor is not None:
         tasks.append(zms_monitor.run())
     if settings.WEB_PORT > 0:
-        tasks.append(_run_web_server(settings, supervisor, db, broadcast, beacon))
-        tasks.append(_heartbeat_loop(settings, supervisor, db, local_storage, broadcast))
+        tasks.append(_run_web_server(settings, supervisor, read_db, db, broadcast, beacon))
+        tasks.append(_heartbeat_loop(settings, supervisor, read_db, local_storage, broadcast))
     if settings.DB_RETENTION_DAYS > 0:
         tasks.append(_cleanup_loop(settings, db))
     # Keep the process alive even in Standby / headless (no web) mode; the
@@ -206,6 +211,7 @@ async def run(settings: AppSettings) -> None:
             await zms_monitor.stop()
         if nats_producer is not None:
             await nats_producer.close()
+        await read_db.close()
         await db.close()
 
 
@@ -308,6 +314,7 @@ async def _run_web_server(
     settings: AppSettings,
     supervisor: PipelineSupervisor,
     database: object,
+    write_database: object,
     broadcast: LiveBroadcast,
     beacon: ProgressBeacon,
 ) -> None:
@@ -320,6 +327,7 @@ async def _run_web_server(
     app.state.supervisor = supervisor
     app.state.beacon = beacon
     app.state.database = database
+    app.state.write_database = write_database
     app.state.broadcast = broadcast
     app.state.processor = supervisor.processor
 

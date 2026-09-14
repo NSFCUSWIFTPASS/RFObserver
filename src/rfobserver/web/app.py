@@ -35,6 +35,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     app.state.processor = None
     app.state.database = None
+    app.state.write_database = None
     app.state.broadcast = None
 
     if STATIC_DIR.exists():

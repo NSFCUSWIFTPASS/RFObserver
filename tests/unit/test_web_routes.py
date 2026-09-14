@@ -1189,3 +1189,25 @@ async def test_iq_captures_endpoint(settings, tmp_path):
             assert {c["filename"] for c in r2.json()["captures"]} == {"a.sc16"}
     finally:
         await database.close()
+
+
+@pytest.mark.asyncio
+async def test_ui_prefs_put_uses_write_connection_when_split(settings, tmp_path):
+    from rfobserver.storage.database import SensorDatabase
+
+    path = str(tmp_path / "prefs.sqlite")
+    writer = SensorDatabase(path)
+    await writer.connect()
+    reader = SensorDatabase(path, read_only=True)
+    await reader.connect()
+    try:
+        app = create_app(settings)
+        app.state.database = reader
+        app.state.write_database = writer
+        client = TestClient(app)
+        r = client.put("/api/ui-prefs", json={"theme": "dark"})
+        assert r.status_code == 200, r.text
+        assert client.get("/api/ui-prefs").json()["theme"] == "dark"
+    finally:
+        await reader.close()
+        await writer.close()

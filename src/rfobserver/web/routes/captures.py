@@ -106,6 +106,11 @@ async def captures_list(request: Request) -> list[dict[str, Any]]:
                 entry["meta"] = json.loads(json_path.read_text())
             except (json.JSONDecodeError, OSError):
                 entry["meta"] = None
+            else:
+                # The per-gap list can hold up to _MAX_RECORDED_GAPS entries per
+                # capture; keep the list payload small (the .json keeps it).
+                if isinstance(entry["meta"], dict):
+                    entry["meta"].pop("gaps", None)
         else:
             entry["meta"] = None
 
@@ -311,11 +316,12 @@ async def capture_detections(request: Request, filename: str) -> dict[str, Any]:
 
     meta = ds._read_json(sc16_path.with_suffix(".json")) or {}
     start_iso = meta.get("start_time")
-    dur = float(meta.get("duration_sec", 0.0))
+    # True time span (samples plus overflow loss); older captures lack it.
+    span = float(meta.get("time_span_sec") or meta.get("duration_sec", 0.0))
     too_new = False
     if start_iso:
         try:
-            end = datetime.fromisoformat(start_iso).timestamp() + dur
+            end = datetime.fromisoformat(start_iso).timestamp() + span
             too_new = (datetime.now(timezone.utc).timestamp() - end) < grace
         except ValueError:
             too_new = False

@@ -65,6 +65,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         sup = getattr(app.state, "supervisor", None)
         if sup is not None:
             beacon = getattr(app.state, "beacon", None)
+            proc = sup.processor
+            # Overflow counters are per receiver instance: they reset when the
+            # supervisor rebuilds the receiver.
+            has_loss = proc is not None and hasattr(proc, "receive_loss")
+            loss = proc.receive_loss() if has_loss else None
             body["pipeline"] = {
                 "active": sup.active,
                 "gave_up": sup.gave_up,
@@ -73,6 +78,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 "beacon_age_sec": round(beacon.age(), 1)
                 if beacon is not None and sup.active
                 else None,
+                "overflow_events": loss["overflow_events"] if loss else None,
+                "overflow_lost_samples": loss["overflow_lost_samples"] if loss else None,
             }
             if sup.gave_up:
                 body["status"] = "degraded"

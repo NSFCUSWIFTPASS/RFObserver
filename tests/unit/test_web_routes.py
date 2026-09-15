@@ -45,7 +45,7 @@ def test_health_without_supervisor_has_no_pipeline_block(client):
 
 def test_health_reports_pipeline_and_degrades_on_give_up(settings):
     app = create_app(settings)
-    sup = MagicMock(active=False, gave_up=True, consecutive_crashes=6)
+    sup = MagicMock(active=False, gave_up=True, consecutive_crashes=6, processor=None)
     app.state.supervisor = sup
     app.state.beacon = None
     data = TestClient(app).get("/api/health").json()
@@ -55,6 +55,8 @@ def test_health_reports_pipeline_and_degrades_on_give_up(settings):
         "gave_up": True,
         "consecutive_crashes": 6,
         "beacon_age_sec": None,
+        "overflow_events": None,
+        "overflow_lost_samples": None,
     }
 
 
@@ -62,7 +64,7 @@ def test_health_active_and_fresh_beacon_reports_ok(settings):
     from rfobserver.pipeline.beacon import ProgressBeacon
 
     app = create_app(settings)
-    sup = MagicMock(active=True, gave_up=False, consecutive_crashes=0)
+    sup = MagicMock(active=True, gave_up=False, consecutive_crashes=0, processor=None)
     app.state.supervisor = sup
     beacon = ProgressBeacon()
     beacon.mark()
@@ -70,6 +72,27 @@ def test_health_active_and_fresh_beacon_reports_ok(settings):
     data = TestClient(app).get("/api/health").json()
     assert data["status"] == "ok"
     assert 0.0 <= data["pipeline"]["beacon_age_sec"] < 1.0
+
+
+def test_health_reports_overflow_loss_when_processor_has_receive_loss(settings):
+    app = create_app(settings)
+    sup = MagicMock(active=True, gave_up=False, consecutive_crashes=0)
+    sup.processor.receive_loss.return_value = {"overflow_events": 2, "overflow_lost_samples": 50}
+    app.state.supervisor = sup
+    app.state.beacon = None
+    data = TestClient(app).get("/api/health").json()
+    assert data["pipeline"]["overflow_events"] == 2
+    assert data["pipeline"]["overflow_lost_samples"] == 50
+
+
+def test_health_reports_null_overflow_loss_without_processor(settings):
+    app = create_app(settings)
+    sup = MagicMock(active=True, gave_up=False, consecutive_crashes=0, processor=None)
+    app.state.supervisor = sup
+    app.state.beacon = None
+    data = TestClient(app).get("/api/health").json()
+    assert data["pipeline"]["overflow_events"] is None
+    assert data["pipeline"]["overflow_lost_samples"] is None
 
 
 def test_api_status(client):

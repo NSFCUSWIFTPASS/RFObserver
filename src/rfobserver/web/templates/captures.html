@@ -223,7 +223,7 @@
             if (hasPsd) {
                 viewerContainer.style.display = "";
                 viewerEl.innerHTML = '<div class="viewer-label">Loading PSD data...</div>';
-                loadPsdViewer(filename, m.duration_sec);
+                loadPsdViewer(filename, m.time_span_sec ?? m.duration_sec);
             } else {
                 closePsdWs();
                 viewerDetections = [];

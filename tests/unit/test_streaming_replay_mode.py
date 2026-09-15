@@ -152,7 +152,7 @@ def test_replay_mode_check_trigger_and_record_writes_full_iq_when_recording(tmp_
     assert proc._recording_state == "recording"
 
     calls: list[np.ndarray] = []
-    proc._write_recording_chunk = lambda buf: calls.append(buf)  # type: ignore[method-assign]
+    proc._write_recording_chunk = lambda buf, gaps=(), chunk_start=None: calls.append(buf)  # type: ignore[method-assign]
 
     buf = _above_threshold_buf()
     proc._check_trigger_and_record(buf)
@@ -172,7 +172,7 @@ def test_replay_mode_check_trigger_still_inert_without_opt_in(tmp_path):
     proc._recording_state = "recording"
 
     calls: list[np.ndarray] = []
-    proc._write_recording_chunk = lambda buf: calls.append(buf)  # type: ignore[method-assign]
+    proc._write_recording_chunk = lambda buf, gaps=(), chunk_start=None: calls.append(buf)  # type: ignore[method-assign]
 
     buf = _above_threshold_buf()
     proc._check_trigger_and_record(buf)

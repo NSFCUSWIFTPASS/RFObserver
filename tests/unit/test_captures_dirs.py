@@ -57,3 +57,17 @@ async def test_detail_resolves_capture_in_subdir(app, settings):
     r = await _get(app, "/captures/detail/trig-cap.sc16")
     assert r.status_code == 200
     assert r.json()["filename"] == "trig-cap.sc16"
+
+
+@pytest.mark.asyncio
+async def test_list_leaves_out_the_per_gap_list(app, settings):
+    sc16 = _seed(settings, "manual", "gappy-cap")
+    meta = {"center_freq_hz": 915_000_000, "lost_samples": 12, "gaps": [[100, 5], [200, 7]]}
+    sc16.with_suffix(".json").write_text(json.dumps(meta))
+
+    r = await _get(app, "/captures/list")
+    [entry] = [e for e in r.json() if e["filename"] == "gappy-cap.sc16"]
+    assert "gaps" not in entry["meta"]
+    assert entry["meta"]["lost_samples"] == 12
+    # The .json on disk keeps it.
+    assert json.loads(sc16.with_suffix(".json").read_text())["gaps"] == [[100, 5], [200, 7]]

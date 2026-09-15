@@ -108,7 +108,9 @@ def _build_web_server(config: uvicorn.Config) -> uvicorn.Server:
     """A uvicorn server that leaves SIGINT and SIGTERM to run()."""
     import uvicorn
 
-    class _AppSignalsServer(uvicorn.Server):
+    # Where uvicorn is not installed (the CI lint job) mypy sees Server as Any;
+    # where it is, the ignore is unused, hence both codes.
+    class _AppSignalsServer(uvicorn.Server):  # type: ignore[misc,unused-ignore]
         @contextlib.contextmanager
         def capture_signals(self) -> Generator[None, None, None]:
             # The stock version re-raises the captured signal after serving;

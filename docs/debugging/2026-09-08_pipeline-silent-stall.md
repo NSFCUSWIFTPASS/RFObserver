@@ -136,3 +136,26 @@ Causal chain, with anchors:
 Design spec:
 `docs/superpowers/specs/2026-09-08-pipeline-stall-resilience-design.md`
 (three cuts: safety net first, then core affinity, then UI-thread isolation).
+
+## CORRECTION 2026-09-14 (measured on hardware)
+
+Measured on nano-super (live B200mini, 15 W, a 74k-window 24 h DB); full data
+in `2026-09-14_stall-safety-net-hardware-validation.md`. Two claims above are
+corrected:
+
+- **"runs a CPU-heavy blob-decode loop inline on that loop ... blocking it for
+  many seconds": WITHDRAWN as the mechanism.** During 24 h Dashboard queries
+  (waterfall 16 to 24 s, stats 12 to 17 s) the maximum event-loop lag was only
+  1.1 to 1.9 s, so the loop kept running. What starves the pipeline is the
+  **single aiosqlite connection's queue**: every pipeline write waited 2.7 to
+  3.8 s, and even the O(1) `count_detections` took 3 to 5 s. Because
+  `_drain_burst_results` saves bursts one at a time (execute and commit per
+  burst), about 6.5 bursts/s arriving against about 0.3/s saved keeps the
+  consumer from advancing.
+- **"can spuriously trip the 30 s DB write-timeout": not reproduced** at this
+  load (1 tab). Per-write latency peaked at 3.8 s. It may still happen with
+  heavier load (several tabs, a bigger DB); not tested.
+
+The terminal failure described above (an unguarded `insert_detection` raise
+killing an orphaned task) is not affected by this correction. Cut 1 fixes it,
+and F1/F2 in the 2026-09-14 doc verify the fix on hardware.

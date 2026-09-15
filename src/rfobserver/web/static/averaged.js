@@ -219,12 +219,18 @@
     function schedulePoll() {
         if (!state.live) return;
         if (state.pollTimer) clearTimeout(state.pollTimer);
-        state.pollTimer = setTimeout(pollTick, POLL_MS);
+        state.pollTimer = setTimeout(function () { pollTick(false); }, POLL_MS);
     }
 
-    function pollTick() {
+    // A timer tick skips while a load is in flight; the poll after it catches
+    // up. A user action (preset, back/forward, refresh, tuning, Now on) must
+    // not wait behind that load: it is for the previous range and, still being
+    // the latest load, would clear the spinner before the picked range renders.
+    // Starting the new load supersedes it: loadAll aborts the old fetches and
+    // bumps loadSeq, so the old range can neither render nor clear the spinner.
+    function pollTick(userAction) {
         if (!state.live) return;
-        if (document.hidden || state.loading) { schedulePoll(); return; }
+        if (document.hidden || (state.loading && !userAction)) { schedulePoll(); return; }
         state.untilMs = Date.now();
         state.sinceMs = state.untilMs - state.spanMs;
         loadAll(true).then(schedulePoll, schedulePoll);
@@ -295,7 +301,7 @@
         updateRangeLabel();
         setStale(true);
         if (s.live) {
-            if (state.live) pollTick(); // re-anchor the sliding window
+            if (state.live) pollTick(true); // re-anchor the sliding window
             else setLive(true);         // setLive polls right away
         } else {
             state.sinceMs = s.sinceMs;
@@ -417,7 +423,7 @@
         updateRangeLabel();
         if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
         if (on) {
-            pollTick();
+            pollTick(true);
         } else {
             $("avg-updated").textContent = "";
             const st = $("avg-status");
@@ -444,7 +450,7 @@
     // Reload after a user action that changed the range or tuning.
     function reload() {
         setStale(true);
-        if (state.live) pollTick(); // pollTick reloads immediately
+        if (state.live) pollTick(true); // pollTick reloads immediately
         else loadAll(false);
     }
 
@@ -1242,7 +1248,7 @@
         $("avg-back").addEventListener("click", function () { navRange(state.rangeBack, state.rangeFwd); });
         $("avg-fwd").addEventListener("click", function () { navRange(state.rangeFwd, state.rangeBack); });
         $("avg-refresh").addEventListener("click", function () {
-            if (state.live) { setStale(true); pollTick(); }
+            if (state.live) { setStale(true); pollTick(true); }
             else reload();
         });
         $("avg-picker-btn").addEventListener("click", function (e) {
@@ -1271,7 +1277,7 @@
                 updateRangeLabel();
                 closePicker();
                 setStale(true);
-                if (state.live) pollTick(); // reload immediately on the new span
+                if (state.live) pollTick(true); // reload immediately on the new span
                 else setLive(true);         // setLive polls right away
             });
         });
@@ -1280,7 +1286,7 @@
             $(id).addEventListener("change", reload);
         });
         document.addEventListener("visibilitychange", function () {
-            if (!document.hidden && state.live) pollTick();
+            if (!document.hidden && state.live) pollTick(false);
         });
         $("avg-hint").textContent =
             "PSD blobs are pruned after the configured retention window (DB_RETENTION_DAYS); "

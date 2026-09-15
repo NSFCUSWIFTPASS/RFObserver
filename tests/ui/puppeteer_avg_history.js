@@ -576,6 +576,50 @@ async function main() {
     assert(/windows/.test(status), "preset " + preset + " loaded");
   }
 
+  // Regression: a preset picked while a Now poll for the previous span is
+  // still in flight must keep the spinner on until the NEW span has rendered.
+  // The bug: pollTick deferred to the next 2 s tick when a load was in flight,
+  // so the old-span poll (still the latest load) cleared the spinner and the
+  // picked span only appeared seconds later. Waterfall responses are slowed
+  // here so a poll is reliably in flight; the status text at the moment the
+  // spinner turns off shows which span was rendered.
+  await page.evaluate(() => {
+    const orig = window.fetch;
+    const probe = { orig: orig, inflight: 0, offStatus: [] };
+    window.__spinProbe = probe;
+    window.fetch = function (url) {
+      if (!String(url).includes("/api/averaged/waterfall")) return orig.apply(this, arguments);
+      probe.inflight++;
+      return orig
+        .apply(this, arguments)
+        .then((r) => new Promise((res) => setTimeout(() => res(r), 1500)))
+        .finally(() => { probe.inflight--; });
+    };
+    const sp = document.getElementById("avg-spinner");
+    probe.obs = new MutationObserver(() => {
+      if (!sp.classList.contains("on")) {
+        probe.offStatus.push(document.getElementById("avg-status").textContent);
+      }
+    });
+    probe.obs.observe(sp, { attributes: true, attributeFilter: ["class"] });
+  });
+  await page.waitForFunction(() => window.__spinProbe.inflight > 0, { timeout: 30000, polling: 20 });
+  await page.click("#avg-picker-btn");
+  await page.click('[data-preset="day"]');
+  await page.waitForFunction(() => window.__spinProbe.offStatus.length > 0, { timeout: 90000, polling: 50 });
+  const offStatus = await page.evaluate(() => {
+    const probe = window.__spinProbe;
+    probe.obs.disconnect();
+    window.fetch = probe.orig;
+    return probe.offStatus[0];
+  });
+  console.log("spinner turned off with status:", offStatus);
+  assert(
+    offStatus.includes("2.4 min/row"),
+    "spinner stays on until the picked span (24 h) renders, not the in-flight 7-day poll (got '"
+      + offStatus + "')"
+  );
+
   // Changing a tuning select reloads the range immediately (spinner cycle).
   await page.select("#avg-gain", "");
   await waitSpinnerCycle(page);

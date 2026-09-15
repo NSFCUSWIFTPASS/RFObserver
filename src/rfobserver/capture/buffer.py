@@ -184,19 +184,7 @@ class CircularBuffer:
 
     def read(self) -> np.ndarray:
         """Read all available samples in chronological order."""
-        with self._lock:
-            # Strictly less: at exactly one capacity written, _write_pos has
-            # wrapped to 0 and the whole buffer is valid.
-            if self._total_written < self._max_samples:
-                return self._buffer[: self._write_pos].copy()
-
-            # Buffer wrapped -- read from write_pos to end, then start to write_pos
-            return np.concatenate(
-                [
-                    self._buffer[self._write_pos :],
-                    self._buffer[: self._write_pos],
-                ]
-            )
+        return self.read_with_position()[0]
 
     def read_with_position(self) -> tuple[np.ndarray, int]:
         """``read()`` plus ``total_written`` at that instant (one lock hold).
@@ -205,8 +193,11 @@ class CircularBuffer:
         ``[total_written - len(data), total_written)``.
         """
         with self._lock:
+            # Strictly less: at exactly one capacity written, _write_pos has
+            # wrapped to 0 and the whole buffer is valid.
             if self._total_written < self._max_samples:
                 return self._buffer[: self._write_pos].copy(), self._total_written
+            # Wrapped: read from write_pos to the end, then start to write_pos.
             data = np.concatenate(
                 [self._buffer[self._write_pos :], self._buffer[: self._write_pos]]
             )

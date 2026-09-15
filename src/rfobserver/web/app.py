@@ -66,6 +66,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         if sup is not None:
             beacon = getattr(app.state, "beacon", None)
             proc = sup.processor
+            # Overflow counters are per receiver instance: they reset when the
+            # supervisor rebuilds the receiver.
             has_loss = proc is not None and hasattr(proc, "receive_loss")
             loss = proc.receive_loss() if has_loss else None
             body["pipeline"] = {

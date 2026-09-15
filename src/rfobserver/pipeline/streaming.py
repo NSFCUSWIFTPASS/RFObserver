@@ -629,6 +629,13 @@ class StreamingProcessor:
             "dropped_chunks": self._recording_dropped,
         }
 
+    def receive_loss(self) -> dict[str, int]:
+        """Cumulative UHD overflow loss since this receiver was built."""
+        return {
+            "overflow_events": int(getattr(self._receiver, "overflow_events", 0)),
+            "overflow_lost_samples": int(getattr(self._receiver, "overflow_lost_samples", 0)),
+        }
+
     # Backward-compat aliases for existing /api/trigger endpoints
     def manual_trigger(self) -> None:
         self.start_recording()
@@ -764,15 +771,18 @@ class StreamingProcessor:
                         recv_count += 1
                         if recv_count % 50 == 0:
                             recv_ms = (t_recv_done - recv_time) * 1000
+                            loss = self.receive_loss()
                             logger.info(
                                 "TIMING recv#%d: recv=%.1fms dropped=%d (IQ=%.1fms) "
-                                "handoff_dropped=%d/%d",
+                                "handoff_dropped=%d/%d ovf=%d lost=%d",
                                 recv_count,
                                 recv_ms,
                                 self._dropped_chunks,
                                 self._chunk_duration * 1000,
                                 self._result_handoff.dropped,
                                 self._burst_handoff.dropped,
+                                loss["overflow_events"],
+                                loss["overflow_lost_samples"],
                             )
 
         except Exception:

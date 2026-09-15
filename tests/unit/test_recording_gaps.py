@@ -169,3 +169,10 @@ def test_reconfigure_resets_the_stream_gap_log(tmp_path: Path) -> None:
     proc._recompute_chunk_params()
     assert list(proc._stream_gaps) == []
     assert proc._pre_trigger_buf.total_written == 0
+
+
+def test_receive_loss_reads_cumulative_counters_from_the_receiver(tmp_path: Path) -> None:
+    proc = _proc(tmp_path)
+    proc._receiver.overflow_events = 3
+    proc._receiver.overflow_lost_samples = 900
+    assert proc.receive_loss() == {"overflow_events": 3, "overflow_lost_samples": 900}

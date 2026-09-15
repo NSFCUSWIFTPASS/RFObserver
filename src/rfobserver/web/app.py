@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, WebSocket
 from fastapi.staticfiles import StaticFiles
@@ -14,8 +14,28 @@ from rfobserver.__about__ import __version__
 from rfobserver.config import AppSettings
 from rfobserver.web.websocket import LiveBroadcast, websocket_endpoint
 
+if TYPE_CHECKING:
+    from fastapi import Response
+
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+# Where fastapi is not installed (the CI lint job) mypy sees StaticFiles as Any;
+# where it is, the ignore is unused, hence both codes.
+class _RevalidatedStaticFiles(StaticFiles):  # type: ignore[misc,unused-ignore]
+    """Static assets served with ``Cache-Control: no-cache``.
+
+    With no Cache-Control, browsers cache the page scripts heuristically (from
+    an old Last-Modified) and keep running a stale script after an update until
+    a hard refresh. no-cache makes each page load revalidate; the ETag turns
+    that into a cheap 304.
+    """
+
+    def file_response(self, *args: Any, **kwargs: Any) -> Response:
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 def create_app(settings: AppSettings | None = None) -> FastAPI:
@@ -47,7 +67,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.stats_sem = asyncio.Semaphore(1)
 
     if STATIC_DIR.exists():
-        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+        app.mount("/static", _RevalidatedStaticFiles(directory=str(STATIC_DIR)), name="static")
 
     from rfobserver.web.routes import api, averaged, captures, config, dashboard, history, modules
 

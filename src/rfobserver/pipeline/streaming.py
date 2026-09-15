@@ -73,6 +73,9 @@ _STOP = object()
 # overflow_events keep counting past it (gaps_truncated says so).
 _MAX_RECORDED_GAPS = 1000
 # Receive gaps remembered at stream positions, for mapping into a pre-roll.
+# More than this many overflow gaps inside one pre-roll would undercount
+# lost_samples (the oldest fall out of the log); that is not realistic, and
+# more than _MAX_RECORDED_GAPS mapped gaps already sets gaps_truncated.
 _STREAM_GAP_LOG_LEN = 4096
 
 
@@ -343,6 +346,14 @@ class StreamingProcessor:
         self._recording_lost = 0
         self._recording_overflows = 0
         self._recording_gaps_truncated = False
+        # Stream-position continuity of the current recording (see
+        # _write_recording_chunk): the pre-trigger ring its positions refer to,
+        # and the stream position just after the file's last sample (None
+        # until the file has a sample to continue from).
+        self._recording_ring: CircularBuffer | None = None
+        self._recording_next_pos: int | None = None
+        # Wall time of the file's first sample, taken at the pre-roll read.
+        self._recording_wall_start: float | None = None
         self._trigger_initiated: bool = False  # True if trigger fired (vs manual)
         self._below_threshold_count = 0
         # True when the current "armed" state came from continuous auto-arm (vs a
@@ -727,10 +738,11 @@ class StreamingProcessor:
 
                         # Log this chunk's receive gaps at stream positions
                         # BEFORE the ring write, so a pre-roll read that
-                        # includes the chunk also sees its gaps.
+                        # includes the chunk also sees its gaps. chunk_start
+                        # also lets the recording check its own continuity.
                         chunk_gaps = [g for g in self._receiver.last_gaps if g[0] < n]
+                        chunk_start = self._pre_trigger_buf.total_written
                         if chunk_gaps:
-                            chunk_start = self._pre_trigger_buf.total_written
                             with self._stream_gaps_lock:
                                 for off, lost in chunk_gaps:
                                     self._stream_gaps.append((chunk_start + off, lost))
@@ -743,7 +755,7 @@ class StreamingProcessor:
                             self._module_manager.feed_all(buf[:n], center_freq, s.BANDWIDTH)
 
                         # Handle recording / trigger
-                        self._check_trigger_and_record(buf[:n], chunk_gaps)
+                        self._check_trigger_and_record(buf[:n], chunk_gaps, chunk_start)
 
                         # Enqueue for processing — best-effort, drop if behind.
                         # In lossless mode block until the dispatch loop drains a
@@ -796,17 +808,19 @@ class StreamingProcessor:
         self,
         sc16_buf: np.ndarray[Any, np.dtype[Any]],
         gaps: Sequence[tuple[int, int]] = (),
+        chunk_start: int | None = None,
     ) -> None:
         """Handle recording and trigger logic for each chunk.
 
-        ``gaps`` are the chunk's receive gaps, ``(offset_in_chunk, lost)``.
+        ``gaps`` are the chunk's receive gaps, ``(offset_in_chunk, lost)``;
+        ``chunk_start`` is its stream position (see _write_recording_chunk).
         """
         if self._replay_mode and not self._replay_record:
             return
         state = self._recording_state
 
         if state == "recording":
-            self._write_recording_chunk(sc16_buf, gaps)
+            self._write_recording_chunk(sc16_buf, gaps, chunk_start)
 
             # Auto-stop on the effective max duration (RAM-derived cap in RAM mode).
             if (time.monotonic() - self._recording_start) >= self._effective_max_sec:
@@ -826,6 +840,13 @@ class StreamingProcessor:
         continuous = self._settings.TRIGGER_CONTINUOUS
         with self._rec_lock:
             state = self._recording_state
+            if state == "recording":
+                # A manual start flipped the state while this thread waited for
+                # the lock. Its pre-roll read may or may not include this chunk;
+                # the continuity check in _write_recording_chunk sorts that out.
+                # The auto-stop checks run on the next chunk.
+                self._write_recording_chunk(sc16_buf, gaps, chunk_start)
+                return
             if state == "idle" and continuous and not self._replay_mode:
                 # Continuous trigger auto-arms whenever idle -- on sensor start, when
                 # the toggle is switched on, and (since a capture's finalize job
@@ -873,40 +894,86 @@ class StreamingProcessor:
         self,
         sc16_buf: np.ndarray[Any, np.dtype[Any]],
         gaps: Sequence[tuple[int, int]] = (),
+        chunk_start: int | None = None,
     ) -> None:
         """Write a chunk to the active recording (RAM buffer or disk queue).
 
         ``gaps`` (``(offset_in_chunk, lost)``) land at the chunk's file
         position. A dropped chunk becomes one gap holding its own samples and
         the overflow losses inside it.
+
+        ``chunk_start`` (the pre-trigger ring's ``total_written`` before this
+        chunk) is checked against the stream position right after the file's
+        last sample, which a manual start on another thread can leave out of
+        step with this chunk: samples the file already holds (the start's
+        pre-roll read included them) are trimmed, and samples that never
+        reached it become one gap.
         """
         n = len(sc16_buf)
+        ram_buf = self._recording_buf
+        file_pos = self._recording_buf_pos if ram_buf is not None else self._recording_bytes // 4
 
-        if self._recording_buf is not None:
+        if chunk_start is not None:
+            next_pos = self._recording_next_pos
+            if self._pre_trigger_buf is not self._recording_ring:
+                # Reconfigured: the new ring restarts positions at 0, so there
+                # is nothing to compare with. Continue from this chunk.
+                self._recording_ring = self._pre_trigger_buf
+            elif next_pos is not None and chunk_start < next_pos:
+                skip = next_pos - chunk_start
+                if skip >= n:
+                    return  # the whole chunk is already in the file
+                sc16_buf = sc16_buf[skip:]
+                # Gaps before `skip` are inside the pre-roll and were mapped
+                # there; one at `skip` (stream next_pos) was not, so it stays.
+                gaps = [(off - skip, lost) for off, lost in gaps if off >= skip]
+                chunk_start += skip
+                n = len(sc16_buf)
+            elif next_pos is not None and chunk_start > next_pos:
+                self._add_missing_stretch(file_pos, next_pos, chunk_start)
+
+        if ram_buf is not None:
             # RAM-buffered mode
-            file_pos = self._recording_buf_pos
             end = file_pos + n
-            if end <= len(self._recording_buf):
-                self._recording_buf[file_pos:end] = sc16_buf
+            written = end <= len(ram_buf)
+            if written:
+                ram_buf[file_pos:end] = sc16_buf
                 self._recording_buf_pos = end
                 self._recording_bytes = end * 4  # int32 = 4 bytes
             else:
                 self._drop_recording_chunk(file_pos, n, gaps)
                 logger.warning("RAM buffer full: dropped chunk")
-                return
         else:
             # Disk-streaming mode: convert to bytes on receiver thread
             # (.tobytes() is a fast C-level copy that plays well with GIL)
-            file_pos = self._recording_bytes // 4
             try:
                 self._recording_queue.put_nowait(("iq", sc16_buf.tobytes()))
                 self._recording_bytes += n * 4
+                written = True
             except queue.Full:
+                written = False
                 self._drop_recording_chunk(file_pos, n, gaps)
                 logger.warning("Recording queue full: dropped chunk")
-                return
-        for off, lost in gaps:
-            self._add_recording_gap(file_pos + off, lost, overflow=True)
+        # A dropped chunk is already a gap: the next chunk continues after it.
+        if chunk_start is not None:
+            self._recording_next_pos = chunk_start + n
+        if written:
+            for off, lost in gaps:
+                self._add_recording_gap(file_pos + off, lost, overflow=True)
+
+    def _add_missing_stretch(self, file_pos: int, next_pos: int, chunk_start: int) -> None:
+        """Account stream ``[next_pos, chunk_start)``, which never reached the
+        file, as one gap at ``file_pos``.
+
+        The overflow gaps logged inside it count as overflow events, but their
+        lost samples are inside this single gap, as for a dropped chunk. A gap
+        logged at ``chunk_start`` belongs to the next chunk's own gaps.
+        """
+        with self._stream_gaps_lock:
+            logged = [lost for s, lost in self._stream_gaps if next_pos <= s < chunk_start]
+        if file_pos > 0:
+            self._recording_overflows += len(logged)
+        self._add_recording_gap(file_pos, chunk_start - next_pos + sum(logged), overflow=False)
 
     def _drop_recording_chunk(self, file_pos: int, n: int, gaps: Sequence[tuple[int, int]]) -> None:
         """Account a chunk that never reached the file as one gap at ``file_pos``.
@@ -920,13 +987,21 @@ class StreamingProcessor:
         self._add_recording_gap(file_pos, n + sum(lost for _, lost in gaps), overflow=False)
 
     def _add_recording_gap(self, index: int, lost: int, *, overflow: bool) -> None:
-        """Record samples missing from the file right before ``index`` (> 0)."""
+        """Record samples missing from the file right before ``index`` (> 0).
+
+        Gaps at the same index (a missing stretch or dropped chunk and the
+        next chunk's own gap, or consecutive drops) merge into one entry.
+        """
         if index <= 0 or lost <= 0:
             return
         self._recording_lost += lost
         if overflow:
             self._recording_overflows += 1
-        if len(self._recording_gaps) < _MAX_RECORDED_GAPS:
+        # Indices never decrease, so only the last entry can match. Merging
+        # adds no entry, so it never sets gaps_truncated.
+        if self._recording_gaps and self._recording_gaps[-1][0] == index:
+            self._recording_gaps[-1][1] += lost
+        elif len(self._recording_gaps) < _MAX_RECORDED_GAPS:
             self._recording_gaps.append([index, lost])
         else:
             self._recording_gaps_truncated = True
@@ -972,6 +1047,7 @@ class StreamingProcessor:
         self._recording_lost = 0
         self._recording_overflows = 0
         self._recording_gaps_truncated = False
+        self._recording_wall_start = None
         self._recording_start = time.monotonic()
         self._below_threshold_count = 0
         self._recording_grids = []
@@ -992,6 +1068,7 @@ class StreamingProcessor:
         s = self._settings
         ring = self._pre_trigger_buf
         pre_data, pre_end = ring.read_with_position()
+        t_read = time.time()
         pre_start = pre_end - len(pre_data)
         # Drain the matching pre-trigger PSD grids so the .psd companion starts
         # with rows covering the same pre-roll span as the IQ prepended below.
@@ -1012,12 +1089,14 @@ class StreamingProcessor:
             self._recording_buf = np.zeros(total_samples, dtype=np.int32)
             self._recording_buf_pos = 0
 
+            written = 0
             if len(pre_data) > 0:
-                n = min(len(pre_data), total_samples)
-                self._recording_buf[:n] = pre_data[:n]
-                self._recording_buf_pos = n
-                self._recording_bytes = n * 4
-                self._add_preroll_gaps(ring, pre_start, pre_end, written=n)
+                written = min(len(pre_data), total_samples)
+                self._recording_buf[:written] = pre_data[:written]
+                self._recording_buf_pos = written
+                self._recording_bytes = written * 4
+                self._add_preroll_gaps(ring, pre_start, pre_end, written=written)
+            self._anchor_recording(ring, pre_start, written, len(pre_data), t_read)
 
             # Seed the grid list with the pre-roll grids; live grids append after.
             if pre_roll is not None:
@@ -1044,13 +1123,16 @@ class StreamingProcessor:
             # Queue the pre-trigger samples by reference — the writer's
             # f.write() accepts any buffer-like object, so the old .tobytes()
             # copy (hundreds of MB on the receiver thread) is unnecessary.
+            written = 0
             if len(pre_data) > 0:
                 try:
                     self._recording_queue.put_nowait(("iq", pre_data))
-                    self._recording_bytes = len(pre_data) * 4
-                    self._add_preroll_gaps(ring, pre_start, pre_end, written=len(pre_data))
+                    written = len(pre_data)
+                    self._recording_bytes = written * 4
+                    self._add_preroll_gaps(ring, pre_start, pre_end, written=written)
                 except queue.Full:
                     logger.warning("Recording queue full: pre-trigger dropped")
+            self._anchor_recording(ring, pre_start, written, len(pre_data), t_read)
 
             # Seed the pre-roll grids ahead of any live grid so the .psd starts
             # at the pre-trigger head. Queued before the writer thread starts, so
@@ -1074,6 +1156,26 @@ class StreamingProcessor:
             # the queue behind the pre-trigger samples seeded above.
             self._recording_state = "recording"
             logger.info("Recording started (disk): %s", self._recording_file)
+
+    def _anchor_recording(
+        self, ring: CircularBuffer, pre_start: int, written: int, pre_len: int, t_read: float
+    ) -> None:
+        """Pin where the file starts, once the pre-roll is placed (before the
+        state flips to "recording").
+
+        In the stream: the continuity check in _write_recording_chunk continues
+        from ``pre_start + written`` in ``ring``, or from the first chunk when
+        nothing was written. In wall time: start_time is the pre-roll read
+        time minus the pre-roll's span (its samples plus the loss mapped into
+        it), not the metadata write time, which runs late by the finalize
+        latency.
+        """
+        self._recording_ring = ring
+        self._recording_next_pos = pre_start + written if written > 0 else None
+        rx_config = getattr(self._receiver, "config", None)
+        rate = float(getattr(rx_config, "bandwidth_hz", None) or self._settings.BANDWIDTH)
+        span = (pre_len + self._recording_lost) / rate if rate > 0 else 0.0
+        self._recording_wall_start = t_read - span
 
     def _end_recording(self) -> None:
         """Finalize the recording (runs on the recording-control thread).
@@ -1272,7 +1374,10 @@ class StreamingProcessor:
         # sample length.
         lost = self._recording_lost
         time_span = (total_samples + lost) / sample_rate_hz if sample_rate_hz > 0 else duration
-        start_dt = datetime.fromtimestamp(time.time() - time_span, tz=timezone.utc)
+        if self._recording_wall_start is not None:
+            start_dt = datetime.fromtimestamp(self._recording_wall_start, tz=timezone.utc)
+        else:
+            start_dt = datetime.fromtimestamp(time.time() - time_span, tz=timezone.utc)
         meta = {
             "file": filename,
             "format": "sc16",

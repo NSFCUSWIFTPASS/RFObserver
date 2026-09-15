@@ -135,9 +135,7 @@ async def test_gaps_inside_recording_are_in_metadata(tmp_path: Path, ram: bool) 
     db = SensorDatabase(settings.DB_PATH)
     await db.connect()
     try:
-        meta, sc16, _proc, _reads = await _record(
-            settings, db, receiver, start_when=2, stop_when=12
-        )
+        meta, sc16, proc, reads = await _record(settings, db, receiver, start_when=2, stop_when=12)
     finally:
         await db.close()
 
@@ -151,6 +149,13 @@ async def test_gaps_inside_recording_are_in_metadata(tmp_path: Path, ram: bool) 
         assert lost == 1234
     indices = [idx for idx, _ in gaps]
     assert indices == sorted(set(indices)), "gap positions must be distinct and increasing"
+    # Exact positions: the file is stream samples from the pre-roll start on,
+    # with no chunk skipped or repeated, so receiver call k's gap (stream
+    # sample k*chunk + 17) sits at k*chunk + 17 - pre_start.
+    chunk = proc._chunk_samples
+    pre_len, pre_end = reads[0]
+    pre_start = pre_end - pre_len
+    assert indices == [k * chunk + 17 - pre_start for k in (6, 9)]
     assert meta["time_span_sec"] == round((total + 2468) / BANDWIDTH, 3)
     assert meta["gaps_truncated"] is False
     assert meta["dropped_chunks"] == 0

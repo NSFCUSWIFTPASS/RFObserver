@@ -620,6 +620,75 @@ async function main() {
       + offStatus + "')"
   );
 
+  // A failed load must name the request that died, the reason, the elapsed
+  // time, and whether the server is back and freshly restarted. A watchdog
+  // escalation or an OOM kill ends the process under the request, which is
+  // otherwise invisible: the UI only said "Load failed".
+  await page.evaluate(() => {
+    const orig = window.fetch;
+    window.__failProbe = { orig: orig };
+    window.fetch = function (url) {
+      if (String(url).includes("/api/averaged/waterfall")) {
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      return orig.apply(this, arguments);
+    };
+  });
+  await page.click("#avg-refresh");
+  await page.waitForFunction(
+    () => /failed:/i.test(document.getElementById("avg-status").textContent),
+    { timeout: 30000, polling: 100 }
+  );
+  const failMsg = await page.$eval("#avg-status", (el) => el.textContent);
+  await page.evaluate(() => { window.fetch = window.__failProbe.orig; });
+  console.log("failed-load status:", failMsg);
+  assert(
+    /waterfall \(Failed to fetch\) after \d+s/.test(failMsg),
+    "failed load names the endpoint, reason and elapsed time (got '" + failMsg + "')"
+  );
+  assert(
+    /server (up|up [\d.]+ ?(s|min|h)|restarted during the load \(up \d+s\)|unreachable)/.test(failMsg),
+    "failed load reports whether the server is back (got '" + failMsg + "')"
+  );
+  await waitStatusContains(page, "windows", 90000); // recovers on the next poll
+
+  // The signature that matters in the field: the process died under the
+  // request (watchdog escalation, OOM kill) and came back. Health is stubbed so
+  // the branch is deterministic rather than racing a real restart.
+  for (const [health, needle, label] of [
+    [JSON.stringify({ status: "ok", uptime_sec: 2.0 }), "server restarted during the load (up 2s)", "restarted"],
+    [null, "server unreachable", "down"],
+  ]) {
+    await page.evaluate((healthBody) => {
+      const orig = window.fetch;
+      window.__failProbe = { orig: orig };
+      window.fetch = function (url) {
+        const u = String(url);
+        if (u.includes("/api/averaged/waterfall")) {
+          return Promise.reject(new TypeError("Failed to fetch"));
+        }
+        if (u.includes("/api/health")) {
+          return healthBody === null
+            ? Promise.reject(new TypeError("Failed to fetch"))
+            : Promise.resolve(new Response(healthBody, {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              }));
+        }
+        return orig.apply(this, arguments);
+      };
+    }, health);
+    await page.click("#avg-refresh");
+    await page.waitForFunction(
+      (n) => document.getElementById("avg-status").textContent.includes(n),
+      { timeout: 30000, polling: 100 },
+      needle
+    );
+    await page.evaluate(() => { window.fetch = window.__failProbe.orig; });
+    console.log("failed-load (" + label + "):", await page.$eval("#avg-status", (el) => el.textContent));
+    await waitStatusContains(page, "windows", 90000);
+  }
+
   // Changing a tuning select reloads the range immediately (spinner cycle).
   await page.select("#avg-gain", "");
   await waitSpinnerCycle(page);

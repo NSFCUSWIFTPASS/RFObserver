@@ -122,7 +122,7 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "psd_time_resolution_ms": ("PSD_TIME_RESOLUTION_MS", float),
         "num_fft_bins": ("NUM_FFT_BINS", int),
         "archive_max_gb": ("ARCHIVE_MAX_GB", float),
-        "history_days": ("HISTORY_DAYS", int),
+        "history_days": ("DB_RETENTION_DAYS", int),
         # Sensor identity + location (all optional — empty input clears)
         "sensor_name": ("SENSOR_NAME", str),
         "latitude": ("LATITUDE", float),

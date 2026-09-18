@@ -258,10 +258,12 @@
                 <div class="form-group">
                     <label for="archive-max">Archive Max (GB)</label>
                     <input type="number" id="archive-max" name="archive_max_gb" value="{{ settings.ARCHIVE_MAX_GB }}" step="1" min="1">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">IQ captures only. Over this size the oldest automatic captures are deleted; manual captures are kept.</span>
                 </div>
                 <div class="form-group">
-                    <label for="history-days">History Days</label>
-                    <input type="number" id="history-days" name="history_days" value="{{ settings.HISTORY_DAYS }}" min="1">
+                    <label for="history-days">PSD History (days)</label>
+                    <input type="number" id="history-days" name="history_days" value="{{ settings.DB_RETENTION_DAYS }}" min="1">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Spectra older than this lose their PSD data. Stats and detections are kept.</span>
                 </div>
             </div>
         </div>

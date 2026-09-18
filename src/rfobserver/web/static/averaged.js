@@ -486,6 +486,52 @@
         return p;
     }
 
+    // Fetch that labels its rejection with the endpoint name, so a failed load
+    // can say WHICH request died rather than just "Load failed".
+    function tagged(name, url, signal) {
+        return fetch(url, { signal: signal }).catch(function (err) {
+            err.endpoint = name;
+            throw err;
+        });
+    }
+
+    function fmtUptime(sec) {
+        if (sec < 120) return Math.round(sec) + "s";
+        if (sec < 7200) return Math.round(sec / 60) + " min";
+        return (sec / 3600).toFixed(1) + " h";
+    }
+
+    // Build the detail for a failed load: which request died, why, after how
+    // long, and whether the server is back and freshly restarted. A pipeline
+    // watchdog escalation or an OOM kill ends the process under the request, so
+    // the fetch rejects with no status; uptime_sec tells that apart from a
+    // network drop. One cheap /api/health probe, never a retry of the load.
+    async function describeLoadFailure(err, startedAt) {
+        const secs = ((performance.now() - startedAt) / 1000).toFixed(0);
+        const what = (err && err.endpoint) || "request";
+        const why = err && err.name === "AbortError"
+            ? "aborted"
+            : (err && (err.message || err.name)) || "network error";
+        let server = "server unreachable";
+        try {
+            const resp = await fetch("/api/health", { cache: "no-store" });
+            const health = resp.ok ? await resp.json() : null;
+            const up = health && health.uptime_sec;
+            if (up == null) {
+                server = "server up";
+            } else if (up <= Number(secs) + 5) {
+                // Younger than the load that just died: the process went away
+                // under the request (watchdog escalation, OOM kill, a deploy).
+                server = "server restarted during the load (up " + Math.round(up) + "s)";
+            } else {
+                server = "server up " + fmtUptime(up);
+            }
+        } catch (_) {
+            // Leave "server unreachable": the probe itself failed.
+        }
+        return what + " (" + why + ") after " + secs + "s - " + server;
+    }
+
     async function loadAll(background) {
         // Request-sequencing guard: a range change (drag-zoom, preset, Apply) can
         // fire a new load while a previous one — most often a "Now" poll for the
@@ -512,19 +558,24 @@
                 ? state.wf.stats[state.selRow].start_epoch : null;
 
             const params = tuningParams();
+            const startedAt = performance.now();
             let wfResp, statsResp, detResp, iqResp;
             try {
                 [wfResp, statsResp, detResp, iqResp] = await Promise.all([
-                    fetch("/api/averaged/waterfall?" + params.toString(), { signal: abort.signal }),
-                    fetch("/api/averaged/stats?" + params.toString(), { signal: abort.signal }),
-                    fetch("/api/detections.json?" + params.toString(), { signal: abort.signal }),
-                    fetch("/api/iq-captures?" + params.toString(), { signal: abort.signal }),
+                    tagged("waterfall", "/api/averaged/waterfall?" + params.toString(), abort.signal),
+                    tagged("stats", "/api/averaged/stats?" + params.toString(), abort.signal),
+                    tagged("detections", "/api/detections.json?" + params.toString(), abort.signal),
+                    tagged("iq-captures", "/api/iq-captures?" + params.toString(), abort.signal),
                 ]);
-            } catch (_) {
+            } catch (err) {
                 // Superseded (our own abort) or a genuine network error: only the
                 // current load may report; a stale one stays silent.
                 if (seq !== state.loadSeq) return;
-                $("avg-status").textContent = state.live ? "Update failed - retrying" : "Load failed";
+                const detail = await describeLoadFailure(err, startedAt);
+                if (seq !== state.loadSeq) return; // the health probe awaited
+                $("avg-status").textContent = state.live
+                    ? "Update failed: " + detail + " - retrying"
+                    : "Load failed: " + detail;
                 return;
             }
             if (seq !== state.loadSeq) return; // a newer load started: discard this response

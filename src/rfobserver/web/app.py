@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -79,9 +80,18 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.include_router(api.router, prefix="/api")
     app.include_router(modules.router, prefix="/api")
 
+    # Process start, so /api/health can report uptime: a Dashboard load that
+    # fails mid-request needs to tell a restarted server (watchdog escalation,
+    # OOM kill, a deploy) apart from a network drop.
+    started_monotonic = time.monotonic()
+
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
-        body: dict[str, Any] = {"status": "ok", "version": __version__}
+        body: dict[str, Any] = {
+            "status": "ok",
+            "version": __version__,
+            "uptime_sec": round(time.monotonic() - started_monotonic, 1),
+        }
         sup = getattr(app.state, "supervisor", None)
         if sup is not None:
             beacon = getattr(app.state, "beacon", None)

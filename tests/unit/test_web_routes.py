@@ -349,6 +349,20 @@ class TestConfigApply:
         assert settings.ARCHIVE_MAX_GB == 100.0
         processor.reconfigure.assert_not_called()
 
+    def test_apply_history_days_sets_db_retention(
+        self, client_with_processor, monkeypatch, tmp_path
+    ):
+        # The form field named history_days is the PSD retention control; it
+        # must land on the setting the cleanup loop reads, not the dead
+        # HISTORY_DAYS, and must survive a restart.
+        monkeypatch.chdir(tmp_path)
+        client, settings, processor = client_with_processor
+        resp = client.post("/config/apply", json={"history_days": "30"})
+        assert resp.status_code == 200
+        assert settings.DB_RETENTION_DAYS == 30
+        processor.reconfigure.assert_not_called()
+        assert "RFOBS_DB_RETENTION_DAYS=30" in (tmp_path / ".env").read_text()
+
     def test_apply_trigger_continuous_bool(self, client_with_processor):
         client, settings, processor = client_with_processor
         resp = client.post("/config/apply", json={"trigger_continuous": True})

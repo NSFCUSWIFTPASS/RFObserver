@@ -3,7 +3,7 @@ from __future__ import annotations
 import socket
 from dataclasses import dataclass
 
-from pydantic import Field, SecretStr, computed_field
+from pydantic import Field, SecretStr, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -104,6 +104,11 @@ class AppSettings(BaseSettings):
     STORAGE_PATH: str = "/tmp/rfobserver"
     DB_PATH: str = "/tmp/rfobserver/rfobserver.db"
     ARCHIVE_MAX_GB: float = 50.0
+    # Deprecated: the config page's retention field used to write this, but
+    # nothing ever read it. The page now writes DB_RETENTION_DAYS; a stored
+    # HISTORY_DAYS is carried into it once (see _carry_legacy_history_days) so
+    # an existing deployment's value starts working instead of silently
+    # reverting to the default.
     HISTORY_DAYS: int = 7
     # Scheduled DB retention: PSD blobs of averaged windows older than
     # DB_RETENTION_DAYS are nulled out (the cheap stats rows, detections, and
@@ -208,6 +213,21 @@ class AppSettings(BaseSettings):
     ZMS_MONITOR_NAME: str | None = None
     ZMS_MONITOR_SCHEMA_PATH: str | None = None
     ZMS_METRIC_ID: str | None = None
+
+    @model_validator(mode="after")
+    def _carry_legacy_history_days(self) -> AppSettings:
+        """Let a stored HISTORY_DAYS drive PSD retention.
+
+        The config page's retention field wrote HISTORY_DAYS, which nothing
+        read, so the value looked applied while PSD blobs kept aging out at the
+        DB_RETENTION_DAYS default. The page now writes DB_RETENTION_DAYS; an
+        existing HISTORY_DAYS still in a deployment's .env is honoured here,
+        unless DB_RETENTION_DAYS is set explicitly too.
+        """
+        provided = self.model_fields_set
+        if "HISTORY_DAYS" in provided and "DB_RETENTION_DAYS" not in provided:
+            object.__setattr__(self, "DB_RETENTION_DAYS", self.HISTORY_DAYS)
+        return self
 
     @computed_field  # type: ignore[prop-decorator]
     @property

@@ -133,7 +133,7 @@ _CONFIG_FIELDS: list[tuple[str, Any, str]] = [
     ("psd_time_resolution_ms", 1.0, "PSD_TIME_RESOLUTION_MS"),
     ("num_fft_bins", 512, "NUM_FFT_BINS"),
     ("archive_max_gb", 0.05, "ARCHIVE_MAX_GB"),
-    ("history_days", 14, "HISTORY_DAYS"),
+    ("history_days", 14, "DB_RETENTION_DAYS"),
     ("nats_host", "127.0.0.1", "NATS_HOST"),
     ("nats_port", 4223, "NATS_PORT"),
     ("zms_zmc_http", "http://localhost:9210/v1", "ZMS_ZMC_HTTP"),

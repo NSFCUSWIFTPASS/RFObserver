@@ -39,9 +39,20 @@
  *     legend shows them, power trace re-scales), persist them across a page
  *     reload (stored in the DB config table), reject inverted bounds, and
  *     clearing them returns to auto
+ *   - the Peaks button opens a popover that searches on open, re-searches
+ *     when a control changes, and closes on Escape (like the range picker)
  *
  * Assumes the instance has accrued >600 averaged windows in the last day
  * (any instance up for ~10+ minutes at the default window rate).
+ *
+ * The peaks section needs several well-separated peaks, which a freshly
+ * started mock instance does not have yet (its data is all more recent than
+ * one peak-search window, so the separation rule correctly collapses it into
+ * a single event). Before running this file, seed synthetic history against
+ * the same live instance:
+ *   PYTHONPATH= .venv/bin/python tests/ui/seed_peaks.py
+ * then wait for the rollup loop to fold it in -- poll /api/averaged/peaks
+ * until it returns enough peaks rather than sleeping a fixed amount.
  *
  * Usage:
  *   NODE_PATH=<dir-with-puppeteer-core> node tests/ui/puppeteer_avg_history.js
@@ -760,6 +771,37 @@ async function main() {
   }));
   assert(th.attr === "auto" && th.sel === "auto", "theme back to Auto after reload");
   assert(th.bg === "rgb(245, 245, 247)", "Auto resolves to the OS theme (light here)");
+
+  // Peak finder: the panel opens, searches, and lists what it found.
+  await page.click("#avg-peaks-btn");
+  await page.waitForSelector("#avg-peaks-panel:not([hidden])");
+  await page.waitForFunction(function () {
+    const el = document.getElementById("avg-peaks-list");
+    return el && !el.textContent.includes("Searching...");
+  }, { timeout: 15000 });
+  const peaksFoot = await page.$eval("#avg-peaks-foot", function (e) { return e.textContent; });
+  console.log("peaks footer:", peaksFoot);
+  assert(/searched .* in \d/.test(peaksFoot), "peaks footer should report the search: " + peaksFoot);
+  const peakCount = await page.$$eval("#avg-peaks-list .avg-peaks-item", function (els) {
+    return els.length;
+  });
+  console.log("peaks listed:", peakCount);
+  assert(
+    peakCount >= 5,
+    "peaks list should show the seeded well-separated events (got " + peakCount + "); " +
+      "run tests/ui/seed_peaks.py against this instance first"
+  );
+
+  // Changing a control re-runs the search against the new parameters.
+  await page.click('#avg-peaks-panel button[data-peaks-window="3600"]');
+  await page.waitForFunction(function () {
+    const b = document.querySelector('#avg-peaks-panel button[data-peaks-window="3600"]');
+    return b && b.classList.contains("active");
+  });
+
+  // Escape closes it, like the range picker.
+  await page.keyboard.press("Escape");
+  await page.waitForSelector("#avg-peaks-panel[hidden]");
 
   await page.screenshot({ path: SHOT });
   console.log("screenshot saved to", SHOT);

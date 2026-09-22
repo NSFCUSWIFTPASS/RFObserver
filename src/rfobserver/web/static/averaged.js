@@ -355,8 +355,20 @@
             if (!res.ok) throw new Error("HTTP " + res.status);
             const body = await res.json();
             if (seq !== p.seq) return;   // a newer search has taken over
+            // A new search replaces items wholesale; re-locate the peak that
+            // was open (if any) by its peak_time so the label/arrows keep
+            // pointing at the same event instead of a stale index into the
+            // new list. Not found (it fell out of this search) means the
+            // range no longer corresponds to a peak, so drop back to -1.
+            const openPeakTime = p.index >= 0 && p.items[p.index]
+                ? p.items[p.index].peak_time
+                : null;
             p.items = body.peaks;
+            p.index = openPeakTime === null
+                ? -1
+                : p.items.findIndex(function (x) { return x.peak_time === openPeakTime; });
             renderPeaks(body, Date.now() - started);
+            updatePeakNav();
         } catch (err) {
             if (seq !== p.seq) return;
             $("avg-peaks-list").innerHTML = "";

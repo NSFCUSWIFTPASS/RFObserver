@@ -80,13 +80,19 @@ _STREAM_GAP_LOG_LEN = 4096
 
 # Bounds on how long finalize waits for the in-flight PSD grids covering the
 # tail of a recording. The IQ is written synchronously in the receive loop but
-# grids emerge about four chunks later, so at stop time the last chunks of IQ
-# have no rows yet. The wait ends the moment the grids catch up (the normal
-# case, roughly one pipeline latency). RECORDING_MAX_SEC caps it, with
-# _FALLBACK used when that is 0 ("no limit") and _CEILING keeping the wait
-# inside the 15 s budget _request_end_recording allows a manual stop --
-# without the ceiling a default RECORDING_MAX_SEC of 30 s could outlast it.
-_GRID_TAIL_DRAIN_FALLBACK_SEC = 5.0
+# grids emerge several chunks later, so at stop time the last chunks of IQ have
+# no rows yet. The wait ends the moment the grids catch up, which is the normal
+# case and costs roughly one pipeline latency.
+#
+# The bound is deliberately NOT derived from RECORDING_MAX_SEC. How long the
+# tail takes to arrive is a property of the pipeline, not of how long the
+# recording ran, and scaling the wait to the recording length breaks exactly
+# the case that needs it most: on nano-super (3 workers, ~920 ms median
+# latency) a RECORDING_MAX_SEC of 0.5 s truncated the .psd 205 ms short of the
+# IQ. _FLOOR covers a slow box's latency; _CEILING keeps the wait inside the
+# 15 s budget _request_end_recording allows a manual stop, and a longer
+# RECORDING_MAX_SEC may raise the floor but never past it.
+_GRID_TAIL_DRAIN_FLOOR_SEC = 3.0
 _GRID_TAIL_DRAIN_CEILING_SEC = 10.0
 
 
@@ -1247,11 +1253,15 @@ class StreamingProcessor:
         """Wait for the in-flight PSD grids covering the tail of the recording.
 
         The IQ is written synchronously in the receive loop but grids emerge
-        about four chunks later, so at stop time the last chunks of IQ have no
+        several chunks later, so at stop time the last chunks of IQ have no
         grid rows yet. Without this wait the .psd ends short of the .sc16 by one
         pipeline latency, and for a capture shorter than that latency it never
         reaches the trigger instant at all. Returns as soon as the grids reach
         the recording's last sample, which is the normal case.
+
+        A timeout here is not fatal: the rows that did arrive are still
+        correctly placed, the .psd is simply short, and the warning says by how
+        much.
         """
         end = self._recording_end_sample
         if end is None or self._recording_start_sample is None:
@@ -1259,8 +1269,8 @@ class StreamingProcessor:
             return
         cap = float(self._settings.RECORDING_MAX_SEC or 0.0)
         if not math.isfinite(cap) or cap <= 0:
-            cap = _GRID_TAIL_DRAIN_FALLBACK_SEC
-        cap = min(cap, _GRID_TAIL_DRAIN_CEILING_SEC)
+            cap = 0.0
+        cap = min(max(cap, _GRID_TAIL_DRAIN_FLOOR_SEC), _GRID_TAIL_DRAIN_CEILING_SEC)
         deadline = time.monotonic() + cap
         while self._grid_last_sample < end and time.monotonic() < deadline:
             time.sleep(0.02)

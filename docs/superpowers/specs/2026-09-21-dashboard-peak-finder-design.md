@@ -313,11 +313,22 @@ Row costs with blobs nulled, measured over 2M rows: row 147 B, `idx_time` 38 B,
   lint-only venv, unit tests on 3.10 and 3.11, integration tests with NATS on
   :4222.
 
-## Open, not yet decided
+## Decided, previously open
 
-- Whether the peaks list should also offer a "jump to the loudest IQ capture"
-  shortcut, given `iq_captures` is already queried by the Dashboard.
-- Whether `PEAKS_ROLLUP_INTERVAL_SEC` deserves a config-page control or stays
-  environment-only. Currently proposed as environment-only.
-- How the popover should behave on a sensor with no data in the chosen lookback:
-  empty list with a hint, or fall back to the widest range that has data.
+- **No "jump to the loudest IQ capture" shortcut.** Landing on a peak already
+  shows any IQ capture inside that window through the Dashboard's existing
+  overlay, so a separate control adds a surface without adding reach.
+- **`PEAKS_ROLLUP_INTERVAL_SEC` stays environment-only.** It is a maintenance
+  cadence with a sound default; a config-page control would have to be explained
+  to every operator who will never change it.
+- **An empty lookback shows an empty list and says so.** Never widen the search
+  beyond what was asked for. Partial history is a separate case and is already
+  covered by `covered_since`, which reports how far back the search reached.
+  Silently returning peaks from outside the requested range would make the list
+  untrustworthy, which is worse than returning nothing.
+
+## Open, not yet answered
+
+- The one-time backfill cost on the real 30 GB field database is estimated, not
+  measured. It should be timed on a copy before this is deployed, since it is a
+  full pass over the table.

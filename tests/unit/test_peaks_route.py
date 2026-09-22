@@ -132,6 +132,25 @@ async def test_empty_range_returns_an_empty_list_not_a_wider_search(client):
     assert r.json()["peaks"] == []
 
 
+async def test_cache_key_quantises_until_to_the_minute(client):
+    c, db = client
+    await _seed(db, 100, -20.0)
+    await _roll(db)
+    since = (NOW - timedelta(days=7)).isoformat()
+    params = {"since": since, "until": NOW.isoformat(), "window_sec": 1800}
+    r1 = await c.get("/api/averaged/peaks", params=params)
+    assert r1.status_code == 200
+
+    # Same minute, different seconds -- the Dashboard sends a fresh
+    # Date.now().toISOString() on every popover open, so this must still hit
+    # the cache rather than re-querying.
+    params2 = {**params, "until": (NOW + timedelta(seconds=45)).isoformat()}
+    r2 = await c.get("/api/averaged/peaks", params=params2)
+    assert r2.status_code == 200
+    assert r1.json() == r2.json()
+    assert len(_PEAKS_CACHE) == 1
+
+
 @pytest.mark.parametrize(
     "params",
     [
@@ -139,6 +158,8 @@ async def test_empty_range_returns_an_empty_list_not_a_wider_search(client):
         {"count": 0},
         {"count": 21},
         {"metric": "nonsense"},
+        {"count": "abc"},
+        {"window_sec": "abc"},
     ],
 )
 async def test_invalid_parameters_are_rejected(client, params):

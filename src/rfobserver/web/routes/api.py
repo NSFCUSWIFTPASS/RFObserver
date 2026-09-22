@@ -1036,6 +1036,9 @@ def _as_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
+# Must stay registered before the parameterised `/averaged/{window_id}` route
+# below: Starlette matches routes in registration order, and `{window_id}` is
+# typed int, so a later registration here would 422 on the literal "peaks".
 @router.get("/averaged/peaks", response_model=None)
 async def averaged_peaks(
     request: Request,
@@ -1059,19 +1062,30 @@ async def averaged_peaks(
     since_dt, until_dt = _parse_range(since, until)
     since_dt, until_dt = _as_utc(since_dt), _as_utc(until_dt)
 
-    window = int(window_sec) if window_sec else 1800
+    try:
+        window = int(window_sec) if window_sec else 1800
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="window_sec must be an integer") from exc
     if window not in _PEAK_WINDOW_SEC:
         raise HTTPException(
             status_code=400, detail=f"window_sec must be one of {list(_PEAK_WINDOW_SEC)}"
         )
-    n = int(count) if count else 10
+    try:
+        n = int(count) if count else 10
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="count must be an integer") from exc
     if not 1 <= n <= _PEAK_COUNT_MAX:
         raise HTTPException(status_code=400, detail=f"count must be 1 to {_PEAK_COUNT_MAX}")
     metric_name = metric or "pwr_max"
     if metric_name not in METRICS:
         raise HTTPException(status_code=400, detail=f"metric must be one of {list(METRICS)}")
 
-    key = (since, until, window, n, metric_name, sdr_center, sample_rate, gain)
+    # `until` is quantised to the minute in the key (matching the rollup's own
+    # minute buckets) so that repeated popover opens with a fresh
+    # `Date.now().toISOString()` still hit the cache; the exact `until_dt` is
+    # still what gets queried below.
+    until_minute = until[:16]
+    key = (since, until_minute, window, n, metric_name, sdr_center, sample_rate, gain)
     hit = _PEAKS_CACHE.get(key)
     if hit is not None:
         return hit

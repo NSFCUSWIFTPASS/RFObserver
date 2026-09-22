@@ -757,6 +757,22 @@ def _format_capture(r: dict[str, Any]) -> str:
     return " / ".join(parts)
 
 
+def _int_param(raw: str | None, default: int, name: str) -> int:
+    """Parse an integer query param, or answer 400 if it is not one.
+
+    A bare int() here raises ValueError, which Starlette turns into a 500, so a
+    typo in a URL reads as a server fault. Unlike _opt_float below, a bad value
+    is not silently treated as absent: these bound how much work the query does,
+    so quietly substituting a default would hide the mistake.
+    """
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{name} must be an integer") from exc
+
+
 def _opt_float(raw: str | None) -> float | None:
     """Parse an optional numeric query param; '' (the 'All' filter) → None."""
     if raw is None or raw == "":
@@ -973,8 +989,8 @@ async def averaged_waterfall(
     if db is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     since_dt, until_dt = _parse_range(since, until)
-    mr = max(1, min(2000, int(max_rows) if max_rows else 600))
-    mb = max(2, min(2048, int(max_bins) if max_bins else 512))
+    mr = max(1, min(2000, _int_param(max_rows, 600, "max_rows")))
+    mb = max(2, min(2048, _int_param(max_bins, 512, "max_bins")))
     key = (since, until, sdr_center, sample_rate, gain, mr, mb)
     cached = _WATERFALL_CACHE.get(key)
     if cached is not None:
@@ -1022,7 +1038,7 @@ async def averaged_stats(
             sdr_center_freq=_opt_float(sdr_center),
             sample_rate=_opt_float(sample_rate),
             gain=_opt_float(gain),
-            max_points=int(max_points) if max_points else 600,
+            max_points=_int_param(max_points, 600, "max_points"),
         )
     return result
 
@@ -1062,18 +1078,12 @@ async def averaged_peaks(
     since_dt, until_dt = _parse_range(since, until)
     since_dt, until_dt = _as_utc(since_dt), _as_utc(until_dt)
 
-    try:
-        window = int(window_sec) if window_sec else 1800
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="window_sec must be an integer") from exc
+    window = _int_param(window_sec, 1800, "window_sec")
     if window not in _PEAK_WINDOW_SEC:
         raise HTTPException(
             status_code=400, detail=f"window_sec must be one of {list(_PEAK_WINDOW_SEC)}"
         )
-    try:
-        n = int(count) if count else 10
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="count must be an integer") from exc
+    n = _int_param(count, 10, "count")
     if not 1 <= n <= _PEAK_COUNT_MAX:
         raise HTTPException(status_code=400, detail=f"count must be 1 to {_PEAK_COUNT_MAX}")
     metric_name = metric or "pwr_max"

@@ -152,7 +152,9 @@ def _open_psd(sc16_path: Path) -> tuple[np.ndarray[Any, np.dtype[Any]], dict[str
     Returns ``(grid, info)`` where ``grid`` may be a read-only memmap (only the
     windowed slice is ever materialized) and ``info`` carries freq_axis (np array),
     time_resolution_s, center_freq_hz, bandwidth_hz, total_rows, num_bins, grid_min,
-    grid_max, and cal_offset_db. Returns ``None`` if no PSD companion exists.
+    grid_max, cal_offset_db, and the alignment pair start_sample_offset /
+    slice_samples that pins row 0 to a position in the .sc16. Returns ``None``
+    if no PSD companion exists.
     """
     loaded = psd_grid.load_grid(sc16_path)
     if loaded is not None:
@@ -167,6 +169,10 @@ def _open_psd(sc16_path: Path) -> tuple[np.ndarray[Any, np.dtype[Any]], dict[str
             "grid_min": float(meta["grid_min"]),
             "grid_max": float(meta["grid_max"]),
             "cal_offset_db": float(meta["cal_offset_db"]) if "cal_offset_db" in meta else None,
+            # Absent on captures recorded before the grid was pinned to the IQ;
+            # the client falls back to assuming row 0 starts the file.
+            "start_sample_offset": int(meta.get("start_sample_offset", 0)),
+            "slice_samples": int(meta.get("slice_samples", 0)),
         }
 
     npz_path = sc16_path.with_suffix(".npz")
@@ -188,6 +194,9 @@ def _open_psd(sc16_path: Path) -> tuple[np.ndarray[Any, np.dtype[Any]], dict[str
         "grid_max": float(grid.max()) if total_rows else -40.0,
         # Display calibration baked in at record time (absent → client uses dBFS).
         "cal_offset_db": float(data["cal_offset_db"]) if "cal_offset_db" in data.files else None,
+        # Legacy .npz never carried alignment metadata.
+        "start_sample_offset": 0,
+        "slice_samples": 0,
     }
 
 
@@ -276,6 +285,8 @@ async def capture_psd(
         "count": int(sliced.shape[0]),
         "center_freq_hz": info["center_freq_hz"],
         "bandwidth_hz": info["bandwidth_hz"],
+        "start_sample_offset": info["start_sample_offset"],
+        "slice_samples": info["slice_samples"],
     }
 
 

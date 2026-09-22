@@ -407,10 +407,10 @@ def test_race_probe_manual_start_on_another_thread_keeps_the_chunk(tmp_path: Pat
     read_done = threading.Event()
     orig_drain = proc._grid_prebuf.drain
 
-    def slow_drain():  # type: ignore[no-untyped-def]
+    def slow_drain(from_sample=None):  # type: ignore[no-untyped-def]
         read_done.set()  # the ring read happened just before drain()
         time.sleep(0.05)  # the web thread is still inside _begin_recording
-        return orig_drain()
+        return orig_drain(from_sample)
 
     proc._grid_prebuf.drain = slow_drain  # type: ignore[method-assign]
     t = threading.Thread(target=proc.start_recording)

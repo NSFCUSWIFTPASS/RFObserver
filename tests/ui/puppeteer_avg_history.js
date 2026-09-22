@@ -39,9 +39,35 @@
  *     legend shows them, power trace re-scales), persist them across a page
  *     reload (stored in the DB config table), reject inverted bounds, and
  *     clearing them returns to auto
+ *   - the Peaks button opens a popover that searches on open, re-searches
+ *     when a control changes, and closes on Escape (like the range picker)
+ *   - picking a peak navigates the Dashboard to it and closes the popover;
+ *     the arrows step between peaks without another search; choosing a
+ *     preset clears peak mode (the label reverts to "Peaks")
+ *   - a control change that re-runs the search re-reconciles the open peak
+ *     against the new results by peak_time; if it falls out of the new list
+ *     (e.g. narrowing "Show top" past its rank) peak mode clears itself
  *
  * Assumes the instance has accrued >600 averaged windows in the last day
  * (any instance up for ~10+ minutes at the default window rate).
+ *
+ * REQUIRED SETUP -- run this against the instance before this file, every
+ * time, including a freshly started one with an empty database:
+ *   PYTHONPATH= .venv/bin/python tests/ui/seed_peaks.py
+ * It seeds two things this file depends on and a fresh instance does not
+ * have yet:
+ *   - six well-separated loud windows for the peaks section. A freshly
+ *     started mock instance's data is all more recent than one peak-search
+ *     window, so the separation rule correctly collapses it into a single
+ *     event; after seeding, wait for the rollup loop to fold it in -- poll
+ *     /api/averaged/peaks until it returns enough peaks rather than
+ *     sleeping a fixed amount.
+ *   - ~20 minutes of continuous recent history, which the drag-zoom and raw
+ *     -mode sections below need: they zoom into / inspect a sub-range of the
+ *     default "Last 15 minutes" view, which is empty on a freshly started
+ *     instance. Skipping this step does not fail loudly -- the drag-zoom
+ *     assertions just fail because the zoomed range has no data, which reads
+ *     like a product bug rather than a missing setup step.
  *
  * Usage:
  *   NODE_PATH=<dir-with-puppeteer-core> node tests/ui/puppeteer_avg_history.js
@@ -760,6 +786,103 @@ async function main() {
   }));
   assert(th.attr === "auto" && th.sel === "auto", "theme back to Auto after reload");
   assert(th.bg === "rgb(245, 245, 247)", "Auto resolves to the OS theme (light here)");
+
+  // Peak finder: the panel opens, searches, and lists what it found.
+  await page.click("#avg-peaks-btn");
+  await page.waitForSelector("#avg-peaks-panel:not([hidden])");
+  await page.waitForFunction(function () {
+    const el = document.getElementById("avg-peaks-list");
+    return el && !el.textContent.includes("Searching...");
+  }, { timeout: 15000 });
+  const peaksFoot = await page.$eval("#avg-peaks-foot", function (e) { return e.textContent; });
+  console.log("peaks footer:", peaksFoot);
+  assert(/searched .* in \d/.test(peaksFoot), "peaks footer should report the search: " + peaksFoot);
+  const peakCount = await page.$$eval("#avg-peaks-list .avg-peaks-item", function (els) {
+    return els.length;
+  });
+  console.log("peaks listed:", peakCount);
+  assert(
+    peakCount >= 5,
+    "peaks list should show the seeded well-separated events (got " + peakCount + "); " +
+      "run tests/ui/seed_peaks.py against this instance first"
+  );
+
+  // Changing a control re-runs the search against the new parameters. The
+  // active class alone only proves the click handler ran, not that the
+  // search did, so also wait for the footer (which carries a fresh elapsed
+  // time on every completed search) to move off the text captured above.
+  await page.click('#avg-peaks-panel button[data-peaks-window="3600"]');
+  await page.waitForFunction(function (prevFoot) {
+    const b = document.querySelector('#avg-peaks-panel button[data-peaks-window="3600"]');
+    const foot = document.getElementById("avg-peaks-foot").textContent;
+    return b && b.classList.contains("active") && foot !== prevFoot && foot.length > 0;
+  }, {}, peaksFoot);
+
+  // Escape closes it, like the range picker.
+  await page.keyboard.press("Escape");
+  await page.waitForSelector("#avg-peaks-panel[hidden]");
+
+  // Picking a peak closes the panel and navigates the Dashboard to it.
+  await page.click("#avg-peaks-btn");
+  await page.waitForFunction(function () {
+    return document.querySelectorAll("#avg-peaks-list .avg-peaks-item").length > 0;
+  }, { timeout: 15000 });
+  const firstWhen = await page.$eval(".avg-peaks-item .avg-peaks-when",
+    function (e) { return e.textContent; });
+  await page.click(".avg-peaks-item");
+  await page.waitForSelector("#avg-peaks-panel[hidden]");
+  await page.waitForFunction(function () {
+    return document.getElementById("avg-peaks-label").textContent.startsWith("Peak 1/");
+  });
+  assert(firstWhen.length > 0, "peak row should show a timestamp");
+
+  // The arrows step without reopening the panel.
+  await page.click("#avg-peaks-next");
+  await page.waitForFunction(function () {
+    return document.getElementById("avg-peaks-label").textContent.startsWith("Peak 2/");
+  });
+
+  // Choosing a preset means the range is no longer a peak, so the label resets.
+  await page.click("#avg-picker-btn");
+  await page.click('#avg-picker button[data-preset="15m"]');
+  await page.waitForFunction(function () {
+    return document.getElementById("avg-peaks-label").textContent === "Peaks";
+  });
+
+  // A new search replaces state.peaks.items wholesale, so the open peak's
+  // index must be re-reconciled against it (matched by peak_time), not left
+  // pointing at a stale position. Pin this down deterministically: pick the
+  // weakest of the six seeded peaks (rank 6), then narrow "Show top" to 5.
+  // Rank 6 cannot survive in a top-5 list, so peak mode must clear itself.
+  // Window is reset to the default 30 min first -- the "changing a control"
+  // check above left it at 1 hour, which merges the seeded peaks (spaced 40
+  // min apart) down to 3 and there would be no rank 6 to click.
+  await page.click("#avg-peaks-btn");
+  await page.click('#avg-peaks-panel button[data-peaks-window="1800"]');
+  await page.waitForFunction(function () {
+    return document.querySelectorAll('.avg-peaks-item[data-peak-rank="6"]').length > 0;
+  }, { timeout: 15000 });
+  await page.click('.avg-peaks-item[data-peak-rank="6"]');
+  await page.waitForSelector("#avg-peaks-panel[hidden]");
+  await page.waitForFunction(function () {
+    return document.getElementById("avg-peaks-label").textContent.startsWith("Peak 6/");
+  });
+  await page.click("#avg-peaks-btn");
+  await page.waitForFunction(function () {
+    return document.querySelectorAll("#avg-peaks-list .avg-peaks-item").length > 0;
+  }, { timeout: 15000 });
+  await page.click('#avg-peaks-panel button[data-peaks-count="5"]');
+  await page.waitForFunction(function () {
+    return document.getElementById("avg-peaks-label").textContent === "Peaks";
+  }, { timeout: 15000 });
+  const prevHiddenAfterNarrow = await page.$eval("#avg-peaks-prev", function (el) { return el.hidden; });
+  const nextHiddenAfterNarrow = await page.$eval("#avg-peaks-next", function (el) { return el.hidden; });
+  assert(
+    prevHiddenAfterNarrow && nextHiddenAfterNarrow,
+    "the nav arrows must hide once the open peak falls out of a narrower search"
+  );
+  await page.keyboard.press("Escape");
+  await page.waitForSelector("#avg-peaks-panel[hidden]");
 
   await page.screenshot({ path: SHOT });
   console.log("screenshot saved to", SHOT);

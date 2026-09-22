@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Any
 import aiosqlite
 import numpy as np
 
+from rfobserver.storage.rollup import METRICS, PEAK_TIME_COLUMN, MinuteSummary, WindowRow
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping, Sequence
 
@@ -46,6 +48,11 @@ _INSERT_DETECTION_SQL = """INSERT OR IGNORE INTO detections
     sdr_center_freq_hz, sample_rate_hz, lo_offset_hz, analog_bw_hz,
     gain_db, antenna, device_serial, peak_freq_hz)
    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+
+_UPSERT_AVG_MINUTE_SQL = """INSERT OR REPLACE INTO avg_minutes
+    (minute_start, sdr_center_freq_hz, n, sample_rate_hz, gain_db,
+     pwr_max, pwr_snr, pwr_avg, peak_max_time, peak_snr_time, peak_avg_time)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
 
 
 def _detection_row(
@@ -177,6 +184,29 @@ CREATE TABLE IF NOT EXISTS iq_captures (
     total_samples INTEGER,
     trigger_initiated INTEGER,
     created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- One row per minute per centre frequency, summarising avg_windows so the
+-- Dashboard's peak finder can rank a month of history without scanning
+-- millions of rows (43k rows a month here against 5M there). Each metric
+-- carries the start_time of the window that achieved it, so a chosen peak
+-- opens on the real event rather than on a minute boundary. A minute is
+-- always folded from all of its windows at once, so INSERT OR REPLACE is
+-- exact rather than lossy. The primary key's implicit index serves the
+-- range scan; no separate index is needed at this row count.
+CREATE TABLE IF NOT EXISTS avg_minutes (
+    minute_start TEXT NOT NULL,
+    sdr_center_freq_hz REAL NOT NULL,
+    n INTEGER NOT NULL,
+    sample_rate_hz REAL,
+    gain_db REAL,
+    pwr_max REAL,
+    pwr_snr REAL,
+    pwr_avg REAL,
+    peak_max_time TEXT,
+    peak_snr_time TEXT,
+    peak_avg_time TEXT,
+    PRIMARY KEY (minute_start, sdr_center_freq_hz)
 );
 
 CREATE INDEX IF NOT EXISTS idx_detections_time ON detections(start_time);
@@ -1196,6 +1226,81 @@ class SensorDatabase:
             "max_pwr": gmax if gmax != float("-inf") else 0.0,
             "points": points,
         }
+
+    @_guarded_write
+    async def upsert_avg_minutes(self, summaries: Sequence[MinuteSummary]) -> int:
+        """Write minute summaries, replacing any existing row for the same key."""
+        if not summaries:
+            return 0
+        assert self._db is not None
+        await self._db.executemany(_UPSERT_AVG_MINUTE_SQL, [tuple(s) for s in summaries])
+        await self._db.commit()
+        return len(summaries)
+
+    async def iter_rollup_windows(
+        self, *, since: datetime, until: datetime, chunk: int = 5000
+    ) -> AsyncIterator[list[WindowRow]]:
+        """Yield the light columns the rollup folds, in chunks."""
+        columns = (
+            "start_time, sdr_center_freq_hz, sample_rate_hz, gain_db, pwr_max, pwr_median, pwr_avg"
+        )
+        where = "WHERE start_time >= ? AND start_time < ?"
+        params: list[Any] = [since.isoformat(), until.isoformat()]
+        async for rows in self._scan_avg_windows(columns, where, params, chunk=chunk):
+            # _scan_avg_windows appends its keyset columns (start_time, id).
+            yield [WindowRow(*r[:7]) for r in rows]
+
+    async def query_avg_minute_peaks(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        metric: str,
+        sdr_center_freq: float | None = None,
+        sample_rate: float | None = None,
+        gain: float | None = None,
+        limit: int = 2000,
+    ) -> list[tuple[str, float, float | None, float | None, float | None]]:
+        """Top rollup minutes for a metric, strongest first.
+
+        `metric` is interpolated into the ORDER BY, so it is whitelisted rather
+        than parameterised. The minute bounds are widened to whole minutes and
+        the caller re-checks each peak timestamp against the true range, since
+        a minute at either edge may straddle it.
+        """
+        if metric not in METRICS:
+            raise ValueError(f"unknown metric {metric!r}, expected one of {METRICS}")
+        assert self._db is not None
+        peak_col = PEAK_TIME_COLUMN[metric]
+        conditions, params = self._sdr_conditions(sdr_center_freq, sample_rate, gain)
+        where = [
+            "minute_start >= ?",
+            "minute_start <= ?",
+            f"{metric} IS NOT NULL",
+            f"{peak_col} IS NOT NULL",
+            *conditions,
+        ]
+        args: list[Any] = [
+            since.isoformat()[:16],
+            until.isoformat()[:16],
+            *params,
+            limit,
+        ]
+        sql = (
+            f"SELECT {peak_col}, {metric}, pwr_max, pwr_snr, pwr_avg FROM avg_minutes "
+            f"WHERE {' AND '.join(where)} ORDER BY {metric} DESC LIMIT ?"
+        )
+        rows = await self._db.execute_fetchall(sql, args)
+        return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
+
+    async def oldest_avg_window_time(self) -> datetime | None:
+        """Start time of the earliest averaged window, or None if there are none."""
+        assert self._db is not None
+        async with self._db.execute("SELECT MIN(start_time) FROM avg_windows") as cursor:
+            row = await cursor.fetchone()
+        if row is None or row[0] is None:
+            return None
+        return datetime.fromisoformat(row[0])
 
     async def avg_window_configs(self) -> dict[str, Any]:
         """Distinct SDR tuning configs present in avg_windows + the most recent.

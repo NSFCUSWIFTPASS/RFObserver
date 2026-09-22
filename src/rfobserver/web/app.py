@@ -66,6 +66,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     # wait their turn instead of starving the pipeline.
     app.state.waterfall_sem = asyncio.Semaphore(1)
     app.state.stats_sem = asyncio.Semaphore(1)
+    # The peak search reads the rollup, not the blobs, so it is far lighter than
+    # the two above; it still gets its own gate so a burst of panel opens cannot
+    # queue behind a waterfall or starve the pipeline.
+    app.state.peaks_sem = asyncio.Semaphore(1)
 
     if STATIC_DIR.exists():
         app.mount("/static", _RevalidatedStaticFiles(directory=str(STATIC_DIR)), name="static")

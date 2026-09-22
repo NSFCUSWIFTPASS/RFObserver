@@ -246,3 +246,36 @@ def test_peak_freq_hz_reports_peak_bin_not_midpoint():
     b = res.bursts[0]
     assert abs(b.peak_freq_hz - (915e6 + freq_axis[3])) < 1.0  # peak = bin 3
     assert abs(b.center_freq_hz - (915e6 + freq_axis[4])) < 1.0  # midpoint = bin 4 (unchanged)
+
+
+def test_default_threshold_does_not_turn_noise_into_bursts() -> None:
+    """The app's default burst threshold must not fire on noise alone.
+
+    Each PSD row is a single unaveraged FFT, so every cell is an exponentially
+    distributed noise sample. At the old 10 dB default ~0.1% of cells cleared
+    the threshold: ~7,400 "bursts" per 4096-row window of pure noise, enough to
+    stall the pipeline and write ~11M noise detections a day on nano-super
+    (docs/debugging/2026-09-22_psd-pipeline-latency.md).
+    """
+    from types import SimpleNamespace
+
+    from rfobserver.config import AppSettings
+    from rfobserver.pipeline.streaming import StreamingProcessor
+    from rfobserver.processing.spectral import PSDGridConfig, compute_psd_grid
+
+    s = AppSettings(_env_file=None, BANDWIDTH=2_000_000)
+    config = StreamingProcessor._make_burst_config(SimpleNamespace(_settings=s))  # type: ignore[arg-type]
+    rng = np.random.default_rng(1)
+    n = 1024 * s.NUM_FFT_BINS
+    noise = ((rng.standard_normal(n) + 1j * rng.standard_normal(n)) * 0.01).astype(np.complex64)
+    grid = compute_psd_grid(
+        noise,
+        s.BANDWIDTH,
+        config=PSDGridConfig(
+            num_bins=s.NUM_FFT_BINS, time_resolution_ms=s.PSD_TIME_RESOLUTION_MS, num_workers=1
+        ),
+    )
+    result = detect_bursts(
+        grid, config=config, center_freq_hz=915e6, capture_time=datetime.now(timezone.utc)
+    )
+    assert len(result.bursts) < 5, f"{len(result.bursts)} bursts detected in pure noise"

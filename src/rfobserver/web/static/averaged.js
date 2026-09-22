@@ -1439,7 +1439,7 @@
         $("avg-picker-btn").addEventListener("click", function (e) {
             e.stopPropagation();
             if (state.pickerOpen) closePicker();
-            else openPicker();
+            else { closePeaks(); openPicker(); }
         });
         $("avg-picker").addEventListener("click", function (e) { e.stopPropagation(); });
         $("avg-peaks-btn").addEventListener("click", function (e) {

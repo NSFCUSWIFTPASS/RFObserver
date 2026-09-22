@@ -184,6 +184,50 @@
         }
     }
 
+    // Download links for one capture. The SigMF pair is the same IQ bytes as the
+    // .sc16 plus generated metadata, for analysis tools; the raw files are listed
+    // as stored. Every link is a plain GET, so the same URLs work from curl
+    // (and resume with curl -C -).
+    function downloadLinks(d) {
+        const files = d.files || [];
+        if (!files.length) return "";
+        const sizeOf = {};
+        files.forEach(function(f) { sizeOf[f.name] = f.size_bytes; });
+        function link(name, label) {
+            const size = sizeOf[name] != null ? ' <span class="dl-size">' + formatBytes(sizeOf[name]) + '</span>' : '';
+            return '<a class="dl-link" href="/captures/download/' + encodeURIComponent(name)
+                + '" download="' + name + '">' + label + '</a>' + size;
+        }
+        const sc16 = files.find(function(f) { return f.name.endsWith(".sc16"); });
+        let html = '<div class="dl-section"><div class="dl-title">Download</div>';
+        if (d.sigmf && sc16) {
+            sizeOf[d.sigmf.data] = sc16.size_bytes;
+            html += '<div class="dl-row"><span class="dl-kind">IQ (SigMF)</span>'
+                + link(d.sigmf.meta, ".sigmf-meta") + link(d.sigmf.data, ".sigmf-data") + '</div>';
+        }
+        const labels = [
+            [".sc16", "Raw IQ", ".sc16"], [".json", "Metadata", ".json"],
+            [".psd", "PSD", ".psd"], [".psd.json", "PSD", ".psd.json"],
+            [".detections.json", "Detections", ".detections.json"],
+        ];
+        const groups = {};
+        const order = [];
+        labels.forEach(function(entry) {
+            const f = files.find(function(x) {
+                return x.name.endsWith(entry[0])
+                    && !(entry[0] === ".json" && /\.(psd|detections)\.json$/.test(x.name))
+                    && !(entry[0] === ".psd" && x.name.endsWith(".psd.json"));
+            });
+            if (!f) return;
+            if (!groups[entry[1]]) { groups[entry[1]] = []; order.push(entry[1]); }
+            groups[entry[1]].push(link(f.name, entry[2]));
+        });
+        order.forEach(function(kind) {
+            html += '<div class="dl-row"><span class="dl-kind">' + kind + '</span>' + groups[kind].join("") + '</div>';
+        });
+        return html + '</div>';
+    }
+
     async function showDetail(filename, hasPsd) {
         document.querySelectorAll(".capture-item").forEach(function(el) {
             el.classList.toggle("selected", el.dataset.file === filename);
@@ -217,6 +261,7 @@
             if (m.hostname) html += row("Hostname", m.hostname);
             if (m.serial) html += row("Serial", m.serial);
             html += '</table>';
+            html += downloadLinks(d);
 
             detailEl.innerHTML = html;
 

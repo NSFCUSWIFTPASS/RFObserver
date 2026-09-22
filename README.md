@@ -12,7 +12,7 @@ RFObserver supports configurable add-ons to the post processing pipeline for dem
 - Real-time PSD grid + summary PSD computation, IQ statistics (mean/max/median/std/kurtosis).
 - Rolling burst detector with dual-threshold hysteresis on per-bin noise floor.
 - Trigger-based IQ recording (manual or power-threshold) with a pre-trigger circular buffer; streaming-to-disk or RAM-buffered modes.
-- Capture view with waterfall and spectrogram in the Web UI for post analysis
+- Capture view with waterfall and spectrogram in the Web UI for post analysis; captures download as raw files or SigMF, resumable over HTTP
 - Pluggable post-processing add-ons; FM audio demodulation included.
 - Configurable via API
 - Local WebUI (FastAPI + HTMX): live spectrogram, detection history, capture browser, runtime reconfiguration of every pipeline knob.
@@ -49,6 +49,40 @@ rfobserver web
 >
 > Or invoke it without touching `PATH`, via the full path
 > (`~/.local/bin/rfobserver config`) or as a module (`python3 -m rfobserver config`).
+
+## Downloading captures
+
+Each capture on the Captures page has a Download section. The same files are
+plain HTTP downloads, so they can be scripted:
+
+```bash
+SENSOR=http://sensor:8888
+
+# What is available: every capture's files with sizes, plus its SigMF names
+curl -s $SENSOR/captures/list | python3 -m json.tool
+
+# One file (-C - resumes an interrupted download; the server supports HTTP Range)
+curl -C - -O -J $SENSOR/captures/download/<capture>.sc16
+
+# The same IQ as standard SigMF, for inspectrum, GNU Radio, the sigmf library, etc.
+curl -C - -O -J $SENSOR/captures/download/<capture>.sigmf-meta
+curl -C - -O -J $SENSOR/captures/download/<capture>.sigmf-data
+
+# Everything on the sensor, resumable (re-run after an interruption)
+curl -s $SENSOR/captures/list |
+  python3 -c 'import sys,json; [print(f["name"]) for c in json.load(sys.stdin) for f in c["files"]]' |
+  while read -r f; do curl -s -C - -o "$f" "$SENSOR/captures/download/$f"; done
+```
+
+Files available per capture: `.sc16` (raw interleaved int16 I/Q), `.json`
+(capture metadata), `.psd` and `.psd.json` (the waterfall grid), and
+`.detections.json`. `.sigmf-data` is the `.sc16` itself, which is byte-identical
+to SigMF `ci16_le`; `.sigmf-meta` is generated from the `.json`, with each
+overflow gap marked as a new capture segment so timestamps stay correct. A
+capture that is still being recorded answers `409` until it is finalized.
+
+The web UI has no authentication: anyone who can reach the port can download
+captures.
 
 ## Development
 

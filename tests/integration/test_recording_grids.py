@@ -111,6 +111,17 @@ def _assert_psd_covers_iq(storage_dir: Path, bandwidth_hz: int) -> None:
     included. Without the pre-trigger PSD buffer the grid would start only at
     the recording trigger and be far shorter than the (pre-roll + recorded) IQ."""
     sc16 = next(storage_dir.glob("*.sc16"))
+    # load_grid memmaps at the sidecar's declared shape, so a sidecar claiming
+    # more rows than the file holds raises "mmap length is greater than file
+    # size" and the Captures page fails outright. Check the file agrees before
+    # anything else.
+    raw_path, _ = psd_grid.grid_paths(sc16)
+    raw_meta = json.loads(sc16.with_suffix(".psd.json").read_text())
+    declared = int(raw_meta["rows"]) * int(raw_meta["num_bins"]) * 4
+    assert raw_path.stat().st_size == declared, (
+        f".psd is {raw_path.stat().st_size} bytes but the sidecar declares {declared}"
+    )
+
     loaded = psd_grid.load_grid(sc16)
     assert loaded is not None
     mm, meta = loaded

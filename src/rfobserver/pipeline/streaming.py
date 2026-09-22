@@ -1347,6 +1347,29 @@ class StreamingProcessor:
                     fh.write(np.ascontiguousarray(g, dtype=np.float32).tobytes())
                     self._grid_rows += g.shape[0]
             self._recording_grids = []
+        if self._recording_freq_axis is not None:
+            # The row count must come from the file, never from the queued-rows
+            # counter. A row counted at put time but not written (a late put
+            # racing the writer's shutdown) would make the sidecar claim more
+            # rows than exist, and load_grid's memmap then fails outright with
+            # "mmap length is greater than file size". Truncate any partial
+            # trailing row for the same reason.
+            num_bins = int(self._recording_freq_axis.shape[0])
+            row_bytes = 4 * num_bins
+            if num_bins > 0 and raw_path.exists():
+                size = raw_path.stat().st_size
+                actual_rows = size // row_bytes
+                if size % row_bytes:
+                    with contextlib.suppress(OSError):
+                        os.truncate(raw_path, actual_rows * row_bytes)
+                if actual_rows != self._grid_rows:
+                    logger.warning(
+                        "PSD grid rows on disk (%d) differ from rows queued (%d); "
+                        "reporting the file",
+                        actual_rows,
+                        self._grid_rows,
+                    )
+                self._grid_rows = actual_rows
         if self._grid_rows > 0 and self._recording_freq_axis is not None:
             psd_grid.write_meta(
                 meta_path,
@@ -1752,11 +1775,7 @@ class StreamingProcessor:
                     cr.psd_grid.time_axis[1] - cr.psd_grid.time_axis[0]
                 )
             if grid.size:
-                if self._grid_first_sample is None:
-                    self._grid_first_sample = first_sample
-                self._grid_last_sample = first_sample + int(grid.shape[0]) * self._slice_samples
-                self._grid_min = min(self._grid_min, float(grid.min()))
-                self._grid_max = max(self._grid_max, float(grid.max()))
+                stored = True
                 if self._grid_raw_path is not None:
                     data = np.ascontiguousarray(grid, dtype=np.float32).tobytes()
                     try:
@@ -1765,8 +1784,19 @@ class StreamingProcessor:
                     except queue.Full:
                         # Companion data — drop rather than stall the dispatch loop.
                         self._grid_dropped += grid.shape[0]
+                        stored = False
                 else:
                     self._recording_grids.append(grid.copy())
+                # Advance the fill trackers only once the rows are actually
+                # stored. _await_tail_grids watches _grid_last_sample, so
+                # advancing it before the put would let finalize declare the
+                # tail complete for rows that were never queued.
+                if stored:
+                    if self._grid_first_sample is None:
+                        self._grid_first_sample = first_sample
+                    self._grid_last_sample = first_sample + int(grid.shape[0]) * self._slice_samples
+                    self._grid_min = min(self._grid_min, float(grid.min()))
+                    self._grid_max = max(self._grid_max, float(grid.max()))
         else:
             # Not recording: keep a rolling window of recent grids tagged with
             # their stream position, so a recording that fires can take the rows

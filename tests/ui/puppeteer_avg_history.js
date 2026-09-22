@@ -41,6 +41,9 @@
  *     clearing them returns to auto
  *   - the Peaks button opens a popover that searches on open, re-searches
  *     when a control changes, and closes on Escape (like the range picker)
+ *   - picking a peak navigates the Dashboard to it and closes the popover;
+ *     the arrows step between peaks without another search; choosing a
+ *     preset clears peak mode (the label reverts to "Peaks")
  *
  * Assumes the instance has accrued >600 averaged windows in the last day
  * (any instance up for ~10+ minutes at the default window rate).
@@ -792,16 +795,47 @@ async function main() {
       "run tests/ui/seed_peaks.py against this instance first"
   );
 
-  // Changing a control re-runs the search against the new parameters.
+  // Changing a control re-runs the search against the new parameters. The
+  // active class alone only proves the click handler ran, not that the
+  // search did, so also wait for the footer (which carries a fresh elapsed
+  // time on every completed search) to move off the text captured above.
   await page.click('#avg-peaks-panel button[data-peaks-window="3600"]');
-  await page.waitForFunction(function () {
+  await page.waitForFunction(function (prevFoot) {
     const b = document.querySelector('#avg-peaks-panel button[data-peaks-window="3600"]');
-    return b && b.classList.contains("active");
-  });
+    const foot = document.getElementById("avg-peaks-foot").textContent;
+    return b && b.classList.contains("active") && foot !== prevFoot && foot.length > 0;
+  }, {}, peaksFoot);
 
   // Escape closes it, like the range picker.
   await page.keyboard.press("Escape");
   await page.waitForSelector("#avg-peaks-panel[hidden]");
+
+  // Picking a peak closes the panel and navigates the Dashboard to it.
+  await page.click("#avg-peaks-btn");
+  await page.waitForFunction(function () {
+    return document.querySelectorAll("#avg-peaks-list .avg-peaks-item").length > 0;
+  }, { timeout: 15000 });
+  const firstWhen = await page.$eval(".avg-peaks-item .avg-peaks-when",
+    function (e) { return e.textContent; });
+  await page.click(".avg-peaks-item");
+  await page.waitForSelector("#avg-peaks-panel[hidden]");
+  await page.waitForFunction(function () {
+    return document.getElementById("avg-peaks-label").textContent.startsWith("Peak 1/");
+  });
+  assert(firstWhen.length > 0, "peak row should show a timestamp");
+
+  // The arrows step without reopening the panel.
+  await page.click("#avg-peaks-next");
+  await page.waitForFunction(function () {
+    return document.getElementById("avg-peaks-label").textContent.startsWith("Peak 2/");
+  });
+
+  // Choosing a preset means the range is no longer a peak, so the label resets.
+  await page.click("#avg-picker-btn");
+  await page.click('#avg-picker button[data-preset="15m"]');
+  await page.waitForFunction(function () {
+    return document.getElementById("avg-peaks-label").textContent === "Peaks";
+  });
 
   await page.screenshot({ path: SHOT });
   console.log("screenshot saved to", SHOT);

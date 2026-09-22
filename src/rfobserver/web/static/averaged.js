@@ -407,6 +407,56 @@
             state.peaks.lookback];
     }
 
+    function applyPeak(idx) {
+        const p = state.peaks;
+        const peak = p.items[idx];
+        if (!peak) return;
+        // Same path as the absolute-range Apply button, so back/forward works.
+        pushRangeHistory();
+        state.sinceMs = Date.parse(peak.since);
+        state.untilMs = Date.parse(peak.until);
+        state.spanMs = state.untilMs - state.sinceMs;
+        state.activePreset = null;
+        p.index = idx;
+        markPresetButtons();
+        updatePeakNav();
+        setLive(false);
+        setStale(true);
+        loadAll(false);
+    }
+
+    function pickPeak(rank) {
+        const idx = state.peaks.items.findIndex(function (x) { return x.rank === rank; });
+        if (idx < 0) return;
+        applyPeak(idx);
+        closePeaks();
+    }
+
+    function stepPeak(delta) {
+        const next = state.peaks.index + delta;
+        if (next < 0 || next >= state.peaks.items.length) return;
+        applyPeak(next);   // from the cached list; no refetch
+    }
+
+    function updatePeakNav() {
+        const p = state.peaks;
+        const active = p.index >= 0 && p.index < p.items.length;
+        $("avg-peaks-label").textContent = active
+            ? "Peak " + (p.index + 1) + "/" + p.items.length
+            : "Peaks";
+        $("avg-peaks-prev").hidden = !active;
+        $("avg-peaks-next").hidden = !active;
+        $("avg-peaks-prev").disabled = !active || p.index === 0;
+        $("avg-peaks-next").disabled = !active || p.index === p.items.length - 1;
+    }
+
+    // The range no longer corresponds to a peak, so stop claiming it does.
+    function clearPeakMode() {
+        if (state.peaks.index < 0) return;
+        state.peaks.index = -1;
+        updatePeakNav();
+    }
+
     // --- range back/forward history (undo/redo of range selections) ---
 
     function rangeSnapshot() {
@@ -429,6 +479,7 @@
     }
 
     function applyRangeSnapshot(s) {
+        clearPeakMode();
         state.activePreset = s.activePreset;
         state.spanMs = s.spanMs;
         markPresetButtons();
@@ -1412,6 +1463,7 @@
                 $("avg-status").textContent = "Invalid range: start must be before end";
                 return;
             }
+            clearPeakMode();
             pushRangeHistory();
             state.sinceMs = s.getTime();
             state.untilMs = u.getTime();
@@ -1425,6 +1477,7 @@
         });
         $("avg-now").addEventListener("click", function () {
             if (state.live) { setLive(false); return; }
+            clearPeakMode();
             pushRangeHistory();
             state.followLatest = true;
             setStale(true);
@@ -1460,6 +1513,18 @@
             markPeaksButtons();
             loadPeaks();
         });
+        $("avg-peaks-list").addEventListener("click", function (e) {
+            const row = e.target.closest(".avg-peaks-item");
+            if (row) pickPeak(Number(row.dataset.peakRank));
+        });
+        $("avg-peaks-prev").addEventListener("click", function (e) {
+            e.stopPropagation();
+            stepPeak(-1);
+        });
+        $("avg-peaks-next").addEventListener("click", function (e) {
+            e.stopPropagation();
+            stepPeak(1);
+        });
         for (const key in SCALE_FIELDS) {
             $(SCALE_FIELDS[key]).addEventListener("change", applyScaleInputs);
         }
@@ -1474,6 +1539,7 @@
         });
         document.querySelectorAll("[data-preset]").forEach(function (btn) {
             btn.addEventListener("click", function () {
+                clearPeakMode();
                 pushRangeHistory();
                 state.activePreset = btn.dataset.preset;
                 state.spanMs = PRESET_MS[btn.dataset.preset] || DAY_MS;

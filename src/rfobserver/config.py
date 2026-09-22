@@ -116,6 +116,11 @@ class AppSettings(BaseSettings):
     # (0 disables the retention loop).
     DB_RETENTION_DAYS: int = 7
     DB_CLEANUP_INTERVAL_SEC: float = 3600.0
+    # How often the avg_minutes rollup folds newly closed minutes and advances
+    # its backfill of older history (0 disables the rollup, which disables the
+    # Dashboard's peak finder). The work per tick is bounded by a span and a
+    # time budget, so this is a latency knob, not a load knob.
+    PEAKS_ROLLUP_INTERVAL_SEC: float = 60.0
     # Grace period after a recording stops before its detections sidecar
     # (<base>.detections.json) is written, so late-arriving burst detections
     # that fall inside the capture window are captured. The captures route

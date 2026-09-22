@@ -11,8 +11,11 @@ import contextlib
 import logging
 import os
 import signal
+import time
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
+from rfobserver.storage.rollup import ROLLUP_NEWEST_KEY, ROLLUP_OLDEST_KEY, WindowRow, fold_windows
 from rfobserver.web.websocket import LiveBroadcast
 
 if TYPE_CHECKING:
@@ -24,6 +27,7 @@ if TYPE_CHECKING:
     from rfobserver.config import AppSettings
     from rfobserver.pipeline.beacon import ProgressBeacon
     from rfobserver.pipeline.supervisor import PipelineSupervisor
+    from rfobserver.storage.database import SensorDatabase
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +38,12 @@ _WEB_SHUTDOWN_TIMEOUT_SEC = 5.0
 # uvicorn cancels its own request and websocket tasks (e.g. a quiet /ws/audio
 # that never calls receive) before our 5s bound above, which stays as a backstop.
 _WEB_GRACEFUL_SHUTDOWN_SEC = 3  # int: uvicorn types it as int | None
+# One hour of windows is about 7,200 rows, which bounds peak memory per step no
+# matter how far behind the rollup has fallen.
+_ROLLUP_SPAN = timedelta(hours=1)
+# Wall-clock budget per pass, so a cold backfill of a month finishes in minutes
+# without any single pass blocking the loop.
+_ROLLUP_BUDGET_SEC = 5.0
 
 
 def make_give_up_handler(
@@ -284,6 +294,8 @@ async def run(settings: AppSettings) -> None:
         )
     if settings.DB_RETENTION_DAYS > 0:
         workers.append(asyncio.create_task(_cleanup_loop(settings, db)))
+    if settings.PEAKS_ROLLUP_INTERVAL_SEC > 0:
+        workers.append(asyncio.create_task(_rollup_loop(settings, db)))
     # Serve until a stop signal. The supervisor owns the processor task
     # independently of these, so a Standby or headless run waits here too.
     stop_task = asyncio.create_task(stop.wait())
@@ -451,6 +463,82 @@ async def _cleanup_loop(settings: AppSettings, db: Any) -> None:
             logger.exception("Retention cleanup failed; continuing")
 
         await asyncio.sleep(settings.DB_CLEANUP_INTERVAL_SEC)
+
+
+def _minute_str(when: datetime) -> str:
+    """Minute-resolution key, matching avg_minutes.minute_start."""
+    return when.strftime("%Y-%m-%dT%H:%M")
+
+
+def _parse_minute(key: str) -> datetime:
+    return datetime.fromisoformat(key + ":00+00:00")
+
+
+async def _rollup_span(db: SensorDatabase, since: datetime, until: datetime) -> int:
+    """Fold one bounded span of windows into avg_minutes."""
+    rows: list[WindowRow] = []
+    async for chunk in db.iter_rollup_windows(since=since, until=until):
+        rows.extend(chunk)
+    if not rows:
+        return 0
+    written: int = await db.upsert_avg_minutes(fold_windows(rows))
+    return written
+
+
+async def _rollup_forward(db: SensorDatabase, now: datetime) -> None:
+    """Fold every minute that has closed since the last run."""
+    closed = now.replace(second=0, microsecond=0)
+    key = await db.get_config(ROLLUP_NEWEST_KEY)
+    if key is None:
+        # First run: anchor at the current minute and let the backfill reach
+        # back, so a fresh start does not scan the whole table up front.
+        await db.set_config(ROLLUP_NEWEST_KEY, _minute_str(closed))
+        return
+    since = _parse_minute(key)
+    deadline = time.monotonic() + _ROLLUP_BUDGET_SEC
+    while since < closed and time.monotonic() < deadline:
+        until = min(since + _ROLLUP_SPAN, closed)
+        await _rollup_span(db, since, until)
+        since = until
+        await db.set_config(ROLLUP_NEWEST_KEY, _minute_str(since))
+
+
+async def _rollup_backfill(db: SensorDatabase, now: datetime) -> None:
+    """Extend the rollup backwards, newest history first."""
+    oldest_window = await db.oldest_avg_window_time()
+    if oldest_window is None:
+        return
+    key = await db.get_config(ROLLUP_OLDEST_KEY)
+    if key is None:
+        key = await db.get_config(ROLLUP_NEWEST_KEY)
+        if key is None:
+            return
+        await db.set_config(ROLLUP_OLDEST_KEY, key)
+    until = _parse_minute(key)
+    floor = oldest_window.replace(second=0, microsecond=0)
+    deadline = time.monotonic() + _ROLLUP_BUDGET_SEC
+    while until > floor and time.monotonic() < deadline:
+        since = max(until - _ROLLUP_SPAN, floor)
+        await _rollup_span(db, since, until)
+        until = since
+        await db.set_config(ROLLUP_OLDEST_KEY, _minute_str(until))
+
+
+async def _rollup_loop(settings: AppSettings, db: SensorDatabase) -> None:
+    """Keep avg_minutes in step with avg_windows.
+
+    The forward pass folds minutes that have just closed (about 120 windows).
+    The backfill pass deepens history newest-first, so the peak finder works on
+    recent data immediately instead of waiting for a full pass over the table.
+    """
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            await _rollup_forward(db, now)
+            await _rollup_backfill(db, now)
+        except Exception:
+            logger.exception("avg_minutes rollup pass failed")
+        await asyncio.sleep(settings.PEAKS_ROLLUP_INTERVAL_SEC)
 
 
 async def _run_web_server(

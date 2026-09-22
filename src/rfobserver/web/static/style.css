@@ -809,6 +809,49 @@ body {
     word-break: break-all;
 }
 
+/* Capture download links (detail panel) */
+.dl-section {
+    margin-top: 14px;
+    font-size: 12px;
+}
+
+.dl-title {
+    color: var(--text-secondary);
+    font-weight: 600;
+    margin-bottom: 6px;
+}
+
+.dl-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 12px;
+    padding: 4px 0;
+    border-bottom: 1px solid var(--divider);
+}
+
+.dl-kind {
+    color: var(--text-secondary);
+    font-weight: 500;
+    width: 108px;
+    flex-shrink: 0;
+}
+
+.dl-link {
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 500;
+}
+
+.dl-link:hover {
+    text-decoration: underline;
+}
+
+.dl-size {
+    color: var(--text-secondary);
+    margin-left: -8px;
+}
+
 /* Capture viewer */
 .capture-viewer {
     margin-top: 16px;

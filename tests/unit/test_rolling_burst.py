@@ -158,3 +158,132 @@ def test_emitted_burst_carries_peak_freq_hz_of_strongest_constituent() -> None:
     )
     assert abs(b.peak_freq_hz - peak_bin_freq) < 1.0
     assert abs(midpoint_freq - peak_bin_freq) > 1.0  # sanity: peak != midpoint
+
+
+# --- _absorb matching: sub-quadratic, same decisions --------------------------
+#
+# On a noisy band _absorb was called for thousands of bursts per evaluation and
+# scanned every tracked burst each time, in pure Python with the GIL held. It
+# starved the PSD workers (docs/debugging/2026-09-22_psd-pipeline-latency.md).
+# The index must change the cost, never the decisions.
+
+import copy  # noqa: E402
+import time  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from rfobserver.processing.rolling_burst import _TrackedBurst  # noqa: E402
+
+
+def _naive_absorb(tracked, tol, eval_count, burst, abs_start, abs_end, f_lo, f_hi, growing):
+    """Verbatim copy of the original linear-scan matcher: the reference."""
+    for t in tracked:
+        freq_close = abs(burst.center_freq_hz - t.center_freq_hz) <= (
+            tol + (f_hi - f_lo + t.f_hi_hz - t.f_lo_hz) / 2
+        )
+        time_close = abs_start <= t.abs_end + 3 and abs_end >= t.abs_start - 3
+        if freq_close and time_close:
+            t.abs_start = min(t.abs_start, abs_start)
+            t.abs_end = max(t.abs_end, abs_end)
+            t.f_lo_hz = min(t.f_lo_hz, f_lo)
+            t.f_hi_hz = max(t.f_hi_hz, f_hi)
+            t.center_freq_hz = (t.f_lo_hz + t.f_hi_hz) / 2
+            if burst.peak_power_db > t.peak_power_db:
+                t.peak_freq_hz = burst.peak_freq_hz
+            t.peak_power_db = max(t.peak_power_db, burst.peak_power_db)
+            t.last_eval = eval_count
+            t.still_growing = growing
+            return
+    tracked.append(
+        _TrackedBurst(
+            abs_start=abs_start,
+            abs_end=abs_end,
+            f_lo_hz=f_lo,
+            f_hi_hz=f_hi,
+            center_freq_hz=burst.center_freq_hz,
+            peak_power_db=burst.peak_power_db,
+            peak_freq_hz=burst.peak_freq_hz,
+            last_eval=eval_count,
+            still_growing=growing,
+        )
+    )
+
+
+def _state(tracked):
+    return [
+        (
+            t.abs_start,
+            t.abs_end,
+            t.f_lo_hz,
+            t.f_hi_hz,
+            t.center_freq_hz,
+            t.peak_power_db,
+            t.peak_freq_hz,
+            t.last_eval,
+            t.still_growing,
+        )
+        for t in tracked
+    ]
+
+
+def _random_bursts(rng, n, span_hz, max_bw_hz, max_row):
+    out = []
+    for _ in range(n):
+        c = float(rng.uniform(-span_hz / 2, span_hz / 2))
+        bw = float(rng.uniform(0, max_bw_hz))
+        start = int(rng.integers(0, max_row))
+        out.append(
+            (
+                SimpleNamespace(
+                    center_freq_hz=c,
+                    bandwidth_hz=bw,
+                    peak_power_db=float(rng.uniform(-100, -40)),
+                    peak_freq_hz=c,
+                ),
+                start,
+                start + int(rng.integers(1, 30)),
+                bool(rng.integers(0, 2)),
+            )
+        )
+    return out
+
+
+def test_absorb_makes_the_same_decisions_as_the_linear_scan() -> None:
+    """Randomized: dense clustered bursts that merge, widen and chain."""
+    rng = np.random.default_rng(7)
+    for trial in range(20):
+        det = _detector(window=4096, eval_iv=2048, num_bins=2048, tres_s=0.001)
+        ref: list = []
+        tol = det._match_freq_tol_hz
+        # A narrow span with wide bursts forces many merges and widenings, which
+        # is where an index that misses a re-registered bucket would diverge.
+        span = float(rng.choice([20_000.0, 200_000.0, 1_000_000.0]))
+        for ev in range(4):
+            det._eval_count = ev + 1
+            for burst, a0, a1, grow in _random_bursts(rng, 300, span, 15_000.0, 400):
+                f_lo = burst.center_freq_hz - burst.bandwidth_hz / 2
+                f_hi = burst.center_freq_hz + burst.bandwidth_hz / 2
+                det._absorb(burst, a0, a1, f_lo, f_hi, grow)
+                _naive_absorb(ref, tol, ev + 1, burst, a0, a1, f_lo, f_hi, grow)
+            assert _state(det._tracked) == _state(ref), f"diverged: trial {trial}, eval {ev}"
+            # Scroll: drop tracks as _collect_finished would, on both sides.
+            cut = int(rng.integers(0, 200))
+            det._collect_finished(cut)
+            ref = [copy.copy(t) for t in ref if not t.abs_end < cut]
+            assert _state(det._tracked) == _state(ref)
+
+
+def test_absorb_scales_to_a_noisy_band() -> None:
+    """~7,000 single-cell noise bursts per window is what a 10 dB threshold
+    produces on pure noise. The linear scan did ~25M Python comparisons per
+    evaluation at that count (seconds with the GIL held); the index must keep
+    it well under a second."""
+    rng = np.random.default_rng(3)
+    det = _detector(window=4096, eval_iv=2048, num_bins=2048, tres_s=0.001)
+    bursts = _random_bursts(rng, 7000, 1_000_000.0, 2_000.0, 4096)
+    t0 = time.perf_counter()
+    for burst, a0, a1, grow in bursts:
+        f_lo = burst.center_freq_hz - burst.bandwidth_hz / 2
+        f_hi = burst.center_freq_hz + burst.bandwidth_hz / 2
+        det._absorb(burst, a0, a1, f_lo, f_hi, grow)
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 1.0, f"absorbing 7000 bursts took {elapsed:.2f}s"

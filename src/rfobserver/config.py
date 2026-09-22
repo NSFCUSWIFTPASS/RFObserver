@@ -67,7 +67,12 @@ class AppSettings(BaseSettings):
     TRIGGER_CONTINUOUS: bool = False
 
     # Burst detection
-    BURST_THRESHOLD_HIGH_DB: float = 10.0
+    # dB above the noise floor a PSD cell must reach to seed a burst. Each PSD
+    # row is a single unaveraged FFT, so cells are exponentially distributed
+    # noise samples: at 10 dB ~0.1% of cells cleared it, ~7,400 noise "bursts"
+    # per window, which stalled the pipeline. 30 dB yields none on pure noise.
+    # See docs/debugging/2026-09-22_psd-pipeline-latency.md.
+    BURST_THRESHOLD_HIGH_DB: float = 30.0
     BURST_THRESHOLD_LOW_RATIO: float = 0.6
     BURST_MERGE_FREQ_BINS: int = 5
     BURST_MERGE_TIME_MS: float = 3.0

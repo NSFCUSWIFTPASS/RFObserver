@@ -224,3 +224,102 @@ future schema or hardware change -- see "What was NOT determined".
   scale linearly since every hour has the same row count and blob size by
   construction, but this was not independently confirmed at the full 30-day
   size.
+
+---
+
+## CORRECTION 2026-09-22: measured on the Jetson, and the open items above are now closed
+
+The numbers above were taken on the x86 workstation (31 GiB RAM, warm page
+cache). The run below was taken on **nano-super** (Jetson Orin Nano, aarch64,
+6 cores, **7 GB RAM**, NVMe, Python 3.10.12), against a **10.6 GB / 1,209,600
+row** fixture with real 8192-byte blobs, with the page cache dropped
+immediately beforehand. 7 GB of RAM against a 10.6 GB database means the reads
+were genuinely served from disk, which the workstation run could not claim.
+
+The "open, not yet answered" items above about Jetson timing, concurrent
+pipeline writes and the per-statement distribution are all closed by this run.
+The 30-day figure remains a linear extrapolation.
+
+### Cold backfill, two independent runs
+
+```
+Full cold backfill: 7 _rollup_backfill() calls, 29.6s wall
+  avg_minutes rows produced: 10080
+  history span backfilled: 7.00 days -> 4.22 s/day
+  chunk statement timings across full backfill:
+    n=1352 min=0.2ms median=15.8ms p95=18.6ms max=27.0ms mean=16.1ms
+
+Full cold backfill: 7 _rollup_backfill() calls, 29.2s wall
+  history span backfilled: 7.00 days -> 4.17 s/day
+  chunk statement timings across full backfill:
+    n=1352 min=0.1ms median=15.7ms p95=18.6ms max=28.3ms mean=15.9ms
+
+Single _rollup_span(15 min): 0.041s, 16 avg_minutes rows written
+```
+
+So a 30-day field backfill extrapolates to about **two minutes**, and the
+per-statement worst case is **27 ms**.
+
+### Why this is the number that matters
+
+A chunk read is one statement on the writer connection, and aiosqlite
+serialises a connection through one worker thread, so it blocks the pipeline's
+inline `insert_avg_window`. That insert is fed by an 8-slot queue that drops at
+the producer rather than waiting. At roughly 25 chunks per second the queue
+fills in about 300 ms, so a single statement blocking longer than that starts
+silently discarding recorded spectrum. The measured maximum of 27 ms sits about
+**11x under that line**, and the p95 of 18.6 ms about 16x under it.
+
+### Contention observed directly
+
+With the pipeline running against the same database and the backfill genuinely
+walking seven days of unfolded history, across 54 TIMING lines:
+
+```
+TIMING recv#2700: recv=63.1ms dropped=0 (IQ=36.6ms) handoff_dropped=0/0 ovf=0 lost=0
+```
+
+Zero drops, and the write rate under active backfill (1.66 rows/s) matched the
+steady-state rate (1.70 rows/s), so the rollup was not quietly starving the
+pipeline either.
+
+### The reason it is fast, which is worth knowing before anyone reorders columns
+
+`iter_rollup_windows` selects only `start_time, sdr_center_freq_hz,
+sample_rate_hz, gain_db, pwr_max, pwr_median, pwr_avg`, and every one of those
+columns precedes `psd_powers` in the `avg_windows` row layout. SQLite parses a
+record left to right and stops once it has the columns asked for, so it never
+faults in the 8 KB blob's overflow pages. Measured disk I/O for the full 7-day
+cold backfill was about **708 MB, not 10 GB**.
+
+This is a property of the column ORDER in `CREATE TABLE avg_windows`, not
+something the query asks for. If `psd_powers` is ever moved earlier in the
+table definition, this backfill gets dramatically slower and the safety margin
+above evaporates. Treat the column order as load-bearing.
+
+### Suites on the target hardware
+
+- Unit: 549 passed, 33.5 s.
+- Integration: 104 passed, 12 skipped, 0 failed, 14 min 2 s. The skips are
+  `@pytest.mark.slow` burst-matrix cases gated behind `--runslow`. `nats-server`
+  is not installed on that box and its absence caused zero failures.
+
+### Measurement traps hit during this run
+
+- **A backfill that has already finished proves nothing.** The first contention
+  observation was taken after the benchmark runs had already walked
+  `rollup_oldest` to the floor, so the rollup loop had only the trivial forward
+  pass to do. It had to be re-queued by resetting `rollup_oldest` back to the
+  newest minute before the zero-drop result meant anything. Check the watermark
+  is not already at the floor before trusting a contention result.
+- **`pkill -f "rfobserver run"` over ssh kills the calling shell**, exactly as
+  this project's CLAUDE.md warns, and so does `pgrep -f rfobserver` when the
+  pattern appears in the command's own text. Match on the venv path instead, or
+  use `fuser -k 8888/tcp`.
+
+### Still not determined
+
+- The field sensor's real 30 GB / 30-day database and a real SDR were not
+  tested; the 30-day figure is extrapolated by row count from the 7-day fixture.
+- nano-super runs at the 15 W profile and is not MAXN-capable, so it is if
+  anything a pessimistic proxy for CPU, and a fair one for I/O.

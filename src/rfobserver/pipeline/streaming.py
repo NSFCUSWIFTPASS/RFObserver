@@ -93,6 +93,14 @@ _STREAM_GAP_LOG_LEN = 4096
 # 15 s budget _request_end_recording allows a manual stop, and a longer
 # RECORDING_MAX_SEC may raise the floor but never past it.
 _GRID_TAIL_DRAIN_FLOOR_SEC = 3.0
+
+# How often the dispatch loop re-checks for finished work while chunks are in
+# flight. Finished results are collected at the top of the loop, and the loop
+# otherwise blocks in _chunk_queue.get(), which returns early only for a NEW
+# chunk: with a long timeout every chunk waited a full chunk period (~205 ms)
+# for its successor before its PSD was handed on. A new chunk still wakes the
+# get() immediately, so this bounds only the added delay on finished work.
+_RESULT_POLL_SEC = 0.005
 _GRID_TAIL_DRAIN_CEILING_SEC = 10.0
 
 
@@ -1639,7 +1647,9 @@ class StreamingProcessor:
                         logger.exception("Processing worker failed")
 
                 try:
-                    item = self._chunk_queue.get(timeout=0.5)
+                    item = self._chunk_queue.get(
+                        timeout=_RESULT_POLL_SEC if pending_futures else 0.5
+                    )
                 except queue.Empty:
                     continue
                 if item is _STOP:

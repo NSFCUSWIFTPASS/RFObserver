@@ -147,6 +147,7 @@
     let viewerFreqs = null;    // freq axis (relative to the SDR center)
     let viewerCenterFreq = 0;  // absolute SDR center; detections are absolute, freq_axis is relative
     let viewerTimeRes = 0;     // seconds per row
+    let viewerTimeOffset = 0;  // seconds from the .sc16 start to PSD row 0
     let viewerTotalRows = 0;
     let viewerMin = -120;
     let viewerMax = -40;
@@ -278,15 +279,26 @@
             viewerFreqs = first.freq_axis;
             viewerCenterFreq = first.center_freq_hz || 0;
             viewerTotalRows = first.total_rows;
-            // Effective time resolution: the PSD grid's nominal
-            // time_resolution_s does NOT satisfy total_rows * tres == duration,
-            // so labels/table Time (and the sidecar rows) drift out of the grid.
-            // Use duration / total_rows so the time axis matches the grid and
-            // the sidecar's proportional row placement. Fall back to the nominal
-            // PSD tres when duration or rows are unavailable.
-            viewerTimeRes = (durationSec && viewerTotalRows > 0)
-                ? (durationSec / viewerTotalRows)
-                : first.time_resolution_s;
+            // The .psd is pinned to the .sc16 by start_sample_offset: row k
+            // covers IQ samples [start_sample_offset + k*slice_samples, ...).
+            // Use the grid's own resolution plus that offset. The older
+            // duration/total_rows stretch is kept only as a fallback for
+            // captures recorded before the grid carried alignment metadata --
+            // it silently absorbed a pipeline-latency misalignment into a
+            // rescaled axis. See
+            // docs/debugging/2026-09-22_trigger-psd-iq-misalignment.md.
+            const sampleRate = first.bandwidth_hz || 0;
+            if (first.slice_samples > 0 && first.time_resolution_s > 0) {
+                viewerTimeRes = first.time_resolution_s;
+                viewerTimeOffset = sampleRate
+                    ? ((first.start_sample_offset || 0) / sampleRate)
+                    : 0;
+            } else {
+                viewerTimeRes = (durationSec && viewerTotalRows > 0)
+                    ? (durationSec / viewerTotalRows)
+                    : first.time_resolution_s;
+                viewerTimeOffset = 0;
+            }
             const calSet = typeof first.cal_offset_db === "number";
             viewerOffset = calSet ? first.cal_offset_db : 0;
             viewerUnit = calSet ? "dBm/Hz" : "dBFS";
@@ -568,7 +580,7 @@
                 let h = '';
                 for (let i = 0; i < viewerDetections.length; i++) {
                     const det = viewerDetections[i];
-                    const t = (det.row_start * viewerTimeRes).toFixed(3) + "s";
+                    const t = (viewerTimeOffset + det.row_start * viewerTimeRes).toFixed(3) + "s";
                     const fHz = (det.peak_freq_hz != null) ? det.peak_freq_hz : det.center_freq_hz;
                     const f = (fHz / 1e6).toFixed(3) + " MHz";
                     const bw = (det.bandwidth_hz / 1e3).toFixed(1) + " kHz";
@@ -602,7 +614,7 @@
                 if (v < firstVisibleRow) v = firstVisibleRow;
                 if (v > lastVisible) v = lastVisible;
                 slider.value = v;
-                timeLabel.textContent = (v * viewerTimeRes).toFixed(3) + "s";
+                timeLabel.textContent = (viewerTimeOffset + v * viewerTimeRes).toFixed(3) + "s";
             }
 
             let rafPending = false;
@@ -640,7 +652,7 @@
 
             slider.addEventListener("input", function() {
                 const idx = parseInt(this.value);
-                timeLabel.textContent = (idx * viewerTimeRes).toFixed(3) + "s";
+                timeLabel.textContent = (viewerTimeOffset + idx * viewerTimeRes).toFixed(3) + "s";
                 renderWaterfall();
                 drawViewerPSD(idx);
             });

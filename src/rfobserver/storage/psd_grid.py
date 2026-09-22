@@ -37,8 +37,18 @@ def write_meta(
     grid_min: float,
     grid_max: float,
     cal_offset_db: float | None,
+    start_sample_offset: int = 0,
+    slice_samples: int = 0,
 ) -> None:
-    """Write the JSON sidecar describing the raw .psd grid."""
+    """Write the JSON sidecar describing the raw .psd grid.
+
+    ``start_sample_offset`` and ``slice_samples`` pin the grid to the companion
+    ``.sc16``: row ``k`` covers IQ samples ``[start_sample_offset +
+    k*slice_samples, start_sample_offset + (k+1)*slice_samples)``. Without them
+    a reader can only assume row 0 starts at the IQ's first sample, which is
+    how a pipeline-latency misalignment stayed invisible for so long (see
+    docs/debugging/2026-09-22_trigger-psd-iq-misalignment.md).
+    """
     meta: dict[str, Any] = {
         "rows": int(rows),
         "num_bins": int(num_bins),
@@ -48,6 +58,9 @@ def write_meta(
         "freq_axis": [float(x) for x in np.asarray(freq_axis).tolist()],
         "grid_min": float(grid_min),
         "grid_max": float(grid_max),
+        # Alignment to the .sc16 (see docstring).
+        "start_sample_offset": int(start_sample_offset),
+        "slice_samples": int(slice_samples),
     }
     if cal_offset_db is not None:
         meta["cal_offset_db"] = float(cal_offset_db)

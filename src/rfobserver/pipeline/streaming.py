@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from rfobserver.capture.buffer import CircularBuffer, GridPreBuffer
+from rfobserver.capture.buffer import CircularBuffer, GridPreBuffer, trim_grid_rows
 from rfobserver.processing.burst import BurstDetectionConfig
 from rfobserver.processing.iq_utils import (
     IQMoments,
@@ -77,6 +77,17 @@ _MAX_RECORDED_GAPS = 1000
 # lost_samples (the oldest fall out of the log); that is not realistic, and
 # more than _MAX_RECORDED_GAPS mapped gaps already sets gaps_truncated.
 _STREAM_GAP_LOG_LEN = 4096
+
+# Bounds on how long finalize waits for the in-flight PSD grids covering the
+# tail of a recording. The IQ is written synchronously in the receive loop but
+# grids emerge about four chunks later, so at stop time the last chunks of IQ
+# have no rows yet. The wait ends the moment the grids catch up (the normal
+# case, roughly one pipeline latency). RECORDING_MAX_SEC caps it, with
+# _FALLBACK used when that is 0 ("no limit") and _CEILING keeping the wait
+# inside the 15 s budget _request_end_recording allows a manual stop --
+# without the ceiling a default RECORDING_MAX_SEC of 30 s could outlast it.
+_GRID_TAIL_DRAIN_FALLBACK_SEC = 5.0
+_GRID_TAIL_DRAIN_CEILING_SEC = 10.0
 
 
 def _preroll_gaps(
@@ -141,6 +152,7 @@ class _ChunkResult:
         "center_freq_hz",
         "capture_num",
         "recv_time",
+        "chunk_start",
         "process_ms",
         "sc16_buf",
     )
@@ -153,6 +165,7 @@ class _ChunkResult:
         center_freq_hz: int,
         capture_num: int,
         recv_time: float,
+        chunk_start: int,
         process_ms: float,
         sc16_buf: np.ndarray[Any, np.dtype[Any]],
         iq_moments: IQMoments,
@@ -164,6 +177,7 @@ class _ChunkResult:
         self.center_freq_hz = center_freq_hz
         self.capture_num = capture_num
         self.recv_time = recv_time
+        self.chunk_start = chunk_start
         self.process_ms = process_ms
         self.sc16_buf = sc16_buf
 
@@ -352,6 +366,15 @@ class StreamingProcessor:
         # until the file has a sample to continue from).
         self._recording_ring: CircularBuffer | None = None
         self._recording_next_pos: int | None = None
+        # Absolute stream sample bounds of the current recording, and how far
+        # the .psd companion has been filled within them. The PSD path lags the
+        # IQ by the pipeline latency, so grid rows are placed against these
+        # bounds rather than appended in arrival order.
+        self._recording_start_sample: int | None = None
+        self._recording_end_sample: int | None = None
+        self._grid_first_sample: int | None = None
+        self._grid_last_sample: int = 0
+        self._grid_accepting: bool = False
         # Wall time of the file's first sample, taken at the pre-roll read.
         self._recording_wall_start: float | None = None
         self._trigger_initiated: bool = False  # True if trigger fired (vs manual)
@@ -445,6 +468,10 @@ class StreamingProcessor:
         chunk_slices = s.STREAMING_CHUNK_SLICES
         self._chunk_samples = chunk_slices * actual_slice_samples
         self._chunk_duration = self._chunk_samples / s.BANDWIDTH
+        # Samples per PSD grid row: the unit mapping a grid row index to an
+        # absolute stream sample position, so recorded rows can be placed by
+        # position rather than by arrival order.
+        self._slice_samples = actual_slice_samples
 
         # Buffer pool: 12 pre-allocated SC16 (int32) buffers.
         # Fill a local pool first, then swap — otherwise concurrent put_nowait
@@ -619,8 +646,15 @@ class StreamingProcessor:
         with self._rec_lock:
             if self._recording_state != "recording":
                 return
-            # Stops chunk writes (_check_trigger_and_record) and grid appends
-            # (_handle_chunk_result) — both gate on the exact "recording" state.
+            # Stops chunk writes (_check_trigger_and_record), which gate on the
+            # exact "recording" state. Grid appends deliberately continue: they
+            # gate on _grid_accepting so the rows covering the tail of the IQ,
+            # still in the worker pool at this point, can land before the file
+            # is closed.
+            # Freeze the IQ end position before the flip: grid rows are
+            # trimmed against it, and grids still in flight keep arriving
+            # after this point (that is the tail _await_tail_grids waits for).
+            self._recording_end_sample = self._recording_next_pos
             self._recording_state = "finalizing"
             self._end_done.clear()
         self._schedule_recctl(self._end_recording)
@@ -764,7 +798,7 @@ class StreamingProcessor:
                         # a full queue.
                         if self._drop_on_overflow:
                             try:
-                                self._chunk_queue.put_nowait((buf, recv_time))
+                                self._chunk_queue.put_nowait((buf, recv_time, chunk_start))
                             except queue.Full:
                                 self._dropped_chunks += 1
                                 with contextlib.suppress(queue.Full):
@@ -772,7 +806,9 @@ class StreamingProcessor:
                         else:
                             while self._running:
                                 try:
-                                    self._chunk_queue.put((buf, recv_time), timeout=0.1)
+                                    self._chunk_queue.put(
+                                        (buf, recv_time, chunk_start), timeout=0.1
+                                    )
                                     break
                                 except queue.Full:
                                     continue
@@ -957,6 +993,9 @@ class StreamingProcessor:
         # A dropped chunk is already a gap: the next chunk continues after it.
         if chunk_start is not None:
             self._recording_next_pos = chunk_start + n
+            if self._recording_start_sample is None:
+                # No pre-roll was written, so the file starts at this chunk.
+                self._recording_start_sample = chunk_start
         if written:
             for off, lost in gaps:
                 self._add_recording_gap(file_pos + off, lost, overflow=True)
@@ -1070,16 +1109,26 @@ class StreamingProcessor:
         pre_data, pre_end = ring.read_with_position()
         t_read = time.time()
         pre_start = pre_end - len(pre_data)
-        # Drain the matching pre-trigger PSD grids so the .psd companion starts
-        # with rows covering the same pre-roll span as the IQ prepended below.
-        # Seed the grid meta from them so it is correct even if no live chunk
-        # is captured before the recording stops.
-        pre_roll = self._grid_prebuf.drain()
+        # Take only the buffered grid rows that actually cover this recording's
+        # IQ. Grids reach the pre-buffer behind the chunk queue and worker pool,
+        # so when that latency exceeds TRIGGER_PRE_SEC (the field default of
+        # 0.2 s against ~820 ms of latency) every buffered grid predates
+        # pre_start and this correctly yields nothing: the rows covering the
+        # pre-roll have not been computed yet and arrive shortly after as live
+        # grids. Selecting by arrival order instead put the .psd ~820 ms out of
+        # step with its .sc16. See
+        # docs/debugging/2026-09-22_trigger-psd-iq-misalignment.md.
+        pre_roll = self._grid_prebuf.drain(from_sample=pre_start)
+        self._grid_first_sample = None
+        self._grid_last_sample = 0
+        self._recording_end_sample = None
         if pre_roll is not None:
             self._recording_freq_axis = pre_roll.freq_axis
             self._recording_time_res = pre_roll.time_res
             self._grid_min = pre_roll.grid_min
             self._grid_max = pre_roll.grid_max
+            self._grid_first_sample = pre_roll.start_sample
+            self._grid_last_sample = pre_roll.start_sample + pre_roll.rows * self._slice_samples
 
         if s.RECORDING_RAM_BUFFER:
             self._grid_raw_path = None
@@ -1102,6 +1151,7 @@ class StreamingProcessor:
             if pre_roll is not None:
                 self._recording_grids = list(pre_roll.grids)
 
+            self._grid_accepting = True
             self._recording_state = "recording"
             logger.info(
                 "Recording started (RAM): %s (%.1f MB allocated)",
@@ -1154,6 +1204,7 @@ class StreamingProcessor:
             self._writer_thread.start()
             # Flip last: chunk writes gate on this state, and they must enter
             # the queue behind the pre-trigger samples seeded above.
+            self._grid_accepting = True
             self._recording_state = "recording"
             logger.info("Recording started (disk): %s", self._recording_file)
 
@@ -1172,6 +1223,7 @@ class StreamingProcessor:
         """
         self._recording_ring = ring
         self._recording_next_pos = pre_start + written if written > 0 else None
+        self._recording_start_sample = pre_start if written > 0 else None
         rx_config = getattr(self._receiver, "config", None)
         rate = float(getattr(rx_config, "bandwidth_hz", None) or self._settings.BANDWIDTH)
         span = (pre_len + self._recording_lost) / rate if rate > 0 else 0.0
@@ -1191,10 +1243,41 @@ class StreamingProcessor:
             self._recording_state = "idle"
             self._end_done.set()
 
+    def _await_tail_grids(self) -> None:
+        """Wait for the in-flight PSD grids covering the tail of the recording.
+
+        The IQ is written synchronously in the receive loop but grids emerge
+        about four chunks later, so at stop time the last chunks of IQ have no
+        grid rows yet. Without this wait the .psd ends short of the .sc16 by one
+        pipeline latency, and for a capture shorter than that latency it never
+        reaches the trigger instant at all. Returns as soon as the grids reach
+        the recording's last sample, which is the normal case.
+        """
+        end = self._recording_end_sample
+        if end is None or self._recording_start_sample is None:
+            time.sleep(0.05)
+            return
+        cap = float(self._settings.RECORDING_MAX_SEC or 0.0)
+        if not math.isfinite(cap) or cap <= 0:
+            cap = _GRID_TAIL_DRAIN_FALLBACK_SEC
+        cap = min(cap, _GRID_TAIL_DRAIN_CEILING_SEC)
+        deadline = time.monotonic() + cap
+        while self._grid_last_sample < end and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if self._grid_last_sample < end:
+            rate = float(self._settings.BANDWIDTH) or 1.0
+            logger.warning(
+                "PSD tail did not drain within %.1fs; .psd is %.3fs short of the IQ",
+                cap,
+                (end - self._grid_last_sample) / rate,
+            )
+
     def _finalize_recording(self) -> None:
         """Stop recording, flush to disk, write metadata."""
-        # Brief sleep lets any in-flight _handle_chunk_result finish its append
-        time.sleep(0.05)
+        self._await_tail_grids()
+        # Past this point no further grid rows may enter the file: the writer
+        # thread is about to be stopped and its handle closed.
+        self._grid_accepting = False
 
         duration = time.monotonic() - self._recording_start
         base_name = self._recording_file or "recording.sc16"
@@ -1266,6 +1349,13 @@ class StreamingProcessor:
                 grid_min=(0.0 if self._grid_min == float("inf") else self._grid_min),
                 grid_max=(0.0 if self._grid_max == float("-inf") else self._grid_max),
                 cal_offset_db=self._recording_cal_offset,
+                start_sample_offset=(
+                    self._grid_first_sample - self._recording_start_sample
+                    if self._grid_first_sample is not None
+                    and self._recording_start_sample is not None
+                    else 0
+                ),
+                slice_samples=self._slice_samples,
             )
             logger.info("PSD data saved: %s (%d rows)", meta_path.name, self._grid_rows)
 
@@ -1522,7 +1612,7 @@ class StreamingProcessor:
                 if item is _STOP:
                     break
 
-                sc16_buf, recv_time = item
+                sc16_buf, recv_time, chunk_start = item
                 capture_num += 1
 
                 # Too many in flight: drop (live) or, in lossless mode, block on
@@ -1543,6 +1633,7 @@ class StreamingProcessor:
                     self._process_one_chunk,
                     sc16_buf,
                     recv_time,
+                    chunk_start,
                     capture_num,
                     center_freq,
                     grid_config,
@@ -1573,6 +1664,7 @@ class StreamingProcessor:
         self,
         sc16_buf: np.ndarray[Any, np.dtype[Any]],
         recv_time: float,
+        chunk_start: int,
         capture_num: int,
         center_freq: int,
         grid_config: PSDGridConfig,
@@ -1610,6 +1702,7 @@ class StreamingProcessor:
             center_freq_hz=center_freq,
             capture_num=capture_num,
             recv_time=recv_time,
+            chunk_start=chunk_start,
             process_ms=process_ms,
             sc16_buf=sc16_buf,
             iq_moments=iq_moments,
@@ -1629,34 +1722,55 @@ class StreamingProcessor:
         # dropping PSD chunks (black waterfall rows) whenever the disk is
         # saturated by the IQ stream. RAM mode keeps them in the list, which
         # is bounded by the RAM-derived _effective_max_sec auto-stop.
-        if self._recording_state == "recording":
-            grid = cr.psd_grid.grid
+        if self._grid_accepting and self._recording_start_sample is not None:
+            # Place rows by the samples they describe, not by when they arrived.
+            # While still recording there is no end bound yet, so use a sentinel
+            # past this chunk's last row and trim only at the head.
+            end = self._recording_end_sample
+            if end is None:
+                end = cr.chunk_start + int(cr.psd_grid.grid.shape[0]) * self._slice_samples
+            grid, first_sample = trim_grid_rows(
+                cr.psd_grid.grid,
+                cr.chunk_start,
+                self._slice_samples,
+                self._recording_start_sample,
+                end,
+            )
             self._recording_freq_axis = cr.psd_grid.freq_axis
             if len(cr.psd_grid.time_axis) > 1:
                 self._recording_time_res = float(
                     cr.psd_grid.time_axis[1] - cr.psd_grid.time_axis[0]
                 )
             if grid.size:
+                if self._grid_first_sample is None:
+                    self._grid_first_sample = first_sample
+                self._grid_last_sample = first_sample + int(grid.shape[0]) * self._slice_samples
                 self._grid_min = min(self._grid_min, float(grid.min()))
                 self._grid_max = max(self._grid_max, float(grid.max()))
-            if self._grid_raw_path is not None:
-                data = np.ascontiguousarray(grid, dtype=np.float32).tobytes()
-                try:
-                    self._recording_queue.put_nowait(("grid", data))
-                    self._grid_rows += grid.shape[0]
-                except queue.Full:
-                    # Companion data — drop rather than stall the dispatch loop.
-                    self._grid_dropped += grid.shape[0]
-            else:
-                self._recording_grids.append(grid.copy())
+                if self._grid_raw_path is not None:
+                    data = np.ascontiguousarray(grid, dtype=np.float32).tobytes()
+                    try:
+                        self._recording_queue.put_nowait(("grid", data))
+                        self._grid_rows += grid.shape[0]
+                    except queue.Full:
+                        # Companion data — drop rather than stall the dispatch loop.
+                        self._grid_dropped += grid.shape[0]
+                else:
+                    self._recording_grids.append(grid.copy())
         else:
-            # Not recording: keep a rolling pre-trigger window of computed grids
-            # so a recording that fires can prepend PSD rows covering the same
-            # pre-roll span as the IQ pre-trigger buffer.
+            # Not recording: keep a rolling window of recent grids tagged with
+            # their stream position, so a recording that fires can take the rows
+            # that actually cover its pre-roll IQ.
             pre_time_res = 0.0
             if len(cr.psd_grid.time_axis) > 1:
                 pre_time_res = float(cr.psd_grid.time_axis[1] - cr.psd_grid.time_axis[0])
-            self._grid_prebuf.write(cr.psd_grid.grid, cr.psd_grid.freq_axis, pre_time_res)
+            self._grid_prebuf.write(
+                cr.psd_grid.grid,
+                cr.psd_grid.freq_axis,
+                pre_time_res,
+                cr.chunk_start,
+                self._slice_samples,
+            )
 
         self._capture_count = cr.capture_num
         latency_ms = (time.monotonic() - cr.recv_time) * 1000.0

@@ -20,12 +20,44 @@ from typing import Any
 import numpy as np
 
 
+def trim_grid_rows(
+    grid: np.ndarray[Any, np.dtype[Any]],
+    chunk_start: int,
+    slice_samples: int,
+    start_sample: int,
+    end_sample: int,
+) -> tuple[np.ndarray[Any, np.dtype[Any]], int]:
+    """Return the rows of ``grid`` lying wholly inside ``[start_sample, end_sample)``.
+
+    Row ``k`` of a chunk beginning at ``chunk_start`` covers stream samples
+    ``[chunk_start + k*slice_samples, chunk_start + (k+1)*slice_samples)``. A
+    row straddling either boundary is dropped rather than misplaced, so the
+    returned position is always a true row boundary. The second element is the
+    absolute sample position of the first kept row, or -1 when no row
+    qualifies.
+    """
+    rows = int(grid.shape[0]) if grid.ndim == 2 else 0
+    if rows == 0 or slice_samples <= 0 or end_sample <= start_sample:
+        return grid[:0], -1
+    first = 0
+    if start_sample > chunk_start:
+        # Ceiling division: a row straddling the start is dropped.
+        first = (start_sample - chunk_start + slice_samples - 1) // slice_samples
+    # Last row whose END is still inside the recording.
+    last = (end_sample - chunk_start) // slice_samples
+    last = min(last, rows)
+    if first >= last:
+        return grid[:0], -1
+    return grid[first:last], chunk_start + first * slice_samples
+
+
 @dataclass
 class GridPreRoll:
     """Drained pre-trigger PSD grids plus the metadata to persist them.
 
     ``grids`` are the retained per-chunk grids in chronological order (each
     ``(rows, num_bins)`` float32); ``rows`` is their combined row count.
+    ``start_sample`` is the absolute stream position of the first row.
     """
 
     grids: list[np.ndarray[Any, np.dtype[Any]]]
@@ -34,15 +66,27 @@ class GridPreRoll:
     rows: int
     grid_min: float
     grid_max: float
+    start_sample: int
 
 
 class GridPreBuffer:
-    """Rolling buffer of recent PSD-grid chunks for pre-trigger PSD.
+    """Rolling buffer of recent PSD-grid chunks, tagged by stream position.
 
     Mirrors ``CircularBuffer`` (the IQ pre-trigger buffer) but for computed
     PSD grids: keeps the most recent grids whose combined time span is at most
-    ``max_seconds`` so, when a recording fires, the pre-roll IQ that gets
-    prepended to the ``.sc16`` has matching PSD rows for the ``.psd`` companion.
+    ``max_seconds``, each tagged with the absolute stream sample position it
+    was computed from, so a recording can take the rows that actually cover
+    its IQ via ``drain(from_sample=...)``.
+
+    Position tagging is load-bearing, not bookkeeping. Grids reach this buffer
+    only after passing through the chunk queue and the worker pool, so they
+    lag the IQ by the pipeline latency. Selecting "the most recent
+    ``TRIGGER_PRE_SEC`` of grids" therefore yields rows from an earlier
+    interval than the IQ pre-roll whenever that latency exceeds
+    ``TRIGGER_PRE_SEC``. Selecting by position instead yields nothing in that
+    case, which is correct: the rows covering the pre-roll simply have not
+    been computed yet, and arrive shortly after as live grids. See
+    docs/debugging/2026-09-22_trigger-psd-iq-misalignment.md.
 
     Thread-safe: written from the dispatch thread as each chunk's grid is
     handled, drained from the recording fire site (receiver thread for
@@ -54,7 +98,8 @@ class GridPreBuffer:
 
     def __init__(self, max_seconds: float) -> None:
         self._max_seconds = max(0.0, float(max_seconds))
-        self._grids: deque[tuple[np.ndarray[Any, np.dtype[Any]], float]] = deque()
+        # (grid, time_res, chunk_start, slice_samples)
+        self._grids: deque[tuple[np.ndarray[Any, np.dtype[Any]], float, int, int]] = deque()
         self._freq_axis: np.ndarray[Any, np.dtype[Any]] | None = None
         self._rows = 0
         self._span = 0.0
@@ -71,49 +116,76 @@ class GridPreBuffer:
         grid: np.ndarray[Any, np.dtype[Any]],
         freq_axis: np.ndarray[Any, np.dtype[Any]],
         time_res: float,
+        chunk_start: int,
+        slice_samples: int,
     ) -> None:
         """Append one chunk's grid, dropping oldest grids past ``max_seconds``.
 
-        Empty grids and non-positive ``time_res`` are ignored (they carry no
-        usable time span). A copy is stored so a later mutation of the source
-        array (e.g. buffer-pool reuse) cannot corrupt the pre-roll.
+        ``chunk_start`` is the position of the chunk's first sample in the
+        receiver's sample stream and ``slice_samples`` the samples per grid
+        row, so a later ``drain(from_sample=...)`` can select rows by position
+        rather than by arrival order.
+
+        Empty grids, non-positive ``time_res`` and non-positive
+        ``slice_samples`` are ignored (they carry no usable span or position).
+        A copy is stored so a later mutation of the source array (e.g.
+        buffer-pool reuse) cannot corrupt the pre-roll.
         """
-        if grid.size == 0 or grid.shape[0] == 0 or time_res <= 0:
+        if grid.size == 0 or grid.shape[0] == 0 or time_res <= 0 or slice_samples <= 0:
             return
         rows = int(grid.shape[0])
         span = rows * float(time_res)
         stored = np.ascontiguousarray(grid, dtype=np.float32).copy()
         with self._lock:
-            self._grids.append((stored, float(time_res)))
+            self._grids.append((stored, float(time_res), int(chunk_start), int(slice_samples)))
             self._freq_axis = np.asarray(freq_axis).copy()
             self._rows += rows
             self._span += span
             # Trim oldest while over budget, but always keep the last grid.
             while self._span > self._max_seconds and len(self._grids) > 1:
-                g, tr = self._grids.popleft()
+                g, tr, _cs, _ss = self._grids.popleft()
                 self._rows -= int(g.shape[0])
                 self._span -= int(g.shape[0]) * tr
 
-    def drain(self) -> GridPreRoll | None:
-        """Return the buffered pre-roll (chronological) and clear, or None if empty."""
+    def drain(self, from_sample: int | None = None) -> GridPreRoll | None:
+        """Return the buffered pre-roll (chronological) and clear.
+
+        With ``from_sample`` set, only rows whose first sample is at or after
+        that stream position are returned; a row straddling the boundary is
+        dropped rather than misplaced, so ``start_sample`` is always a true row
+        boundary. Returns None when nothing qualifies, which is the normal case
+        whenever the PSD pipeline latency exceeds the pre-roll window: every
+        buffered grid predates the recording.
+        """
         with self._lock:
             if not self._grids or self._freq_axis is None:
                 self._reset_locked()
                 return None
-            grids = [g for (g, _) in self._grids]
+            kept: list[np.ndarray[Any, np.dtype[Any]]] = []
+            start_sample = -1
+            for g, _tr, chunk_start, slice_samples in self._grids:
+                rows = int(g.shape[0])
+                first = 0
+                if from_sample is not None and from_sample > chunk_start:
+                    first = (from_sample - chunk_start + slice_samples - 1) // slice_samples
+                if first >= rows:
+                    continue
+                if start_sample < 0:
+                    start_sample = chunk_start + first * slice_samples
+                kept.append(g[first:] if first else g)
             time_res = self._grids[-1][1]
             freq_axis = self._freq_axis
-            rows = self._rows
-            gmin = min(float(g.min()) for g in grids)
-            gmax = max(float(g.max()) for g in grids)
             self._reset_locked()
+            if not kept:
+                return None
             return GridPreRoll(
-                grids=grids,
+                grids=kept,
                 freq_axis=freq_axis,
                 time_res=float(time_res),
-                rows=int(rows),
-                grid_min=gmin,
-                grid_max=gmax,
+                rows=int(sum(int(g.shape[0]) for g in kept)),
+                grid_min=min(float(g.min()) for g in kept),
+                grid_max=max(float(g.max()) for g in kept),
+                start_sample=int(start_sample),
             )
 
     def clear(self) -> None:

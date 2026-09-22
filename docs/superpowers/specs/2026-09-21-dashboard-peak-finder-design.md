@@ -329,6 +329,14 @@ Row costs with blobs nulled, measured over 2M rows: row 147 B, `idx_time` 38 B,
 
 ## Open, not yet answered
 
-- The one-time backfill cost on the real 30 GB field database is estimated, not
-  measured. It should be timed on a copy before this is deployed, since it is a
-  full pass over the table.
+- The one-time backfill cost was measured on a synthetic 7-day / 10.65 GB
+  database (workstation, real 8192-byte PSD blobs, real schema and indexes),
+  not the real 30 GB field database: 0.95 s per day of history, extrapolating
+  to ~29 s for a full 30-day backfill, with a single `_rollup_span` call over
+  one hour of data taking 12-41 ms. Both clear the spec's bar by roughly two
+  orders of magnitude, so `_ROLLUP_SPAN` and `_ROLLUP_BUDGET_SEC` are
+  unchanged. The workstation is faster than the Jetson field box, so this is
+  an extrapolation with a comfortable margin, not a verified Jetson number --
+  see `docs/debugging/2026-09-21_peak-finder-backfill-cost.md` for the full
+  procedure, evidence, and what was not determined (notably: warm page cache
+  during the measurement, and no Jetson run yet).

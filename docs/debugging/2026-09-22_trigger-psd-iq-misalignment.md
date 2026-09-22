@@ -397,3 +397,14 @@ accident. It now requires `max(50, nrows // 4)`. A quarter of the capture was ch
 deliberately: a half would have excluded the pre-fix peak itself (1154 rows of 2046),
 turning a precise failure into the vaguer "does not describe the IQ at any lag". Verified
 to still fail pre-fix with `PSD is 1154 rows out of step with the IQ` and pass post-fix.
+
+## CORRECTION (2026-09-22): the "819 ms predicted from queue depth" match was coincidence
+
+**WITHDRAWN:** "Measured offset +822 ms; predicted from queue depth 819 ms. Two
+independent routes to the same number." Stage timing (see
+`2026-09-22_psd-pipeline-latency.md`, CORRECTION) shows `_chunk_queue` is not standing
+full (queue stage median 4-7 ms). The ~820 ms offset was acquisition (~235 ms mock) plus
+GIL-inflated processing plus collection delay; that it landed on 4 x 204.8 ms was
+numerology. The alignment fix is unaffected, since it anchors by sample position and does
+not depend on the latency's value or cause. Also correct the table in "The answer": the
+grid pre-buffer lags by the pipeline latency `L`, not by "about four chunks".

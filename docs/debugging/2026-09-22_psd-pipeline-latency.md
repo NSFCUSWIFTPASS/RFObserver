@@ -115,3 +115,198 @@ TIMING recv#1600: recv=232.4ms dropped=0 (IQ=204.8ms) handoff_dropped=0/0 ovf=0 
   point FFT, which should be far cheaper than that. Possibly contention from 21 threads
   plus the mock generator on one box, possibly something costlier inside
   `compute_psd_grid`. Worth a separate look before any worker-count tuning.
+
+## CORRECTION (2026-09-22, same day): root cause is GIL starvation by the burst tracker
+
+Appended, not edited in. Three claims above are **withdrawn**:
+
+1. **WITHDRAWN: "latency ... excludes the 204.8 ms acquisition."** `recv_time` is taken
+   at `streaming.py:772`, *before* `recv_chunk()`, so the logged `latency` includes the
+   chunk's own acquisition (~205 ms real, ~235 ms mock).
+2. **WITHDRAWN: "almost none of it is computation ... the pool runs at roughly 7%
+   utilisation."** The workers did use little CPU, but because they were starved of the
+   GIL, not because they were idle. Processing is 34-60% of latency.
+3. **WITHDRAWN: the ~410 ms "collection floor" and head-of-line blocking as the main
+   causes.** Collection-on-arrival is real but is ~110-170 ms median; head-of-line
+   blocking is a side effect of GIL-inflated variance and vanishes when the GIL is freed.
+
+### The answer
+
+The ~11 ms (workstation) / ~30 ms (Jetson) worker job is inflated ~20x because the
+`burst` thread holds the GIL ~80% of wall time, in pure-Python code:
+
+- `detect_bursts` finds ~4,000-7,000 "bursts" per 4096-row window **on noise alone**.
+  Each PSD row is a single unaveraged FFT, so every cell is an exponentially distributed
+  noise sample and the fixed 10 dB-over-median threshold is crossed by ~0.1% of ~8.4M
+  cells per window.
+- `RollingBurstDetector._absorb` (`processing/rolling_burst.py:171`) matches each detected
+  burst against every tracked burst with a linear Python scan: O(bursts x tracked) per
+  evaluation, GIL held throughout.
+- Every PSD worker returns into Python after each numpy call and must reacquire the GIL,
+  waiting up to `sys.getswitchinterval()` (5 ms) each time behind the burst thread.
+
+### Procedure
+
+1. **Stage decomposition on a live `StreamingProcessor`**, no source changes: wrap
+   `recv_chunk`, the `_chunk_queue.get`, `_process_one_chunk` and `_handle_chunk_result`
+   and timestamp each chunk (`scratchpad latency_probe.py`, reproduced below as numbers).
+   Isolates which stage owns the time.
+2. **Isolated benchmark** of each worker step on one quiet thread. Isolates inherent cost
+   from contention.
+3. **BLAS/OMP threads pinned to 1** as the control for thread-pool oversubscription.
+4. **`sys.setswitchinterval` 5 ms -> 0.5 ms** as the GIL-convoy test: if the GIL is the
+   contention, shrinking the switch interval must collapse processing time.
+5. **py-spy `--gil --threads`** (binary extracted from its wheel, no install) to name the
+   thread and function holding the GIL.
+6. **Repeat 5 on real hardware** (nano-super, B200mini, 915 MHz) plus per-thread CPU from
+   `/proc/<pid>/task/*/stat`, to rule out a mock artifact.
+7. **Pure Gaussian noise through `compute_psd_grid` + `detect_bursts`** to decide whether
+   the burst count is RF activity or detector false alarms.
+
+### Evidence
+
+Stage decomposition, workstation, mock, 21 workers (ms):
+
+```
+             default (5 ms switch)            switch interval 0.5 ms
+stage     median    p90    max             median    p90    max
+acq        236.6  302.0  432.9              210.2  221.9  418.5
+queue        4.1   20.5   28.3                1.3    1.9   10.9
+exec         0.5   10.5   27.4                0.7    0.8    1.4
+process    214.2  503.0  580.6               60.2   67.0  158.1
+hol          0.0  143.3  213.7                0.0    0.0    0.0
+poll       166.7  238.3  413.3              150.9  196.3  418.6
+total      638.7  898.7 1082.7              422.6  442.0  648.2
+BLAS pinned to 1 thread (5 ms switch): process median 451.5 -- no improvement
+```
+
+Isolated worker cost (one thread, no pipeline):
+
+```
+             workstation   nano-super
+convert          0.5 ms       1.3 ms
+psd_grid         4.9 ms      18.5 ms
+moments          5.8 ms       9.5 ms
+summary          0.1 ms       0.4 ms
+total          ~11 ms       ~30 ms      live: 214-650 ms
+```
+
+GIL holders (py-spy `--gil`, 200 Hz):
+
+```
+workstation (mock, 75 s):   burst 97.4%   _absorb 87.9%  find_objects 5.2%
+nano-super  (B200mini, 30s): burst 94.3%   _absorb 85.5%  find_objects 3.8%
+nano-super: 5234 GIL samples of 6000 possible -> burst thread holds the GIL ~82% of wall
+```
+
+Per-thread CPU on nano-super with the real B200mini, 20 s (2000 ticks = one core):
+
+```
+1888  burst      (py-spy: active+gil)
+ 189  psd_0
+ 183  psd_2
+ 161  psd_1
+  69  recv       UHD recv() copy/convert + ring write + trigger check
+  42  (native)   not a Python thread; consistent with UHD's libusb event loop
+  32  MainThread
+   9  dispatch
+```
+
+nano-super live pipeline at the edge of real time: process 520-650 ms per 204.8 ms chunk
+on 3 workers; counters showed `dropped=23` chunks and one UHD overflow losing 1,018,910
+samples (~0.5 s) during a 100 s run.
+
+Detector on pure complex Gaussian noise, one 4096 x 2048 window:
+
+```
+7411 bursts   duration median 1.02 ms (one row)   bandwidth median 1953 Hz (~2 bins)
+detect_bursts itself: 500 ms per evaluation
+```
+
+Real B200mini at 915 MHz: 4,300-4,834 bursts per evaluation, and **10,653 rows written
+to `detections` in ~84 s of streaming** (~127/s, ~11M/day), essentially all noise.
+
+### Measured and REJECTED -- do not retry
+
+- **Queue depth (`_chunk_queue` maxsize=4) as the latency mechanism.** Queue stage median
+  4-7 ms: the queue is not standing full.
+- **BLAS/OpenMP thread oversubscription.** Pinning pools to 1 thread did not reduce
+  processing time (451 ms median).
+- **"It is a mock artifact."** Reproduced on the real B200mini, same thread, same function.
+- **Adding or removing PSD workers.** Workers are GIL-starved, not CPU-bound; each chunk
+  runs on one thread, so more workers cannot shorten a chunk's latency.
+
+### Measurement traps
+
+- **`recv_time` is taken before the receive.** Any latency read from the `PROC` log line
+  includes one full chunk of acquisition.
+- **Low worker CPU looked like idleness.** A GIL-starved thread and an idle thread both
+  show low CPU; only `py-spy --gil` or the switch-interval test tells them apart.
+- **`pgrep -f "bin/rfobserver run"` matched the `timeout` wrapper and would match the
+  invoking ssh shell.** Have the process write its own PID (`sh -c 'echo $$ > pid; exec
+  ...'`) and confirm `readlink /proc/$PID/exe` is python.
+
+### Open, not yet answered
+
+- Fix not designed. Candidate levers, not yet weighed: stop the noise false alarms at the
+  source (average FFTs per row, or a threshold scaled to the single-cell noise
+  distribution, or a minimum burst size); make `_absorb` sub-quadratic; move burst
+  detection to a process so it cannot hold the pipeline's GIL; collect results without
+  waiting for a new chunk.
+- The field sensor's burst settings and band are unknown from here, so its detection rate
+  is not measured.
+- Identity of native thread 42-tick thread asserted from the design (libusb event loop),
+  not confirmed by stack.
+
+## Threshold test: BURST_THRESHOLD_HIGH_DB 10 -> 30 (2026-09-22)
+
+The user reported the deployed sensor sees nowhere near thousands of bursts and asked to
+test with a 30 dB threshold. Setting only, no code change (`RFOBS_BURST_THRESHOLD_HIGH_DB=30`).
+
+Pure Gaussian noise, one 4096 x 2048 window:
+
+```
+10 dB: 7411 bursts   detect_bursts 508 ms
+30 dB:    0 bursts   detect_bursts 168 ms
+```
+
+nano-super, real B200mini, 915 MHz, 2 Msps, same profiling as above:
+
+```
+                         10 dB                    30 dB
+bursts per evaluation    4,300-4,834              1-4
+PROC process             520-650 ms               56-61 ms
+PROC latency             1,027-1,247 ms           409.4-410.8 ms
+dropped chunks           23                       0
+UHD overflow / lost      1 / 1,018,910 samples    0 / 0
+detections written       10,653 in ~84 s          18 in ~92 s
+burst thread CPU         94% of a core, +gil      20% of a core, idle at dump
+GIL busy (wall)          ~82%, 94% burst          5%, 4% of that burst
+```
+
+**Conclusion: the latency blow-up, the drops and the overflow on the test box were all
+the 10 dB default threshold turning single-cell noise into thousands of bursts.** At 30 dB
+the GIL is effectively uncontended.
+
+### What remains: 410 ms, and it is now deterministic
+
+410 ms is 2 x 204.8 ms. Processing (~60 ms) finishes well inside one chunk period, and
+the dispatch loop only collects finished results when the *next* chunk arrives, so every
+chunk surfaces exactly one chunk period after its own acquisition ends:
+
+```
+204.8 ms acquisition + ~60 ms processing + ~145 ms waiting for the next arrival = ~410 ms
+```
+
+Collecting results as soon as they finish would bring this to ~265 ms. Acquisition is
+fixed by the chunk size.
+
+Live worker cost is still ~2x the isolated ~30 ms (60 vs 30 ms): residual contention,
+not investigated.
+
+### Open
+
+- The 10 dB default in `config.py` is what a fresh install or the test box runs; the
+  field sensor's actual setting has not been read from here.
+- A genuinely busy band at 30 dB could still yield many real bursts, and `_absorb` is
+  still O(bursts x tracked). The quadratic is latent, not removed.

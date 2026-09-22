@@ -310,3 +310,56 @@ not investigated.
   field sensor's actual setting has not been read from here.
 - A genuinely busy band at 30 dB could still yield many real bursts, and `_absorb` is
   still O(bursts x tracked). The quadratic is latent, not removed.
+
+## Fixes applied and validated (branch perf/burst-latency, 2026-09-22)
+
+Three changes, each with its own test:
+
+1. `BURST_THRESHOLD_HIGH_DB` default 10 -> 30 dB (`3983ee5`). Test: the default
+   configuration must not turn pure noise into bursts (1,886 at 10 dB on 1024 rows).
+2. `_absorb` candidates from a frequency-bucket index (`9d62d76`). Same decisions as the
+   linear scan (randomized equivalence test, confirmed to fail when re-indexing on
+   widening is skipped). 7,000 bursts: 1,760 ms -> 80 ms.
+3. Dispatch loop polls every 5 ms while work is in flight (`c13f7c8`). Test: a finished
+   chunk is handled without waiting for the next arrival (500 ms pre-fix).
+
+nano-super, real B200mini, 915 MHz, 2 Msps:
+
+```
+                     before (10 dB)     30 dB, old loop    new default (30 dB)   new code at 10 dB
+bursts / eval        4,300-4,834        1-4                1-3                   5,700-10,422
+process              520-650 ms         56-61 ms           56-63 ms              34-670 ms
+latency              1,027-1,247 ms     409-411 ms         266-274 ms            212-1,413 ms
+dropped chunks       23                 0                  0                     49
+GIL busy (wall)      ~82%               5%                 5%                    82% (burst 94%)
+```
+
+Latency at the new default is 204.8 ms acquisition + ~60 ms processing, as predicted.
+
+**The index does not rescue a 10 dB noise storm on its own.** Workstation profile of the
+burst thread at 10 dB after the index (70 s, mock): GIL share down from ~80% of wall to
+~29%, now spread over the per-burst Python everywhere:
+
+```
+inclusive: _evaluate 76%   detect_bursts/_extract_fingerprints 47%   _absorb 26%
+leaves:    find_objects 36%   _burst_detection_loop 24%   _candidates 11%   _absorb 9%
+```
+
+At thousands of bursts per evaluation the cost is the number of bursts, not any one
+algorithm. On the Jetson's slower cores that still saturates the GIL. Not producing noise
+bursts is the fix; the index is defence for a genuinely busy band.
+
+### Measurement trap
+
+- **An instantaneous worker stub hides the collection delay.** The first version of the
+  dispatch test used a stub that returned immediately; the worker finished before the
+  loop re-entered `get()`, and the test passed against the unfixed code. It needs work
+  that outlasts the loop's turnaround (50 ms), after which it fails at exactly 500 ms.
+
+### Still open
+
+- Bursts per evaluation at 10 dB differed between runs (4,300-4,834 vs 5,700-10,422) on
+  the same band; not investigated (RF environment, or evaluations previously skipped
+  while the tracker fell behind).
+- If a real busy band must run at a low threshold, the remaining lever is moving burst
+  detection into its own process, or capping bursts per evaluation.

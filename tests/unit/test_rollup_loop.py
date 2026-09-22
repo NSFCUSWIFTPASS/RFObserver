@@ -110,7 +110,9 @@ async def test_backfill_stops_at_the_oldest_window(db):
 async def test_backfill_does_nothing_on_an_empty_database(db):
     await db.set_config(ROLLUP_NEWEST_KEY, "2026-09-19T06:00")
     await _rollup_backfill(db, NOW)
-    assert await db.get_config(ROLLUP_OLDEST_KEY) in (None, "2026-09-19T06:00")
+    # oldest_avg_window_time() is None on an empty database, so
+    # _rollup_backfill returns before ever touching ROLLUP_OLDEST_KEY.
+    assert await db.get_config(ROLLUP_OLDEST_KEY) is None
 
 
 async def test_rollup_is_idempotent(db):

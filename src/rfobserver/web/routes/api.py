@@ -1080,12 +1080,15 @@ async def averaged_peaks(
     if metric_name not in METRICS:
         raise HTTPException(status_code=400, detail=f"metric must be one of {list(METRICS)}")
 
-    # `until` is quantised to the minute in the key (matching the rollup's own
-    # minute buckets) so that repeated popover opens with a fresh
-    # `Date.now().toISOString()` still hit the cache; the exact `until_dt` is
+    # Both `since` and `until` are quantised to the minute in the key (matching
+    # the rollup's own minute buckets). averaged.js derives `since` from
+    # `Date.now() - lookback`, so it is just as fresh to the millisecond as
+    # `until` on every search; quantising only `until` left the key changing on
+    # every request and the cache never hit. The exact since_dt/until_dt are
     # still what gets queried below.
+    since_minute = since[:16]
     until_minute = until[:16]
-    key = (since, until_minute, window, n, metric_name, sdr_center, sample_rate, gain)
+    key = (since_minute, until_minute, window, n, metric_name, sdr_center, sample_rate, gain)
     hit = _PEAKS_CACHE.get(key)
     if hit is not None:
         return hit

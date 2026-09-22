@@ -38,9 +38,15 @@ _WEB_SHUTDOWN_TIMEOUT_SEC = 5.0
 # uvicorn cancels its own request and websocket tasks (e.g. a quiet /ws/audio
 # that never calls receive) before our 5s bound above, which stays as a backstop.
 _WEB_GRACEFUL_SHUTDOWN_SEC = 3  # int: uvicorn types it as int | None
-# One hour of windows is about 7,200 rows, which bounds peak memory per step no
-# matter how far behind the rollup has fallen.
-_ROLLUP_SPAN = timedelta(hours=1)
+# iter_rollup_windows chunks each span into execute_fetchall calls on the writer
+# connection, and aiosqlite serialises all operations on that connection through
+# one worker thread. The streaming pipeline awaits insert_avg_window inline on
+# that same connection, feeding a bounded queue that drops (rather than blocks)
+# once the pipeline falls behind, so one oversized rollup statement can stall
+# the writer long enough to lose live data. The span here is only an indirect
+# cap on rows per statement; the explicit chunk= passed to iter_rollup_windows
+# below is what actually bounds it regardless of span or DURATION_SEC.
+_ROLLUP_SPAN = timedelta(minutes=15)
 # Wall-clock budget per pass, so a cold backfill of a month finishes in minutes
 # without any single pass blocking the loop.
 _ROLLUP_BUDGET_SEC = 5.0
@@ -477,7 +483,7 @@ def _parse_minute(key: str) -> datetime:
 async def _rollup_span(db: SensorDatabase, since: datetime, until: datetime) -> int:
     """Fold one bounded span of windows into avg_minutes."""
     rows: list[WindowRow] = []
-    async for chunk in db.iter_rollup_windows(since=since, until=until):
+    async for chunk in db.iter_rollup_windows(since=since, until=until, chunk=1000):
         rows.extend(chunk)
     if not rows:
         return 0

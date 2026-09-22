@@ -8,7 +8,7 @@ import logging
 import math
 import struct
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 from rfobserver.__about__ import __version__
+from rfobserver.storage.rollup import METRICS, ROLLUP_OLDEST_KEY, Candidate, select_peaks
 from rfobserver.web.routes.config import _persist_settings
 from rfobserver.web.uiprefs import THEME_VALUES, UI_PREFS_KEY
 
@@ -38,6 +39,14 @@ _WATERFALL_VERSION = 2
 # instant after the first ~5-10 s aggregation of a week.
 _WATERFALL_CACHE: OrderedDict[tuple[Any, ...], bytes] = OrderedDict()
 _WATERFALL_CACHE_MAX = 8
+
+_PEAKS_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
+_PEAKS_CACHE_MAX = 8
+# At minute resolution this covers 33 hours of one event dominating the range
+# before the separation rule can run out of candidates.
+_PEAKS_CANDIDATE_LIMIT = 2000
+_PEAK_WINDOW_SEC = (900, 1800, 3600, 10800)
+_PEAK_COUNT_MAX = 20
 
 
 def _get_processor(request: Request) -> Any:
@@ -1016,6 +1025,120 @@ async def averaged_stats(
             max_points=int(max_points) if max_points else 600,
         )
     return result
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Treat a naive datetime as UTC.
+
+    Stored timestamps are timezone-aware, query parameters may not be, and
+    comparing the two raises TypeError.
+    """
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+@router.get("/averaged/peaks", response_model=None)
+async def averaged_peaks(
+    request: Request,
+    since: str,
+    until: str,
+    window_sec: str | None = None,
+    count: str | None = None,
+    metric: str | None = None,
+    sdr_center: str | None = None,
+    sample_rate: str | None = None,
+    gain: str | None = None,
+) -> dict[str, Any] | Response:
+    """Strongest separated events in a range, for the Dashboard's peak finder.
+
+    Reads the avg_minutes rollup, so cost depends on the number of minutes in
+    the range rather than on the number of windows.
+    """
+    db = _get_db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    since_dt, until_dt = _parse_range(since, until)
+    since_dt, until_dt = _as_utc(since_dt), _as_utc(until_dt)
+
+    window = int(window_sec) if window_sec else 1800
+    if window not in _PEAK_WINDOW_SEC:
+        raise HTTPException(
+            status_code=400, detail=f"window_sec must be one of {list(_PEAK_WINDOW_SEC)}"
+        )
+    n = int(count) if count else 10
+    if not 1 <= n <= _PEAK_COUNT_MAX:
+        raise HTTPException(status_code=400, detail=f"count must be 1 to {_PEAK_COUNT_MAX}")
+    metric_name = metric or "pwr_max"
+    if metric_name not in METRICS:
+        raise HTTPException(status_code=400, detail=f"metric must be one of {list(METRICS)}")
+
+    key = (since, until, window, n, metric_name, sdr_center, sample_rate, gain)
+    hit = _PEAKS_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    async with request.app.state.peaks_sem:
+        if await request.is_disconnected():
+            return Response(status_code=499)
+        hit = _PEAKS_CACHE.get(key)
+        if hit is not None:
+            return hit
+        rows = await db.query_avg_minute_peaks(
+            since=since_dt,
+            until=until_dt,
+            metric=metric_name,
+            sdr_center_freq=_opt_float(sdr_center),
+            sample_rate=_opt_float(sample_rate),
+            gain=_opt_float(gain),
+            limit=_PEAKS_CANDIDATE_LIMIT,
+        )
+        covered_key = await db.get_config(ROLLUP_OLDEST_KEY)
+
+    candidates: list[Candidate] = []
+    for peak_time, value, pwr_max, pwr_snr, pwr_avg in rows:
+        when = _as_utc(datetime.fromisoformat(peak_time))
+        # An edge minute can straddle the requested range.
+        if when < since_dt or when >= until_dt:
+            continue
+        candidates.append(
+            Candidate(
+                peak_time=when, value=value, pwr_max=pwr_max, pwr_snr=pwr_snr, pwr_avg=pwr_avg
+            )
+        )
+
+    now = datetime.now(timezone.utc)
+    peaks = select_peaks(candidates, window_sec=window, count=n, now=now)
+    settings = request.app.state.settings
+    psd_cutoff = now - timedelta(days=settings.DB_RETENTION_DAYS)
+    covered = since_dt
+    if covered_key:
+        covered = max(covered, _as_utc(datetime.fromisoformat(covered_key + ":00")))
+
+    payload: dict[str, Any] = {
+        "metric": metric_name,
+        "window_sec": window,
+        "peaks": [
+            {
+                "rank": p.rank,
+                "peak_time": p.peak_time.isoformat(),
+                "since": p.since.isoformat(),
+                "until": p.until.isoformat(),
+                "value": p.value,
+                "pwr_max": p.pwr_max,
+                "pwr_snr": p.pwr_snr,
+                "pwr_avg": p.pwr_avg,
+                "psd_available": p.peak_time >= psd_cutoff,
+            }
+            for p in peaks
+        ],
+        "covered_since": covered.isoformat(),
+        "psd_cutoff": psd_cutoff.isoformat(),
+        "truncated": len(peaks) < n and len(rows) >= _PEAKS_CANDIDATE_LIMIT,
+    }
+    _PEAKS_CACHE[key] = payload
+    _PEAKS_CACHE.move_to_end(key)
+    while len(_PEAKS_CACHE) > _PEAKS_CACHE_MAX:
+        _PEAKS_CACHE.popitem(last=False)
+    return payload
 
 
 @router.get("/iq-captures")

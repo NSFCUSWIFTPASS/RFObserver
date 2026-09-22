@@ -309,3 +309,91 @@ Full suite green: 573 unit, 106 integration + 10 skipped.
   lag +/-4 scores ~0.917, so the test's `abs(best_lag) <= 1` leans on the argmax rather
   than a sharp peak. It separates 1154 from 0 decisively, which is what it exists for,
   but it would not reliably catch a 2-3 row regression.
+
+## CORRECTION and Jetson validation (2026-09-22)
+
+Appended per convention. The "Post-fix verification" section above reported the
+workstation result as if the fix were complete. **It was not.** Validating on nano-super
+(6 cores -> 3 workers, Python 3.10, aarch64) found two further defects that the
+workstation could not surface, both introduced by the fix itself.
+
+### Defect 1: the tail wait was bounded by the wrong quantity
+
+The first implementation capped `_await_tail_grids` at `RECORDING_MAX_SEC`. On
+nano-super with `RECORDING_MAX_SEC=0.5`:
+
+```
+WARNING PSD tail did not drain within 0.5s; .psd is 0.205s short of the IQ
+nano-super latency over the run: min 879.2 ms  median 918.8 ms  max 1183.9 ms  (n=11)
+```
+
+How long in-flight grids take to arrive is a property of the pipeline, not of how long
+the recording ran. Scaling the wait to the recording length breaks precisely the
+short-capture case the whole fix exists for, and the shorter the capture the worse the
+mismatch. The bound is now a fixed floor (3 s) under the existing ceiling (10 s), with
+`RECORDING_MAX_SEC` able to raise the floor but never pass the ceiling.
+
+**The workstation could not have caught this**: at 21 workers its latency is ~820 ms
+but the probe there used `RECORDING_MAX_SEC=2`, so the 2 s cap happened to exceed it.
+The defect needed both a slow box and a short cap.
+
+### Defect 2: the sidecar row count could exceed the file
+
+The second nano-super capture produced:
+
+```
+sidecar rows : 595
+num_bins     : 2048
+file bytes   : 3235840   ->  file rows 395.0
+load_grid    : ValueError: mmap length is greater than file size
+```
+
+595 - 395 = 200 rows, exactly one chunk's grid. `load_grid` memmaps at the sidecar's
+declared shape, so this capture would have failed the Captures page outright -- a worse
+symptom than the misalignment being fixed.
+
+Two causes:
+
+1. `_grid_last_sample` advanced *before* the rows were queued, so `_await_tail_grids`
+   could declare the tail complete for rows that were never stored. It now advances only
+   after a successful put.
+2. `rows` came from `_grid_rows`, a counter incremented at put time. A put landing after
+   the writer's `None` sentinel is counted but never written. The count is now read from
+   the file size after the writer has closed it, and a partial trailing row is truncated.
+   A disagreement is logged rather than shipped.
+
+**Trap for next time: a counter of what was enqueued is not a count of what was
+written.** Any sidecar field describing a file's shape should be derived from the file
+after it is closed. The new assertion in `_assert_psd_covers_iq` checks exactly this
+(`st_size == rows * num_bins * 4`) and is what would have caught it.
+
+### Final nano-super result
+
+```
+IQ  span 0.6100 s   pre_trigger 0.2 s   dropped 0
+PSD span 0.6093 s   rows 595
+start_sample_offset 640   slice_samples 2048
+
+best lag +0 rows, corr 0.535 over all 595 rows
+PSD covers trigger-0.200s .. trigger+0.410s
+IQ  covers trigger-0.200s .. trigger+0.410s
+.psd contains the trigger instant?  YES
+sidecar rows 595 | file rows 595 | load_grid -> (595, 2048)
+no tail-drain warning, no row-count warning
+```
+
+### A measurement trap hit during this validation
+
+**An argmax over a tiny overlap window is not a measurement.** My first check of the
+nano-super capture reported `best lag -570 rows (-583.7 ms), corr 0.714` and I briefly
+took it as a real misalignment. At lag -570 out of 595 total rows only **25 rows**
+overlap, and a 25-point correlation reaches 0.7 by chance. The same failure in a
+different disguise as the too-narrow lag range recorded earlier in this file. The check
+now requires an overlap of at least `max(50, n//2)` rows, after which the same capture
+reported lag +2, and lag 0 once the row-count defect was fixed.
+
+The regression test originally carried a weaker floor (`len(x) < 10`), safe only by
+accident. It now requires `max(50, nrows // 4)`. A quarter of the capture was chosen
+deliberately: a half would have excluded the pre-fix peak itself (1154 rows of 2046),
+turning a precise failure into the vaguer "does not describe the IQ at any lag". Verified
+to still fail pre-fix with `PSD is 1154 rows out of step with the IQ` and pass post-fix.

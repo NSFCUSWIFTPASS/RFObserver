@@ -294,7 +294,12 @@ async def test_psd_rows_align_with_the_iq_they_describe(tmp_path: Path) -> None:
             x, y = a[: nrows - lag], b[lag:nrows]
         else:
             x, y = a[-lag:nrows], b[: nrows + lag]
-        if len(x) < 10 or x.std() < 1e-9 or y.std() < 1e-9:
+        # Require a substantial overlap. A few dozen rows correlate above 0.7 by
+        # chance, so without this the argmax can land on a near-total shift with
+        # a 25-row window and report a misalignment that is not there. A quarter
+        # of the capture still admits the pre-fix offset (1154 rows of 2046,
+        # leaving 892 overlapping) while excluding the degenerate windows.
+        if len(x) < max(50, nrows // 4) or x.std() < 1e-9 or y.std() < 1e-9:
             continue
         c = float(np.corrcoef(x, y)[0, 1])
         if c > best_corr:

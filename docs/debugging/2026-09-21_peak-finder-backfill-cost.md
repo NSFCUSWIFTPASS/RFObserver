@@ -323,3 +323,21 @@ above evaporates. Treat the column order as load-bearing.
   tested; the 30-day figure is extrapolated by row count from the 7-day fixture.
 - nano-super runs at the 15 W profile and is not MAXN-capable, so it is if
   anything a pessimistic proxy for CPU, and a fair one for I/O.
+
+### CORRECTION to the trap above, same day
+
+The trap entry above states that the contention observation had to be re-queued
+before it meant anything. That is wrong about the run actually reported here.
+The operator who ran it has transcript evidence that the watermarks and
+`avg_minutes` were empty immediately before the pipeline was launched
+(`config rows left: []`, `avg_minutes rows: 0`), and that `rollup_oldest`
+reached the floor for the first time only about 140 s into the run. So the
+observed window was genuinely during an active backfill.
+
+What happened is that a second observer checked the watermark later, after the
+backfill had completed, saw it at the floor, and wrongly inferred the whole run
+had been steady-state. The general advice in the trap still stands: check the
+watermark is not already at the floor before trusting a contention result. The
+specific claim that this run was invalid does not.
+
+Either reading gives the same verdict, since neither shows any queue pressure.

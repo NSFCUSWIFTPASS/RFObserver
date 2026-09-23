@@ -25,6 +25,7 @@ import logging
 import math
 import os
 import queue
+import shutil
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -46,6 +47,12 @@ from rfobserver.processing.spectral import (
     PSDGridConfig,
     compute_psd_grid,
     compute_summary_psd,
+)
+from rfobserver.storage.governor import (
+    HARD_FLOOR_FRACTION,
+    describe_write_error,
+    is_disk_full_error,
+    resolve_floor,
 )
 
 if TYPE_CHECKING:
@@ -379,6 +386,13 @@ class StreamingProcessor:
         self._recording_gaps_truncated = False
         # Why the current (or last) recording ended; written to the .json.
         self._stop_reason: str | None = None
+        # Set by the writer thread (or the RAM flush) on a failed write; the
+        # receiver thread ends the recording on seeing it.
+        self._writer_error: str | None = None
+        # Set by the writer's own disk check when free space drops below half
+        # the floor mid-recording (the governor's 10 s tick is too slow).
+        self._disk_floor_hit = False
+        self._disk_usage: Callable[[Any], Any] = shutil.disk_usage
         # The last refusal to start a recording (storage step >= 3), shown by
         # the API and UI. Cleared by the next start that is allowed.
         self._last_refusal: str | None = None
@@ -915,6 +929,12 @@ class StreamingProcessor:
         state = self._recording_state
 
         if state == "recording":
+            if self._writer_error is not None:
+                self._request_end_recording(wait=False, reason="write_error")
+                return
+            if self._disk_floor_hit:
+                self._request_end_recording(wait=False, reason="disk_floor")
+                return
             self._write_recording_chunk(sc16_buf, gaps, chunk_start)
 
             # Auto-stop on the effective max duration (RAM-derived cap in RAM mode).
@@ -1149,6 +1169,8 @@ class StreamingProcessor:
         self._recording_overflows = 0
         self._recording_gaps_truncated = False
         self._stop_reason = None
+        self._writer_error = None
+        self._disk_floor_hit = False
         self._recording_wall_start = None
         self._recording_start = time.monotonic()
         self._below_threshold_count = 0
@@ -1360,8 +1382,12 @@ class StreamingProcessor:
             # makes, which would double IQ RAM right at the memory-cap boundary.
             filepath = self._recording_dir / base_name
             used = self._recording_buf[: self._recording_buf_pos]
-            used.tofile(str(filepath))
-            self._recording_bytes = self._recording_buf_pos * 4
+            try:
+                used.tofile(str(filepath))
+            except OSError as exc:
+                # Whatever reached disk is kept; metadata, DB insert and
+                # eviction still run, flagged as failed.
+                self._writer_error = describe_write_error(exc)
             self._recording_buf = None
             self._recording_buf_pos = 0
         else:
@@ -1385,6 +1411,11 @@ class StreamingProcessor:
                 if orig.exists():
                     orig.rename(dest)
 
+        # Metadata comes from the file on disk, never from the enqueue counter.
+        self._recording_bytes = self._bytes_from_file(self._recording_dir / base_name)
+        if self._writer_error is not None:
+            self._report_write_error(f"{base_name}: {self._writer_error}")
+
         # Finalize the PSD grid companion (<base>.psd + .psd.json). Disk mode
         # streamed rows via the writer thread (which owns and has closed the
         # file by the join above); RAM mode flushes its list here row-by-row
@@ -1399,10 +1430,13 @@ class StreamingProcessor:
                     self._grid_raw_path.rename(raw_path)
             self._grid_raw_path = None
         elif self._recording_grids:
-            with open(raw_path, "wb") as fh:
-                for g in self._recording_grids:
-                    fh.write(np.ascontiguousarray(g, dtype=np.float32).tobytes())
-                    self._grid_rows += g.shape[0]
+            try:
+                with open(raw_path, "wb") as fh:
+                    for g in self._recording_grids:
+                        fh.write(np.ascontiguousarray(g, dtype=np.float32).tobytes())
+                        self._grid_rows += g.shape[0]
+            except OSError as exc:
+                self._report_write_error(f"{raw_path.name}: {describe_write_error(exc)}")
             self._recording_grids = []
         if self._recording_freq_axis is not None:
             # The row count must come from the file, never from the queued-rows
@@ -1428,26 +1462,29 @@ class StreamingProcessor:
                     )
                 self._grid_rows = actual_rows
         if self._grid_rows > 0 and self._recording_freq_axis is not None:
-            psd_grid.write_meta(
-                meta_path,
-                rows=self._grid_rows,
-                num_bins=int(self._recording_freq_axis.shape[0]),
-                time_resolution_s=self._recording_time_res,
-                center_freq_hz=self._settings.FREQUENCY_START,
-                bandwidth_hz=self._settings.BANDWIDTH,
-                freq_axis=self._recording_freq_axis,
-                grid_min=(0.0 if self._grid_min == float("inf") else self._grid_min),
-                grid_max=(0.0 if self._grid_max == float("-inf") else self._grid_max),
-                cal_offset_db=self._recording_cal_offset,
-                start_sample_offset=(
-                    self._grid_first_sample - self._recording_start_sample
-                    if self._grid_first_sample is not None
-                    and self._recording_start_sample is not None
-                    else 0
-                ),
-                slice_samples=self._slice_samples,
-            )
-            logger.info("PSD data saved: %s (%d rows)", meta_path.name, self._grid_rows)
+            try:
+                psd_grid.write_meta(
+                    meta_path,
+                    rows=self._grid_rows,
+                    num_bins=int(self._recording_freq_axis.shape[0]),
+                    time_resolution_s=self._recording_time_res,
+                    center_freq_hz=self._settings.FREQUENCY_START,
+                    bandwidth_hz=self._settings.BANDWIDTH,
+                    freq_axis=self._recording_freq_axis,
+                    grid_min=(0.0 if self._grid_min == float("inf") else self._grid_min),
+                    grid_max=(0.0 if self._grid_max == float("-inf") else self._grid_max),
+                    cal_offset_db=self._recording_cal_offset,
+                    start_sample_offset=(
+                        self._grid_first_sample - self._recording_start_sample
+                        if self._grid_first_sample is not None
+                        and self._recording_start_sample is not None
+                        else 0
+                    ),
+                    slice_samples=self._slice_samples,
+                )
+                logger.info("PSD data saved: %s (%d rows)", meta_path.name, self._grid_rows)
+            except OSError as exc:
+                self._report_write_error(f"{meta_path.name}: {describe_write_error(exc)}")
 
         # Write companion metadata JSON
         self._write_recording_metadata(base_name, duration)
@@ -1482,6 +1519,48 @@ class StreamingProcessor:
         # runtime via /config/apply after LocalStorage snapshotted it at startup.
         self._storage.max_bytes = int(self._settings.ARCHIVE_MAX_GB * 1024**3)
         self._storage.enforce_cap()
+
+    def _report_write_error(self, message: str) -> None:
+        """Log a failed write and set the governor's sticky flag."""
+        logger.error("Write failed: %s", message)
+        if self._governor is not None:
+            self._governor.report_write_error(message)
+
+    def _check_disk_floor(self) -> None:
+        """Writer thread, about once per second of IQ: end the recording
+        cleanly if free space is below half the floor, before ENOSPC."""
+        try:
+            du = self._disk_usage(self._recording_dir)
+        except OSError:
+            return
+        floor = resolve_floor(self._settings.DISK_MIN_FREE_GB, du.total)
+        if du.free < floor * HARD_FLOOR_FRACTION and not self._disk_floor_hit:
+            logger.warning(
+                "Free space %.2f GB below half the %.2f GB floor: ending the recording",
+                du.free / 1024**3,
+                floor / 1024**3,
+            )
+            self._disk_floor_hit = True
+
+    def _bytes_from_file(self, path: Path) -> int:
+        """The capture's true size, from the closed file: a partial trailing
+        sample (a short write) is truncated away. The enqueue counter can
+        claim bytes that never reached the disk."""
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return 0
+        whole = size - size % 4
+        if whole != size:
+            with contextlib.suppress(OSError):
+                os.truncate(path, whole)
+        if whole != self._recording_bytes and self._writer_error is None:
+            logger.warning(
+                "IQ bytes on disk (%d) differ from bytes queued (%d); reporting the file",
+                whole,
+                self._recording_bytes,
+            )
+        return whole
 
     async def _deferred_sidecar(self, sc16_path: Path, grace: float) -> None:
         """Write the detections sidecar after a grace delay (runs on the loop).
@@ -1553,6 +1632,13 @@ class StreamingProcessor:
         # the wall time the capture covers; duration_sec stays the file's
         # sample length.
         lost = self._recording_lost
+        write_error = self._writer_error
+        gaps = self._recording_gaps
+        if write_error is not None:
+            # The file ends early: gaps queued past its end describe nothing.
+            gaps = [g for g in gaps if g[0] <= total_samples]
+            if not self._recording_gaps_truncated:
+                lost = sum(g[1] for g in gaps)
         time_span = (total_samples + lost) / sample_rate_hz if sample_rate_hz > 0 else duration
         if self._recording_wall_start is not None:
             start_dt = datetime.fromtimestamp(self._recording_wall_start, tz=timezone.utc)
@@ -1572,18 +1658,25 @@ class StreamingProcessor:
             "dropped_chunks": self._recording_dropped,
             "overflow_events": self._recording_overflows,
             "lost_samples": lost,
-            "gaps": self._recording_gaps,
+            "gaps": gaps,
             "gaps_truncated": self._recording_gaps_truncated,
             "time_span_sec": round(time_span, 3),
             "pre_trigger_sec": s.TRIGGER_PRE_SEC,
             "trigger_initiated": self._trigger_initiated,
             "stopped_reason": self._stop_reason or "manual",
+            "write_failed": write_error is not None,
             "ram_buffered": s.RECORDING_RAM_BUFFER,
             "hostname": s.HOSTNAME,
             "serial": self._receiver.serial,
         }
+        if write_error is not None:
+            meta["write_error"] = write_error
         json_path = self._recording_dir / filename.replace(".sc16", ".json")
-        json_path.write_text(_json.dumps(meta, indent=2))
+        try:
+            json_path.write_text(_json.dumps(meta, indent=2))
+        except OSError as exc:
+            # Report and carry on: the DB insert below still records the capture.
+            self._report_write_error(f"{filename} metadata .json: {describe_write_error(exc)}")
 
         # Record the capture's span in the DB so the Dashboard can highlight
         # where IQ is available and link straight to it. Uses the settings-
@@ -1630,6 +1723,10 @@ class StreamingProcessor:
             logger.debug("Could not pin writer thread to core")
 
         filepath = self._recording_dir / (self._recording_file or "recording.sc16")
+        rate = float(self._settings.BANDWIDTH) or 1.0
+        check_every = max(1, int(rate * 4))  # about one second of IQ
+        since_check = 0
+        stopped = False
         try:
             with (
                 open(filepath, "wb", buffering=8 * 1024 * 1024) as f,
@@ -1638,16 +1735,32 @@ class StreamingProcessor:
                 while True:
                     item = self._recording_queue.get()
                     if item is None:
+                        stopped = True
                         break
                     kind, data = item
                     if kind == "iq":
                         f.write(data)
+                        since_check += memoryview(data).nbytes
+                        if since_check >= check_every:
+                            since_check = 0
+                            self._check_disk_floor()
                     else:
                         gf.write(data)
-                    # No flush — let OS buffer writes for throughput.
-                    # Data is flushed on file close at loop exit.
-        except Exception:
-            logger.exception("File writer crashed")
+                    # No flush: let the OS buffer writes for throughput. The
+                    # close at loop exit flushes, and can itself fail (ENOSPC).
+        except Exception as exc:
+            self._writer_error = describe_write_error(exc)
+            logger.error(
+                "Recording write failed (%s); ending the recording",
+                self._writer_error,
+                # An OS error is fully described; anything else is a bug.
+                exc_info=not isinstance(exc, OSError),
+            )
+            if not stopped:
+                # Keep consuming so finalize's stop sentinel is never blocked
+                # and the receiver thread never sees a full queue.
+                while self._recording_queue.get() is not None:
+                    pass
 
     # -- Dispatch thread --
 
@@ -2290,9 +2403,15 @@ class StreamingProcessor:
                 pwr_median=iq_stats.median,
                 pwr_std=iq_stats.std,
                 kurtosis=iq_stats.kurtosis,
-                powers=avg_powers,
+                powers=(
+                    None
+                    if self._governor is not None and self._governor.state.skip_psd_blobs
+                    else avg_powers
+                ),
             )
-        except Exception:
+        except Exception as exc:
+            if is_disk_full_error(exc):
+                self._report_write_error(f"database: {exc}")
             logger.exception("avg-window persist failed (chunk #%d)", result.capture_num)
 
     async def _publish_processed(
@@ -2397,7 +2516,9 @@ class StreamingProcessor:
         if rows:
             try:
                 await self._db.insert_detections(rows)
-            except Exception:
+            except Exception as exc:
+                if is_disk_full_error(exc):
+                    self._report_write_error(f"database: {exc}")
                 logger.exception("insert_detections failed for %d bursts; skipping", len(rows))
 
     # -- Helpers --

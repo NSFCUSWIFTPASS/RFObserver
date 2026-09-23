@@ -585,6 +585,24 @@ async def set_storage_path(request: Request) -> dict[str, Any]:
     return {"status": "ok", "path": new_path, "message": f"Storage path set to {new_path}"}
 
 
+@router.post("/storage/clear-degraded")
+async def storage_clear_degraded(request: Request) -> dict[str, Any]:
+    """Acknowledge a storage failure: clears the sticky degraded flag (and the
+    last write error). The flag stays set after space recovers until this is
+    called, so the evidence survives until someone has seen it."""
+    from rfobserver.storage.governor import DEGRADED_CONFIG_KEY
+
+    gov = getattr(request.app.state, "storage_governor", None)
+    if gov is None:
+        raise HTTPException(status_code=409, detail="Storage governor not running")
+    gov.clear_degraded()
+    wdb = getattr(request.app.state, "write_database", None)
+    if wdb is not None:
+        await wdb.set_config(DEGRADED_CONFIG_KEY, "")
+    result: dict[str, Any] = gov.state.to_health()
+    return result
+
+
 # -- ZMS status/toggle --
 
 

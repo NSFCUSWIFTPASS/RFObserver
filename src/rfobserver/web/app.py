@@ -118,6 +118,14 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             }
             if sup.gave_up:
                 body["status"] = "degraded"
+        gov = getattr(app.state, "storage_governor", None)
+        if gov is not None:
+            st = gov.state
+            body["storage"] = st.to_health()
+            # Steps 1-2 are the system working as designed: reported, not
+            # degraded. Step >= 3 or the sticky flag is degraded.
+            if st.degraded:
+                body["status"] = "degraded"
         return body
 
     @app.websocket("/ws/live")

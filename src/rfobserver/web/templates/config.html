@@ -263,7 +263,34 @@
                 <div class="form-group">
                     <label for="history-days">PSD History (days)</label>
                     <input type="number" id="history-days" name="history_days" value="{{ settings.DB_RETENTION_DAYS }}" min="1">
-                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Spectra older than this lose their PSD data. Stats and detections are kept.</span>
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Spectra older than this lose their PSD data. Stats and detections follow Stats History.</span>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="disk-min-free">Minimum Free Space (GB)</label>
+                    <input type="number" id="disk-min-free" name="disk_min_free_gb" value="{{ settings.DISK_MIN_FREE_GB }}" step="1" min="0">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">0 = automatic: 5% of the volume, at least 2 GB. Below it the oldest automatic captures are deleted, then history is pruned harder, then recordings are refused. Manual captures are never deleted.</span>
+                </div>
+                <div class="form-group">
+                    <label for="stats-retention">Stats History (days)</label>
+                    <input type="number" id="stats-retention" name="stats_retention_days" value="{{ settings.STATS_RETENTION_DAYS }}" min="0">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Power statistics, detections and minute summaries older than this are deleted. 0 keeps them forever.</span>
+                </div>
+                <div class="form-group">
+                    <label for="storage-check">Storage Check (s)</label>
+                    <input type="number" id="storage-check" name="storage_check_sec" value="{{ settings.STORAGE_CHECK_SEC }}" step="1" min="1">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">How often free space is checked. A recording checks its own disk about every second.</span>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group" style="flex: 1;">
+                    <label>Volume</label>
+                    <div id="storage-bar" class="storage-bar" role="img" aria-label="Storage volume usage">
+                        <span class="sb-seg sb-manual"></span><span class="sb-seg sb-auto"></span><span class="sb-seg sb-db"></span><span class="sb-seg sb-other"></span>
+                        <span class="sb-floor" title="Minimum free space"></span>
+                    </div>
+                    <div id="storage-legend" class="storage-legend">--</div>
                 </div>
             </div>
         </div>
@@ -903,5 +930,37 @@
         }
     }
 })();
+
+// Storage bar: manual, auto, DB and everything else, left to right; the
+// remainder is free. The red line marks the minimum free space.
+async function refreshStorageBar() {
+    let s;
+    try {
+        const r = await fetch('/api/health', {cache: 'no-store'});
+        s = (await r.json()).storage;
+    } catch (e) { return; }
+    const bar = document.getElementById('storage-bar');
+    const legend = document.getElementById('storage-legend');
+    if (!bar || !s || !s.volume_gb) { if (legend) legend.textContent = 'Not available'; return; }
+    const vol = s.volume_gb;
+    const dbHere = s.db_volume ? 0 : s.db_gb;
+    const used = vol - s.free_gb;
+    const other = Math.max(0, used - s.manual_gb - s.auto_gb - dbHere);
+    const pct = v => (100 * Math.max(0, v) / vol).toFixed(2) + '%';
+    bar.querySelector('.sb-manual').style.width = pct(s.manual_gb);
+    bar.querySelector('.sb-auto').style.width = pct(s.auto_gb);
+    bar.querySelector('.sb-db').style.width = pct(dbHere);
+    bar.querySelector('.sb-other').style.width = pct(other);
+    bar.querySelector('.sb-floor').style.left = pct(vol - s.floor_gb);
+    const parts = [
+        `Manual ${s.manual_gb} GB`, `Automatic ${s.auto_gb} GB`,
+        s.db_volume ? `Database ${s.db_gb} GB (other volume, ${s.db_volume.free_gb} GB free)` : `Database ${s.db_gb} GB`,
+        `Other ${other.toFixed(1)} GB`, `Free ${s.free_gb} of ${vol} GB`, `Minimum free ${s.floor_gb} GB`,
+    ];
+    if (s.step > 0) parts.push(`Step ${s.step}: ${s.step_text}`);
+    legend.textContent = parts.join('  ·  ');
+}
+refreshStorageBar();
+setInterval(refreshStorageBar, 30000);
 </script>
 {% endblock %}

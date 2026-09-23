@@ -2,6 +2,11 @@
 {% block title %}Live - RFObserver{% endblock %}
 {% block content %}
 <script src="/static/shared-charts.js"></script>
+<div id="storage-banner" class="storage-banner" role="status" style="display: none;">
+    <span class="storage-banner-label">Storage</span>
+    <span id="storage-banner-text" class="storage-banner-text"></span>
+    <button type="button" id="storage-banner-clear" class="storage-banner-clear" style="display: none;">Clear Warning</button>
+</div>
 <div class="graph-stack">
     <div class="card">
         <div class="card-header">
@@ -24,6 +29,7 @@
                 <button id="rec-btn" class="rec-btn rec-start" title="Start recording">REC</button>
                 <button id="arm-btn" class="rec-btn rec-arm" title="Arm trigger">ARM</button>
                 <button id="stop-btn" class="rec-btn rec-stop" style="display:none;" title="Stop">STOP</button>
+                <span id="rec-notice" class="rec-notice" style="display:none;"></span>
                 <span id="rec-status" class="rec-status-label"></span>
             </span>
         </div>
@@ -1230,6 +1236,47 @@
     let lastBurstSeqSeen = -1;
     let lastDetectionCount = -1;
     const statusBarEl = document.getElementById("status-bar-label");
+
+    const storageBanner = document.getElementById("storage-banner");
+    const storageBannerText = document.getElementById("storage-banner-text");
+    const storageBannerClear = document.getElementById("storage-banner-clear");
+
+    function updateStorageBanner(s) {
+        const show = s && (s.step > 0 || s.degraded_since);
+        storageBanner.style.display = show ? "flex" : "none";
+        if (!show) return;
+        const parts = [];
+        if (s.step > 0) {
+            parts.push(`Step ${s.step}: ${s.step_text}. ${s.free_gb} GB free, minimum ${s.floor_gb} GB.`);
+        }
+        if (s.last_write_error) {
+            parts.push(`Last write error: ${s.last_write_error.error}`);
+        } else if (s.degraded_since) {
+            parts.push(`A storage problem occurred at ${new Date(s.degraded_since).toLocaleString()}.`);
+        }
+        storageBannerText.textContent = parts.join(" ");
+        storageBanner.classList.toggle("storage-banner-critical", s.step >= 3 || !!s.degraded_since);
+        storageBannerClear.style.display = s.degraded_since ? "" : "none";
+    }
+
+    storageBannerClear.addEventListener("click", async function() {
+        const r = await fetch("/api/storage/clear-degraded", {method: "POST"});
+        if (r.ok) updateStorageBanner(await r.json());
+    });
+
+    const recNotice = document.getElementById("rec-notice");
+    let recNoticeTimer = null;
+    async function recordRequest(url) {
+        const r = await fetch(url, {method: "POST"});
+        if (r.ok) return;
+        let detail = "Request failed";
+        try { detail = (await r.json()).detail || detail; } catch (e) { /* keep default */ }
+        recNotice.textContent = detail;
+        recNotice.style.display = "";
+        clearTimeout(recNoticeTimer);
+        recNoticeTimer = setTimeout(() => { recNotice.style.display = "none"; }, 10000);
+    }
+
     function handleHeartbeat(d) {
         // Don't clobber the status bar while the user is inline-editing one of
         // its values — the rebuild would destroy the open <input>. The edit
@@ -1239,6 +1286,7 @@
                 && statusBarEl.innerHTML !== d.status_bar_html) {
             statusBarEl.innerHTML = d.status_bar_html;
         }
+        if (d.storage !== undefined) updateStorageBanner(d.storage);
         if (d.recording) {
             updateRecUI(
                 d.recording.state,
@@ -1266,10 +1314,10 @@
     }
 
     recBtn.addEventListener("click", async function() {
-        await fetch("/api/recording/start", {method: "POST"});
+        await recordRequest("/api/recording/start");
     });
     armBtn.addEventListener("click", async function() {
-        await fetch("/api/recording/arm", {method: "POST"});
+        await recordRequest("/api/recording/arm");
     });
     stopBtn.addEventListener("click", async function() {
         await fetch("/api/recording/stop", {method: "POST"});

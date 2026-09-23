@@ -87,3 +87,36 @@ def test_sticky_flag_is_degraded_after_recovery_until_cleared():
 
 def test_clear_without_a_governor_is_409():
     assert _client(None).post("/api/storage/clear-degraded").status_code == 409
+
+
+def test_dashboard_has_the_storage_banner_and_record_notice():
+    # dashboard.html (the rec/arm/stop live view with the heartbeat websocket)
+    # is served at /live/; "/" is the separate averaged-history landing page.
+    html = _client(None).get("/live/").text
+    for needle in ('id="storage-banner"', 'id="storage-banner-clear"', 'id="rec-notice"'):
+        assert needle in html
+
+
+def test_config_page_has_the_storage_bar_and_fields():
+    html = _client(None).get("/config").text
+    for needle in (
+        'id="storage-bar"',
+        'name="disk_min_free_gb"',
+        'name="stats_retention_days"',
+        'name="storage_check_sec"',
+    ):
+        assert needle in html
+
+
+def test_config_apply_accepts_the_storage_settings(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    app = create_app(AppSettings(_env_file=None))
+    c = TestClient(app)
+    r = c.post(
+        "/config/apply",
+        json={"disk_min_free_gb": "12.5", "stats_retention_days": "365", "storage_check_sec": "5"},
+    )
+    assert r.status_code == 200, r.text
+    s = app.state.settings
+    assert s.DISK_MIN_FREE_GB == 12.5 and s.STATS_RETENTION_DAYS == 365
+    assert s.STORAGE_CHECK_SEC == 5.0

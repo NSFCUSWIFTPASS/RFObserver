@@ -1798,3 +1798,55 @@ body {
     gap: 16px;
     flex-wrap: wrap;
 }
+
+/* Storage governor banner (dashboard): amber while RFObserver is freeing
+   space on its own (steps 1-2), red once recordings are refused or a write
+   failed. */
+.storage-banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+    padding: 8px 14px;
+    border-radius: var(--radius);
+    background: rgba(255, 159, 10, 0.12);
+    color: var(--text-primary);
+    font-size: 13px;
+}
+.storage-banner-critical { background: rgba(255, 59, 48, 0.12); }
+.storage-banner-label { font-weight: 600; }
+.storage-banner-text { flex: 1; }
+.storage-banner-clear {
+    border: none;
+    border-radius: 8px;
+    padding: 4px 12px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 12px;
+    cursor: pointer;
+}
+.rec-notice { margin-left: 8px; font-size: 11px; color: #ff3b30; }
+
+/* Config page storage bar */
+.storage-bar {
+    position: relative;
+    display: flex;
+    height: 14px;
+    border-radius: 7px;
+    overflow: hidden;
+    background: var(--divider);
+    border: 1px solid var(--border);
+}
+.sb-seg { height: 100%; }
+.sb-manual { background: #0a84ff; }
+.sb-auto { background: #5e5ce6; }
+.sb-db { background: #ff9f0a; }
+.sb-other { background: #8e8e93; }
+.sb-floor {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: #ff3b30;
+}
+.storage-legend { margin-top: 4px; font-size: 10px; color: var(--text-secondary); }

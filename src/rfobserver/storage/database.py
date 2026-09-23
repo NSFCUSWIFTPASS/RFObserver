@@ -17,11 +17,13 @@ rows instead of the whole history.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
 import logging
 import math
-from datetime import datetime, timedelta
+import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -41,6 +43,24 @@ _DB_WRITE_TIMEOUT_SEC = 30.0
 # The WAL is truncated back to this size whenever a checkpoint lets it rewind,
 # so a burst of growth (e.g. behind a long reader snapshot) is not kept forever.
 _WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024  # 67108864
+
+# Rows per retention statement. Statement size on the writer connection is what
+# starves the pipeline (the peak-finder rollup, 2026-09-21): keep each one well
+# under the ~300 ms at which chunks begin to drop. Set from a nano-super
+# measurement (docs/debugging/..., Task 9 of the storage budgeting plan).
+RETENTION_CHUNK_ROWS = 5000
+# Tables row retention may delete from, and their time column.
+_RETENTION_TABLES = {
+    "avg_windows": "start_time",
+    "detections": "start_time",
+    "avg_minutes": "minute_start",
+}
+
+
+def _retention_cutoff(days: int) -> str:
+    """Same naive-UTC ISO form prune_avg_psd_blobs has always compared with."""
+    return (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)).isoformat()
+
 
 _INSERT_DETECTION_SQL = """INSERT OR IGNORE INTO detections
    (burst_id, start_time, stop_time, center_freq_hz, bandwidth_hz,
@@ -266,6 +286,9 @@ class SensorDatabase:
         self._db: aiosqlite.Connection | None = None
         self._write_timeout = _DB_WRITE_TIMEOUT_SEC
         self._reconnect_lock = asyncio.Lock()
+        # (start_time, rowid) up to which every avg_windows blob is known to be
+        # pruned, so each hourly pass resumes instead of rescanning history.
+        self._blob_prune_mark: tuple[str, int] = ("", 0)
 
     @property
     def read_only(self) -> bool:
@@ -571,14 +594,15 @@ class SensorDatabase:
         pwr_median: float,
         pwr_std: float,
         kurtosis: float,
-        powers: list[float],
+        powers: list[float] | None,
         interference: bool | None = None,
         violations: bytes | None = None,
     ) -> None:
         """Persist one DURATION_SEC-averaged window. ``powers`` is stored as a
         little-endian float32 BLOB (raw dBFS)."""
         assert self._db is not None
-        psd_blob = np.asarray(powers, dtype="<f4").tobytes()
+        # None (storage step 4) keeps the stats row but stores no PSD blob.
+        psd_blob = None if powers is None else np.asarray(powers, dtype="<f4").tobytes()
         await self._db.execute(
             """INSERT INTO avg_windows
                (start_time, duration_sec, sdr_center_freq_hz, sample_rate_hz,
@@ -1509,25 +1533,102 @@ class SensorDatabase:
         await self._db.commit()
 
     @_guarded_write
-    async def prune_avg_psd_blobs(self, days: int = 7) -> int:
+    async def _prune_blob_chunk(self, cutoff: str, limit: int) -> tuple[int, int]:
+        """Null one chunk of blobs after the watermark. Returns (rows scanned, nulled)."""
+        assert self._db is not None
+        after_time, after_rowid = self._blob_prune_mark
+        async with self._db.execute(
+            "SELECT rowid, start_time FROM avg_windows "
+            "WHERE start_time < ? AND (start_time, rowid) > (?, ?) "
+            "ORDER BY start_time, rowid LIMIT ?",
+            (cutoff, after_time, after_rowid, limit),
+        ) as cur:
+            rows = list(await cur.fetchall())
+        if not rows:
+            return 0, 0
+        ids = [r[0] for r in rows]
+        marks = ",".join("?" * len(ids))
+        cursor = await self._db.execute(
+            "UPDATE avg_windows SET psd_powers = NULL, violations = NULL "
+            f"WHERE rowid IN ({marks}) AND psd_powers IS NOT NULL",
+            ids,
+        )
+        await self._db.commit()
+        self._blob_prune_mark = (rows[-1][1], rows[-1][0])
+        return len(rows), int(cursor.rowcount)
+
+    async def prune_avg_psd_blobs(
+        self, days: int = 7, *, chunk: int = RETENTION_CHUNK_ROWS, pause_sec: float = 0.05
+    ) -> int:
         """Evict the PSD blobs of averaged windows older than ``days`` days.
 
         Only the heavy ``psd_powers``/``violations`` blobs are nulled out; the
-        cheap stats row (and detections, stats, tone_checks) is kept
-        permanently. A pruned window still answers the light query and its
-        detail endpoint (with ``powers: null``): at ~8 KB per window the blob
-        is ~98% of the row's storage, so this bounds the DB file without
-        losing any statistics. Returns how many blobs were nulled this pass.
+        cheap stats row is kept (row retention is delete_older_than). Walks the
+        start_time index in chunks from a watermark, so each statement is small
+        and a pass after the first touches only the newly expired rows. The DB
+        file does not shrink (auto_vacuum=0): freed pages are reused by later
+        inserts. Returns how many blobs were nulled this pass.
         """
-        assert self._db is not None
-        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-        cursor = await self._db.execute(
-            "UPDATE avg_windows SET psd_powers = NULL, violations = NULL "
-            "WHERE start_time < ? AND psd_powers IS NOT NULL",
-            (cutoff,),
-        )
-        await self._db.commit()
-        pruned: int = cursor.rowcount
+        cutoff = _retention_cutoff(days)
+        pruned = 0
+        while True:
+            result: tuple[int, int] = await self._prune_blob_chunk(cutoff, chunk)
+            scanned, nulled = result
+            pruned += nulled
+            if scanned < chunk:
+                break
+            await asyncio.sleep(pause_sec)
         if pruned > 0:
             logger.info("Pruned PSD blobs for %d avg windows (cutoff: %s)", pruned, cutoff)
         return pruned
+
+    @_guarded_write
+    async def _delete_older_chunk(self, table: str, cutoff: str, limit: int) -> int:
+        assert self._db is not None
+        col = _RETENTION_TABLES[table]
+        cursor = await self._db.execute(
+            f"DELETE FROM {table} WHERE rowid IN "
+            f"(SELECT rowid FROM {table} WHERE {col} < ? ORDER BY {col} LIMIT ?)",
+            (cutoff, limit),
+        )
+        await self._db.commit()
+        return int(cursor.rowcount)
+
+    async def delete_older_than(
+        self,
+        table: str,
+        days: int,
+        *,
+        chunk: int = RETENTION_CHUNK_ROWS,
+        pause_sec: float = 0.05,
+    ) -> int:
+        """Delete rows of ``table`` older than ``days`` days, ``chunk`` rows per
+        statement with a pause between, so the pipeline's inserts interleave.
+        Raises KeyError for a table outside _RETENTION_TABLES."""
+        _RETENTION_TABLES[table]  # validate before building any SQL
+        cutoff = _retention_cutoff(days)
+        total = 0
+        while True:
+            n: int = await self._delete_older_chunk(table, cutoff, chunk)
+            total += n
+            if n < chunk:
+                break
+            await asyncio.sleep(pause_sec)
+        if total:
+            logger.info("Retention: deleted %d %s rows older than %d days", total, table, days)
+        return total
+
+    async def file_stats(self) -> tuple[int, int]:
+        """(DB file plus WAL bytes, bytes of free pages reusable without growth)."""
+        assert self._db is not None
+        async with self._db.execute("PRAGMA page_size") as cur:
+            page_row = await cur.fetchone()
+        page_size = int(page_row[0]) if page_row is not None else 0
+        async with self._db.execute("PRAGMA freelist_count") as cur:
+            free_row = await cur.fetchone()
+        free_pages = int(free_row[0]) if free_row is not None else 0
+        size = 0
+        for suffix in ("", "-wal"):
+            with contextlib.suppress(OSError):
+                size += os.stat(self._db_path + suffix).st_size
+        return size, page_size * free_pages

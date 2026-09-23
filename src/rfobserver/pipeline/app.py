@@ -448,27 +448,64 @@ async def _heartbeat_loop(
         await asyncio.sleep(interval_sec)
 
 
-async def _cleanup_loop(settings: AppSettings, db: Any) -> None:
-    """Scheduled DB retention: null out PSD blobs older than DB_RETENTION_DAYS.
+def _retention_days(configured: int, pressure_cap: int, pressure: bool) -> int:
+    """Retention in days for one class of data: the configured value, cut to
+    the pressure cap at storage step >= 2 (which applies even when the
+    configured retention is disabled). 0 = do not prune."""
+    if not pressure:
+        return configured
+    return pressure_cap if configured <= 0 else min(configured, pressure_cap)
 
-    Only the heavy PSD/violations blobs of ``avg_windows`` are evicted; the
-    stats rows, detections, and tone_checks are kept permanently. Runs one
-    pass immediately, then repeats every ``DB_CLEANUP_INTERVAL_SEC``. Each
-    pass is wrapped in try/except so a transient DB error never kills the
-    process (the pipeline keeps running).
+
+async def _run_retention(settings: AppSettings, db: Any, *, pressure: bool) -> None:
+    """One retention pass. Each part has its own try so one failure does not
+    stop the rest, and the pipeline keeps running regardless."""
+    from rfobserver.storage.governor import PRESSURE_DETECTION_DAYS, PRESSURE_PSD_DAYS
+
+    parts: list[tuple[str, int]] = [
+        ("blobs", _retention_days(settings.DB_RETENTION_DAYS, PRESSURE_PSD_DAYS, pressure)),
+        (
+            "detections",
+            _retention_days(settings.STATS_RETENTION_DAYS, PRESSURE_DETECTION_DAYS, pressure),
+        ),
+        ("avg_windows", settings.STATS_RETENTION_DAYS),
+        ("avg_minutes", settings.STATS_RETENTION_DAYS),
+    ]
+    for what, days in parts:
+        if days <= 0:
+            continue
+        try:
+            if what == "blobs":
+                await db.prune_avg_psd_blobs(days)
+            else:
+                await db.delete_older_than(what, days)
+        except Exception:
+            logger.exception("Retention of %s failed; continuing", what)
+
+
+async def _cleanup_loop(
+    settings: AppSettings,
+    db: Any,
+    governor: Any = None,
+    wake: asyncio.Event | None = None,
+) -> None:
+    """Scheduled DB retention.
+
+    PSD blobs expire after DB_RETENTION_DAYS; stats rows, detections and
+    minute rollups after STATS_RETENTION_DAYS. At storage step >= 2 the blob
+    and detection cutoffs tighten to the pressure caps. Runs one pass
+    immediately, then every DB_CLEANUP_INTERVAL_SEC, or at once when ``wake``
+    is set (the storage loop sets it on entering step 2).
     """
     while True:
-        try:
-            removed = await db.prune_avg_psd_blobs(settings.DB_RETENTION_DAYS)
-            logger.info(
-                "Retention: pruned PSD blobs for %d windows older than %d days",
-                removed,
-                settings.DB_RETENTION_DAYS,
-            )
-        except Exception:
-            logger.exception("Retention cleanup failed; continuing")
-
-        await asyncio.sleep(settings.DB_CLEANUP_INTERVAL_SEC)
+        pressure = governor is not None and governor.state.pressure
+        await _run_retention(settings, db, pressure=pressure)
+        if wake is None:
+            await asyncio.sleep(settings.DB_CLEANUP_INTERVAL_SEC)
+            continue
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(wake.wait(), timeout=settings.DB_CLEANUP_INTERVAL_SEC)
+        wake.clear()
 
 
 def _minute_str(when: datetime) -> str:

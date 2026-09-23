@@ -198,3 +198,93 @@ async def test_cleanup_loop_wakes_early_on_the_event():
     with contextlib.suppress(asyncio.CancelledError):
         await task
     assert first >= 1 and len(d.calls) > first
+
+
+def _spy_scans(d: SensorDatabase) -> list[int]:
+    """Record rows scanned per _prune_blob_chunk call on this instance."""
+    scans: list[int] = []
+    real = d._prune_blob_chunk
+
+    async def spy(cutoff, limit):
+        scanned, nulled = await real(cutoff, limit)
+        scans.append(scanned)
+        return scanned, nulled
+
+    d._prune_blob_chunk = spy
+    return scans
+
+
+async def test_blob_prune_mark_survives_a_restart(tmp_path):
+    """A new process resumes from the persisted watermark instead of
+    rescanning all stats-only history (validation doc, Finding 2)."""
+    path = str(tmp_path / "m.db")
+    first = SensorDatabase(path)
+    await first.connect()
+    now = datetime.utcnow()
+    for i in range(12):
+        await _window(first, now - timedelta(days=40, minutes=i))
+    assert await first.prune_avg_psd_blobs(30, chunk=5, pause_sec=0) == 12
+    await first.close()
+
+    second = SensorDatabase(path)
+    await second.connect()
+    try:
+        scans = _spy_scans(second)
+        assert await second.prune_avg_psd_blobs(30, chunk=5, pause_sec=0) == 0
+        assert sum(scans) == 0  # nothing rescanned
+        # Newly expired rows after the mark are still pruned.
+        await _window(second, now - timedelta(days=35))
+        assert await second.prune_avg_psd_blobs(30, chunk=5, pause_sec=0) == 1
+    finally:
+        await second.close()
+
+
+async def test_blob_prune_mark_saved_mid_pass(tmp_path, monkeypatch):
+    """A long first pass interrupted by a restart resumes near where it stopped."""
+    from rfobserver.storage import database
+
+    monkeypatch.setattr(database, "_BLOB_MARK_SAVE_EVERY_CHUNKS", 2)
+    path = str(tmp_path / "i.db")
+    first = SensorDatabase(path)
+    await first.connect()
+    now = datetime.utcnow()
+    for i in range(20):
+        await _window(first, now - timedelta(days=40, minutes=20 - i))
+    real = first._prune_blob_chunk
+    calls = 0
+
+    async def dies_on_third(cutoff, limit):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise RuntimeError("process stopped")
+        return await real(cutoff, limit)
+
+    first._prune_blob_chunk = dies_on_third
+    with pytest.raises(RuntimeError):
+        await first.prune_avg_psd_blobs(30, chunk=5, pause_sec=0)
+    await first.close()
+
+    second = SensorDatabase(path)
+    await second.connect()
+    try:
+        scans = _spy_scans(second)
+        assert await second.prune_avg_psd_blobs(30, chunk=5, pause_sec=0) == 10
+        assert sum(scans) == 10  # the 10 rows nulled before the stop are skipped
+        nulled = "SELECT COUNT(*) FROM avg_windows WHERE psd_powers IS NULL"
+        assert await _count(second, nulled) == 20
+    finally:
+        await second.close()
+
+
+async def test_garbled_blob_prune_mark_falls_back_to_a_full_scan(db):
+    now = datetime.utcnow()
+    for i in range(3):
+        await _window(db, now - timedelta(days=40, minutes=i))
+    for bad in ("not json", '["x"]', '{"a": 1}', '[1, "x"]'):
+        await db.set_config("blob_prune_mark", bad)
+        db._blob_prune_mark_loaded = False
+        db._blob_prune_mark = ("", 0)
+        await db._db.execute("UPDATE avg_windows SET psd_powers = x'00'")
+        await db._db.commit()
+        assert await db.prune_avg_psd_blobs(30, chunk=5, pause_sec=0) == 3, bad

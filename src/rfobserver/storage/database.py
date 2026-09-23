@@ -53,6 +53,13 @@ _WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024  # 67108864
 # avg_windows 21 ms). At 500, detections p99 was 183 ms; at 1000, 529 ms.
 # docs/debugging/2026-09-23_storage-budgeting-validation.md
 RETENTION_CHUNK_ROWS = 250
+# The blob-prune watermark is kept in the config table so a restart resumes the
+# walk instead of rescanning all stats-only history (65 min for 20 M rows on
+# nano-super). Saved at the end of each pass and every this many chunks
+# (10,000 rows at 250) so an interrupted first pass resumes near where it
+# stopped.
+BLOB_PRUNE_MARK_CONFIG_KEY = "blob_prune_mark"
+_BLOB_MARK_SAVE_EVERY_CHUNKS = 40
 # Tables row retention may delete from, and their time column.
 _RETENTION_TABLES = {
     "avg_windows": "start_time",
@@ -293,6 +300,9 @@ class SensorDatabase:
         # (start_time, rowid) up to which every avg_windows blob is known to be
         # pruned, so each hourly pass resumes instead of rescanning history.
         self._blob_prune_mark: tuple[str, int] = ("", 0)
+        # Loaded from the config table on the first pass in this process.
+        self._blob_prune_mark_loaded = False
+        self._blob_prune_mark_saved: tuple[str, int] = ("", 0)
 
     @property
     def read_only(self) -> bool:
@@ -335,6 +345,12 @@ class SensorDatabase:
         await conn.execute(f"PRAGMA journal_size_limit={_WAL_SIZE_LIMIT_BYTES}")
         await conn.execute("PRAGMA synchronous=NORMAL")
         await conn.execute("PRAGMA busy_timeout=2000")
+        # Ubuntu's SQLite is built with SECURE_DELETE on, so every freed page is
+        # also overwritten with zeros. Nulling PSD blobs with it on stalled this
+        # writer 10 to 30 s in 4 of 4 runs on nano-super; with it off, 2 of 2
+        # ran with no statement over 200 ms. Spectrum data is not sensitive.
+        # docs/debugging/2026-09-23_storage-budgeting-validation.md, section 4.5
+        await conn.execute("PRAGMA secure_delete=OFF")
 
     @staticmethod
     def _guarded_write(fn: Any) -> Any:
@@ -1561,6 +1577,38 @@ class SensorDatabase:
         self._blob_prune_mark = (rows[-1][1], rows[-1][0])
         return len(rows), int(cursor.rowcount)
 
+    async def _load_blob_prune_mark(self) -> None:
+        """Read the persisted watermark once per process. A missing or garbled
+        value falls back to a full scan from the start, which is always safe."""
+        self._blob_prune_mark_loaded = True
+        mark: tuple[str, int] = ("", 0)
+        raw = await self.get_config(BLOB_PRUNE_MARK_CONFIG_KEY)
+        if raw:
+            try:
+                value = json.loads(raw)
+                if (
+                    isinstance(value, list)
+                    and len(value) == 2
+                    and isinstance(value[0], str)
+                    and isinstance(value[1], int)
+                    and not isinstance(value[1], bool)
+                ):
+                    mark = (value[0], value[1])
+                else:
+                    logger.warning("Ignoring malformed %s: %r", BLOB_PRUNE_MARK_CONFIG_KEY, raw)
+            except ValueError:
+                logger.warning("Ignoring malformed %s: %r", BLOB_PRUNE_MARK_CONFIG_KEY, raw)
+        self._blob_prune_mark = mark
+        self._blob_prune_mark_saved = mark
+
+    async def _save_blob_prune_mark(self) -> None:
+        """Persist the watermark (one small guarded write), if it moved."""
+        mark = self._blob_prune_mark
+        if mark == self._blob_prune_mark_saved:
+            return
+        await self.set_config(BLOB_PRUNE_MARK_CONFIG_KEY, json.dumps([mark[0], mark[1]]))
+        self._blob_prune_mark_saved = mark
+
     async def prune_avg_psd_blobs(
         self, days: int = 7, *, chunk: int = RETENTION_CHUNK_ROWS, pause_sec: float = 0.05
     ) -> int:
@@ -1572,16 +1620,27 @@ class SensorDatabase:
         and a pass after the first touches only the newly expired rows. The DB
         file does not shrink (auto_vacuum=0): freed pages are reused by later
         inserts. Returns how many blobs were nulled this pass.
+
+        The watermark only ever advances past rows whose blobs were nulled and
+        committed, and is persisted (config key ``blob_prune_mark``) so a new
+        process resumes from it.
         """
+        if not self._blob_prune_mark_loaded:
+            await self._load_blob_prune_mark()
         cutoff = _retention_cutoff(days)
         pruned = 0
+        chunks = 0
         while True:
             result: tuple[int, int] = await self._prune_blob_chunk(cutoff, chunk)
             scanned, nulled = result
             pruned += nulled
+            chunks += 1
             if scanned < chunk:
                 break
+            if chunks % _BLOB_MARK_SAVE_EVERY_CHUNKS == 0:
+                await self._save_blob_prune_mark()
             await asyncio.sleep(pause_sec)
+        await self._save_blob_prune_mark()
         if pruned > 0:
             logger.info("Pruned PSD blobs for %d avg windows (cutoff: %s)", pruned, cutoff)
         return pruned

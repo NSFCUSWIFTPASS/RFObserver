@@ -13,6 +13,7 @@ import os
 import signal
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from rfobserver.storage.rollup import ROLLUP_NEWEST_KEY, ROLLUP_OLDEST_KEY, WindowRow, fold_windows
@@ -172,6 +173,16 @@ async def run(settings: AppSettings) -> None:
             raise
 
     local_storage = LocalStorage(settings.STORAGE_PATH, max_gb=settings.ARCHIVE_MAX_GB)
+
+    from rfobserver.storage.governor import DEGRADED_CONFIG_KEY, StorageGovernor
+
+    storage_governor = StorageGovernor()
+    try:
+        storage_governor.restore_degraded(await db.get_config(DEGRADED_CONFIG_KEY))
+    except Exception:
+        logger.exception("Could not read the persisted storage degraded flag")
+    retention_wake = asyncio.Event()
+
     broadcast = LiveBroadcast()
 
     # ZMS monitor (optional). Two conditions both required:
@@ -228,6 +239,7 @@ async def run(settings: AppSettings) -> None:
                 nats_producer=nats_producer,
                 replay_mode=replay_mode,
                 beacon=beacon,
+                storage_governor=storage_governor,
             )
             # Attach module manager for upstream signal processing
             proc._module_manager = ModuleManager()
@@ -290,16 +302,40 @@ async def run(settings: AppSettings) -> None:
         workers.append(asyncio.create_task(zms_monitor.run()))
     if read_db is not None:
         web_task = asyncio.create_task(
-            _run_web_server(settings, supervisor, read_db, db, broadcast, beacon, stop)
+            _run_web_server(
+                settings,
+                supervisor,
+                read_db,
+                db,
+                broadcast,
+                beacon,
+                stop,
+                storage_governor=storage_governor,
+            )
         )
         workers.append(web_task)
         workers.append(
             asyncio.create_task(
-                _heartbeat_loop(settings, supervisor, read_db, local_storage, broadcast)
+                _heartbeat_loop(
+                    settings,
+                    supervisor,
+                    read_db,
+                    local_storage,
+                    broadcast,
+                    governor=storage_governor,
+                )
             )
         )
-    if settings.DB_RETENTION_DAYS > 0:
-        workers.append(asyncio.create_task(_cleanup_loop(settings, db)))
+    # Retention always runs: even with DB_RETENTION_DAYS=0 the storage governor
+    # may need the step 2 pressure cutoffs.
+    workers.append(
+        asyncio.create_task(_cleanup_loop(settings, db, storage_governor, retention_wake))
+    )
+    workers.append(
+        asyncio.create_task(
+            _storage_loop(settings, storage_governor, db, local_storage, supervisor, retention_wake)
+        )
+    )
     if settings.PEAKS_ROLLUP_INTERVAL_SEC > 0:
         workers.append(asyncio.create_task(_rollup_loop(settings, db)))
     # Serve until a stop signal. The supervisor owns the processor task
@@ -383,6 +419,7 @@ async def _heartbeat_loop(
     local_storage: object,
     broadcast: LiveBroadcast,
     interval_sec: float = 1.0,
+    governor: Any = None,
 ) -> None:
     """Push slow-changing state to /ws/live so each page can stop polling.
 
@@ -440,6 +477,7 @@ async def _heartbeat_loop(
                     "modules": build_modules_payload(module_manager),
                     "detection_count": detection_count,
                     "capture_count": capture_count,
+                    "storage": governor.state.to_health() if governor is not None else None,
                 }
             )
         except Exception:
@@ -506,6 +544,85 @@ async def _cleanup_loop(
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(wake.wait(), timeout=settings.DB_CLEANUP_INTERVAL_SEC)
         wake.clear()
+
+
+def _active_capture_names(supervisor: Any) -> set[str]:
+    """The capture being recorded or finalized, which eviction must not take."""
+    proc = getattr(supervisor, "processor", None)
+    if proc is None or not hasattr(proc, "recording_status"):
+        return set()
+    st = proc.recording_status()
+    name = st.get("file")
+    if st.get("state") in ("recording", "finalizing") and name:
+        return {str(name)}
+    return set()
+
+
+async def _storage_tick(
+    settings: AppSettings,
+    governor: Any,
+    db: Any,
+    local_storage: Any,
+    supervisor: Any,
+    retention_wake: asyncio.Event,
+) -> None:
+    """One governor tick: sample, decide, act, persist the sticky flag."""
+    from rfobserver.storage.governor import DEGRADED_CONFIG_KEY
+
+    active = _active_capture_names(supervisor)
+    db_file, db_reusable = await db.file_stats()
+    sample = await asyncio.to_thread(
+        local_storage.sample,
+        db_path=Path(settings.DB_PATH),
+        active_names=active,
+        db_file_bytes=db_file,
+        db_reusable_bytes=db_reusable,
+    )
+    prev_step = governor.state.step
+    actions = governor.tick(
+        sample, min_free_gb=settings.DISK_MIN_FREE_GB, now=datetime.now(timezone.utc)
+    )
+    st = governor.state
+    if st.step != prev_step:
+        log = logger.warning if st.step > prev_step else logger.info
+        log(
+            "Storage step %d -> %d (%s): %.1f GB free, floor %.1f GB",
+            prev_step,
+            st.step,
+            st.to_health()["step_text"],
+            sample.data.free_bytes / 1024**3,
+            st.floor_bytes / 1024**3,
+        )
+    if actions.evict_to_free_bytes is not None:
+        await asyncio.to_thread(
+            local_storage.evict_until_free, actions.evict_to_free_bytes, exclude=active
+        )
+    if actions.start_pressure_prune:
+        retention_wake.set()
+    changed, value = governor.take_degraded_change()
+    if changed:
+        try:
+            await db.set_config(DEGRADED_CONFIG_KEY, value)
+        except Exception:
+            logger.exception("Could not persist the storage degraded flag")
+
+
+async def _storage_loop(
+    settings: AppSettings,
+    governor: Any,
+    db: Any,
+    local_storage: Any,
+    supervisor: Any,
+    retention_wake: asyncio.Event,
+) -> None:
+    """Every STORAGE_CHECK_SEC: one governor tick. A failed tick is logged and
+    the loop continues; the published state keeps its last value."""
+    while True:
+        try:
+            await _storage_tick(settings, governor, db, local_storage, supervisor, retention_wake)
+        except Exception:
+            logger.exception("Storage check failed; continuing")
+        await asyncio.sleep(max(1.0, float(settings.STORAGE_CHECK_SEC)))
 
 
 def _minute_str(when: datetime) -> str:
@@ -592,6 +709,7 @@ async def _run_web_server(
     broadcast: LiveBroadcast,
     beacon: ProgressBeacon,
     stop: asyncio.Event,
+    storage_governor: Any = None,
 ) -> None:
     """Run the FastAPI web server as an async task."""
     import uvicorn
@@ -603,6 +721,7 @@ async def _run_web_server(
     app.state.beacon = beacon
     app.state.database = database
     app.state.write_database = write_database
+    app.state.storage_governor = storage_governor
     app.state.broadcast = broadcast
     app.state.processor = supervisor.processor
 

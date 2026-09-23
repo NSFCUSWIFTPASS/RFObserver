@@ -58,6 +58,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.processor = None
     app.state.database = None
     app.state.write_database = None
+    app.state.storage_governor = None
     app.state.broadcast = None
 
     # One heavy Dashboard aggregation of each kind at a time. On a field-size DB a

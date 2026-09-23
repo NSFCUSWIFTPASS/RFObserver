@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from rfobserver.pipeline.beacon import ProgressBeacon
     from rfobserver.processing.spectral import PSDGridResult
     from rfobserver.storage.database import SensorDatabase
+    from rfobserver.storage.governor import StorageGovernor
     from rfobserver.storage.local import LocalStorage
     from rfobserver.transport.nats_producer import NatsProducer
     from rfobserver.web.websocket import LiveBroadcast
@@ -310,6 +311,7 @@ class StreamingProcessor:
         drop_on_overflow: bool = True,
         replay_mode: bool = False,
         beacon: ProgressBeacon | None = None,
+        storage_governor: StorageGovernor | None = None,
     ) -> None:
         self._receiver = receiver
         self._db = database
@@ -319,6 +321,7 @@ class StreamingProcessor:
         self._zms_monitor = zms_monitor
         self._nats_producer = nats_producer
         self._beacon = beacon
+        self._governor = storage_governor
         self._running = False
         # Live capture must never block the receiver thread, so chunks are
         # dropped when processing falls behind (the default). Offline replay of

@@ -48,7 +48,7 @@ def reg(monkeypatch: pytest.MonkeyPatch) -> _Registry:
             if self.read_only and registry.fail_reader_close:
                 raise RuntimeError("reader close failed")
 
-    async def fake_web_server(*args: Any) -> None:
+    async def fake_web_server(*args: Any, **kwargs: Any) -> None:
         registry.web_args = args
         stop = args[-1]
         assert isinstance(stop, asyncio.Event)
@@ -57,7 +57,7 @@ def reg(monkeypatch: pytest.MonkeyPatch) -> _Registry:
         await stop.wait()
         registry.web_stopped_by_event = True
 
-    async def fake_heartbeat(*args: Any) -> None:
+    async def fake_heartbeat(*args: Any, **kwargs: Any) -> None:
         await asyncio.Event().wait()
 
     async def fake_set_active(self: Any, active: bool) -> None:
@@ -215,7 +215,7 @@ async def test_cancelled_pipeline_stop_still_closes_the_dbs(reg: _Registry, tmp_
 async def test_worker_failure_propagates_after_cleanup(
     reg: _Registry, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def dying_heartbeat(*args: Any) -> None:
+    async def dying_heartbeat(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("heartbeat died")
 
     monkeypatch.setattr(app_mod, "_heartbeat_loop", dying_heartbeat)

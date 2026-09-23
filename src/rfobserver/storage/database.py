@@ -46,9 +46,13 @@ _WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024  # 67108864
 
 # Rows per retention statement. Statement size on the writer connection is what
 # starves the pipeline (the peak-finder rollup, 2026-09-21): keep each one well
-# under the ~300 ms at which chunks begin to drop. Set from a nano-super
-# measurement (docs/debugging/..., Task 9 of the storage budgeting plan).
-RETENTION_CHUNK_ROWS = 5000
+# under the ~300 ms at which chunks begin to drop. Measured on nano-super
+# (15 W, cold page cache, 27.7 GB DB: 20 M avg_windows, 2.2 M PSD blobs,
+# 10 M detections): the largest chunk whose p99 statement time is under 100 ms
+# for every retention statement is 250 (p99 detections 94 ms, blob null 38 ms,
+# avg_windows 21 ms). At 500, detections p99 was 183 ms; at 1000, 529 ms.
+# docs/debugging/2026-09-23_storage-budgeting-validation.md
+RETENTION_CHUNK_ROWS = 250
 # Tables row retention may delete from, and their time column.
 _RETENTION_TABLES = {
     "avg_windows": "start_time",

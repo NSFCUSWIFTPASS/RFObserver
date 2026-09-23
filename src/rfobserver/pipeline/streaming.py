@@ -377,6 +377,11 @@ class StreamingProcessor:
         self._recording_lost = 0
         self._recording_overflows = 0
         self._recording_gaps_truncated = False
+        # Why the current (or last) recording ended; written to the .json.
+        self._stop_reason: str | None = None
+        # The last refusal to start a recording (storage step >= 3), shown by
+        # the API and UI. Cleared by the next start that is allowed.
+        self._last_refusal: str | None = None
         # Stream-position continuity of the current recording (see
         # _write_recording_chunk): the pre-trigger ring its positions refer to,
         # and the stream position just after the file's last sample (None
@@ -556,7 +561,7 @@ class StreamingProcessor:
             # Stop any active recording, waiting for the finalize job so the
             # capture files are properly closed before threads exit.
             if self._recording_state == "recording":
-                self._request_end_recording(wait=True)
+                self._request_end_recording(wait=True, reason="shutdown")
             elif self._recording_state == "finalizing":
                 self._end_done.wait(timeout=15)
             self._recording_state = "idle"
@@ -598,10 +603,36 @@ class StreamingProcessor:
         """Opt in/out of recording during replay (manual record only)."""
         self._replay_record = bool(on)
 
+    def _recording_refusal(self) -> str | None:
+        """Why a recording may not start now, or None. Storage step >= 3:
+        free space is below the floor and nothing RFObserver can delete
+        would raise it."""
+        g = self._governor
+        if g is None:
+            return None
+        st = g.state
+        if not st.refuse_recording:
+            return None
+        h = st.to_health()
+        return (
+            f"Recording refused: free space {h['free_gb']} GB is below the "
+            f"{h['floor_gb']} GB floor (storage step {st.step}, {h['step_text']})"
+        )
+
+    def _note_refusal(self, reason: str) -> None:
+        if reason != self._last_refusal:
+            logger.warning(reason)
+        self._last_refusal = reason
+
     def start_recording(self) -> None:
         """Start recording IQ data immediately (manual mode)."""
         if self._replay_mode and not self._replay_record:
             return
+        reason = self._recording_refusal()
+        if reason is not None:
+            self._note_refusal(reason)
+            return
+        self._last_refusal = None
         with self._rec_lock:
             # "finalizing" means a finalize job still reads the recording
             # fields; beginning now would clobber them.
@@ -614,6 +645,11 @@ class StreamingProcessor:
         """Arm the power trigger — recording starts when threshold is exceeded."""
         if self._replay_mode:
             return
+        reason = self._recording_refusal()
+        if reason is not None:
+            self._note_refusal(reason)
+            return
+        self._last_refusal = None
         with self._rec_lock:
             if self._recording_state in ("recording", "finalizing"):
                 return
@@ -629,7 +665,7 @@ class StreamingProcessor:
         already wraps this in asyncio.to_thread).
         """
         if self._recording_state == "recording":
-            self._request_end_recording(wait=True)
+            self._request_end_recording(wait=True, reason="manual")
         elif self._recording_state == "finalizing":
             self._end_done.wait(timeout=15)
         self._recording_state = "idle"
@@ -656,13 +692,14 @@ class StreamingProcessor:
             except Exception:
                 logger.exception("Recording-control job failed")
 
-    def _request_end_recording(self, wait: bool) -> None:
+    def _request_end_recording(self, wait: bool, reason: str = "manual") -> None:
         """Flip recording -> finalizing and hand finalization to the control
         thread. ``wait`` (manual stop, shutdown) blocks until the job finishes;
         the receiver thread always passes wait=False and never stalls."""
         with self._rec_lock:
             if self._recording_state != "recording":
                 return
+            self._stop_reason = reason
             # Stops chunk writes (_check_trigger_and_record), which gate on the
             # exact "recording" state. Grid appends deliberately continue: they
             # gate on _grid_accepting so the rows covering the tail of the IQ,
@@ -689,6 +726,7 @@ class StreamingProcessor:
             "bytes": self._recording_bytes,
             "duration_sec": round(duration, 1),
             "dropped_chunks": self._recording_dropped,
+            "refused": self._last_refusal,
         }
 
     def receive_loss(self) -> dict[str, int]:
@@ -877,7 +915,7 @@ class StreamingProcessor:
 
             # Auto-stop on the effective max duration (RAM-derived cap in RAM mode).
             if (time.monotonic() - self._recording_start) >= self._effective_max_sec:
-                self._request_end_recording(wait=False)
+                self._request_end_recording(wait=False, reason="max_duration")
                 return
 
             # Auto-stop for trigger-initiated recordings when power drops
@@ -885,7 +923,7 @@ class StreamingProcessor:
                 if not self._check_power_above_threshold(sc16_buf):
                     self._below_threshold_count += 1
                     if self._below_threshold_count >= self._settings.TRIGGER_HYSTERESIS:
-                        self._request_end_recording(wait=False)
+                        self._request_end_recording(wait=False, reason="trigger_end")
                 else:
                     self._below_threshold_count = 0
             return
@@ -918,6 +956,12 @@ class StreamingProcessor:
 
             # If armed, check threshold to start recording
             if state == "armed" and self._check_power_above_threshold(sc16_buf):
+                reason = self._recording_refusal()
+                if reason is not None:
+                    # Stay armed: once space is back the next crossing fires.
+                    self._note_refusal(reason)
+                    return
+                self._last_refusal = None
                 self._trigger_initiated = True
                 self._begin_recording()
                 # No explicit write of this chunk: the pre-trigger read inside
@@ -1103,6 +1147,7 @@ class StreamingProcessor:
         self._recording_lost = 0
         self._recording_overflows = 0
         self._recording_gaps_truncated = False
+        self._stop_reason = None
         self._recording_wall_start = None
         self._recording_start = time.monotonic()
         self._below_threshold_count = 0
@@ -1531,6 +1576,7 @@ class StreamingProcessor:
             "time_span_sec": round(time_span, 3),
             "pre_trigger_sec": s.TRIGGER_PRE_SEC,
             "trigger_initiated": self._trigger_initiated,
+            "stopped_reason": self._stop_reason or "manual",
             "ram_buffered": s.RECORDING_RAM_BUFFER,
             "hostname": s.HOSTNAME,
             "serial": self._receiver.serial,

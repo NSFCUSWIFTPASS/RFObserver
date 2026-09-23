@@ -432,9 +432,9 @@ async def replay_record(request: Request) -> dict[str, Any]:
         proc.set_replay_recording(True)
         # begin() snapshots the pre-trigger buffer — keep it off the event loop.
         await asyncio.to_thread(proc.start_recording)
-    else:
-        await asyncio.to_thread(proc.stop_recording)
-        proc.set_replay_recording(False)
+        return _raise_if_refused(proc)
+    await asyncio.to_thread(proc.stop_recording)
+    proc.set_replay_recording(False)
     return _rec_status(proc)
 
 
@@ -444,6 +444,7 @@ async def trigger_capture(request: Request) -> dict[str, str]:
     proc = _get_processor(request)
     if proc is not None and hasattr(proc, "manual_trigger"):
         await asyncio.to_thread(proc.manual_trigger)
+        _raise_if_refused(proc)
         return {"status": "triggered"}
     return {"status": "not_supported", "detail": "Streaming mode not active"}
 
@@ -472,6 +473,16 @@ def _rec_status(proc: Any) -> dict[str, Any]:
     return result
 
 
+def _raise_if_refused(proc: Any) -> dict[str, Any]:
+    """The recording status, or 409 when storage refused the start/arm."""
+    st = _rec_status(proc)
+    refused = st.get("refused")
+    # isinstance: a MagicMock processor (web route tests) returns a truthy mock.
+    if isinstance(refused, str) and st.get("state") not in ("recording", "finalizing", "armed"):
+        raise HTTPException(status_code=409, detail=refused)
+    return st
+
+
 @router.get("/recording/status")
 async def recording_status(request: Request) -> dict[str, Any]:
     """Get current recording state."""
@@ -488,7 +499,7 @@ async def recording_start(request: Request) -> dict[str, Any]:
     if proc is not None and hasattr(proc, "start_recording"):
         # begin() snapshots the pre-trigger buffer — keep it off the event loop.
         await asyncio.to_thread(proc.start_recording)
-        return _rec_status(proc)
+        return _raise_if_refused(proc)
     return _idle_status()
 
 
@@ -498,7 +509,7 @@ async def recording_arm(request: Request) -> dict[str, Any]:
     proc = _get_processor(request)
     if proc is not None and hasattr(proc, "arm_trigger"):
         proc.arm_trigger()
-        return _rec_status(proc)
+        return _raise_if_refused(proc)
     return _idle_status()
 
 

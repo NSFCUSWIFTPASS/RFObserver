@@ -624,15 +624,22 @@ class StreamingProcessor:
             logger.warning(reason)
         self._last_refusal = reason
 
+    def _refused(self) -> bool:
+        """True (and noted) when storage refuses a recording right now;
+        otherwise clears any stale refusal and returns False."""
+        reason = self._recording_refusal()
+        if reason is not None:
+            self._note_refusal(reason)
+            return True
+        self._last_refusal = None
+        return False
+
     def start_recording(self) -> None:
         """Start recording IQ data immediately (manual mode)."""
         if self._replay_mode and not self._replay_record:
             return
-        reason = self._recording_refusal()
-        if reason is not None:
-            self._note_refusal(reason)
+        if self._refused():
             return
-        self._last_refusal = None
         with self._rec_lock:
             # "finalizing" means a finalize job still reads the recording
             # fields; beginning now would clobber them.
@@ -645,11 +652,8 @@ class StreamingProcessor:
         """Arm the power trigger — recording starts when threshold is exceeded."""
         if self._replay_mode:
             return
-        reason = self._recording_refusal()
-        if reason is not None:
-            self._note_refusal(reason)
+        if self._refused():
             return
-        self._last_refusal = None
         with self._rec_lock:
             if self._recording_state in ("recording", "finalizing"):
                 return
@@ -956,12 +960,9 @@ class StreamingProcessor:
 
             # If armed, check threshold to start recording
             if state == "armed" and self._check_power_above_threshold(sc16_buf):
-                reason = self._recording_refusal()
-                if reason is not None:
-                    # Stay armed: once space is back the next crossing fires.
-                    self._note_refusal(reason)
+                # Stay armed on refusal: once space is back the next crossing fires.
+                if self._refused():
                     return
-                self._last_refusal = None
                 self._trigger_initiated = True
                 self._begin_recording()
                 # No explicit write of this chunk: the pre-trigger read inside

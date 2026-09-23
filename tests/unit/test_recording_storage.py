@@ -407,3 +407,112 @@ async def test_sqlite_disk_full_reports_to_the_governor(tmp_path):
     stats = SimpleNamespace(average=0.0, max=0.0, median=0.0, std=0.0, kurtosis=0.0)
     await proc._persist_avg_window([1.0, 2.0], result, stats)
     assert "disk is full" in gov.state.last_write_error["error"]
+
+
+# --- no churn after a disk_floor / write_error stop (validation Finding 4) ----
+
+
+def _healthy_tick(gov: StorageGovernor) -> None:
+    gov.tick(
+        StorageSample(
+            data=VolumeSample(200 * GB, 1000 * GB),
+            db_volume=None,
+            db_file_bytes=0,
+            db_reusable_bytes=0,
+            auto_bytes=0,
+            manual_bytes=0,
+            evictable_auto=False,
+        ),
+        min_free_gb=0,
+        now=T0,
+    )
+
+
+def _disk_floor_stop(tmp_path, gov):
+    proc = _proc(tmp_path, gov, RECORDING_RAM_BUFFER=False, DISK_MIN_FREE_GB=10)
+    proc._disk_usage = lambda p: SimpleNamespace(total=1000 * GB, used=996 * GB, free=4 * GB)
+    _run_disk_recording(proc, chunks=40, n=100_000)
+    assert _only_json(proc)["stopped_reason"] == "disk_floor"
+    return proc
+
+
+def test_disk_floor_stop_holds_starts_until_the_next_governor_tick(tmp_path):
+    gov = _governor_at(0)
+    proc = _disk_floor_stop(tmp_path, gov)
+    proc.start_recording()
+    st = proc.recording_status()
+    assert st["state"] == "idle"
+    assert "held" in st["refused"] and "disk_floor" in st["refused"]
+    proc.arm_trigger()
+    assert proc.recording_status()["state"] == "idle"
+    _healthy_tick(gov)
+    proc.start_recording()
+    try:
+        assert proc.recording_status()["state"] == "recording"
+    finally:
+        proc.stop_recording()
+
+
+def test_armed_trigger_does_not_fire_during_the_hold(tmp_path):
+    gov = _governor_at(0)
+    proc = _disk_floor_stop(tmp_path, gov)
+    proc._recording_state = "armed"  # e.g. continuous re-arm on idle
+    proc._settings.TRIGGER_THRESHOLD_DB = -200.0
+    proc._check_trigger_and_record(np.full(4096, 1 << 20, dtype=np.int32), (), 0)
+    assert proc.recording_status()["state"] == "armed"
+
+
+def test_write_error_stop_holds_starts(tmp_path, monkeypatch):
+    gov = _governor_at(0)
+    proc = _proc(tmp_path, gov, RECORDING_RAM_BUFFER=False)
+    _patch_sc16_open(monkeypatch, ok=6000)
+    _run_disk_recording(proc, chunks=50)
+    assert _only_json(proc)["stopped_reason"] == "write_error"
+    proc.start_recording()
+    assert proc.recording_status()["state"] == "idle"
+    assert "write_error" in proc.recording_status()["refused"]
+
+
+def test_manual_stop_does_not_hold(tmp_path):
+    gov = _governor_at(0)
+    proc = _proc(tmp_path, gov, RECORDING_RAM_BUFFER=True, RECORDING_MAX_SEC=1.0)
+    proc.start_recording()
+    proc.stop_recording()
+    proc.start_recording()
+    try:
+        assert proc.recording_status()["state"] == "recording"
+    finally:
+        proc.stop_recording()
+
+
+def test_no_governor_no_hold_after_disk_floor(tmp_path):
+    proc = _disk_floor_stop(tmp_path, None)
+    proc.start_recording()
+    try:
+        assert proc.recording_status()["state"] == "recording"
+    finally:
+        proc.stop_recording()
+
+
+def test_two_starts_in_the_same_second_get_distinct_files(tmp_path, monkeypatch):
+    from rfobserver.pipeline import streaming
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 23, 23, 14, 15, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(streaming, "datetime", _Frozen)
+    proc = _proc(tmp_path, None, RECORDING_RAM_BUFFER=True, RECORDING_MAX_SEC=1.0)
+    names = []
+    for _ in range(3):
+        proc.start_recording()
+        proc._write_recording_chunk(np.ones(1000, dtype=np.int32))
+        names.append(proc.recording_status()["file"])
+        proc.stop_recording()
+    files = sorted(p.name for p in proc._storage.manual_dir.glob("*.sc16"))
+    assert len(set(names)) == 3 and len(files) == 3
+    assert names[1].endswith("20260923T231415-2.sc16")
+    assert names[2].endswith("20260923T231415-3.sc16")
+    jsons = [p for p in proc._storage.manual_dir.glob("*.json")]
+    assert len(jsons) == 3

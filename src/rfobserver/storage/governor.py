@@ -166,11 +166,19 @@ class StorageGovernor:
         )
         self._good_ticks = 0
         self._degraded_dirty = False
+        self._ticks = 0
 
     @property
     def state(self) -> StorageState:
         with self._lock:
             return self._state
+
+    @property
+    def ticks(self) -> int:
+        """Completed ticks since start; only ever increases. The recorder uses
+        it to wait for a fresh storage check after a disk_floor/write_error stop."""
+        with self._lock:
+            return self._ticks
 
     def tick(self, sample: StorageSample, *, min_free_gb: float, now: datetime) -> StorageActions:
         with self._lock:
@@ -202,6 +210,7 @@ class StorageGovernor:
             if step >= 3 and st.step < 3 and degraded_since is None:
                 degraded_since = now
                 self._degraded_dirty = True
+            self._ticks += 1
             self._state = replace(
                 st,
                 step=step,

@@ -396,6 +396,11 @@ class StreamingProcessor:
         # The last refusal to start a recording (storage step >= 3), shown by
         # the API and UI. Cleared by the next start that is allowed.
         self._last_refusal: str | None = None
+        # After a recording ends for disk_floor or write_error: (governor tick
+        # count at that moment, reason). New starts are held until the governor
+        # completes a later tick, so continuous triggering cannot start and
+        # abort capture after capture before the next storage check.
+        self._storage_hold: tuple[int, str] | None = None
         # Stream-position continuity of the current recording (see
         # _write_recording_chunk): the pre-trigger ring its positions refer to,
         # and the stream position just after the file's last sample (None
@@ -620,18 +625,27 @@ class StreamingProcessor:
     def _recording_refusal(self) -> str | None:
         """Why a recording may not start now, or None. Storage step >= 3:
         free space is below the floor and nothing RFObserver can delete
-        would raise it."""
+        would raise it. Also held after a disk_floor/write_error stop until
+        the governor's next tick."""
         g = self._governor
         if g is None:
             return None
         st = g.state
-        if not st.refuse_recording:
-            return None
-        h = st.to_health()
-        return (
-            f"Recording refused: free space {h['free_gb']} GB is below the "
-            f"{h['floor_gb']} GB floor (storage step {st.step}, {h['step_text']})"
-        )
+        if st.refuse_recording:
+            h = st.to_health()
+            return (
+                f"Recording refused: free space {h['free_gb']} GB is below the "
+                f"{h['floor_gb']} GB floor (storage step {st.step}, {h['step_text']})"
+            )
+        hold = self._storage_hold
+        if hold is not None:
+            if g.ticks <= hold[0]:
+                return (
+                    f"Recording held: the last capture stopped for {hold[1]}; "
+                    "waiting for the next storage check"
+                )
+            self._storage_hold = None
+        return None
 
     def _note_refusal(self, reason: str) -> None:
         if reason != self._last_refusal:
@@ -1139,6 +1153,18 @@ class StreamingProcessor:
         for idx, lost in _preroll_gaps(logged, start, end, written):
             self._add_recording_gap(idx, lost, overflow=True)
 
+    def _unique_capture_name(self, stem: str) -> str:
+        """``<stem>.sc16``, or ``<stem>-2.sc16``, ``-3`` ... when a capture of
+        that name exists in auto/ or manual/: two starts in one second would
+        otherwise overwrite the first (and share its iq_captures row)."""
+        dirs = (self._storage.auto_dir, self._storage.manual_dir)
+        name = f"{stem}.sc16"
+        n = 1
+        while any((d / name).exists() for d in dirs):
+            n += 1
+            name = f"{stem}-{n}.sc16"
+        return name
+
     def _begin_recording(self) -> None:
         """Start recording: allocate the RAM buffer or start the disk writer.
 
@@ -1157,10 +1183,12 @@ class StreamingProcessor:
         if self._replay_mode and not self._replay_record:
             return
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        self._recording_file = f"{self._receiver.serial}-{self._settings.HOSTNAME}-{ts}.sc16"
         # Triggered/continuous captures -> auto/ (FIFO); manual/replay -> manual/.
         self._recording_dir = (
             self._storage.auto_dir if self._trigger_initiated else self._storage.manual_dir
+        )
+        self._recording_file = self._unique_capture_name(
+            f"{self._receiver.serial}-{self._settings.HOSTNAME}-{ts}"
         )
         self._recording_bytes = 0
         self._recording_dropped = 0
@@ -1325,6 +1353,9 @@ class StreamingProcessor:
         try:
             self._finalize_recording()
         finally:
+            # Set before "idle", so a continuous re-arm already sees the hold.
+            if self._governor is not None and self._stop_reason in ("disk_floor", "write_error"):
+                self._storage_hold = (self._governor.ticks, self._stop_reason)
             self._recording_state = "idle"
             self._end_done.set()
 

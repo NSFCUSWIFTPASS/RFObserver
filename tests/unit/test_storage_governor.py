@@ -240,3 +240,10 @@ def test_describe_write_error():
         "ENOSPC: No space left on device"
     )
     assert describe_write_error(ValueError("bad")) == "ValueError: bad"
+
+
+def test_ticks_count_every_completed_tick():
+    gov = StorageGovernor()
+    assert gov.ticks == 0
+    _run(gov, _s(200), _s(40), _s(200))
+    assert gov.ticks == 3

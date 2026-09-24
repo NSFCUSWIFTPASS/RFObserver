@@ -322,6 +322,45 @@ def test_step_text_changes_while_evicting_young_but_step_and_status_do_not():
     assert h["last_young_eviction"] == (T0 + timedelta(seconds=20)).isoformat()
 
 
+def test_evicting_young_at_step_3_or_4_keeps_the_steps_own_text():
+    """A young eviction can be reported while the step later escalates (a
+    capture finished and was evicted, then the volume still ran out and hit
+    step 3/4): the operator must still see "recordings refused" etc., not the
+    young-eviction wording, or a real step-3/4 emergency reads as routine."""
+    gov = StorageGovernor()
+    _run(gov, _s(40, evictable=False), _s(40, evictable=False))  # step 3
+    gov.note_young_evictions(1, 42.0, T0 + timedelta(seconds=25))
+    h = gov.state.to_health()
+    assert h["step"] == 3
+    assert h["step_text"] == "recordings refused"
+    assert h["evicting_young"] is True  # still reported, just not in step_text
+    assert h["young_evictions"] == 1
+
+    gov2 = StorageGovernor()
+    _run(gov2, _s(20, evictable=False))  # step 4
+    gov2.note_young_evictions(1, 42.0, T0 + timedelta(seconds=25))
+    h2 = gov2.state.to_health()
+    assert h2["step"] == 4
+    assert h2["step_text"] == "PSD history writes stopped"
+    assert h2["evicting_young"] is True
+
+
+def test_evicting_young_at_step_0_after_recovery_keeps_healthy_text():
+    """A young eviction can still be within its 30-minute window when the
+    volume recovers to step 0: the plain "healthy" text must show, not the
+    young-eviction wording, even though evicting_young is still true."""
+    gov = StorageGovernor()
+    _run(gov, _s(40))  # step 1
+    gov.note_young_evictions(1, 42.0, T0 + timedelta(seconds=20))
+    _run(gov, _s(60), _s(60), _s(60))  # 3 ticks to recover to step 0
+    st = gov.state
+    assert st.step == 0
+    assert st.evicting_young is True  # window has not lapsed yet
+    h = st.to_health()
+    assert h["step_text"] == "healthy"
+    assert h["evicting_young"] is True
+
+
 def test_window_lapse_on_a_later_tick_clears_evicting_young():
     gov = StorageGovernor()
     _run(gov, _s(40))

@@ -140,7 +140,15 @@ class StorageState:
                 "free_gb": _gb(s.db_volume.free_bytes),
                 "floor_gb": _gb(self.db_floor_bytes),
             }
-        step_text = EVICTING_YOUNG_STEP_TEXT if self.evicting_young else STEP_TEXT[self.step]
+        # Only step 1's own text is replaced: at step >= 2 (or 0, after recovery)
+        # the plain step text still matters and must not be hidden behind the
+        # young-eviction wording for up to YOUNG_EVICTION_WINDOW_SEC. The
+        # evicting_young flag and the dashboard banner still carry the warning.
+        step_text = (
+            EVICTING_YOUNG_STEP_TEXT
+            if self.evicting_young and self.step == 1
+            else STEP_TEXT[self.step]
+        )
         return {
             "free_gb": _gb(s.data.free_bytes) if s else None,
             "floor_gb": _gb(self.floor_bytes) if s else None,
@@ -246,14 +254,12 @@ class StorageGovernor:
                 self._degraded_dirty = True
 
             evicting_young = st.evicting_young
+            window_lapsed = False
             if evicting_young and st.last_young_eviction is not None:
                 elapsed = (now - st.last_young_eviction).total_seconds()
                 if elapsed >= YOUNG_EVICTION_WINDOW_SEC:
                     evicting_young = False
-                    logger.info(
-                        "Storage: no young evictions in %d min; evicting_young warning cleared",
-                        YOUNG_EVICTION_WINDOW_SEC // 60,
-                    )
+                    window_lapsed = True
 
             self._ticks += 1
             self._state = replace(
@@ -269,10 +275,16 @@ class StorageGovernor:
 
             target = int(floor * RECOVERY_MARGIN)
             evict = step >= 1 and sample.evictable_auto and data.free_bytes < target
-            return StorageActions(
+            actions = StorageActions(
                 evict_to_free_bytes=target if evict else None,
                 start_pressure_prune=st.step < 2 <= step,
             )
+        if window_lapsed:
+            logger.info(
+                "Storage: no young evictions in %d min; evicting_young warning cleared",
+                YOUNG_EVICTION_WINDOW_SEC // 60,
+            )
+        return actions
 
     def report_write_error(self, message: str, now: datetime | None = None) -> None:
         when = now or datetime.now(timezone.utc)

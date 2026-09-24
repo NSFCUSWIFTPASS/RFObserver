@@ -648,6 +648,11 @@ async def _storage_tick(
                 sample.data.free_bytes / 1024**3,
                 st.floor_bytes / 1024**3,
             )
+            # A fresh timestamp, not `started`: eviction runs after the tick's
+            # own `now` (governor.tick() above) and can take a while under
+            # asyncio.to_thread, so the window that note_young_evictions and
+            # the later tick() compare against should start from when the
+            # evictions actually happened, not when this tick began.
             governor.note_young_evictions(
                 len(young),
                 min(age for _, age in young),

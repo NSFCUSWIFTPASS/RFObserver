@@ -8,13 +8,29 @@ compressed ``.npz`` which materialized the whole grid.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Write ``text`` to ``<path>.tmp`` and rename it over ``path``. On a full
+    disk the open would otherwise leave a truncated, often 0-byte, file behind;
+    here a failure removes the tmp and leaves no file at all. Raises OSError."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
 
 
 def grid_paths(sc16_path: Path) -> tuple[Path, Path]:
@@ -64,7 +80,7 @@ def write_meta(
     }
     if cal_offset_db is not None:
         meta["cal_offset_db"] = float(cal_offset_db)
-    meta_path.write_text(json.dumps(meta))
+    write_text_atomic(meta_path, json.dumps(meta))
 
 
 def load_grid(sc16_path: Path) -> tuple[np.ndarray[Any, np.dtype[Any]], dict[str, Any]] | None:

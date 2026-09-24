@@ -110,6 +110,7 @@ async def test_replay_mode_deferred_sidecar_uses_grid_path(tmp_path, monkeypatch
     monkeypatch.setattr(sidecar_mod, "write_sidecar", db_mock)
 
     sc16 = tmp_path / "cap.sc16"
+    sc16.write_bytes(b"")  # the sidecar is skipped for a capture that is gone
     await proc._deferred_sidecar(sc16, 0)
 
     grid_mock.assert_called_once()

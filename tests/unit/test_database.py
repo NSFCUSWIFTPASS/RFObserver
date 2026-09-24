@@ -1410,3 +1410,20 @@ async def test_reader_snapshot_stays_fresh_between_scan_chunks(tmp_path, monkeyp
         if reader is not None:
             await reader.close()
         await writer.close()
+
+
+async def _secure_delete(conn) -> int:
+    async with conn.execute("PRAGMA secure_delete") as cur:
+        return int((await cur.fetchone())[0])
+
+
+async def test_writer_disables_secure_delete_on_connect_and_reconnect(db):
+    """secure_delete zero-fills every freed blob page; with it on, blob nulling
+    stalled the writer 10 to 30 s on nano-super (validation doc, 4.5)."""
+    assert await _secure_delete(db._db) == 0
+    corpse = db._db
+    try:
+        await db._reconnect(expect=corpse)
+        assert await _secure_delete(db._db) == 0
+    finally:
+        await corpse.close()

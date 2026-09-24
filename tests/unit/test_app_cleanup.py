@@ -15,6 +15,9 @@ class _FakeDB:
         self.calls.append(days)
         return 0
 
+    async def delete_older_than(self, table: str, days: int) -> int:
+        return 0
+
 
 async def test_cleanup_loop_invokes_prune_with_retention_days():
     settings = AppSettings(_env_file=None)

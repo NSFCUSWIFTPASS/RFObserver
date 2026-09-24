@@ -17,11 +17,13 @@ rows instead of the whole history.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
 import logging
 import math
-from datetime import datetime, timedelta
+import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -41,6 +43,35 @@ _DB_WRITE_TIMEOUT_SEC = 30.0
 # The WAL is truncated back to this size whenever a checkpoint lets it rewind,
 # so a burst of growth (e.g. behind a long reader snapshot) is not kept forever.
 _WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024  # 67108864
+
+# Rows per retention statement. Statement size on the writer connection is what
+# starves the pipeline (the peak-finder rollup, 2026-09-21): keep each one well
+# under the ~300 ms at which chunks begin to drop. Measured on nano-super
+# (15 W, cold page cache, 27.7 GB DB: 20 M avg_windows, 2.2 M PSD blobs,
+# 10 M detections): the largest chunk whose p99 statement time is under 100 ms
+# for every retention statement is 250 (p99 detections 94 ms, blob null 38 ms,
+# avg_windows 21 ms). At 500, detections p99 was 183 ms; at 1000, 529 ms.
+# docs/debugging/2026-09-23_storage-budgeting-validation.md
+RETENTION_CHUNK_ROWS = 250
+# The blob-prune watermark is kept in the config table so a restart resumes the
+# walk instead of rescanning all stats-only history (65 min for 20 M rows on
+# nano-super). Saved at the end of each pass and every this many chunks
+# (10,000 rows at 250) so an interrupted first pass resumes near where it
+# stopped.
+BLOB_PRUNE_MARK_CONFIG_KEY = "blob_prune_mark"
+_BLOB_MARK_SAVE_EVERY_CHUNKS = 40
+# Tables row retention may delete from, and their time column.
+_RETENTION_TABLES = {
+    "avg_windows": "start_time",
+    "detections": "start_time",
+    "avg_minutes": "minute_start",
+}
+
+
+def _retention_cutoff(days: int) -> str:
+    """Same naive-UTC ISO form prune_avg_psd_blobs has always compared with."""
+    return (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)).isoformat()
+
 
 _INSERT_DETECTION_SQL = """INSERT OR IGNORE INTO detections
    (burst_id, start_time, stop_time, center_freq_hz, bandwidth_hz,
@@ -266,6 +297,12 @@ class SensorDatabase:
         self._db: aiosqlite.Connection | None = None
         self._write_timeout = _DB_WRITE_TIMEOUT_SEC
         self._reconnect_lock = asyncio.Lock()
+        # (start_time, rowid) up to which every avg_windows blob is known to be
+        # pruned, so each hourly pass resumes instead of rescanning history.
+        self._blob_prune_mark: tuple[str, int] = ("", 0)
+        # Loaded from the config table on the first pass in this process.
+        self._blob_prune_mark_loaded = False
+        self._blob_prune_mark_saved: tuple[str, int] = ("", 0)
 
     @property
     def read_only(self) -> bool:
@@ -308,6 +345,12 @@ class SensorDatabase:
         await conn.execute(f"PRAGMA journal_size_limit={_WAL_SIZE_LIMIT_BYTES}")
         await conn.execute("PRAGMA synchronous=NORMAL")
         await conn.execute("PRAGMA busy_timeout=2000")
+        # Ubuntu's SQLite is built with SECURE_DELETE on, so every freed page is
+        # also overwritten with zeros. Nulling PSD blobs with it on stalled this
+        # writer 10 to 30 s in 4 of 4 runs on nano-super; with it off, 2 of 2
+        # ran with no statement over 200 ms. Spectrum data is not sensitive.
+        # docs/debugging/2026-09-23_storage-budgeting-validation.md, section 4.5
+        await conn.execute("PRAGMA secure_delete=OFF")
 
     @staticmethod
     def _guarded_write(fn: Any) -> Any:
@@ -571,14 +614,15 @@ class SensorDatabase:
         pwr_median: float,
         pwr_std: float,
         kurtosis: float,
-        powers: list[float],
+        powers: list[float] | None,
         interference: bool | None = None,
         violations: bytes | None = None,
     ) -> None:
         """Persist one DURATION_SEC-averaged window. ``powers`` is stored as a
         little-endian float32 BLOB (raw dBFS)."""
         assert self._db is not None
-        psd_blob = np.asarray(powers, dtype="<f4").tobytes()
+        # None (storage step 4) keeps the stats row but stores no PSD blob.
+        psd_blob = None if powers is None else np.asarray(powers, dtype="<f4").tobytes()
         await self._db.execute(
             """INSERT INTO avg_windows
                (start_time, duration_sec, sdr_center_freq_hz, sample_rate_hz,
@@ -1509,25 +1553,151 @@ class SensorDatabase:
         await self._db.commit()
 
     @_guarded_write
-    async def prune_avg_psd_blobs(self, days: int = 7) -> int:
+    async def _prune_blob_chunk(self, cutoff: str, limit: int) -> tuple[int, int]:
+        """Null one chunk of blobs after the watermark. Returns (rows scanned, nulled)."""
+        assert self._db is not None
+        after_time, after_rowid = self._blob_prune_mark
+        async with self._db.execute(
+            "SELECT rowid, start_time FROM avg_windows "
+            "WHERE start_time < ? AND (start_time, rowid) > (?, ?) "
+            "ORDER BY start_time, rowid LIMIT ?",
+            (cutoff, after_time, after_rowid, limit),
+        ) as cur:
+            rows = list(await cur.fetchall())
+        if not rows:
+            return 0, 0
+        ids = [r[0] for r in rows]
+        marks = ",".join("?" * len(ids))
+        cursor = await self._db.execute(
+            "UPDATE avg_windows SET psd_powers = NULL, violations = NULL "
+            f"WHERE rowid IN ({marks}) AND psd_powers IS NOT NULL",
+            ids,
+        )
+        await self._db.commit()
+        self._blob_prune_mark = (rows[-1][1], rows[-1][0])
+        return len(rows), int(cursor.rowcount)
+
+    async def _load_blob_prune_mark(self) -> None:
+        """Read the persisted watermark once per process. A missing or garbled
+        value falls back to a full scan from the start, which is always safe."""
+        self._blob_prune_mark_loaded = True
+        mark: tuple[str, int] = ("", 0)
+        raw = await self.get_config(BLOB_PRUNE_MARK_CONFIG_KEY)
+        if raw:
+            try:
+                value = json.loads(raw)
+                if (
+                    isinstance(value, list)
+                    and len(value) == 2
+                    and isinstance(value[0], str)
+                    and isinstance(value[1], int)
+                    and not isinstance(value[1], bool)
+                ):
+                    mark = (value[0], value[1])
+                else:
+                    logger.warning("Ignoring malformed %s: %r", BLOB_PRUNE_MARK_CONFIG_KEY, raw)
+            except ValueError:
+                logger.warning("Ignoring malformed %s: %r", BLOB_PRUNE_MARK_CONFIG_KEY, raw)
+        self._blob_prune_mark = mark
+        self._blob_prune_mark_saved = mark
+
+    async def _save_blob_prune_mark(self) -> None:
+        """Persist the watermark (one small guarded write), if it moved. A
+        failed save is logged and the pass continues: the stored mark is
+        older but still correct, so a restart merely rescans a little."""
+        mark = self._blob_prune_mark
+        if mark == self._blob_prune_mark_saved:
+            return
+        try:
+            await self.set_config(BLOB_PRUNE_MARK_CONFIG_KEY, json.dumps([mark[0], mark[1]]))
+        except Exception:
+            logger.exception("Could not persist the blob-prune watermark; continuing")
+            return
+        self._blob_prune_mark_saved = mark
+
+    async def prune_avg_psd_blobs(
+        self, days: int = 7, *, chunk: int = RETENTION_CHUNK_ROWS, pause_sec: float = 0.05
+    ) -> int:
         """Evict the PSD blobs of averaged windows older than ``days`` days.
 
         Only the heavy ``psd_powers``/``violations`` blobs are nulled out; the
-        cheap stats row (and detections, stats, tone_checks) is kept
-        permanently. A pruned window still answers the light query and its
-        detail endpoint (with ``powers: null``): at ~8 KB per window the blob
-        is ~98% of the row's storage, so this bounds the DB file without
-        losing any statistics. Returns how many blobs were nulled this pass.
+        cheap stats row is kept (row retention is delete_older_than). Walks the
+        start_time index in chunks from a watermark, so each statement is small
+        and a pass after the first touches only the newly expired rows. The DB
+        file does not shrink (auto_vacuum=0): freed pages are reused by later
+        inserts. Returns how many blobs were nulled this pass.
+
+        The watermark only ever advances past rows whose blobs were nulled and
+        committed, and is persisted (config key ``blob_prune_mark``) so a new
+        process resumes from it.
         """
-        assert self._db is not None
-        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-        cursor = await self._db.execute(
-            "UPDATE avg_windows SET psd_powers = NULL, violations = NULL "
-            "WHERE start_time < ? AND psd_powers IS NOT NULL",
-            (cutoff,),
-        )
-        await self._db.commit()
-        pruned: int = cursor.rowcount
+        if not self._blob_prune_mark_loaded:
+            await self._load_blob_prune_mark()
+        cutoff = _retention_cutoff(days)
+        pruned = 0
+        chunks = 0
+        while True:
+            result: tuple[int, int] = await self._prune_blob_chunk(cutoff, chunk)
+            scanned, nulled = result
+            pruned += nulled
+            chunks += 1
+            if scanned < chunk:
+                break
+            if chunks % _BLOB_MARK_SAVE_EVERY_CHUNKS == 0:
+                await self._save_blob_prune_mark()
+            await asyncio.sleep(pause_sec)
+        await self._save_blob_prune_mark()
         if pruned > 0:
             logger.info("Pruned PSD blobs for %d avg windows (cutoff: %s)", pruned, cutoff)
         return pruned
+
+    @_guarded_write
+    async def _delete_older_chunk(self, table: str, cutoff: str, limit: int) -> int:
+        assert self._db is not None
+        col = _RETENTION_TABLES[table]
+        cursor = await self._db.execute(
+            f"DELETE FROM {table} WHERE rowid IN "
+            f"(SELECT rowid FROM {table} WHERE {col} < ? ORDER BY {col} LIMIT ?)",
+            (cutoff, limit),
+        )
+        await self._db.commit()
+        return int(cursor.rowcount)
+
+    async def delete_older_than(
+        self,
+        table: str,
+        days: int,
+        *,
+        chunk: int = RETENTION_CHUNK_ROWS,
+        pause_sec: float = 0.05,
+    ) -> int:
+        """Delete rows of ``table`` older than ``days`` days, ``chunk`` rows per
+        statement with a pause between, so the pipeline's inserts interleave.
+        Raises KeyError for a table outside _RETENTION_TABLES."""
+        _RETENTION_TABLES[table]  # validate before building any SQL
+        cutoff = _retention_cutoff(days)
+        total = 0
+        while True:
+            n: int = await self._delete_older_chunk(table, cutoff, chunk)
+            total += n
+            if n < chunk:
+                break
+            await asyncio.sleep(pause_sec)
+        if total:
+            logger.info("Retention: deleted %d %s rows older than %d days", total, table, days)
+        return total
+
+    async def file_stats(self) -> tuple[int, int]:
+        """(DB file plus WAL bytes, bytes of free pages reusable without growth)."""
+        assert self._db is not None
+        async with self._db.execute("PRAGMA page_size") as cur:
+            page_row = await cur.fetchone()
+        page_size = int(page_row[0]) if page_row is not None else 0
+        async with self._db.execute("PRAGMA freelist_count") as cur:
+            free_row = await cur.fetchone()
+        free_pages = int(free_row[0]) if free_row is not None else 0
+        size = 0
+        for suffix in ("", "-wal"):
+            with contextlib.suppress(OSError):
+                size += os.stat(self._db_path + suffix).st_size
+        return size, page_size * free_pages

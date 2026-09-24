@@ -58,6 +58,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.processor = None
     app.state.database = None
     app.state.write_database = None
+    app.state.storage_governor = None
     app.state.broadcast = None
 
     # One heavy Dashboard aggregation of each kind at a time. On a field-size DB a
@@ -116,6 +117,14 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 "overflow_lost_samples": loss["overflow_lost_samples"] if loss else None,
             }
             if sup.gave_up:
+                body["status"] = "degraded"
+        gov = getattr(app.state, "storage_governor", None)
+        if gov is not None:
+            st = gov.state
+            body["storage"] = st.to_health()
+            # Steps 1-2 are the system working as designed: reported, not
+            # degraded. Step >= 3 or the sticky flag is degraded.
+            if st.degraded:
                 body["status"] = "degraded"
         return body
 

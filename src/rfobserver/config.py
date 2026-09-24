@@ -116,11 +116,24 @@ class AppSettings(BaseSettings):
     # reverting to the default.
     HISTORY_DAYS: int = 7
     # Scheduled DB retention: PSD blobs of averaged windows older than
-    # DB_RETENTION_DAYS are nulled out (the cheap stats rows, detections, and
-    # tone_checks are kept permanently) every DB_CLEANUP_INTERVAL_SEC
-    # (0 disables the retention loop).
+    # DB_RETENTION_DAYS are nulled out every DB_CLEANUP_INTERVAL_SEC; stats
+    # rows, detections and minute rollups expire after STATS_RETENTION_DAYS
+    # (tone_checks are kept permanently). The loop always runs; the interval
+    # is clamped to at least 60 s (pipeline/app.py:_cleanup_loop).
     DB_RETENTION_DAYS: int = 7
     DB_CLEANUP_INTERVAL_SEC: float = 3600.0
+    # Storage budgeting (docs/superpowers/specs/2026-09-23-storage-budgeting-design.md).
+    # Free space RFObserver defends on STORAGE_PATH's volume (and on DB_PATH's,
+    # if that is a different device). 0 = auto: 5% of the volume, at least 2 GB.
+    # Below it, automatic captures are evicted oldest first, then PSD history and
+    # detections are pruned harder, then recordings are refused, then PSD blobs
+    # stop being written. Manual captures are never deleted.
+    DISK_MIN_FREE_GB: float = 0.0
+    # Rows of avg_windows (stats), detections and avg_minutes older than this
+    # are deleted (0 disables). DB_RETENTION_DAYS still governs the PSD blobs.
+    STATS_RETENTION_DAYS: int = 730
+    # How often the storage governor samples the disk.
+    STORAGE_CHECK_SEC: float = 10.0
     # How often the avg_minutes rollup folds newly closed minutes and advances
     # its backfill of older history (0 disables the rollup, which disables the
     # Dashboard's peak finder). The work per tick is bounded by a span and a

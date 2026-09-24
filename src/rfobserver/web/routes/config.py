@@ -123,6 +123,9 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "num_fft_bins": ("NUM_FFT_BINS", int),
         "archive_max_gb": ("ARCHIVE_MAX_GB", float),
         "history_days": ("DB_RETENTION_DAYS", int),
+        "disk_min_free_gb": ("DISK_MIN_FREE_GB", float),
+        "stats_retention_days": ("STATS_RETENTION_DAYS", int),
+        "storage_check_sec": ("STORAGE_CHECK_SEC", float),
         # Sensor identity + location (all optional — empty input clears)
         "sensor_name": ("SENSOR_NAME", str),
         "latitude": ("LATITUDE", float),

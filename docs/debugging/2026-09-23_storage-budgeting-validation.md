@@ -540,3 +540,31 @@ check. Covered by `test_a_tick_in_flight_at_the_stop_does_not_release_the_hold`.
 longer cleared on read (that raced the recording-control thread); the comparison alone decides.
 Also since then: a failed save of `blob_prune_mark` is logged and the prune pass continues (the
 stored mark stays older but correct).
+
+### FOLLOW-UP 2026-09-23 (final branch review)
+
+Two further defects were found by the final whole-branch code review, not on hardware. Both are
+fixed in code with unit tests; neither has been re-run on hardware yet.
+
+- **I1: the storage tick could evict the capture being recorded.** `_storage_tick` took the
+  active-capture snapshot once, then awaited `db.file_stats()` (which can queue 10-30 s behind the
+  writer) and the threaded sample before `evict_until_free` re-globbed `auto/`. A capture begun in
+  that window was neither excluded nor counted as non-evictable. Now `evict_until_free` takes
+  `exclude_fn` (re-evaluated right before each delete) and `not_after` (the tick's start time);
+  any `auto/` `.sc16` with mtime at or after `not_after` is neither evicted nor counted evictable
+  by `sample()`. Also `_delete_capture` sizes with `_size_or_zero`, so a concurrent delete by
+  `enforce_cap` cannot abort eviction.
+- **I2: an abandoned writer could corrupt or falsely fail the next recording.** Finalize gives
+  the disk writer 10 s, then drops its handle; all recordings shared one queue and one
+  `_writer_error`, so a still-blocked old writer could consume the next recording's chunks and
+  sentinel and flag it as failed. Each recording now gets its own queue and a generation number;
+  the writer reads only its queue, sets `_writer_error` / `_disk_floor_hit` only while its
+  generation is current, and exits once superseded and drained.
+- Minors in the same wave: a RAM-mode flush failure now applies the start hold; a failing
+  `file_stats` no longer skips the tick (sampled as 0 bytes); a failed persist of the degraded
+  pair is retried on the next tick, persists are serialized by a lock so an older write cannot
+  land after a newer one, and the clear route writes the governor's values after the clear
+  instead of hard-coded blanks.
+
+Open: a hardware re-run with a hung or slow storage volume (I2), and a tick under a slow DB with
+continuous triggering (I1).

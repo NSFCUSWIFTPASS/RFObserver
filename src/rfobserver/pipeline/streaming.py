@@ -1655,7 +1655,11 @@ class StreamingProcessor:
         by re-running burst detection on the recorded PSD grid instead of
         querying the DB.
         """
-        from rfobserver.storage.detections_sidecar import write_sidecar, write_sidecar_from_grid
+        from rfobserver.storage.detections_sidecar import (
+            sidecar_path,
+            write_sidecar,
+            write_sidecar_from_grid,
+        )
 
         try:
             await asyncio.sleep(grace)
@@ -1677,6 +1681,18 @@ class StreamingProcessor:
                 await asyncio.to_thread(write_sidecar_from_grid, sc16_path, cfg)
             elif self._db is not None:
                 await write_sidecar(sc16_path, self._db)
+            else:
+                return
+            if not sc16_path.exists():
+                # Evicted while the sidecar was being built (the DB query or the
+                # re-detection takes long enough for a storage tick to land):
+                # the sidecar just written is an orphan.
+                with contextlib.suppress(OSError):
+                    sidecar_path(sc16_path).unlink()
+                logger.debug(
+                    "Capture %s was evicted during its sidecar write; removed the sidecar",
+                    sc16_path.name,
+                )
         except Exception:
             logger.exception("Detections sidecar write failed for %s", sc16_path.name)
 

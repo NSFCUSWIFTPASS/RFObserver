@@ -627,6 +627,34 @@ async def test_sidecar_is_skipped_when_the_capture_was_evicted(tmp_path, monkeyp
     assert written == [kept]
 
 
+@pytest.mark.parametrize("replay", [False, True])
+async def test_sidecar_is_removed_when_the_capture_is_evicted_during_its_write(
+    tmp_path, monkeypatch, replay
+):
+    """Task 12 item 1: the eviction lands after the grace check but while the
+    sidecar is being built (the DB query); the finished sidecar is an orphan."""
+    from rfobserver.storage import detections_sidecar
+
+    def build_and_evict(sc16_path):
+        sc16_path.unlink()  # evicted while the query / re-detection runs
+        sc16_path.with_suffix(".detections.json").write_text("[]")
+
+    async def fake_write_sidecar(sc16_path, db):
+        build_and_evict(sc16_path)
+
+    def fake_write_sidecar_from_grid(sc16_path, cfg):
+        build_and_evict(sc16_path)
+
+    monkeypatch.setattr(detections_sidecar, "write_sidecar", fake_write_sidecar)
+    monkeypatch.setattr(detections_sidecar, "write_sidecar_from_grid", fake_write_sidecar_from_grid)
+    proc = _proc(tmp_path, None)
+    proc._replay_mode = replay
+    sc16 = proc._storage.auto_dir / "a.sc16"
+    sc16.write_bytes(b"\0" * 8)
+    await proc._deferred_sidecar(sc16, 0.0)
+    assert list(proc._storage.auto_dir.iterdir()) == []
+
+
 # --- F8: recording_status "refused" is current -------------------------------
 
 

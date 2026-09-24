@@ -568,3 +568,364 @@ fixed in code with unit tests; neither has been re-run on hardware yet.
 
 Open: a hardware re-run with a hung or slow storage volume (I2), and a tick under a slow DB with
 continuous triggering (I1).
+
+## 10. Hardware re-verification (2026-09-24)
+
+### 10.1 The question
+
+Date: 2026-09-24. Build: `feat/storage-budgeting` at `fd4094d` ("fix(storage): young-eviction
+text only overrides step 1"), run from the worktree `~/rfobs-storage` (clean, `rfobserver.__file__`
+= `/home/ocollaco/rfobs-storage/src/rfobserver/__init__.py` in every run log). Same box and SDR as
+section 1: nano-super, 15 W profile, SQLite 3.37.2, B200mini `322750B`. Scratch dir `~/rfobs-val2/`
+(now deleted).
+
+Do the fixes from section 9 and the FOLLOW-UP (F1 `secure_delete=OFF`, F2 persisted prune
+watermark, F4 start hold and `-2` names, I1 live-capture protection, I2 per-recording writer
+queues) and the new step 1 young-eviction warning behave on the hardware as they do in the unit
+tests; and does the section 4.6 ENOSPC path still behave?
+
+### 10.2 The answer
+
+All seven probes pass. F1 is confirmed with a control: forcing `secure_delete=ON` back on the
+writer reproduced the 30 s stalls in 2 of 2 runs, the shipped `OFF` ran 2 of 2 with no operation
+over 200 ms. F2 resumed a killed pass exactly at the saved mark and a restart after a completed
+pass scanned 0 rows. F4 started zero captures between the `disk_floor` stop and the storage tick,
+and a same-second manual start got `-2`. I1 held for 10 min of steady-state step 1 plus 6 min with
+the tick's `file_stats` delayed 4 s (0 active captures evicted in 264 rotations). I2 was reproduced
+with a FIFO and the next recording was unaffected. The young-eviction warning turns on, counts,
+leaves `status` "ok", and clears. Four new gaps are under 10.6 Findings; the main one is that the
+section 7 item 7 fix (orphaned `.detections.json`) still leaves orphans through a check-then-write
+race (7 orphans in about 270 evictions).
+
+### 10.3 Procedure (probes in the order run)
+
+Every server ran through a launcher (`launch.py`) that only instruments: it logs
+`PRAGMA secure_delete` as read back on every writer connection (connect and `_reconnect`), every
+aiosqlite operation over 200 ms (`VALTRACE slow ...`, as in 4.4), and per blob-prune pass the
+loaded mark, chunks, rows scanned, nulled and wall time. Two opt-in switches were used only where
+stated: `VAL_SECURE_DELETE_ON=1` (control runs: re-issues `PRAGMA secure_delete=ON` after
+`_configure_writer`) and a file `~/rfobs-val2/slow_file_stats` holding N (delays
+`SensorDatabase.file_stats` by N s), plus `VAL_YOUNG_WINDOW_SEC` (overrides the module constant
+`governor.YOUNG_EVICTION_WINDOW_SEC`). No product file was edited. `RFOBS_WEB_PORT=8888
+RFOBS_SENSOR_ACTIVE=true RFOBS_PEAKS_ROLLUP_INTERVAL_SEC=0` throughout; stopped with
+`fuser -k 8888/tcp`.
+
+| # | Probe | What it isolates / controls for |
+|---|---|---|
+| 1 | Seed 2,000,000 stats-only `avg_windows` rows (700 to 30 days old) then 100,000 rows with 8192 B blobs (20 to 8 days old); 1.32 GB. Copy kept as the A/B source | A first pass that must walk 2 M rows before nulling 100 K blobs |
+| 2 | Mock pipeline on it, cold cache; poll `config.blob_prune_mark` every 1 s; `fuser -k` (SIGKILL) once the mark passes rowid 1,000,000 | F2: a kill mid-pass, then what the restart loads |
+| 3 | Restart on the same DB, cold; let the pass finish; `/api/health` every 5 s from the workstation; afterwards gaps between consecutive `avg_windows.start_time` of rows written during the pass | F2 resume; F1 with the shipped code on a full pass |
+| 4 | Restart again after the completed pass | F2: no rescan |
+| 5 | A/B x2 on fresh copies, mark preset to the last stats-only row so the pass only nulls the 100 K blobs; order ON, OFF, OFF, ON; `drop_caches` before each | F1: whether the stall follows `secure_delete`, on the same day, same device, same data (the control is what makes "no stall" mean something) |
+| 6 | B200mini 2 Msps, continuous trigger (-300 dB), `RECORDING_MAX_SEC=10`, floor 10 GB, default `STORAGE_CHECK_SEC=10`; mid-recording `fallocate` a filler leaving 4 GiB; watch status every 0.1 s | F4 hold: captures between the writer's `disk_floor` stop and the tick |
+| 7 | Same DB, no trigger; POST start, stop, wait for idle, start, timed to begin right after a second boundary; up to 5 tries | F4 unique names |
+| 8 | B200mini 4 Msps, continuous trigger, `RECORDING_MAX_SEC=2`, floor 10 GB, `STORAGE_CHECK_SEC=2`; 2.6 GB of `auto/` captures, then filler to 9 GiB free; 10 min steady state; health every 2 s; screenshots | I1 and the young-eviction warning in the section 7 item 3 steady state |
+| 9 | Same run, `slow_file_stats` = 4 for 6 min | I1 proper: a capture starting between the tick's active snapshot and its eviction |
+| 10 | Restart with `VAL_YOUNG_WINDOW_SEC=120`; wait for a young eviction; remove the filler | The INFO clear line without waiting 30 min |
+| 11 | B200mini 2 Msps, no trigger; pre-create FIFOs named `<stem>.psd` in `manual/` for the next 6 s, POST start (A), remove the unused FIFOs, stop A after 3 s, start B, open a reader on A's FIFO 3 s into B, stop B | I2: A's writer blocks in `open(<A>.psd)` (the writer opens the `.sc16`, then the grid); finalize abandons it; B starts while it is still blocked; then both writers run at once |
+| 12 | 256 MB tmpfs as `STORAGE_PATH` (DB on the NVMe), 2 Msps, `DISK_MIN_FREE_GB=0.001`, `RECORDING_MAX_SEC=0`, `STORAGE_CHECK_SEC=2`, manual start; then restart on the same DB | Section 4.6 regression: real ENOSPC |
+
+Screenshots (headless Chrome via puppeteer, session scratchpad): `young-dashboard.png`,
+`young-config.png`.
+
+### 10.4 Evidence
+
+**F1, runtime pragma** (every writer connection in every run, including after `_reconnect`):
+
+```
+14:13:01,689 valtrace WARNING VALTRACE writer connection configured: PRAGMA secure_delete=0 (/home/ocollaco/rfobs-val2/p12/p12.db)
+```
+
+**F1, A/B on the blob phase** (100,000 blobs, pipeline running, cold, chunk 250):
+
+| Run | Writer | Pass wall time | Ops over 200 ms | `_guarded_write` abandons | insert failures | Max `avg_windows` gap | Max beacon age | nvme timeouts in dmesg |
+|---|---|---|---|---|---|---|---|---|
+| abon | `secure_delete=1` (control) | 129.1 s | 24, max 29,991 ms | 2 | 2 x `insert_detections failed for 68 bursts` | 32.2 s | 30.8 s | 14:22:25, 14:23:05 |
+| aboff | `0` (shipped) | 24.0 s | 0 | 0 | 0 | 0.719 s | 1.0 s or less | none |
+| off2 | `0` (shipped) | 24.1 s | 0 | 0 | 0 | 0.708 s | 1.0 s or less | none |
+| on2 | `secure_delete=1` (control) | 72.0 s | 12, max 30,001 ms | 2 (`_prune_blob_chunk`, `insert_detections`) | `avg-window persist failed (chunk #127)` | 33.1 s | 26.6 s | 14:26:51 |
+
+```
+abon:
+14:22:52,173 VALTRACE slow _execute(commit) 29991 ms:
+14:22:52,174 rfobserver.storage.database ERROR DB write _prune_blob_chunk stuck >30s -- abandoning connection
+14:22:52,177 VALTRACE writer connection configured: PRAGMA secure_delete=1 (/home/ocollaco/rfobs-val2/p12/abon.db)
+14:22:52,342 VALTRACE slow _execute(execute) 29523 ms: INSERT INTO avg_windows
+14:22:54,351 rfobserver.pipeline.streaming ERROR insert_detections failed for 68 bursts; skipping
+14:24:07,222 VALTRACE prune pass end: chunks=401 scanned=100000 nulled=99500 wall=129.1s
+aboff:
+14:24:42,140 VALTRACE writer connection configured: PRAGMA secure_delete=0 (/home/ocollaco/rfobs-val2/p12/aboff.db)
+14:25:06,745 VALTRACE prune pass end: chunks=401 scanned=100000 nulled=100000 wall=24.0s
+dmesg:
+[Thu Sep 24 14:22:25 2026] nvme nvme0: I/O 762 QID 5 timeout, completion polled
+[Thu Sep 24 14:23:05 2026] nvme nvme0: I/O 89 QID 6 timeout, completion polled
+[Thu Sep 24 14:26:51 2026] nvme nvme0: I/O 16 QID 5 timeout, completion polled
+```
+
+(Product log lines with an em-dash are rendered `--` here.) The full first pass with the shipped
+code (runs 1 and 2 below, 2.1 M rows scanned, 100 K nulled) also had 0 operations over 200 ms,
+beacon age never above 1.0 s, and `avg_windows` gaps of median 0.575 s, max 0.729 s.
+
+**F2, kill mid-pass and resume:**
+
+```
+run1 14:13:02,388 VALTRACE prune pass start: mark=('', 0) cutoff=2026-09-17T14:13:02.388185
+     14:13:22 blob_prune_mark = ["2024-11-23T17:47:47.095104+00:00", 90000]
+kill 14:16:39.36 blob_prune_mark = ["2025-09-24T14:11:47.095104+00:00", 1000000] (updated_at 14:16:38)
+     fuser -k 8888/tcp
+run2 14:16:48,488 VALTRACE prune pass start: mark=('2025-09-24T14:11:47.095104+00:00', 1000000)
+     14:20:48,033 VALTRACE prune pass end: chunks=4401 scanned=1100000 nulled=100000 wall=239.5s mark=('2026-09-16T14:12:05.671104+00:00', 2100000)
+     14:20:48,033 INFO Pruned PSD blobs for 100000 avg windows (cutoff: 2026-09-17T14:16:48.488026)
+run3 14:21:19,643 VALTRACE prune pass start: mark=('2026-09-16T14:12:05.671104+00:00', 2100000)
+     14:21:19,646 VALTRACE prune pass end: chunks=1 scanned=0 nulled=0 wall=0.0s
+```
+
+The restart resumed exactly at the last saved mark (saves every 40 chunks; the kill landed on a
+save, so nothing was rescanned; in general up to 10,000 rows would be). About 4,600 rows/s scan
+rate, so the full 2.1 M pass would have been about 7.7 min; the post-completion restart took 3 ms.
+
+**F4, hold after `disk_floor`** (filler `fallocate`d 14:29:20.602 to 14:29:21.498, 4.0 GiB left):
+
+```
+14:29:22,179 WARNING Free space 3.98 GB below half the 10.00 GB floor: ending the recording
+14:29:23,022 INFO Recording saved: ...142916.sc16 (57152000 bytes, 6.8s, ...)
+14:29:23,406 WARNING Recording held: the last capture stopped for disk_floor; waiting for the next storage check
+14:29:25,999 WARNING Storage step 0 -> 4 (PSD history writes stopped): 4.0 GB free, floor 10.0 GB
+14:29:26,094 WARNING Recording refused: free space 4.0 GB is below the 10.0 GB floor (storage step 4, ...)
+status (0.1 s poll):
+14:29:22.428 {"state": "finalizing", "file": "...142916.sc16", "bytes": 57152000, "refused": null}
+14:29:23.351 {"state": "idle", ..., "refused": "Recording held: the last capture stopped for disk_floor; waiting for the next storage check"}
+14:29:23.675 {"state": "armed", ..., "refused": "Recording held: ..."}
+```
+
+Zero captures started in the 3.8 s between the stop and the tick (section 4.7: five). After the
+filler was removed (14:30:11.9) the step went 4 -> 0 at 14:30:40,285 and the next capture started
+at 14:30:40,527. No duplicate name in any `Recording started` line of the run.
+
+**F4, same-second name** (5th try):
+
+```
+14:32:06,054 INFO Recording started (disk): 322750B-nano-super-20260924T143206.sc16
+14:32:06,473 INFO Recording saved: 322750B-nano-super-20260924T143206.sc16 (9638400 bytes, 0.3s, ...)
+14:32:07,047 INFO Recording started (disk): 322750B-nano-super-20260924T143206-2.sc16
+14:32:08,700 INFO Recording saved: 322750B-nano-super-20260924T143206-2.sc16 (14553600 bytes, 1.6s, ...)
+iq_captures:
+(15, '322750B-nano-super-20260924T143206.sc16', 'manual', '2026-09-24T14:32:05.024703+00:00', 1.205, 2409600)
+(16, '322750B-nano-super-20260924T143206-2.sc16', 'manual', '2026-09-24T14:32:05.988696+00:00', 1.819, 3638400)
+```
+
+Both keep their own `.json` (`total_bytes` 9638400 and 14553600), `.psd`, `.psd.json` and
+`.detections.json`.
+
+**I1, steady state** (filler to 9 GiB at 14:35:10.5; 2.6 GB, 34 captures in `auto/`):
+
+```
+14:35:12,955 WARNING Storage step 0 -> 1 (evicting the oldest automatic captures): 9.0 GB free, floor 10.0 GB
+14:35:14,875 WARNING Storage floor: evicted 2.5 GB of automatic captures
+```
+
+Checker over the log (a rotation of a name that had `Recording started` and no `Recording saved`
+yet counts as evicting the active capture) and over `auto/` at the end:
+
+```
+10 min steady state (14:35:10 to 14:45:20):
+starts=151 saved=151 rotations=183 evicted_active=0 []
+zero_byte_sc16=[] orphan_json=[] orphan_detections=6
+error lines=0
+file_stats delayed 4 s (14:45:41 to 14:51:31):
+starts=81 saved=81 rotations=81 evicted_active=0 []
+zero_byte_sc16=[] orphan_json=[] orphan_detections=6 (the same six)
+error lines=0
+delayed ticks 53; ticks with a capture started inside the delayed window 51
+```
+
+One of those ticks, traced:
+
+```
+14:45:55,595 VALTRACE file_stats delayed 4.0 s                       <- tick starts; snapshot empty of 144556
+14:45:56,628 Recording started (disk): ...144556.sc16
+14:45:59,566 Recording saved: ...144556.sc16
+14:45:59,596 Recording started (disk): ...144559.sc16                   <- active at eviction
+14:45:59,669 Rotated old capture: ...144548.sc16                       <- the only eviction this tick
+14:46:05,814 Rotated old capture: ...144556.sc16                       <- next tick
+14:46:12,723 Rotated old capture: ...144559.sc16                       <- after it was saved at 14:46:04,847
+```
+
+`144556` (saved but mtime after the tick start) was kept by `not_after`, `144559` (begun after the
+snapshot, recording) by `exclude_fn`/`not_after`. No writer errors, no 0-byte `.sc16`, no `.json`
+without its `.sc16`.
+
+**Young-eviction warning** (same run):
+
+```
+14:35:14,900 WARNING Storage floor: evicted 33 automatic captures within 10 minutes of recording (...143251.sc16 139 s, ..., ...143505.sc16 5 s); free 9.0 GB, floor 10.0 GB
+14:35:14,906 rfobserver.storage.governor WARNING Storage floor: evicting automatic captures within 600 s of recording (youngest 5 s); this warning stays up for 30 min
+14:45:12,192 WARNING Storage floor: evicted 1 automatic captures within 10 minutes of recording (...144507.sc16 2 s); free 11.4 GB, floor 10.0 GB
+```
+
+150 per-check WARNING lines in the 10 min; the turn-on WARNING once. Health (349 samples at 2 s):
+293 `("ok", step 1, evicting_young true, degraded_since null, "deleting automatic captures minutes
+after they are recorded")`, 1 `("ok", step 1, false, null, "evicting the oldest automatic
+captures")` (the tick before the first eviction finished), 55 at step 0 before the filler; never
+`degraded`; max beacon age 1.9 s. `young_evictions` 36 at 14:35:24, 101 at 14:39:34, 184 at
+14:45:26. One verbatim sample:
+
+```
+14:44:01 {"status":"ok",...,"storage":{"free_gb":11.4,"floor_gb":10.0,"volume_gb":467.0,"db_gb":0.0,"db_reusable_gb":0.0,"auto_gb":0.2,"manual_gb":0.0,"step":1,"step_text":"deleting automatic captures minutes after they are recorded","step_since":"2026-09-24T14:35:12.954924+00:00","last_write_error":null,"degraded_since":null,"db_volume":null,"evicting_young":true,"young_evictions":163,"last_young_eviction":"2026-09-24T14:44:01.003145+00:00"}}
+```
+
+UI, from headless Chrome:
+
+```
+/live/ #storage-banner (class "storage-banner", visible):
+  Storage
+  Step 1: deleting automatic captures minutes after they are recorded. 11.4 GB free, minimum 10 GB. Automatic captures are being deleted within minutes of recording (39 in the last 30 minutes). Free up space or lower Archive Max to keep them.
+/config #storage-legend:
+  Manual 0 GB · Automatic 0.1 GB · Database 0 GB · Other 455.5 GB · Free 11.4 of 467 GB · Minimum free 10 GB · Step 1: deleting automatic captures minutes after they are recorded · Deleting captures soon after recording
+```
+
+Clear, with the window overridden to 120 s (filler removed 14:53:34):
+
+```
+VALTRACE YOUNG_EVICTION_WINDOW_SEC overridden to 120
+14:53:34,124 rfobserver.storage.governor WARNING Storage floor: evicting automatic captures within 600 s of recording (youngest 4 s); this warning stays up for 2 min
+14:53:44,129 INFO Storage step 1 -> 0 (healthy): 427.8 GB free, floor 10.0 GB
+14:55:35,378 rfobserver.storage.governor INFO Storage: no young evictions in 2 min; evicting_young warning cleared
+health: {"status":"ok",...,"step":0,"step_text":"healthy",...,"degraded_since":null,...,"evicting_young":false,"young_evictions":19,"last_young_eviction":"2026-09-24T14:53:34.124259+00:00"}
+```
+
+The clear came 121.3 s after the last young eviction (first tick past the window). With the
+shipped 1800 s constant the clear was not observed on hardware.
+
+**I2, abandoned writer:**
+
+```
+14:56:18,350 INFO Recording started (disk): 322750B-nano-super-20260924T145618.sc16      (A; <A>.psd is a FIFO)
+14:56:32,398 ERROR Recording writer did not exit; abandoning writer thread
+14:56:32,404 WARNING IQ bytes on disk (0) differ from bytes queued (34214400); reporting the file
+14:56:32,422 WARNING PSD grid rows on disk (0) differ from rows queued (4176); reporting the file
+14:56:32,509 INFO Recording saved: 322750B-nano-super-20260924T145618.sc16 (0 bytes, 4.1s, ...)
+14:56:32,877 WARNING A previous recording's writer is still blocked; the new recording uses its own queue and writer
+14:56:32,923 INFO Recording started (disk): 322750B-nano-super-20260924T145632.sc16      (B)
+14:56:35.976 reader opened on A's FIFO (A's writer unblocks while B records)
+14:56:41,132 INFO Recording saved: 322750B-nano-super-20260924T145632.sc16 (66982400 bytes, 8.1s, 0 dropped, 0 grid rows dropped, ...)
+
+B .json: duration_sec 8.373, total_bytes 66982400, total_samples 16745600, stopped_reason manual, write_failed false, write_error None
+B .psd 66977792 bytes = 8176 rows x 2048 bins x 4 B (matches "PSD data saved ... (8176 rows)")
+A .sc16 afterwards: 34214400 bytes (= A's bytes queued); A's grid drained through the FIFO: 34209792 bytes = 4176 rows
+"Recording write failed" lines: 0
+```
+
+A's writer wrote exactly A's queued data and none of B's; B finished clean. Stop A took 11.2 s
+(the 10 s join timeout).
+
+**Regression, real ENOSPC on tmpfs:**
+
+```
+14:57:27,442 INFO Recording started (disk): 322750B-nano-super-20260924T145727.sc16
+14:57:43,918 ERROR Recording write failed (ENOSPC: No space left on device); ending the recording
+14:57:44,494 ERROR Write failed: 322750B-nano-super-20260924T145727.sc16: ENOSPC: No space left on device
+14:57:44,570 ERROR Write failed: 322750B-nano-super-20260924T145727.psd.json: ENOSPC: No space left on device
+14:57:44,624 ERROR Write failed: 322750B-nano-super-20260924T145727.sc16 metadata .json: ENOSPC: No space left on device
+14:57:44,646 INFO Recording saved: ...145727.sc16 (135921664 bytes, 17.1s, 0 dropped, 0 grid rows dropped, 13 overflow gaps (13 samples lost))
+14:57:44,781 WARNING Storage step 0 -> 4 (PSD history writes stopped): 0.0 GB free, floor 0.0 GB
+14:57:47,889 ERROR Detections sidecar write failed for 322750B-nano-super-20260924T145727.sc16
+
+manual/: 0 322750B-nano-super-20260924T145727.detections.json
+         132513792 ...145727.psd
+         135921664 ...145727.sc16        (no .json, no .psd.json)
+iq_captures: ('322750B-nano-super-20260924T145727.sc16', 'manual', 16.99, 33980416)
+config: ('storage_degraded', '2026-09-24T14:57:44.511041+00:00')
+        ('storage_last_write_error', '{"at": "2026-09-24T14:57:44.635382+00:00", "error": "...145727.sc16 metadata .json: ENOSPC: No space left on device"}')
+POST /api/recording/start -> 409 {"detail":"Recording refused: free space 0.0 GB is below the 0.0 GB floor (storage step 4, PSD history writes stopped)"}
+14:57:56,733 INFO TIMING recv#200: recv=187.1ms dropped=0 (IQ=204.8ms) handoff_dropped=0/0 ovf=25 lost=25
+after restart: {"status":"degraded",...,"step":4,...,"last_write_error":{"at":"2026-09-24T14:57:44.635382+00:00","error":"...145727.sc16 metadata .json: ENOSPC: No space left on device"},"degraded_since":"2026-09-24T14:57:44.511041+00:00",...}
+```
+
+`135921664 % 4 == 0`, 33,980,416 samples = 16.99 s at 2 Msps, file-derived. No 0-byte `.json` or
+`.psd.json` (section 7 item 5 fixed); `last_write_error` now survives the restart (item 6 fixed).
+`stopped_reason: write_error` cannot be read back, since no `.json` exists; the reason is in the
+log line and `last_write_error`. The pipeline kept running (TIMING lines, beacon 0.5 s).
+
+### 10.5 Measured and REJECTED (do not retry)
+
+- **Throttling the capture volume to reproduce I2.** This kernel (5.15.185-tegra) has no
+  `dm-delay`, `dm-flakey`, `dm-dust` or `CONFIG_BLK_DEV_THROTTLING` (`dmsetup targets`: verity,
+  crypt, striped, linear, error), so a slow loop device or cgroup `io.max` is not available.
+  `fsfreeze` on a loop ext4 was considered and not used: the finalize's own `.json` write would
+  block on the frozen volume too, so the next recording could not start while the old writer was
+  still blocked. A FIFO at `<stem>.psd` blocks only the writer (the finalize never opens the
+  `.psd`, it only stats it, and `_unique_capture_name` checks only `.sc16`, so no suffix is added).
+- **"No stall in one OFF run" as evidence for F1.** Without a same-day control it could just be a
+  quiet NVMe; the ON control runs are what show the stall is still reproducible on this box today.
+
+### 10.6 Findings (not fixed here; for the controller to route)
+
+1. **Orphaned `.detections.json` still happens (section 7 item 7 is only partly fixed).**
+   `_deferred_sidecar` checks `sc16_path.exists()` after the 3 s grace, then awaits the DB query
+   in `write_sidecar`; an eviction landing between the check and the write leaves the sidecar
+   behind. 1 orphan in probe 6 (`142916`), 6 in the 183 evictions of probe 8. Traced:
+
+   ```
+   14:36:52,898 Recording saved: ...143649.sc16            (grace ends about 14:36:55.9, check passes)
+   14:36:56,254 Rotated old capture: ...143649.sc16
+   ...143649.detections.json 120606 bytes, mtime 14:36:56.584
+   ```
+
+   The window is the `write_sidecar` query time (0.3 to 0.7 s here), so it bites exactly in the
+   young-eviction steady state.
+2. **An abandoned writer's capture is recorded as empty and never corrected.** In probe 11 A's
+   `.json` and `iq_captures` row say `duration_sec 0.0, total_bytes 0, total_samples 0,
+   write_failed false`, and there is no `.psd.json`, but the writer later wrote the full
+   34,214,400 bytes to A's `.sc16` (and its grid). Nothing flags A as incomplete at finalize
+   (`write_failed` is false with 0 bytes on disk against 34 MB queued), and nothing updates the
+   metadata once the writer finishes. I2's goal (B not corrupted or falsely failed) holds.
+3. **`young_evictions` is cumulative for as long as evictions keep coming, but the banner says
+   "(N in the last 30 minutes)".** From the code (`note_young_evictions`: the count restarts only
+   when the previous young eviction is 30 min old), a sensor that stays in this steady state for
+   hours reports every eviction since it began. Not observed wrong on hardware (the 10 min run
+   stayed inside one window: 184 in 10 min, all within 30 min); code reading only.
+4. **Slow DB operations of 1 to 6.5 s while the real SDR records continuously, no retention
+   running.** Runs with the B200mini and disk captures on the same NVMe had operations over 1 s
+   (probe 6: 6, max 6,488 ms; probe 7: 15, max 4,738 ms; probe 8: 23, max 2,218 ms; probe 10: 29,
+   max 2,074 ms), mostly a `fetchall` paired with an `INSERT INTO avg_windows` or `iq_captures`,
+   on a DB under 0.1 GB, with no nvme timeout in dmesg after 14:26:51. Mock runs had none. The same
+   runs show PSD workers saturated at 15 W (`PROC chunk#600: process=579.9ms latency=1279.8ms
+   (IQ=204.8ms)`), so CPU/GIL starvation and page-cache writeback of the capture stream are both
+   candidates; not isolated. None reached the 30 s guard, and beacon age stayed under 2 s.
+
+Observations, not defects: at step 4 the eviction also turns `evicting_young` on (probe 6: the
+`disk_floor` capture evicted 4 s after it was saved); `step_text` stays the step 4 text, as
+`fd4094d` intends. The control runs' "Pruned PSD blobs for 99500" (and 99750) undercount: 0 blobs
+were left, because the retry after an abandoned commit found the rows already nulled by the
+abandoned connection's commit.
+
+### 10.7 Measurement traps hit
+
+- **`pkill -f` on the workstation killed the calling shell** (exit 144) because the pattern was in
+  its own command line; use `pkill -f "[b]eacon.sh"`.
+- **Health `free_gb` lags a fill by up to one tick.** At 14:29:24 health still read 427.8 GB, 2.5 s
+  after the filler; it is the last tick's sample.
+- **The delayed `file_stats` stretches the tick period** from 2 s to about 6 s in probe 9; captures
+  then wait about two ticks before eviction, which is the point of that probe, not a regression.
+- **Wall time of a pass includes the retries.** The ON control's 129 s includes two 30 s waits;
+  compare operations over 200 ms and gaps, not only wall time.
+- **Mark save granularity.** The kill in probe 2 happened to land right after a save; the resume
+  point can trail by up to 40 chunks (10,000 rows) in general.
+
+### 10.8 Open, not yet answered
+
+- Section 8's field-scale questions are unchanged: F1 was measured at 100 K blobs on the mock
+  pipeline, not millions of blobs at 56 Msps or on the field NVMe.
+- The shipped 30 min young-eviction clear was not observed (only with the window overridden to
+  120 s).
+- I2 was reproduced with a blocked `open()`, not with a writer blocked mid-`write()` on a slow
+  device; the latter needs a kernel with `dm-delay` or block throttling.
+- The cause of Finding 4 (CPU starvation vs writeback contention).
+
+### 10.9 Cleanup
+
+`~/rfobs-val2` (DBs, captures, fillers, logs, launcher) deleted; tmpfs unmounted; no `launch.py`
+or `rfobserver` process and nothing on 8888; `/` back to 430 G available. `~/rfobs-replay-data`,
+`~/rfobs-stall`, `~/rfobs-stalltest`, `~/GitHub/RFObserver` (branch `feat/averaged-window-store`,
+`stash@{0}` intact) and the `~/rfobs-storage` worktree (clean at `fd4094d`) were not modified.

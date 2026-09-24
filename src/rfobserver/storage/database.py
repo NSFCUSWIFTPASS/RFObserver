@@ -1602,11 +1602,17 @@ class SensorDatabase:
         self._blob_prune_mark_saved = mark
 
     async def _save_blob_prune_mark(self) -> None:
-        """Persist the watermark (one small guarded write), if it moved."""
+        """Persist the watermark (one small guarded write), if it moved. A
+        failed save is logged and the pass continues: the stored mark is
+        older but still correct, so a restart merely rescans a little."""
         mark = self._blob_prune_mark
         if mark == self._blob_prune_mark_saved:
             return
-        await self.set_config(BLOB_PRUNE_MARK_CONFIG_KEY, json.dumps([mark[0], mark[1]]))
+        try:
+            await self.set_config(BLOB_PRUNE_MARK_CONFIG_KEY, json.dumps([mark[0], mark[1]]))
+        except Exception:
+            logger.exception("Could not persist the blob-prune watermark; continuing")
+            return
         self._blob_prune_mark_saved = mark
 
     async def prune_avg_psd_blobs(

@@ -527,3 +527,16 @@ were re-measured on nano-super; the numbers in sections 4 and 7 are from before 
 Open after these fixes: whether `secure_delete=OFF` removes the stalls at field scale and on the
 field NVMe (unchanged from section 8), and a hardware re-run of the section 4.7 churn probe with
 the hold in place.
+
+### CORRECTION 2026-09-23 (to section 9, item 4)
+
+Item 4's "Known limit" misstated the churn bound as "at most one capture per storage tick". The
+hold as first committed (fd44666) released on the first tick to complete after the stop, and that
+tick could have taken its sample before the stop, so one extra churned capture could still start
+per `disk_floor` or `write_error` event. The hold now lasts while `governor.ticks <= hold + 1` and
+releases at `ticks >= hold + 2`. Ticks run one at a time from one loop, so the second tick to
+complete after the stop must have begun after it: zero extra captures before a fresh storage
+check. Covered by `test_a_tick_in_flight_at_the_stop_does_not_release_the_hold`. The hold is no
+longer cleared on read (that raced the recording-control thread); the comparison alone decides.
+Also since then: a failed save of `blob_prune_mark` is logged and the prune pass continues (the
+stored mark stays older but correct).

@@ -445,7 +445,39 @@ def test_disk_floor_stop_holds_starts_until_the_next_governor_tick(tmp_path):
     assert "held" in st["refused"] and "disk_floor" in st["refused"]
     proc.arm_trigger()
     assert proc.recording_status()["state"] == "idle"
+    # The first tick to complete may have started before the stop: still held.
     _healthy_tick(gov)
+    proc.start_recording()
+    assert proc.recording_status()["state"] == "idle"
+    assert "held" in proc.recording_status()["refused"]
+    # The second must have started after it: released.
+    _healthy_tick(gov)
+    proc.start_recording()
+    try:
+        assert proc.recording_status()["state"] == "recording"
+    finally:
+        proc.stop_recording()
+
+
+def test_a_tick_in_flight_at_the_stop_does_not_release_the_hold(tmp_path):
+    """A tick whose sample was taken before the stop completes after it; its
+    stale sample must not release the hold (validation Finding 4 race)."""
+    gov = _governor_at(0)
+    pre_stop = StorageSample(
+        data=VolumeSample(200 * GB, 1000 * GB),
+        db_volume=None,
+        db_file_bytes=0,
+        db_reusable_bytes=0,
+        auto_bytes=0,
+        manual_bytes=0,
+        evictable_auto=False,
+    )  # sampled before the stop, while free space still looked fine
+    proc = _disk_floor_stop(tmp_path, gov)
+    gov.tick(pre_stop, min_free_gb=0, now=T0)  # the in-flight tick completes
+    proc.start_recording()
+    assert proc.recording_status()["state"] == "idle"
+    assert "held" in proc.recording_status()["refused"]
+    _healthy_tick(gov)  # a tick that began after the stop
     proc.start_recording()
     try:
         assert proc.recording_status()["state"] == "recording"

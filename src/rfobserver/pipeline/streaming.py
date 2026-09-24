@@ -398,7 +398,7 @@ class StreamingProcessor:
         self._last_refusal: str | None = None
         # After a recording ends for disk_floor or write_error: (governor tick
         # count at that moment, reason). New starts are held until the governor
-        # completes a later tick, so continuous triggering cannot start and
+        # completes a tick that began after the stop, so continuous triggering cannot start and
         # abort capture after capture before the next storage check.
         self._storage_hold: tuple[int, str] | None = None
         # Stream-position continuity of the current recording (see
@@ -637,14 +637,15 @@ class StreamingProcessor:
                 f"Recording refused: free space {h['free_gb']} GB is below the "
                 f"{h['floor_gb']} GB floor (storage step {st.step}, {h['step_text']})"
             )
+        # Held until the second tick to complete after the stop: ticks run one
+        # at a time from one loop, so the first may have sampled before the
+        # stop, but the second began after it.
         hold = self._storage_hold
-        if hold is not None:
-            if g.ticks <= hold[0]:
-                return (
-                    f"Recording held: the last capture stopped for {hold[1]}; "
-                    "waiting for the next storage check"
-                )
-            self._storage_hold = None
+        if hold is not None and g.ticks <= hold[0] + 1:
+            return (
+                f"Recording held: the last capture stopped for {hold[1]}; "
+                "waiting for the next storage check"
+            )
         return None
 
     def _note_refusal(self, reason: str) -> None:

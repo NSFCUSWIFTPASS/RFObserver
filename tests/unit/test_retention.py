@@ -303,3 +303,18 @@ async def test_cleanup_loop_interval_0_does_not_hot_loop(with_wake):
     with contextlib.suppress(asyncio.CancelledError):
         await task
     assert len(d.calls) == 4  # exactly one pass: blobs, detections, windows, minutes
+
+
+async def test_a_failed_mark_save_does_not_abort_the_pass(db, monkeypatch):
+    from rfobserver.storage import database
+
+    monkeypatch.setattr(database, "_BLOB_MARK_SAVE_EVERY_CHUNKS", 1)
+    now = datetime.utcnow()
+    for i in range(12):
+        await _window(db, now - timedelta(days=40, minutes=i))
+
+    async def fail(key, value):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(db, "set_config", fail)
+    assert await db.prune_avg_psd_blobs(30, chunk=5, pause_sec=0) == 12

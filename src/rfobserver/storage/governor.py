@@ -1,8 +1,10 @@
 """Storage governor: keeps the storage volume above a free-space floor.
 
 Pure decisions over a sampled StorageSample: nothing here touches the
-filesystem or the DB. pipeline/app.py:_storage_loop samples, ticks, and
-carries out the returned actions; consumers read the published state.
+filesystem or the DB, except persist_degraded_change, which writes the sticky
+flag through the caller's DB handle. pipeline/app.py:_storage_loop samples,
+ticks, and carries out the returned actions; consumers read the published
+state.
 Design: docs/superpowers/specs/2026-09-23-storage-budgeting-design.md
 
 The ladder (cumulative; leaving any step needs free >= floor x 1.15 for
@@ -16,6 +18,7 @@ RECOVERY_TICKS consecutive ticks):
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import json
 import sqlite3
@@ -170,6 +173,9 @@ class StorageGovernor:
         self._good_ticks = 0
         self._degraded_dirty = False
         self._ticks = 0
+        # Serializes persisting the sticky flag (the storage loop and the
+        # clear route), so an older write can never land after a newer one.
+        self.persist_lock = asyncio.Lock()
 
     @property
     def state(self) -> StorageState:
@@ -281,6 +287,11 @@ class StorageGovernor:
                 last_write_error=error if error is not None else st.last_write_error,
             )
 
+    def mark_degraded_dirty(self) -> None:
+        """Persisting the last change failed: the next take returns it again."""
+        with self._lock:
+            self._degraded_dirty = True
+
     def take_degraded_change(self) -> tuple[bool, dict[str, str]]:
         """(changed since last call, config values to persist). The values map
         DEGRADED_CONFIG_KEY to an ISO time or "" and LAST_WRITE_ERROR_CONFIG_KEY
@@ -296,6 +307,23 @@ class StorageGovernor:
                 DEGRADED_CONFIG_KEY: since.isoformat() if since else "",
                 LAST_WRITE_ERROR_CONFIG_KEY: json.dumps(err) if err else "",
             }
+
+
+async def persist_degraded_change(governor: StorageGovernor, db: Any) -> None:
+    """Write the sticky flag and its reason if they changed since the last
+    write. The values are taken under ``persist_lock`` so writes land in
+    order; a failed write marks the change dirty again (the next storage tick
+    retries it) and re-raises."""
+    async with governor.persist_lock:
+        changed, values = governor.take_degraded_change()
+        if not changed:
+            return
+        try:
+            for key, value in values.items():
+                await db.set_config(key, value)
+        except BaseException:
+            governor.mark_degraded_dirty()
+            raise
 
 
 def describe_write_error(exc: BaseException) -> str:

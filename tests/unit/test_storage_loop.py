@@ -158,3 +158,71 @@ async def test_a_capture_begun_during_the_tick_is_excluded_from_eviction():
     # Both the sample and the eviction got the tick's start as not_after.
     assert len(ls.not_after_seen) == 2
     assert all(t is not None and before <= t <= time.time() for t in ls.not_after_seen)
+
+
+# --- final review M4: a failing file_stats does not skip the tick -------------
+
+
+async def test_a_failing_file_stats_still_ticks_and_evicts():
+    class _BadStatsDB(_DB):
+        async def file_stats(self):
+            raise OSError("database is locked")
+
+    s = AppSettings(_env_file=None)
+    gov, ls = StorageGovernor(), _LS([_sample(40, True)])
+    await _storage_tick(s, gov, _BadStatsDB(), ls, _sup(), asyncio.Event())
+    assert gov.ticks == 1 and gov.state.step == 1
+    assert ls.evictions  # the disk decision still acted
+    assert gov.state.sample is not None and gov.state.sample.db_file_bytes == 0
+
+
+# --- final review M5: a failed persist is retried on the next tick ------------
+
+
+async def test_a_failed_flag_persist_is_retried_on_the_next_tick():
+    class _FlakyDB(_DB):
+        fails = 1
+
+        async def set_config(self, k: str, v: str) -> None:
+            if self.fails:
+                self.fails -= 1
+                raise OSError("disk I/O error")
+            await super().set_config(k, v)
+
+    s = AppSettings(_env_file=None)
+    gov, db = StorageGovernor(), _FlakyDB()
+    gov.report_write_error("ENOSPC: No space left on device")
+    await _storage_tick(s, gov, db, _LS([_sample(200, True)]), _sup(), asyncio.Event())
+    assert DEGRADED_CONFIG_KEY not in db.config  # the first persist failed
+    await _storage_tick(s, gov, db, _LS([_sample(200, True)]), _sup(), asyncio.Event())
+    assert db.config[DEGRADED_CONFIG_KEY] == gov.state.degraded_since.isoformat()
+    assert "ENOSPC" in db.config[LAST_WRITE_ERROR_CONFIG_KEY]
+
+
+async def test_a_clear_during_an_in_flight_persist_is_not_overwritten():
+    """A tick persisting the old flag is mid-write when the flag is cleared:
+    the cleared values must land last."""
+    from rfobserver.storage.governor import persist_degraded_change
+
+    release = asyncio.Event()
+
+    class _SlowDB(_DB):
+        async def set_config(self, k: str, v: str) -> None:
+            if v and not release.is_set():
+                await release.wait()  # the tick's write of the old flag stalls
+            await super().set_config(k, v)
+
+    s = AppSettings(_env_file=None)
+    gov, db = StorageGovernor(), _SlowDB()
+    gov.report_write_error("ENOSPC: No space left on device")
+    tick = asyncio.ensure_future(
+        _storage_tick(s, gov, db, _LS([_sample(200, True)]), _sup(), asyncio.Event())
+    )
+    await asyncio.sleep(0.01)  # the tick is now inside its write
+    gov.clear_degraded()  # what the clear route does, then it persists
+    clear = asyncio.ensure_future(persist_degraded_change(gov, db))
+    await asyncio.sleep(0.01)
+    release.set()
+    await asyncio.gather(tick, clear)
+    assert db.config[DEGRADED_CONFIG_KEY] == ""
+    assert db.config[LAST_WRITE_ERROR_CONFIG_KEY] == ""

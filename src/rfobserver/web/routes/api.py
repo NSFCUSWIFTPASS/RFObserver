@@ -589,8 +589,13 @@ async def set_storage_path(request: Request) -> dict[str, Any]:
 async def storage_clear_degraded(request: Request) -> dict[str, Any]:
     """Acknowledge a storage failure: clears the sticky degraded flag (and the
     last write error). The flag stays set after space recovers until this is
-    called, so the evidence survives until someone has seen it."""
-    from rfobserver.storage.governor import DEGRADED_CONFIG_KEY, LAST_WRITE_ERROR_CONFIG_KEY
+    called, so the evidence survives until someone has seen it.
+
+    Persisted at once (a restart right after a clear must not bring the flag
+    back), with the governor's values after the clear rather than blanks: a
+    write error reported in between is kept. A failed write is retried by the
+    next storage tick."""
+    from rfobserver.storage.governor import persist_degraded_change
 
     gov = getattr(request.app.state, "storage_governor", None)
     if gov is None:
@@ -598,8 +603,10 @@ async def storage_clear_degraded(request: Request) -> dict[str, Any]:
     gov.clear_degraded()
     wdb = getattr(request.app.state, "write_database", None)
     if wdb is not None:
-        await wdb.set_config(DEGRADED_CONFIG_KEY, "")
-        await wdb.set_config(LAST_WRITE_ERROR_CONFIG_KEY, "")
+        try:
+            await persist_degraded_change(gov, wdb)
+        except Exception:
+            logger.exception("Could not persist the cleared storage flag; retrying next tick")
     result: dict[str, Any] = gov.state.to_health()
     return result
 

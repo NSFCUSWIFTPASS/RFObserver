@@ -584,13 +584,20 @@ async def _storage_tick(
     retention_wake: asyncio.Event,
 ) -> None:
     """One governor tick: sample, decide, act, persist the sticky flag."""
+    from rfobserver.storage.governor import persist_degraded_change
+
     # The active-capture snapshot and the tick's start time are taken together.
     # A capture begun after this point (file_stats can queue behind the writer
     # for tens of seconds) is caught at eviction by exclude_fn, and its fresh
     # mtime (>= not_after) keeps it out of both the eviction and the evictable count.
     active = _active_capture_names(supervisor)
     started = time.time()
-    db_file, db_reusable = await db.file_stats()
+    try:
+        db_file, db_reusable = await db.file_stats()
+    except Exception:
+        # The disk decision, eviction and the tick count must not wait on the DB.
+        logger.exception("Could not read the DB file size; sampling without it")
+        db_file, db_reusable = 0, 0
     sample = await asyncio.to_thread(
         local_storage.sample,
         db_path=Path(settings.DB_PATH),
@@ -624,13 +631,10 @@ async def _storage_tick(
         )
     if actions.start_pressure_prune:
         retention_wake.set()
-    changed, values = governor.take_degraded_change()
-    if changed:
-        try:
-            for key, value in values.items():
-                await db.set_config(key, value)
-        except Exception:
-            logger.exception("Could not persist the storage degraded flag")
+    try:
+        await persist_degraded_change(governor, db)
+    except Exception:
+        logger.exception("Could not persist the storage degraded flag; retrying next tick")
 
 
 async def _storage_loop(

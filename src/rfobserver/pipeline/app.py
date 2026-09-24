@@ -174,11 +174,11 @@ async def run(settings: AppSettings) -> None:
 
     local_storage = LocalStorage(settings.STORAGE_PATH, max_gb=settings.ARCHIVE_MAX_GB)
 
-    from rfobserver.storage.governor import DEGRADED_CONFIG_KEY, StorageGovernor
+    from rfobserver.storage.governor import StorageGovernor
 
     storage_governor = StorageGovernor()
     try:
-        storage_governor.restore_degraded(await db.get_config(DEGRADED_CONFIG_KEY))
+        await _restore_storage_flag(storage_governor, db)
     except Exception:
         logger.exception("Could not read the persisted storage degraded flag")
     retention_wake = asyncio.Event()
@@ -521,6 +521,21 @@ async def _run_retention(settings: AppSettings, db: Any, *, pressure: bool) -> N
             logger.exception("Retention of %s failed; continuing", what)
 
 
+async def _restore_storage_flag(governor: Any, db: Any) -> None:
+    """Load the persisted sticky flag and its last write error into the governor."""
+    from rfobserver.storage.governor import DEGRADED_CONFIG_KEY, LAST_WRITE_ERROR_CONFIG_KEY
+
+    governor.restore_degraded(
+        await db.get_config(DEGRADED_CONFIG_KEY),
+        await db.get_config(LAST_WRITE_ERROR_CONFIG_KEY),
+    )
+
+
+# Floor on the retention interval: 0 (or a tiny value) must not re-run
+# retention back to back on the writer connection.
+_MIN_CLEANUP_INTERVAL_SEC = 60.0
+
+
 async def _cleanup_loop(
     settings: AppSettings,
     db: Any,
@@ -533,16 +548,18 @@ async def _cleanup_loop(
     minute rollups after STATS_RETENTION_DAYS. At storage step >= 2 the blob
     and detection cutoffs tighten to the pressure caps. Runs one pass
     immediately, then every DB_CLEANUP_INTERVAL_SEC, or at once when ``wake``
-    is set (the storage loop sets it on entering step 2).
+    is set (the storage loop sets it on entering step 2). The interval is
+    clamped to at least _MIN_CLEANUP_INTERVAL_SEC.
     """
     while True:
         pressure = governor is not None and governor.state.pressure
         await _run_retention(settings, db, pressure=pressure)
+        interval = max(_MIN_CLEANUP_INTERVAL_SEC, float(settings.DB_CLEANUP_INTERVAL_SEC))
         if wake is None:
-            await asyncio.sleep(settings.DB_CLEANUP_INTERVAL_SEC)
+            await asyncio.sleep(interval)
             continue
         with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(wake.wait(), timeout=settings.DB_CLEANUP_INTERVAL_SEC)
+            await asyncio.wait_for(wake.wait(), timeout=interval)
         wake.clear()
 
 
@@ -567,8 +584,6 @@ async def _storage_tick(
     retention_wake: asyncio.Event,
 ) -> None:
     """One governor tick: sample, decide, act, persist the sticky flag."""
-    from rfobserver.storage.governor import DEGRADED_CONFIG_KEY
-
     active = _active_capture_names(supervisor)
     db_file, db_reusable = await db.file_stats()
     sample = await asyncio.to_thread(
@@ -599,10 +614,11 @@ async def _storage_tick(
         )
     if actions.start_pressure_prune:
         retention_wake.set()
-    changed, value = governor.take_degraded_change()
+    changed, values = governor.take_degraded_change()
     if changed:
         try:
-            await db.set_config(DEGRADED_CONFIG_KEY, value)
+            for key, value in values.items():
+                await db.set_config(key, value)
         except Exception:
             logger.exception("Could not persist the storage degraded flag")
 

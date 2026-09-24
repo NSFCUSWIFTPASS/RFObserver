@@ -17,6 +17,7 @@ RECOVERY_TICKS consecutive ticks):
 from __future__ import annotations
 
 import errno
+import json
 import sqlite3
 import threading
 from dataclasses import dataclass, replace
@@ -32,6 +33,8 @@ HARD_FLOOR_FRACTION = 0.5
 PRESSURE_PSD_DAYS = 7
 PRESSURE_DETECTION_DAYS = 90
 DEGRADED_CONFIG_KEY = "storage_degraded"
+# The reason that goes with the flag: JSON {"at": ISO, "error": text}, or "".
+LAST_WRITE_ERROR_CONFIG_KEY = "storage_last_write_error"
 
 STEP_TEXT = {
     0: "healthy",
@@ -234,7 +237,8 @@ class StorageGovernor:
             since = self._state.degraded_since
             if since is None:
                 since = when
-                self._degraded_dirty = True
+            # Dirty on every report: the persisted reason must follow the latest.
+            self._degraded_dirty = True
             self._state = replace(
                 self._state,
                 last_write_error={"at": when.isoformat(), "error": message},
@@ -246,26 +250,52 @@ class StorageGovernor:
             self._state = replace(self._state, last_write_error=None, degraded_since=None)
             self._degraded_dirty = True
 
-    def restore_degraded(self, raw: str | None) -> None:
-        """Load the persisted flag at startup (not marked dirty: it is on disk)."""
-        if not raw:
-            return
-        try:
-            since = datetime.fromisoformat(raw)
-        except ValueError:
+    def restore_degraded(self, raw: str | None, raw_error: str | None = None) -> None:
+        """Load the persisted flag and its last write error at startup (not
+        marked dirty: they are on disk). Missing or garbled values are ignored."""
+        since: datetime | None = None
+        if raw:
+            try:
+                since = datetime.fromisoformat(raw)
+            except ValueError:
+                since = None
+        error: dict[str, str] | None = None
+        if raw_error:
+            try:
+                value = json.loads(raw_error)
+            except ValueError:
+                value = None
+            if (
+                isinstance(value, dict)
+                and isinstance(value.get("at"), str)
+                and isinstance(value.get("error"), str)
+            ):
+                error = {"at": value["at"], "error": value["error"]}
+        if since is None and error is None:
             return
         with self._lock:
-            self._state = replace(self._state, degraded_since=since)
+            st = self._state
+            self._state = replace(
+                st,
+                degraded_since=since if since is not None else st.degraded_since,
+                last_write_error=error if error is not None else st.last_write_error,
+            )
 
-    def take_degraded_change(self) -> tuple[bool, str]:
-        """(changed since last call, value to persist: ISO time or "")."""
+    def take_degraded_change(self) -> tuple[bool, dict[str, str]]:
+        """(changed since last call, config values to persist). The values map
+        DEGRADED_CONFIG_KEY to an ISO time or "" and LAST_WRITE_ERROR_CONFIG_KEY
+        to JSON {"at", "error"} or ""; empty when nothing changed."""
         with self._lock:
-            changed = self._degraded_dirty
+            if not self._degraded_dirty:
+                return (False, {})
             self._degraded_dirty = False
-            if not changed:
-                return (False, "")
-            since = self._state.degraded_since
-            return changed, since.isoformat() if since else ""
+            st = self._state
+            since = st.degraded_since
+            err = st.last_write_error
+            return True, {
+                DEGRADED_CONFIG_KEY: since.isoformat() if since else "",
+                LAST_WRITE_ERROR_CONFIG_KEY: json.dumps(err) if err else "",
+            }
 
 
 def describe_write_error(exc: BaseException) -> str:

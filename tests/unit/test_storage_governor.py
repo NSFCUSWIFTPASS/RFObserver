@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import errno
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from rfobserver.storage.governor import (
+    DEGRADED_CONFIG_KEY,
     GB,
+    LAST_WRITE_ERROR_CONFIG_KEY,
     StorageGovernor,
     StorageSample,
     VolumeSample,
@@ -179,24 +182,61 @@ def test_clearing_at_step_3_does_not_reset_the_flag_until_step_3_is_entered_agai
 
 def test_degraded_change_is_reported_once_for_persistence():
     gov = StorageGovernor()
-    assert gov.take_degraded_change() == (False, "")
+    assert gov.take_degraded_change() == (False, {})
     gov.report_write_error("x", now=T0)
-    assert gov.take_degraded_change() == (True, T0.isoformat())
-    assert gov.take_degraded_change() == (False, "")
+    changed, values = gov.take_degraded_change()
+    assert changed
+    assert values[DEGRADED_CONFIG_KEY] == T0.isoformat()
+    assert json.loads(values[LAST_WRITE_ERROR_CONFIG_KEY]) == {"at": T0.isoformat(), "error": "x"}
+    assert gov.take_degraded_change() == (False, {})
     gov.clear_degraded()
-    assert gov.take_degraded_change() == (True, "")
+    assert gov.take_degraded_change() == (
+        True,
+        {DEGRADED_CONFIG_KEY: "", LAST_WRITE_ERROR_CONFIG_KEY: ""},
+    )
+
+
+def test_a_later_write_error_is_persisted_even_when_already_degraded():
+    gov = StorageGovernor()
+    gov.report_write_error("first", now=T0)
+    gov.take_degraded_change()
+    later = T0 + timedelta(minutes=5)
+    gov.report_write_error("second", now=later)
+    changed, values = gov.take_degraded_change()
+    assert changed
+    assert values[DEGRADED_CONFIG_KEY] == T0.isoformat()  # since the first
+    assert json.loads(values[LAST_WRITE_ERROR_CONFIG_KEY])["error"] == "second"
 
 
 def test_restore_degraded_parses_the_persisted_value():
     gov = StorageGovernor()
     gov.restore_degraded(T0.isoformat())
     assert gov.state.degraded_since == T0
-    assert gov.take_degraded_change() == (False, "")  # already persisted
+    assert gov.take_degraded_change() == (False, {})  # already persisted
     gov2 = StorageGovernor()
     gov2.restore_degraded("")
     gov2.restore_degraded(None)
     gov2.restore_degraded("not a timestamp")
     assert gov2.state.degraded_since is None
+
+
+def test_restore_brings_back_the_last_write_error():
+    gov = StorageGovernor()
+    gov.report_write_error("ENOSPC: No space left on device", now=T0)
+    _, values = gov.take_degraded_change()
+    fresh = StorageGovernor()
+    fresh.restore_degraded(values[DEGRADED_CONFIG_KEY], values[LAST_WRITE_ERROR_CONFIG_KEY])
+    assert fresh.state.last_write_error == gov.state.last_write_error
+    assert fresh.state.degraded_since == T0
+    assert fresh.take_degraded_change() == (False, {})
+
+
+@pytest.mark.parametrize("raw", [None, "", "not json", "[1, 2]", '{"at": 1}', '{"error": "x"}'])
+def test_restore_ignores_a_missing_or_garbled_write_error(raw):
+    gov = StorageGovernor()
+    gov.restore_degraded(T0.isoformat(), raw)
+    assert gov.state.last_write_error is None
+    assert gov.state.degraded_since == T0
 
 
 def test_health_block_shape():

@@ -393,8 +393,8 @@ class StreamingProcessor:
         # the floor mid-recording (the governor's 10 s tick is too slow).
         self._disk_floor_hit = False
         self._disk_usage: Callable[[Any], Any] = shutil.disk_usage
-        # The last refusal to start a recording (storage step >= 3), shown by
-        # the API and UI. Cleared by the next start that is allowed.
+        # The last refusal logged, so a refusal that persists is logged once.
+        # The API and UI show the current one (_recording_refusal).
         self._last_refusal: str | None = None
         # After a recording ends for disk_floor or write_error: (governor tick
         # count at that moment, reason). New starts are held until the governor
@@ -758,7 +758,9 @@ class StreamingProcessor:
             "bytes": self._recording_bytes,
             "duration_sec": round(duration, 1),
             "dropped_chunks": self._recording_dropped,
-            "refused": self._last_refusal,
+            # The refusal in force now (not the last one logged), so the UI
+            # notice clears as soon as storage recovers.
+            "refused": self._recording_refusal(),
         }
 
     def receive_loss(self) -> dict[str, int]:
@@ -1605,6 +1607,10 @@ class StreamingProcessor:
 
         try:
             await asyncio.sleep(grace)
+            if not sc16_path.exists():
+                # Evicted inside the grace window: a sidecar now would be an orphan.
+                logger.debug("Capture %s is gone; skipping its detections sidecar", sc16_path.name)
+                return
             if self._replay_mode:
                 s = self._settings
                 cfg = BurstDetectionConfig(
@@ -1702,9 +1708,12 @@ class StreamingProcessor:
         }
         if write_error is not None:
             meta["write_error"] = write_error
+        from rfobserver.storage.psd_grid import write_text_atomic
+
         json_path = self._recording_dir / filename.replace(".sc16", ".json")
         try:
-            json_path.write_text(_json.dumps(meta, indent=2))
+            # Via a tmp file: on a full disk a direct write leaves a 0-byte .json.
+            write_text_atomic(json_path, _json.dumps(meta, indent=2))
         except OSError as exc:
             # Report and carry on: the DB insert below still records the capture.
             self._report_write_error(f"{filename} metadata .json: {describe_write_error(exc)}")

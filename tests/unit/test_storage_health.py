@@ -10,6 +10,7 @@ from rfobserver.config import AppSettings
 from rfobserver.storage.governor import (
     DEGRADED_CONFIG_KEY,
     GB,
+    LAST_WRITE_ERROR_CONFIG_KEY,
     StorageGovernor,
     StorageSample,
     VolumeSample,
@@ -82,6 +83,7 @@ def test_sticky_flag_is_degraded_after_recovery_until_cleared():
     r = c.post("/api/storage/clear-degraded")
     assert r.status_code == 200 and r.json()["degraded_since"] is None
     assert wdb.config[DEGRADED_CONFIG_KEY] == ""
+    assert wdb.config[LAST_WRITE_ERROR_CONFIG_KEY] == ""
     assert c.get("/api/health").json()["status"] == "ok"
 
 

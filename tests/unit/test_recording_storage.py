@@ -516,3 +516,115 @@ def test_two_starts_in_the_same_second_get_distinct_files(tmp_path, monkeypatch)
     assert names[2].endswith("20260923T231415-3.sc16")
     jsons = [p for p in proc._storage.manual_dir.glob("*.json")]
     assert len(jsons) == 3
+
+
+# --- F5: no 0-byte .json on a full disk --------------------------------------
+
+
+def _truncate_then_enospc(monkeypatch) -> None:
+    """Like a real ENOSPC: the open truncates/creates the file, the write fails."""
+
+    def full(self, *a, **k):
+        with open(self, "w"):
+            pass
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(Path, "write_text", full)
+
+
+def test_full_disk_leaves_no_capture_json(tmp_path, monkeypatch):
+    gov = _governor_at(0)
+    proc = _proc(tmp_path, gov, RECORDING_RAM_BUFFER=True, RECORDING_MAX_SEC=1.0)
+    proc.start_recording()
+    proc._write_recording_chunk(np.ones(1000, dtype=np.int32))
+    _truncate_then_enospc(monkeypatch)
+    proc.stop_recording()
+    left = [p.name for p in proc._storage.manual_dir.iterdir() if ".json" in p.name]
+    assert left == []
+    assert "json" in gov.state.last_write_error["error"]
+
+
+def test_full_disk_leaves_no_psd_json(tmp_path, monkeypatch):
+    from rfobserver.storage import psd_grid
+
+    _truncate_then_enospc(monkeypatch)
+    meta = tmp_path / "x.psd.json"
+    with pytest.raises(OSError):
+        psd_grid.write_meta(
+            meta,
+            rows=1,
+            num_bins=2,
+            time_resolution_s=0.1,
+            center_freq_hz=915e6,
+            bandwidth_hz=1e6,
+            freq_axis=np.array([1.0, 2.0]),
+            grid_min=0.0,
+            grid_max=1.0,
+            cal_offset_db=None,
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
+# --- F7: no orphaned .detections.json after eviction -------------------------
+
+
+async def test_sidecar_is_skipped_when_the_capture_was_evicted(tmp_path, monkeypatch):
+    from rfobserver.storage import detections_sidecar
+
+    written = []
+
+    async def fake_write_sidecar(sc16_path, db):
+        written.append(sc16_path)
+        sc16_path.with_suffix(".detections.json").write_text("[]")
+
+    monkeypatch.setattr(detections_sidecar, "write_sidecar", fake_write_sidecar)
+    proc = _proc(tmp_path, None)
+    sc16 = proc._storage.auto_dir / "a.sc16"
+    sc16.write_bytes(b"\0" * 8)
+    import asyncio
+
+    task = asyncio.ensure_future(proc._deferred_sidecar(sc16, 0.05))
+    sc16.unlink()  # evicted inside the grace window
+    await task
+    assert written == []
+    assert list(proc._storage.auto_dir.iterdir()) == []
+
+    kept = proc._storage.auto_dir / "b.sc16"
+    kept.write_bytes(b"\0" * 8)
+    await proc._deferred_sidecar(kept, 0.0)
+    assert written == [kept]
+
+
+# --- F8: recording_status "refused" is current -------------------------------
+
+
+def test_status_refused_clears_on_recovery_without_a_start(tmp_path):
+    gov = _governor_at(3)
+    proc = _proc(tmp_path, gov)
+    proc.start_recording()
+    assert proc.recording_status()["refused"]
+    for _ in range(3):
+        _healthy_tick(gov)
+    assert gov.state.step == 0
+    assert proc.recording_status()["refused"] is None
+
+
+def test_status_refused_shows_a_refusal_in_force_without_a_start(tmp_path):
+    gov = _governor_at(0)
+    proc = _proc(tmp_path, gov)
+    assert proc.recording_status()["refused"] is None
+    for _ in range(2):
+        gov.tick(
+            StorageSample(
+                data=VolumeSample(40 * GB, 1000 * GB),
+                db_volume=None,
+                db_file_bytes=0,
+                db_reusable_bytes=0,
+                auto_bytes=0,
+                manual_bytes=0,
+                evictable_auto=False,
+            ),
+            min_free_gb=0,
+            now=T0,
+        )
+    assert "floor" in proc.recording_status()["refused"]

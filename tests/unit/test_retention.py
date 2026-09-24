@@ -288,3 +288,18 @@ async def test_garbled_blob_prune_mark_falls_back_to_a_full_scan(db):
         await db._db.execute("UPDATE avg_windows SET psd_powers = x'00'")
         await db._db.commit()
         assert await db.prune_avg_psd_blobs(30, chunk=5, pause_sec=0) == 3, bad
+
+
+@pytest.mark.parametrize("with_wake", [False, True])
+async def test_cleanup_loop_interval_0_does_not_hot_loop(with_wake):
+    """DB_CLEANUP_INTERVAL_SEC=0 used to re-run retention back to back."""
+    s = AppSettings(_env_file=None, DB_RETENTION_DAYS=30, DB_CLEANUP_INTERVAL_SEC=0)
+    d = _RecDB()
+    wake = asyncio.Event() if with_wake else None
+    task = asyncio.create_task(_cleanup_loop(s, d, wake=wake))
+    for _ in range(50):
+        await asyncio.sleep(0)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert len(d.calls) == 4  # exactly one pass: blobs, detections, windows, minutes

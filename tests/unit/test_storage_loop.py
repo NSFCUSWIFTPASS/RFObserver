@@ -6,10 +6,15 @@ import asyncio
 from types import SimpleNamespace
 
 from rfobserver.config import AppSettings
-from rfobserver.pipeline.app import _active_capture_names, _storage_tick
+from rfobserver.pipeline.app import (
+    _active_capture_names,
+    _restore_storage_flag,
+    _storage_tick,
+)
 from rfobserver.storage.governor import (
     DEGRADED_CONFIG_KEY,
     GB,
+    LAST_WRITE_ERROR_CONFIG_KEY,
     StorageGovernor,
     StorageSample,
     VolumeSample,
@@ -53,6 +58,9 @@ class _DB:
     async def set_config(self, k: str, v: str) -> None:
         self.config[k] = v
 
+    async def get_config(self, k: str) -> str | None:
+        return self.config.get(k)
+
 
 def _sup(state: str = "idle", file: str | None = None):
     proc = SimpleNamespace(recording_status=lambda: {"state": state, "file": file})
@@ -93,6 +101,12 @@ async def test_write_error_from_a_thread_is_persisted_on_the_next_tick():
     gov.report_write_error("ENOSPC: No space left on device")
     await _storage_tick(s, gov, db, _LS([_sample(200, True)]), _sup(), wake)
     assert db.config[DEGRADED_CONFIG_KEY]
+    assert "ENOSPC" in db.config[LAST_WRITE_ERROR_CONFIG_KEY]
+    # A restart restores both the flag and its reason.
+    fresh = StorageGovernor()
+    fresh.restore_degraded(db.config[DEGRADED_CONFIG_KEY], db.config[LAST_WRITE_ERROR_CONFIG_KEY])
+    assert fresh.state.last_write_error == gov.state.last_write_error
+    assert fresh.state.degraded_since == gov.state.degraded_since
 
 
 async def test_tick_uses_the_live_floor_setting():
@@ -100,3 +114,16 @@ async def test_tick_uses_the_live_floor_setting():
     gov = StorageGovernor()
     await _storage_tick(s, gov, _DB(), _LS([_sample(40, True)]), _sup(), asyncio.Event())
     assert gov.state.step == 0
+
+
+async def test_startup_restores_the_flag_and_the_last_write_error():
+    db = _DB()
+    gov = StorageGovernor()
+    gov.report_write_error("ENOSPC: No space left on device")
+    await _storage_tick(
+        AppSettings(_env_file=None), gov, db, _LS([_sample(200, True)]), _sup(), asyncio.Event()
+    )
+    fresh = StorageGovernor()
+    await _restore_storage_flag(fresh, db)
+    assert fresh.state.degraded_since == gov.state.degraded_since
+    assert fresh.state.last_write_error == gov.state.last_write_error

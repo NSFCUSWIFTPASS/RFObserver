@@ -660,3 +660,111 @@ def test_status_refused_shows_a_refusal_in_force_without_a_start(tmp_path):
             now=T0,
         )
     assert "floor" in proc.recording_status()["refused"]
+
+
+# --- final review I2: an abandoned writer cannot touch the next recording -----
+
+
+class _StuckFile:
+    """A .sc16 whose first write blocks (a hung NFS/USB volume) until released,
+    then fails."""
+
+    def __init__(self, real, release) -> None:
+        self.real, self.release = real, release
+
+    def write(self, data) -> int:
+        self.release.wait(timeout=10)
+        raise OSError(errno.EIO, "Input/output error")
+
+    def close(self) -> None:
+        self.real.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+def test_an_abandoned_writer_cannot_fail_or_starve_the_next_recording(tmp_path, monkeypatch):
+    import builtins
+    import threading
+
+    from rfobserver.pipeline import streaming
+
+    monkeypatch.setattr(streaming, "_WRITER_JOIN_TIMEOUT_SEC", 0.3)
+    real_open = builtins.open
+    release = threading.Event()
+    sc16_opens = []
+
+    def fake_open(path, mode="r", *a, **k):
+        f = real_open(path, mode, *a, **k)
+        if str(path).endswith(".sc16") and "w" in mode:
+            sc16_opens.append(path)
+            if len(sc16_opens) == 1:
+                return _StuckFile(f, release)
+        return f
+
+    monkeypatch.setattr("rfobserver.pipeline.streaming.open", fake_open, raising=False)
+    proc = _proc(tmp_path, None, RECORDING_RAM_BUFFER=False)
+    proc._await_tail_grids = lambda: None
+
+    # Recording 1: its writer blocks on the first write and is abandoned.
+    proc.start_recording()
+    pos = proc._pre_trigger_buf.total_written
+    proc._check_trigger_and_record(np.ones(1000, dtype=np.int32), (), pos)
+    old_writer = proc._writer_thread
+    proc.stop_recording()
+    assert old_writer is not None and old_writer.is_alive()
+
+    # Recording 2 begins; only then does the old write fail.
+    proc.start_recording()
+    new_writer = proc._writer_thread
+    assert new_writer is not None and new_writer is not old_writer
+    release.set()
+    old_writer.join(timeout=5)
+    assert not old_writer.is_alive()  # superseded: it exits instead of lingering
+
+    assert proc._writer_error is None
+    pos = proc._pre_trigger_buf.total_written
+    for _ in range(3):
+        proc._check_trigger_and_record(np.ones(1000, dtype=np.int32), (), pos)
+        pos += 1000
+    assert proc.recording_status()["state"] == "recording"  # not ended as write_error
+    proc.stop_recording()
+    assert not new_writer.is_alive()  # its own sentinel reached it
+    second = Path(sc16_opens[1])
+    meta = json.loads(second.with_suffix(".json").read_text())
+    assert meta["write_failed"] is False
+    assert meta["stopped_reason"] == "manual"
+    assert second.stat().st_size == 3000 * 4
+
+
+# --- final review M2: a RAM-mode flush failure holds new starts ---------------
+
+
+def test_ram_flush_failure_holds_starts_until_two_ticks(tmp_path):
+    gov = _governor_at(0)
+    proc = _proc(tmp_path, gov, RECORDING_RAM_BUFFER=True, RECORDING_MAX_SEC=1.0)
+    proc.start_recording()
+    proc._write_recording_chunk(np.ones(4000, dtype=np.int32))
+
+    class _FailingArray(np.ndarray):
+        def tofile(self, path, *a, **k):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+    proc._recording_buf = proc._recording_buf.view(_FailingArray)
+    proc.stop_recording()  # a manual stop, but the flush failed
+    proc.start_recording()
+    assert proc.recording_status()["state"] == "idle"
+    assert "held" in proc.recording_status()["refused"]
+    assert "write_error" in proc.recording_status()["refused"]
+    _healthy_tick(gov)
+    proc.start_recording()
+    assert proc.recording_status()["state"] == "idle"
+    _healthy_tick(gov)
+    proc.start_recording()
+    try:
+        assert proc.recording_status()["state"] == "recording"
+    finally:
+        proc.stop_recording()

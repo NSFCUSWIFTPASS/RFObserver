@@ -111,6 +111,14 @@ _GRID_TAIL_DRAIN_FLOOR_SEC = 3.0
 _RESULT_POLL_SEC = 0.005
 _GRID_TAIL_DRAIN_CEILING_SEC = 10.0
 
+# How long finalize waits to hand the disk writer its stop sentinel and then
+# for the writer to exit. A writer still blocked after that is abandoned (a
+# hung volume): the recording finalizes without it.
+_WRITER_JOIN_TIMEOUT_SEC = 10.0
+# How often a writer waiting on an empty queue checks whether a newer
+# recording has superseded it.
+_WRITER_POLL_SEC = 0.5
+
 
 def _preroll_gaps(
     stream_gaps: Iterable[tuple[int, int]], start: int, end: int, written: int
@@ -427,9 +435,20 @@ class StreamingProcessor:
 
         # Disk-streaming write queue (default mode). Items are tagged:
         # ("iq", bytes-like) for the .sc16 stream, ("grid", bytes) for the
-        # streamed .psd rows, None to stop the writer.
+        # streamed .psd rows, None to stop the writer. A fresh queue per
+        # recording: a writer abandoned by finalize (blocked on a hung volume)
+        # keeps its own queue and can never consume the next recording's items
+        # or sentinel.
         self._recording_queue: queue.Queue[Any] = queue.Queue(maxsize=64)
         self._writer_thread: threading.Thread | None = None
+        # Bumped at every recording start. A writer only sets _writer_error or
+        # _disk_floor_hit while its generation is current.
+        self._writer_gen = 0
+        # Orders a writer's generation check and its write of those flags
+        # against the bump and reset at the next start.
+        self._writer_gen_lock = threading.Lock()
+        # A writer finalize gave up on, kept so the next start can warn.
+        self._abandoned_writer: threading.Thread | None = None
 
         # Recording-control thread: runs the blocking finalization work
         # (writer drain, file close, metadata, disk-cap eviction) so the
@@ -1200,8 +1219,11 @@ class StreamingProcessor:
         self._recording_overflows = 0
         self._recording_gaps_truncated = False
         self._stop_reason = None
-        self._writer_error = None
-        self._disk_floor_hit = False
+        # Supersede any abandoned writer before clearing its outputs.
+        with self._writer_gen_lock:
+            self._writer_gen += 1
+            self._writer_error = None
+            self._disk_floor_hit = False
         self._recording_wall_start = None
         self._recording_start = time.monotonic()
         self._below_threshold_count = 0
@@ -1279,12 +1301,18 @@ class StreamingProcessor:
             self._recording_buf_pos = 0
             self._grid_raw_path = psd_grid.grid_paths(self._recording_dir / self._recording_file)[0]
 
-            # Drain stale queue data
-            while not self._recording_queue.empty():
-                try:
-                    self._recording_queue.get_nowait()
-                except queue.Empty:
-                    break
+            old = self._abandoned_writer
+            if old is not None and old.is_alive():
+                logger.warning(
+                    "A previous recording's writer is still blocked; "
+                    "the new recording uses its own queue and writer"
+                )
+            else:
+                self._abandoned_writer = None
+            # A fresh queue for this recording, in place before anything is
+            # queued; chunk and grid writes use self._recording_queue.
+            rec_queue: queue.Queue[Any] = queue.Queue(maxsize=64)
+            self._recording_queue = rec_queue
 
             # Queue the pre-trigger samples by reference — the writer's
             # f.write() accepts any buffer-like object, so the old .tobytes()
@@ -1292,7 +1320,7 @@ class StreamingProcessor:
             written = 0
             if len(pre_data) > 0:
                 try:
-                    self._recording_queue.put_nowait(("iq", pre_data))
+                    rec_queue.put_nowait(("iq", pre_data))
                     written = len(pre_data)
                     self._recording_bytes = written * 4
                     self._add_preroll_gaps(ring, pre_start, pre_end, written=written)
@@ -1307,7 +1335,7 @@ class StreamingProcessor:
             if pre_roll is not None:
                 for g in pre_roll.grids:
                     try:
-                        self._recording_queue.put_nowait(
+                        rec_queue.put_nowait(
                             ("grid", np.ascontiguousarray(g, dtype=np.float32).tobytes())
                         )
                         self._grid_rows += int(g.shape[0])
@@ -1315,7 +1343,15 @@ class StreamingProcessor:
                         self._grid_dropped += int(g.shape[0])
 
             self._writer_thread = threading.Thread(
-                target=self._file_writer_loop, name="writer", daemon=True
+                target=self._file_writer_loop,
+                args=(
+                    rec_queue,
+                    self._writer_gen,
+                    self._recording_dir / self._recording_file,
+                    self._grid_raw_path,
+                ),
+                name="writer",
+                daemon=True,
             )
             self._writer_thread.start()
             # Flip last: chunk writes gate on this state, and they must enter
@@ -1357,8 +1393,13 @@ class StreamingProcessor:
             self._finalize_recording()
         finally:
             # Set before "idle", so a continuous re-arm already sees the hold.
-            if self._governor is not None and self._stop_reason in ("disk_floor", "write_error"):
-                self._storage_hold = (self._governor.ticks, self._stop_reason)
+            # A failed write also holds when the stop itself was ordinary (a
+            # RAM-mode flush fails at finalize, after a manual or timed stop).
+            reason = self._stop_reason
+            if reason not in ("disk_floor", "write_error") and self._writer_error is not None:
+                reason = "write_error"
+            if self._governor is not None and reason in ("disk_floor", "write_error"):
+                self._storage_hold = (self._governor.ticks, reason)
             self._recording_state = "idle"
             self._end_done.set()
 
@@ -1429,12 +1470,16 @@ class StreamingProcessor:
             # died (disk full / EROFS), the queue may be full and no consumer
             # will ever drain it, so a plain blocking put would wedge recctl in
             # "finalizing" forever. Time-bounded, then proceed regardless.
+            # The sentinel goes to this recording's own queue.
             try:
-                self._recording_queue.put(None, timeout=10.0)
+                self._recording_queue.put(None, timeout=_WRITER_JOIN_TIMEOUT_SEC)
             except queue.Full:
                 logger.error("Recording writer not draining; abandoning writer thread")
             if self._writer_thread is not None:
-                self._writer_thread.join(timeout=10)
+                self._writer_thread.join(timeout=_WRITER_JOIN_TIMEOUT_SEC)
+                if self._writer_thread.is_alive():
+                    logger.error("Recording writer did not exit; abandoning writer thread")
+                    self._abandoned_writer = self._writer_thread
                 self._writer_thread = None
 
             # Rename file if drops occurred
@@ -1560,21 +1605,27 @@ class StreamingProcessor:
         if self._governor is not None:
             self._governor.report_write_error(message)
 
-    def _check_disk_floor(self) -> None:
+    def _check_disk_floor(self, gen: int | None = None) -> None:
         """Writer thread, about once per second of IQ: end the recording
-        cleanly if free space is below half the floor, before ENOSPC."""
+        cleanly if free space is below half the floor, before ENOSPC. A
+        writer whose generation ``gen`` is no longer current does nothing."""
+        if gen is not None and gen != self._writer_gen:
+            return
         try:
             du = self._disk_usage(self._recording_dir)
         except OSError:
             return
         floor = resolve_floor(self._settings.DISK_MIN_FREE_GB, du.total)
         if du.free < floor * HARD_FLOOR_FRACTION and not self._disk_floor_hit:
+            with self._writer_gen_lock:
+                if gen is not None and gen != self._writer_gen:
+                    return
+                self._disk_floor_hit = True
             logger.warning(
                 "Free space %.2f GB below half the %.2f GB floor: ending the recording",
                 du.free / 1024**3,
                 floor / 1024**3,
             )
-            self._disk_floor_hit = True
 
     def _bytes_from_file(self, path: Path) -> int:
         """The capture's true size, from the closed file: a partial trailing
@@ -1745,14 +1796,26 @@ class StreamingProcessor:
                 )
             )
 
-    def _file_writer_loop(self) -> None:
-        """Dedicated thread: drains recording queue and writes to disk.
+    def _file_writer_loop(
+        self,
+        q: queue.Queue[Any],
+        gen: int,
+        filepath: Path,
+        grid_path: Path,
+    ) -> None:
+        """Dedicated thread: drains one recording's queue ``q`` and writes it
+        to disk.
 
-        Owns both capture files — the .sc16 IQ stream and the streamed .psd
-        grid — so no file open/write/close ever touches the receiver or
+        Owns both capture files -- the .sc16 IQ stream and the streamed .psd
+        grid -- so no file open/write/close ever touches the receiver or
         dispatch threads. Queue items are ("iq", data) / ("grid", data);
         None stops the loop. Pinned to the last CPU core so PSD workers
         can't starve it.
+
+        ``gen`` is the recording generation this writer serves. Once a newer
+        recording has begun (finalize abandoned this writer), it no longer sets
+        the shared _writer_error / _disk_floor_hit, and it exits when its own
+        queue runs dry instead of waiting for a sentinel that may never come.
         """
         # Pin writer to dedicated core (last core) for guaranteed CPU time
         try:
@@ -1763,7 +1826,14 @@ class StreamingProcessor:
         except OSError:
             logger.debug("Could not pin writer thread to core")
 
-        filepath = self._recording_dir / (self._recording_file or "recording.sc16")
+        def next_item() -> Any:
+            while True:
+                try:
+                    return q.get(timeout=_WRITER_POLL_SEC)
+                except queue.Empty:
+                    if gen != self._writer_gen:
+                        return None  # superseded and drained
+
         rate = float(self._settings.BANDWIDTH) or 1.0
         check_every = max(1, int(rate * 4))  # about one second of IQ
         since_check = 0
@@ -1771,10 +1841,10 @@ class StreamingProcessor:
         try:
             with (
                 open(filepath, "wb", buffering=8 * 1024 * 1024) as f,
-                open(self._grid_raw_path, "wb") as gf,
+                open(grid_path, "wb") as gf,
             ):
                 while True:
-                    item = self._recording_queue.get()
+                    item = next_item()
                     if item is None:
                         stopped = True
                         break
@@ -1784,23 +1854,28 @@ class StreamingProcessor:
                         since_check += memoryview(data).nbytes
                         if since_check >= check_every:
                             since_check = 0
-                            self._check_disk_floor()
+                            self._check_disk_floor(gen)
                     else:
                         gf.write(data)
                     # No flush: let the OS buffer writes for throughput. The
                     # close at loop exit flushes, and can itself fail (ENOSPC).
         except Exception as exc:
-            self._writer_error = describe_write_error(exc)
+            error = describe_write_error(exc)
+            with self._writer_gen_lock:
+                current = gen == self._writer_gen
+                if current:
+                    self._writer_error = error
             logger.error(
-                "Recording write failed (%s); ending the recording",
-                self._writer_error,
+                "Recording write failed (%s); %s",
+                error,
+                "ending the recording" if current else "an abandoned writer, ignored",
                 # An OS error is fully described; anything else is a bug.
                 exc_info=not isinstance(exc, OSError),
             )
             if not stopped:
                 # Keep consuming so finalize's stop sentinel is never blocked
                 # and the receiver thread never sees a full queue.
-                while self._recording_queue.get() is not None:
+                while next_item() is not None:
                     pass
 
     # -- Dispatch thread --

@@ -112,6 +112,13 @@ Manual captures (`manual/`) and the capture being recorded are never deleted.
 From step 2 on, nothing the sensor does raises free space: someone has to
 download and delete manual captures or remove whatever else filled the volume.
 
+With continuous triggering, step 1 can settle into deleting each new automatic
+capture shortly after it is saved. When a storage check evicts a capture less
+than 10 minutes old, the sensor flags `evicting_young` in health (and logs a
+warning naming the capture and its age) for 30 minutes after the last such
+eviction, without changing `step` or `status` -- steps 1-2 stay "working as
+designed".
+
 The database file does not shrink. Pruning PSD blobs and deleting old rows free
 pages inside the file, which later inserts reuse, so the file stops growing
 instead of getting smaller (`db_reusable_gb` shows how much is free inside it).

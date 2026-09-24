@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 from rfobserver.config import AppSettings
@@ -35,23 +37,36 @@ def _sample(free_gb: float, evictable: bool) -> StorageSample:
 
 
 class _LS:
-    def __init__(self, samples: list[StorageSample]) -> None:
+    def __init__(
+        self,
+        samples: list[StorageSample],
+        evict_ages: list[tuple[str, float]] | None = None,
+    ) -> None:
         self.samples = samples
         self.evictions: list[tuple[int, set[str]]] = []
         self.active_seen: list[set[str]] = []
         self.not_after_seen: list[float | None] = []
         self.exclude_fn_seen: list[set[str]] = []
+        # (capture name, age in seconds) reported to on_evict during eviction,
+        # in eviction order -- stands in for the ages a real LocalStorage
+        # would compute from each capture's mtime.
+        self.evict_ages = evict_ages or []
 
     def sample(self, *, db_path, active_names, db_file_bytes, db_reusable_bytes, not_after=None):
         self.active_seen.append(set(active_names))
         self.not_after_seen.append(not_after)
         return self.samples.pop(0)
 
-    def evict_until_free(self, target, *, exclude=(), exclude_fn=None, not_after=None):
+    def evict_until_free(
+        self, target, *, exclude=(), exclude_fn=None, not_after=None, on_evict=None
+    ):
         self.evictions.append((target, set(exclude)))
         self.not_after_seen.append(not_after)
         if exclude_fn is not None:
             self.exclude_fn_seen.append(set(exclude_fn()))
+        if on_evict is not None:
+            for name, age in self.evict_ages:
+                on_evict(Path(name), age)
         return 0
 
 
@@ -226,3 +241,46 @@ async def test_a_clear_during_an_in_flight_persist_is_not_overwritten():
     await asyncio.gather(tick, clear)
     assert db.config[DEGRADED_CONFIG_KEY] == ""
     assert db.config[LAST_WRITE_ERROR_CONFIG_KEY] == ""
+
+
+# --- task 10: warn when step 1 evicts captures soon after recording -----------
+
+
+async def test_evicting_a_capture_with_a_fresh_mtime_notes_a_young_eviction():
+    s = AppSettings(_env_file=None)
+    gov = StorageGovernor()
+    ls = _LS([_sample(40, True)], evict_ages=[("A.sc16", 42.0)])
+    await _storage_tick(s, gov, _DB(), ls, _sup(), asyncio.Event())
+    st = gov.state
+    assert st.evicting_young is True
+    assert st.young_evictions == 1
+    assert st.youngest_evicted_age_sec == 42.0
+
+
+async def test_evicting_only_old_captures_does_not_note_a_young_eviction():
+    s = AppSettings(_env_file=None)
+    gov = StorageGovernor()
+    ls = _LS([_sample(40, True)], evict_ages=[("OLD.sc16", 9999.0)])
+    await _storage_tick(s, gov, _DB(), ls, _sup(), asyncio.Event())
+    assert gov.state.evicting_young is False
+    assert gov.state.young_evictions == 0
+
+
+async def test_no_eviction_never_notes_a_young_eviction():
+    s = AppSettings(_env_file=None)
+    gov = StorageGovernor()
+    ls = _LS([_sample(200, True)])  # step 0: nothing evicted
+    await _storage_tick(s, gov, _DB(), ls, _sup(), asyncio.Event())
+    assert gov.state.evicting_young is False
+
+
+async def test_evicting_young_captures_logs_a_warning_naming_each_one(caplog):
+    s = AppSettings(_env_file=None)
+    gov = StorageGovernor()
+    ls = _LS([_sample(40, True)], evict_ages=[("X.sc16", 42.0), ("Y.sc16", 97.0)])
+    with caplog.at_level(logging.WARNING, logger="rfobserver.pipeline.app"):
+        await _storage_tick(s, gov, _DB(), ls, _sup(), asyncio.Event())
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("X.sc16" in m and "42" in m and "Y.sc16" in m and "97" in m for m in warnings), (
+        warnings
+    )

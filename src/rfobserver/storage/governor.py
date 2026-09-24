@@ -21,11 +21,14 @@ from __future__ import annotations
 import asyncio
 import errno
 import json
+import logging
 import sqlite3
 import threading
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 GB = 1024**3
 AUTO_FLOOR_FRACTION = 0.05
@@ -38,6 +41,13 @@ PRESSURE_DETECTION_DAYS = 90
 DEGRADED_CONFIG_KEY = "storage_degraded"
 # The reason that goes with the flag: JSON {"at": ISO, "error": text}, or "".
 LAST_WRITE_ERROR_CONFIG_KEY = "storage_last_write_error"
+# A capture evicted this soon after its last write is "young" -- continuous
+# triggering can otherwise sit just above the floor by deleting each new
+# automatic capture about one storage check after it is saved, and health
+# alone ("step 1") does not distinguish that from ordinary FIFO rotation.
+YOUNG_CAPTURE_SEC = 600
+# The evicting_young warning stays up this long after the last young eviction.
+YOUNG_EVICTION_WINDOW_SEC = 1800
 
 STEP_TEXT = {
     0: "healthy",
@@ -46,6 +56,8 @@ STEP_TEXT = {
     3: "recordings refused",
     4: "PSD history writes stopped",
 }
+
+EVICTING_YOUNG_STEP_TEXT = "deleting automatic captures minutes after they are recorded"
 
 
 def resolve_floor(min_free_gb: float, total_bytes: int) -> int:
@@ -96,6 +108,13 @@ class StorageState:
     sample: StorageSample | None
     last_write_error: dict[str, str] | None
     degraded_since: datetime | None
+    # Set by note_young_evictions; cleared by tick() once YOUNG_EVICTION_WINDOW_SEC
+    # has lapsed since last_young_eviction. Does not affect step or degraded --
+    # steps 1-2 stay "working as designed".
+    evicting_young: bool = False
+    last_young_eviction: datetime | None = None
+    young_evictions: int = 0
+    youngest_evicted_age_sec: float | None = None
 
     @property
     def pressure(self) -> bool:
@@ -121,6 +140,7 @@ class StorageState:
                 "free_gb": _gb(s.db_volume.free_bytes),
                 "floor_gb": _gb(self.db_floor_bytes),
             }
+        step_text = EVICTING_YOUNG_STEP_TEXT if self.evicting_young else STEP_TEXT[self.step]
         return {
             "free_gb": _gb(s.data.free_bytes) if s else None,
             "floor_gb": _gb(self.floor_bytes) if s else None,
@@ -130,11 +150,16 @@ class StorageState:
             "auto_gb": _gb(s.auto_bytes) if s else None,
             "manual_gb": _gb(s.manual_bytes) if s else None,
             "step": self.step,
-            "step_text": STEP_TEXT[self.step],
+            "step_text": step_text,
             "step_since": self.step_since.isoformat(),
             "last_write_error": self.last_write_error,
             "degraded_since": self.degraded_since.isoformat() if self.degraded_since else None,
             "db_volume": db_volume,
+            "evicting_young": self.evicting_young,
+            "young_evictions": self.young_evictions,
+            "last_young_eviction": self.last_young_eviction.isoformat()
+            if self.last_young_eviction
+            else None,
         }
 
 
@@ -219,6 +244,17 @@ class StorageGovernor:
             if step >= 3 and st.step < 3 and degraded_since is None:
                 degraded_since = now
                 self._degraded_dirty = True
+
+            evicting_young = st.evicting_young
+            if evicting_young and st.last_young_eviction is not None:
+                elapsed = (now - st.last_young_eviction).total_seconds()
+                if elapsed >= YOUNG_EVICTION_WINDOW_SEC:
+                    evicting_young = False
+                    logger.info(
+                        "Storage: no young evictions in %d min; evicting_young warning cleared",
+                        YOUNG_EVICTION_WINDOW_SEC // 60,
+                    )
+
             self._ticks += 1
             self._state = replace(
                 st,
@@ -228,6 +264,7 @@ class StorageGovernor:
                 db_floor_bytes=db_floor,
                 sample=sample,
                 degraded_since=degraded_since,
+                evicting_young=evicting_young,
             )
 
             target = int(floor * RECOVERY_MARGIN)
@@ -249,6 +286,36 @@ class StorageGovernor:
                 self._state,
                 last_write_error={"at": when.isoformat(), "error": message},
                 degraded_since=since,
+            )
+
+    def note_young_evictions(self, count: int, youngest_age_sec: float, now: datetime) -> None:
+        """Record that ``count`` automatic captures younger than
+        YOUNG_CAPTURE_SEC were evicted this tick (``youngest_age_sec`` is the
+        age of the youngest of them). Turns the ``evicting_young`` warning on;
+        tick() clears it once YOUNG_EVICTION_WINDOW_SEC passes with no more.
+        Does not touch step or the sticky degraded flag."""
+        with self._lock:
+            st = self._state
+            lapsed = (
+                st.last_young_eviction is None
+                or (now - st.last_young_eviction).total_seconds() >= YOUNG_EVICTION_WINDOW_SEC
+            )
+            young_evictions = count if lapsed else st.young_evictions + count
+            turning_on = not st.evicting_young
+            self._state = replace(
+                st,
+                evicting_young=True,
+                last_young_eviction=now,
+                young_evictions=young_evictions,
+                youngest_evicted_age_sec=youngest_age_sec,
+            )
+        if turning_on:
+            logger.warning(
+                "Storage floor: evicting automatic captures within %d s of recording "
+                "(youngest %.0f s); this warning stays up for %d min",
+                YOUNG_CAPTURE_SEC,
+                youngest_age_sec,
+                YOUNG_EVICTION_WINDOW_SEC // 60,
             )
 
     def clear_degraded(self) -> None:

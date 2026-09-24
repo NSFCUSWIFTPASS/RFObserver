@@ -1249,6 +1249,13 @@
         if (s.step > 0) {
             parts.push(`Step ${s.step}: ${s.step_text}. ${s.free_gb} GB free, minimum ${s.floor_gb} GB.`);
         }
+        if (s.evicting_young) {
+            parts.push(
+                `Automatic captures are being deleted within minutes of recording ` +
+                `(${s.young_evictions} in the last 30 minutes). Free up space or lower ` +
+                `Archive Max to keep them.`
+            );
+        }
         if (s.last_write_error) {
             parts.push(`Last write error: ${s.last_write_error.error}`);
         } else if (s.degraded_since) {

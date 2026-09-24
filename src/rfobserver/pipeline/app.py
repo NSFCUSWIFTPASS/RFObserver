@@ -584,7 +584,7 @@ async def _storage_tick(
     retention_wake: asyncio.Event,
 ) -> None:
     """One governor tick: sample, decide, act, persist the sticky flag."""
-    from rfobserver.storage.governor import persist_degraded_change
+    from rfobserver.storage.governor import YOUNG_CAPTURE_SEC, persist_degraded_change
 
     # The active-capture snapshot and the tick's start time are taken together.
     # A capture begun after this point (file_stats can queue behind the writer
@@ -622,13 +622,37 @@ async def _storage_tick(
             st.floor_bytes / 1024**3,
         )
     if actions.evict_to_free_bytes is not None:
+        # on_evict runs on the worker thread; only collect ages there and call
+        # the governor once the thread returns.
+        young: list[tuple[str, float]] = []
+
+        def on_evict(path: Path, age_sec: float) -> None:
+            if age_sec < YOUNG_CAPTURE_SEC:
+                young.append((path.name, age_sec))
+
         await asyncio.to_thread(
             local_storage.evict_until_free,
             actions.evict_to_free_bytes,
             exclude=active,
             exclude_fn=lambda: _active_capture_names(supervisor),
             not_after=started,
+            on_evict=on_evict,
         )
+        if young:
+            names = ", ".join(f"{name} {age:.0f} s" for name, age in young)
+            logger.warning(
+                "Storage floor: evicted %d automatic captures within 10 minutes of "
+                "recording (%s); free %.1f GB, floor %.1f GB",
+                len(young),
+                names,
+                sample.data.free_bytes / 1024**3,
+                st.floor_bytes / 1024**3,
+            )
+            governor.note_young_evictions(
+                len(young),
+                min(age for _, age in young),
+                datetime.now(timezone.utc),
+            )
     if actions.start_pressure_prune:
         retention_wake.set()
     try:

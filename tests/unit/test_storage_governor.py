@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -13,6 +14,8 @@ from rfobserver.storage.governor import (
     DEGRADED_CONFIG_KEY,
     GB,
     LAST_WRITE_ERROR_CONFIG_KEY,
+    YOUNG_CAPTURE_SEC,
+    YOUNG_EVICTION_WINDOW_SEC,
     StorageGovernor,
     StorageSample,
     VolumeSample,
@@ -287,3 +290,82 @@ def test_ticks_count_every_completed_tick():
     assert gov.ticks == 0
     _run(gov, _s(200), _s(40), _s(200))
     assert gov.ticks == 3
+
+
+# --- task 10: warn when step 1 evicts captures soon after recording -----------
+
+
+def test_note_young_evictions_sets_evicting_young_and_count():
+    gov = StorageGovernor()
+    _run(gov, _s(40))  # step 1
+    when = T0 + timedelta(seconds=20)
+    gov.note_young_evictions(2, 42.0, when)
+    st = gov.state
+    assert st.evicting_young is True
+    assert st.young_evictions == 2
+    assert st.youngest_evicted_age_sec == 42.0
+    assert st.last_young_eviction == when
+    assert st.degraded is False  # step 1 alone never sets the sticky flag
+
+
+def test_step_text_changes_while_evicting_young_but_step_and_status_do_not():
+    gov = StorageGovernor()
+    _run(gov, _s(40))
+    before = gov.state.to_health()
+    assert before["step_text"] == "evicting the oldest automatic captures"
+    gov.note_young_evictions(1, 42.0, T0 + timedelta(seconds=20))
+    h = gov.state.to_health()
+    assert h["step"] == 1
+    assert h["step_text"] == "deleting automatic captures minutes after they are recorded"
+    assert h["evicting_young"] is True
+    assert h["young_evictions"] == 1
+    assert h["last_young_eviction"] == (T0 + timedelta(seconds=20)).isoformat()
+
+
+def test_window_lapse_on_a_later_tick_clears_evicting_young():
+    gov = StorageGovernor()
+    _run(gov, _s(40))
+    when = T0 + timedelta(seconds=20)
+    gov.note_young_evictions(1, 42.0, when)
+    assert gov.state.evicting_young
+    # A tick within the window keeps it set.
+    gov.tick(_s(40), min_free_gb=0.0, now=when + timedelta(seconds=YOUNG_EVICTION_WINDOW_SEC - 1))
+    assert gov.state.evicting_young
+    # A tick after the window lapses clears it.
+    gov.tick(_s(40), min_free_gb=0.0, now=when + timedelta(seconds=YOUNG_EVICTION_WINDOW_SEC + 1))
+    assert not gov.state.evicting_young
+    assert gov.state.to_health()["step_text"] == "evicting the oldest automatic captures"
+
+
+def test_a_new_young_eviction_after_the_lapse_restarts_the_count():
+    gov = StorageGovernor()
+    _run(gov, _s(40))
+    first = T0 + timedelta(seconds=20)
+    gov.note_young_evictions(3, 42.0, first)
+    later = first + timedelta(seconds=YOUNG_EVICTION_WINDOW_SEC + 5)
+    gov.note_young_evictions(1, 99.0, later)
+    st = gov.state
+    assert st.young_evictions == 1
+    assert st.youngest_evicted_age_sec == 99.0
+    assert st.evicting_young
+
+
+def test_young_capture_sec_and_window_constants():
+    assert YOUNG_CAPTURE_SEC == 600
+    assert YOUNG_EVICTION_WINDOW_SEC == 1800
+
+
+def test_logs_warning_when_evicting_young_turns_on_and_info_when_it_clears(caplog):
+    gov = StorageGovernor()
+    _run(gov, _s(40))
+    when = T0 + timedelta(seconds=20)
+    with caplog.at_level(logging.WARNING, logger="rfobserver.storage.governor"):
+        gov.note_young_evictions(1, 42.0, when)
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings and "young" in warnings[0].getMessage().lower()
+    caplog.clear()
+    after_window = when + timedelta(seconds=YOUNG_EVICTION_WINDOW_SEC + 1)
+    with caplog.at_level(logging.INFO, logger="rfobserver.storage.governor"):
+        gov.tick(_s(40), min_free_gb=0.0, now=after_window)
+    infos = [r for r in caplog.records if r.levelname == "INFO"]
+    assert infos and "clear" in infos[0].getMessage().lower()

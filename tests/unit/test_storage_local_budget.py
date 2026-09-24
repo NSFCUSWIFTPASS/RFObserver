@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
+
+import pytest
 
 from rfobserver.storage.local import LocalStorage, is_active_capture
 
@@ -207,3 +210,41 @@ def test_delete_capture_tolerates_a_racing_unlink(tmp_path, monkeypatch):
     ls.evict_until_free(10**12, free_bytes=lambda: 0)
     assert not keep_going.exists()
     assert not (ls.auto_dir / "GONE.json").exists()
+
+
+# --- task 10: on_evict reports each evicted capture's path and age ------------
+
+
+def test_on_evict_called_with_path_and_plausible_age_in_eviction_order(tmp_path):
+    ls = LocalStorage(str(tmp_path), max_gb=100)
+    now = time.time()
+    old = _cap(ls.auto_dir, "OLD", 1000, now - 5000)
+    young = _cap(ls.auto_dir, "YOUNG", 1000, now - 30)
+    active = _cap(ls.auto_dir, "ACTIVE", 1000, now)
+    calls: list[tuple[str, float]] = []
+    ls.evict_until_free(
+        10**12,
+        exclude={"ACTIVE.sc16"},
+        free_bytes=lambda: 0,
+        on_evict=lambda p, age: calls.append((p.name, age)),
+    )
+    assert [name for name, _ in calls] == ["OLD.sc16", "YOUNG.sc16"]  # oldest first
+    assert calls[0][1] == pytest.approx(5000, abs=5)
+    assert calls[1][1] == pytest.approx(30, abs=5)
+    assert not old.exists() and not young.exists() and active.exists()
+
+
+def test_on_evict_not_called_for_protected_captures(tmp_path):
+    ls = LocalStorage(str(tmp_path), max_gb=100)
+    now = time.time()
+    active = _cap(ls.auto_dir, "ACTIVE", 1000, now)
+    m = _cap(ls.manual_dir, "M", 1000, now - 5000)
+    calls: list[tuple[str, float]] = []
+    ls.evict_until_free(
+        10**12,
+        exclude={"ACTIVE.sc16"},
+        free_bytes=lambda: 0,
+        on_evict=lambda p, age: calls.append((p.name, age)),
+    )
+    assert calls == []
+    assert active.exists() and m.exists()

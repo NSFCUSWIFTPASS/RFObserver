@@ -150,3 +150,37 @@ def test_clear_consumes_the_change_so_the_loop_does_not_rewrite_it():
     _client(gov, wdb).post("/api/storage/clear-degraded")
     assert wdb.config[DEGRADED_CONFIG_KEY] == ""
     assert gov.take_degraded_change() == (False, {})
+
+
+# --- task 10: warn when step 1 evicts captures soon after recording -----------
+
+
+def test_health_reports_evicting_young_fields():
+    gov = StorageGovernor()
+    _tick(gov, 40)
+    gov.note_young_evictions(2, 42.0, T0)
+    body = _client(gov).get("/api/health").json()
+    storage = body["storage"]
+    assert storage["evicting_young"] is True
+    assert storage["young_evictions"] == 2
+    assert storage["last_young_eviction"] == T0.isoformat()
+    assert body["status"] == "ok"  # step 1 never sets status to degraded
+
+
+def test_health_evicting_young_defaults_false():
+    gov = StorageGovernor()
+    _tick(gov, 40)
+    storage = _client(gov).get("/api/health").json()["storage"]
+    assert storage["evicting_young"] is False
+    assert storage["young_evictions"] == 0
+    assert storage["last_young_eviction"] is None
+
+
+def test_dashboard_handles_evicting_young():
+    html = _client(None).get("/live/").text
+    assert "evicting_young" in html
+
+
+def test_config_page_legend_handles_evicting_young():
+    html = _client(None).get("/config").text
+    assert "evicting_young" in html

@@ -958,6 +958,7 @@ async function refreshStorageBar() {
         `Other ${other.toFixed(1)} GB`, `Free ${s.free_gb} of ${vol} GB`, `Minimum free ${s.floor_gb} GB`,
     ];
     if (s.step > 0) parts.push(`Step ${s.step}: ${s.step_text}`);
+    if (s.evicting_young) parts.push('Deleting captures soon after recording');
     legend.textContent = parts.join('  ·  ');
 }
 refreshStorageBar();

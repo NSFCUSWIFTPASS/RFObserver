@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -169,6 +170,7 @@ class LocalStorage:
         exclude_fn: Callable[[], Collection[str]] | None = None,
         not_after: float | None = None,
         free_bytes: Callable[[], int] | None = None,
+        on_evict: Callable[[Path, float], None] | None = None,
     ) -> int:
         """Delete the oldest auto/ captures until the volume has
         ``target_free_bytes`` free or none is left to delete. Returns bytes freed.
@@ -180,6 +182,12 @@ class LocalStorage:
         right before each delete, since a recording can begin after the
         snapshot), or an mtime at or after ``not_after`` (a file still being
         written).
+
+        ``on_evict``, if given, is called right before each capture is deleted
+        with (its .sc16 path, its age in seconds = now - mtime). Runs on
+        whatever thread calls evict_until_free (the storage worker thread via
+        asyncio.to_thread); the caller collects ages there and reports them to
+        the governor once this returns.
         """
         free = free_bytes or (lambda: shutil.disk_usage(self.storage_path).free)
 
@@ -199,6 +207,8 @@ class LocalStorage:
             victim = captures.pop(0)
             if protected(victim):
                 continue
+            if on_evict is not None:
+                on_evict(victim, time.time() - self._mtime_or_zero(victim))
             freed += self._delete_capture(victim)
         if freed:
             logger.warning("Storage floor: evicted %.1f GB of automatic captures", freed / 1024**3)

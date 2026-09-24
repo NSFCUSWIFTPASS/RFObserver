@@ -147,3 +147,63 @@ def test_manual_usage(tmp_path):
     ls = LocalStorage(str(tmp_path), max_gb=100)
     _cap(ls.manual_dir, "M", 500, 1)
     assert ls.get_manual_usage_bytes() == 500 + 2 + 8
+
+
+# --- final review I1: a capture begun after the tick's snapshot is never taken ---
+
+
+def test_exclude_fn_is_rechecked_before_each_delete(tmp_path):
+    """A capture that became active after the static snapshot (the tick awaited
+    file_stats and the sample in between) survives: exclude_fn is asked again
+    right before every delete."""
+    ls = LocalStorage(str(tmp_path), max_gb=100)
+    old = _cap(ls.auto_dir, "OLD", 1000, 1)
+    new = _cap(ls.auto_dir, "NEW", 1000, 2)
+    active: set[str] = set()
+
+    def free() -> int:
+        # The recorder begins NEW once eviction is under way.
+        active.add("NEW.sc16")
+        return 0
+
+    ls.evict_until_free(10**12, exclude=(), exclude_fn=lambda: active, free_bytes=free)
+    assert not old.exists()
+    assert new.exists() and (ls.auto_dir / "NEW.psd").exists()
+
+
+def test_a_file_written_after_not_after_is_neither_evicted_nor_evictable(tmp_path):
+    ls = LocalStorage(str(tmp_path), max_gb=100)
+    old = _cap(ls.auto_dir, "OLD", 1000, 1000)
+    fresh = _cap(ls.auto_dir, "FRESH", 1000, 3000)  # still being written at 3000
+    ls.evict_until_free(10**12, not_after=2000.0, free_bytes=lambda: 0)
+    assert not old.exists() and fresh.exists()
+    s = ls.sample(
+        db_path=tmp_path / "db",
+        active_names=(),
+        db_file_bytes=0,
+        db_reusable_bytes=0,
+        not_after=2000.0,
+    )
+    assert s.evictable_auto is False
+    assert s.auto_bytes == 1000 + 2 + 8  # still counted as usage
+
+
+# --- final review M1: a concurrent delete cannot abort eviction ---------------
+
+
+def test_delete_capture_tolerates_a_racing_unlink(tmp_path, monkeypatch):
+    ls = LocalStorage(str(tmp_path), max_gb=100)
+    gone = _cap(ls.auto_dir, "GONE", 1000, 1)
+    keep_going = _cap(ls.auto_dir, "NEXT", 1000, 2)
+    real = LocalStorage._capture_size
+
+    def racing(self, p):
+        if p.name == "GONE.sc16":
+            gone.unlink()  # enforce_cap on the recctl thread got there first
+            p.stat()
+        return real(self, p)
+
+    monkeypatch.setattr(LocalStorage, "_capture_size", racing)
+    ls.evict_until_free(10**12, free_bytes=lambda: 0)
+    assert not keep_going.exists()
+    assert not (ls.auto_dir / "GONE.json").exists()

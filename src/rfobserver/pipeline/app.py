@@ -584,7 +584,12 @@ async def _storage_tick(
     retention_wake: asyncio.Event,
 ) -> None:
     """One governor tick: sample, decide, act, persist the sticky flag."""
+    # The active-capture snapshot and the tick's start time are taken together.
+    # A capture begun after this point (file_stats can queue behind the writer
+    # for tens of seconds) is caught at eviction by exclude_fn, and its fresh
+    # mtime (>= not_after) keeps it out of both the eviction and the evictable count.
     active = _active_capture_names(supervisor)
+    started = time.time()
     db_file, db_reusable = await db.file_stats()
     sample = await asyncio.to_thread(
         local_storage.sample,
@@ -592,6 +597,7 @@ async def _storage_tick(
         active_names=active,
         db_file_bytes=db_file,
         db_reusable_bytes=db_reusable,
+        not_after=started,
     )
     prev_step = governor.state.step
     actions = governor.tick(
@@ -610,7 +616,11 @@ async def _storage_tick(
         )
     if actions.evict_to_free_bytes is not None:
         await asyncio.to_thread(
-            local_storage.evict_until_free, actions.evict_to_free_bytes, exclude=active
+            local_storage.evict_until_free,
+            actions.evict_to_free_bytes,
+            exclude=active,
+            exclude_fn=lambda: _active_capture_names(supervisor),
+            not_after=started,
         )
     if actions.start_pressure_prune:
         retention_wake.set()

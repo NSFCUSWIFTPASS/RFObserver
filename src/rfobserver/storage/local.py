@@ -97,7 +97,9 @@ class LocalStorage:
         a file that cannot be removed is logged and skipped rather than aborting
         eviction, so one bad file cannot silently stop FIFO rotation.
         """
-        freed = self._capture_size(sc16_path)
+        # Tolerant size: enforce_cap (recording-control thread) and
+        # evict_until_free (storage thread) can race on the same capture.
+        freed = self._size_or_zero(sc16_path)
         for p in [sc16_path, *self._companion_paths(sc16_path)]:
             try:
                 p.unlink(missing_ok=True)
@@ -164,23 +166,40 @@ class LocalStorage:
         target_free_bytes: int,
         *,
         exclude: Collection[str] = (),
+        exclude_fn: Callable[[], Collection[str]] | None = None,
+        not_after: float | None = None,
         free_bytes: Callable[[], int] | None = None,
     ) -> int:
         """Delete the oldest auto/ captures until the volume has
         ``target_free_bytes`` free or none is left to delete. Returns bytes freed.
 
         The governor's step 1. Unlike enforce_cap this may take the newest
-        finished capture; it never takes one named in ``exclude`` (the capture
-        being recorded) or anything in manual/.
+        finished capture; it never takes the capture being recorded or anything
+        in manual/. The capture being recorded is recognised three ways:
+        named in ``exclude`` (a snapshot), named by ``exclude_fn`` (asked again
+        right before each delete, since a recording can begin after the
+        snapshot), or an mtime at or after ``not_after`` (a file still being
+        written).
         """
         free = free_bytes or (lambda: shutil.disk_usage(self.storage_path).free)
+
+        def protected(c: Path) -> bool:
+            if is_active_capture(c.name, exclude):
+                return True
+            if not_after is not None and self._mtime_or_zero(c) >= not_after:
+                return True
+            return exclude_fn is not None and is_active_capture(c.name, exclude_fn())
+
         captures = sorted(
-            (c for c in self.auto_dir.glob("*.sc16") if not is_active_capture(c.name, exclude)),
+            (c for c in self.auto_dir.glob("*.sc16") if not protected(c)),
             key=self._mtime_or_zero,
         )
         freed = 0
         while captures and free() < target_free_bytes:
-            freed += self._delete_capture(captures.pop(0))
+            victim = captures.pop(0)
+            if protected(victim):
+                continue
+            freed += self._delete_capture(victim)
         if freed:
             logger.warning("Storage floor: evicted %.1f GB of automatic captures", freed / 1024**3)
         return freed
@@ -192,8 +211,13 @@ class LocalStorage:
         active_names: Collection[str],
         db_file_bytes: int,
         db_reusable_bytes: int,
+        not_after: float | None = None,
     ) -> StorageSample:
-        """The filesystem half of a governor sample (blocking: call in a thread)."""
+        """The filesystem half of a governor sample (blocking: call in a thread).
+
+        A capture counts as evictable when it is not active and, given
+        ``not_after``, was last written before it (evict_until_free skips the
+        rest, so they must not make step 1 look possible)."""
         du = shutil.disk_usage(self.storage_path)
         db_volume = None
         db_dir = Path(db_path).resolve().parent
@@ -211,5 +235,9 @@ class LocalStorage:
             db_reusable_bytes=db_reusable_bytes,
             auto_bytes=sum(self._size_or_zero(c) for c in autos),
             manual_bytes=self.get_manual_usage_bytes(),
-            evictable_auto=any(not is_active_capture(c.name, active_names) for c in autos),
+            evictable_auto=any(
+                not is_active_capture(c.name, active_names)
+                and (not_after is None or self._mtime_or_zero(c) < not_after)
+                for c in autos
+            ),
         )

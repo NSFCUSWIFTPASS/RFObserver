@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 from rfobserver.config import AppSettings
@@ -38,13 +39,19 @@ class _LS:
         self.samples = samples
         self.evictions: list[tuple[int, set[str]]] = []
         self.active_seen: list[set[str]] = []
+        self.not_after_seen: list[float | None] = []
+        self.exclude_fn_seen: list[set[str]] = []
 
-    def sample(self, *, db_path, active_names, db_file_bytes, db_reusable_bytes):
+    def sample(self, *, db_path, active_names, db_file_bytes, db_reusable_bytes, not_after=None):
         self.active_seen.append(set(active_names))
+        self.not_after_seen.append(not_after)
         return self.samples.pop(0)
 
-    def evict_until_free(self, target, *, exclude=()):
+    def evict_until_free(self, target, *, exclude=(), exclude_fn=None, not_after=None):
         self.evictions.append((target, set(exclude)))
+        self.not_after_seen.append(not_after)
+        if exclude_fn is not None:
+            self.exclude_fn_seen.append(set(exclude_fn()))
         return 0
 
 
@@ -127,3 +134,27 @@ async def test_startup_restores_the_flag_and_the_last_write_error():
     await _restore_storage_flag(fresh, db)
     assert fresh.state.degraded_since == gov.state.degraded_since
     assert fresh.state.last_write_error == gov.state.last_write_error
+
+
+# --- final review I1: a capture begun during the tick is excluded -------------
+
+
+async def test_a_capture_begun_during_the_tick_is_excluded_from_eviction():
+    """file_stats can queue 10-30 s behind the writer; a capture that begins
+    in that window must still be excluded at eviction time."""
+    s = AppSettings(_env_file=None)
+    status = {"state": "idle", "file": None}
+    sup = SimpleNamespace(processor=SimpleNamespace(recording_status=lambda: dict(status)))
+
+    class _SlowDB(_DB):
+        async def file_stats(self):
+            status.update(state="recording", file="B.sc16")  # begun meanwhile
+            return 10, 2
+
+    ls = _LS([_sample(40, True)])
+    before = time.time()
+    await _storage_tick(s, StorageGovernor(), _SlowDB(), ls, sup, asyncio.Event())
+    assert ls.evictions and ls.exclude_fn_seen == [{"B.sc16"}]
+    # Both the sample and the eviction got the tick's start as not_after.
+    assert len(ls.not_after_seen) == 2
+    assert all(t is not None and before <= t <= time.time() for t in ls.not_after_seen)

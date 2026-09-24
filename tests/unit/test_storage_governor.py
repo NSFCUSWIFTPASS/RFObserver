@@ -408,3 +408,45 @@ def test_logs_warning_when_evicting_young_turns_on_and_info_when_it_clears(caplo
         gov.tick(_s(40), min_free_gb=0.0, now=after_window)
     infos = [r for r in caplog.records if r.levelname == "INFO"]
     assert infos and "clear" in infos[0].getMessage().lower()
+
+
+# --- task 12 item 3: young_evictions is a rolling 30-minute count -------------
+
+
+def test_young_evictions_is_a_rolling_window_count_not_cumulative():
+    """A sensor stuck in the young-eviction steady state for longer than the
+    window reports only the evictions inside the last 30 minutes, and the flag
+    clears 30 minutes after the last one."""
+    gov = StorageGovernor()
+    _run(gov, _s(40))  # step 1
+    window = YOUNG_EVICTION_WINDOW_SEC
+    # One young eviction every 5 minutes for 60 minutes (13 events, t = 0..3600 s),
+    # with a storage tick between each.
+    for i in range(13):
+        at = T0 + timedelta(seconds=300 * i)
+        gov.note_young_evictions(1, 42.0, at)
+        gov.tick(_s(40), min_free_gb=0.0, now=at + timedelta(seconds=150))
+    last = T0 + timedelta(seconds=3600)
+    # The last tick ran at t = 3750 s: the events inside the last 30 minutes
+    # (t > 1950 s) are t = 2100 .. 3600 s, 6 of the 13.
+    st = gov.state
+    assert st.young_evictions == 6
+    assert st.to_health()["young_evictions"] == 6
+    assert st.evicting_young
+    assert st.last_young_eviction == last
+
+    # A note prunes too: at t = 4800 s only the events after t = 3000 s
+    # (3300 and 3600 s) remain, plus the 2 just noted.
+    gov.note_young_evictions(2, 42.0, last + timedelta(seconds=1200))
+    assert gov.state.young_evictions == 2 + 2
+
+    # 30 minutes after the last one, a tick clears it.
+    newest = last + timedelta(seconds=1200)
+    gov.tick(_s(40), min_free_gb=0.0, now=newest + timedelta(seconds=window - 1))
+    assert gov.state.evicting_young
+    assert gov.state.young_evictions == 2
+    gov.tick(_s(40), min_free_gb=0.0, now=newest + timedelta(seconds=window))
+    st = gov.state
+    assert not st.evicting_young
+    assert st.young_evictions == 0
+    assert st.to_health()["young_evictions"] == 0

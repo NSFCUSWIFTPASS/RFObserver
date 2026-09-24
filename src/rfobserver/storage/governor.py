@@ -24,6 +24,7 @@ import json
 import logging
 import sqlite3
 import threading
+from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
@@ -48,6 +49,10 @@ LAST_WRITE_ERROR_CONFIG_KEY = "storage_last_write_error"
 YOUNG_CAPTURE_SEC = 600
 # The evicting_young warning stays up this long after the last young eviction.
 YOUNG_EVICTION_WINDOW_SEC = 1800
+# Bound on the rolling window's entries (one per tick that evicted young
+# captures). Past it, a new note merges into the newest entry, which can only
+# keep evictions in the count a little longer, never drop them.
+_YOUNG_WINDOW_MAX_ENTRIES = 4096
 
 STEP_TEXT = {
     0: "healthy",
@@ -110,7 +115,8 @@ class StorageState:
     degraded_since: datetime | None
     # Set by note_young_evictions; cleared by tick() once YOUNG_EVICTION_WINDOW_SEC
     # has lapsed since last_young_eviction. Does not affect step or degraded --
-    # steps 1-2 stay "working as designed".
+    # steps 1-2 stay "working as designed". young_evictions is the number of
+    # young evictions within the last YOUNG_EVICTION_WINDOW_SEC (rolling).
     evicting_young: bool = False
     last_young_eviction: datetime | None = None
     young_evictions: int = 0
@@ -206,6 +212,8 @@ class StorageGovernor:
         self._good_ticks = 0
         self._degraded_dirty = False
         self._ticks = 0
+        # Young evictions as (when, count), oldest first, within the window.
+        self._young: deque[tuple[datetime, int]] = deque()
         # Serializes persisting the sticky flag (the storage loop and the
         # clear route), so an older write can never land after a newer one.
         self.persist_lock = asyncio.Lock()
@@ -253,13 +261,9 @@ class StorageGovernor:
                 degraded_since = now
                 self._degraded_dirty = True
 
-            evicting_young = st.evicting_young
-            window_lapsed = False
-            if evicting_young and st.last_young_eviction is not None:
-                elapsed = (now - st.last_young_eviction).total_seconds()
-                if elapsed >= YOUNG_EVICTION_WINDOW_SEC:
-                    evicting_young = False
-                    window_lapsed = True
+            young_evictions = self._prune_young(now)
+            evicting_young = bool(self._young)
+            window_lapsed = st.evicting_young and not evicting_young
 
             self._ticks += 1
             self._state = replace(
@@ -271,6 +275,7 @@ class StorageGovernor:
                 sample=sample,
                 degraded_since=degraded_since,
                 evicting_young=evicting_young,
+                young_evictions=young_evictions,
             )
 
             target = int(floor * RECOVERY_MARGIN)
@@ -308,11 +313,12 @@ class StorageGovernor:
         Does not touch step or the sticky degraded flag."""
         with self._lock:
             st = self._state
-            lapsed = (
-                st.last_young_eviction is None
-                or (now - st.last_young_eviction).total_seconds() >= YOUNG_EVICTION_WINDOW_SEC
-            )
-            young_evictions = count if lapsed else st.young_evictions + count
+            young_evictions = self._prune_young(now) + count
+            if len(self._young) >= _YOUNG_WINDOW_MAX_ENTRIES:
+                _, merged = self._young.pop()
+                self._young.append((now, merged + count))
+            else:
+                self._young.append((now, count))
             turning_on = not st.evicting_young
             self._state = replace(
                 st,
@@ -329,6 +335,15 @@ class StorageGovernor:
                 youngest_age_sec,
                 YOUNG_EVICTION_WINDOW_SEC // 60,
             )
+
+    def _prune_young(self, now: datetime) -> int:
+        """Drop young evictions older than the window; return the sum left.
+        Caller holds ``_lock``."""
+        while self._young and (now - self._young[0][0]).total_seconds() >= (
+            YOUNG_EVICTION_WINDOW_SEC
+        ):
+            self._young.popleft()
+        return sum(c for _, c in self._young)
 
     def clear_degraded(self) -> None:
         with self._lock:

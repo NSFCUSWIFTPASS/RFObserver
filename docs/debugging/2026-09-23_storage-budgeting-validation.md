@@ -483,3 +483,47 @@ A manual recording then started (HTTP 200, `stopped_reason: "manual"`), and afte
   also the slowest rows to delete (about 4,300 rows/s here), so the first retention pass on such a
   DB is long.
 - Whether the real 56 Msps pipeline (not the mock) drops chunks during a 250-row retention pass.
+
+## 9. CORRECTION / follow-up 2026-09-23: fixes for the section 7 findings
+
+Section 7 is left as written. Fixed on `feat/storage-budgeting` in commits c6691b9 (1, 2),
+fd44666 (4) and bf80c06 (5 to 9). Each fix has a unit test that failed before it. None of these
+were re-measured on nano-super; the numbers in sections 4 and 7 are from before the fixes.
+
+1. **Fixed (mitigation as proposed).** `_configure_writer` sets `PRAGMA secure_delete=OFF` on the
+   writer connection, on connect and on the `_reconnect` path (same function). The web layer's
+   read-only connection is unchanged. The stall itself is not re-measured at field scale (see
+   section 8).
+2. **Fixed.** The blob-prune watermark is persisted in `config` under `blob_prune_mark` as JSON
+   `[start_time, rowid]`: loaded once per process at the first `prune_avg_psd_blobs`, saved every
+   40 chunks (10,000 rows) and at the end of each pass, each save its own `set_config` statement.
+   A missing or garbled value falls back to `("", 0)`, a full scan. The mark still advances only
+   past committed, nulled rows.
+3. **Not fixed; parked for the user** (eviction target and steady-state step 1).
+4. **Fixed.** After a recording ends with `disk_floor` or `write_error`, starts (manual, arm,
+   trigger fire, continuous re-arm fire) are refused with "Recording held: the last capture
+   stopped for <reason>; waiting for the next storage check" until `StorageGovernor.ticks`
+   (completed ticks, new) moves past its value at the end of that finalize. Capture names that
+   already exist in `auto/` or `manual/` get `-2`, `-3`, ... before `.sc16`;
+   `is_active_capture` and the captures route's `_drop` stem match both work with the suffix.
+   Known limit: the tick counter increments in `tick()`, after the sample is taken, so a tick
+   whose sample was taken just before the stop can release the hold. That still bounds churn to
+   at most one capture per storage tick instead of several per second.
+5. **Fixed.** The capture `.json` and the `.psd.json` are written to `<name>.tmp` and renamed;
+   on OSError the tmp is removed, so a full disk leaves no `.json` at all rather than a 0-byte
+   one. The facts stay in `iq_captures` and `last_write_error`, as before. The
+   `.detections.json` sidecar (storage/detections_sidecar.py) was not changed.
+6. **Fixed.** `last_write_error` is persisted under `storage_last_write_error` (JSON
+   `{"at", "error"}` or ""), written by the storage loop with `storage_degraded` whenever either
+   changes (every new write error now marks it), restored at startup, and cleared by
+   `POST /api/storage/clear-degraded`.
+7. **Fixed.** The deferred detections sidecar is skipped (debug log) when the `.sc16` no longer
+   exists after the grace delay.
+8. **Fixed.** `recording_status()["refused"]` is the refusal in force now; `_last_refusal` only
+   de-duplicates the log line.
+9. **Fixed.** The config comment now says the loop always runs, and `_cleanup_loop` clamps the
+   interval to at least 60 s.
+
+Open after these fixes: whether `secure_delete=OFF` removes the stalls at field scale and on the
+field NVMe (unchanged from section 8), and a hardware re-run of the section 4.7 churn probe with
+the hold in place.

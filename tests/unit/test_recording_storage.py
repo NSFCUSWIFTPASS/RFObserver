@@ -768,6 +768,97 @@ def test_an_abandoned_writer_cannot_fail_or_starve_the_next_recording(tmp_path, 
     assert second.stat().st_size == 3000 * 4
 
 
+class _SlowFile:
+    """A .sc16 whose first write blocks until released, then succeeds: a slow
+    volume, not a failed one."""
+
+    def __init__(self, real, release) -> None:
+        self.real, self.release = real, release
+
+    def write(self, data) -> int:
+        self.release.wait(timeout=10)
+        return self.real.write(data)
+
+    def close(self) -> None:
+        self.real.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+def test_an_abandoned_writer_flags_its_capture_and_warns_when_it_exits(
+    tmp_path, monkeypatch, caplog
+):
+    """Task 12 item 2: finalize gives up on a writer that is still writing.
+    The capture's .json must say so (not a clean 0-byte capture), the governor
+    flag is set, and the writer's eventual exit is logged with the bytes it
+    left on disk."""
+    import builtins
+    import logging
+    import threading
+
+    from rfobserver.pipeline import streaming
+
+    monkeypatch.setattr(streaming, "_WRITER_JOIN_TIMEOUT_SEC", 0.3)
+    real_open = builtins.open
+    release = threading.Event()
+
+    def fake_open(path, mode="r", *a, **k):
+        f = real_open(path, mode, *a, **k)
+        if str(path).endswith(".sc16") and "w" in mode:
+            return _SlowFile(f, release)
+        return f
+
+    monkeypatch.setattr("rfobserver.pipeline.streaming.open", fake_open, raising=False)
+    gov = _governor_at(0)
+    proc = _proc(tmp_path, gov, RECORDING_RAM_BUFFER=False)
+    proc._await_tail_grids = lambda: None
+
+    proc.start_recording()
+    pos = proc._pre_trigger_buf.total_written
+    proc._check_trigger_and_record(np.ones(1000, dtype=np.int32), (), pos)
+    sc16 = proc._recording_dir / proc._recording_file
+    writer = proc._writer_thread
+    proc.stop_recording()
+    assert writer is not None and writer.is_alive()
+
+    meta = json.loads(sc16.with_suffix(".json").read_text())
+    expected = (
+        "writer timeout: the file writer did not finish within 0.3 s; the .sc16 may "
+        "be incomplete or keep growing after this metadata was written"
+    )
+    assert meta["write_failed"] is True
+    assert meta["write_error"] == expected
+    assert meta["stopped_reason"] == "manual"
+    err = gov.state.last_write_error
+    assert err is not None and sc16.name in err["error"] and "writer timeout" in err["error"]
+    assert gov.state.degraded
+    assert proc.recording_status()["state"] == "idle"
+
+    with caplog.at_level(logging.WARNING, logger="rfobserver.pipeline.streaming"):
+        release.set()
+        writer.join(timeout=5)
+        assert not writer.is_alive()
+    size = sc16.stat().st_size
+    assert size > 0
+    warned = [r for r in caplog.records if r.levelno == logging.WARNING and sc16.name in r.message]
+    assert warned, caplog.text
+    assert str(size) in warned[0].message
+
+
+def test_abandoned_writer_default_message_names_the_shipped_timeout():
+    from rfobserver.pipeline import streaming
+
+    assert streaming._WRITER_JOIN_TIMEOUT_SEC == 10.0
+    assert streaming._writer_timeout_error() == (
+        "writer timeout: the file writer did not finish within 10 s; the .sc16 may "
+        "be incomplete or keep growing after this metadata was written"
+    )
+
+
 # --- final review M2: a RAM-mode flush failure holds new starts ---------------
 
 

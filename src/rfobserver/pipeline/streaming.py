@@ -115,6 +115,17 @@ _GRID_TAIL_DRAIN_CEILING_SEC = 10.0
 # for the writer to exit. A writer still blocked after that is abandoned (a
 # hung volume): the recording finalizes without it.
 _WRITER_JOIN_TIMEOUT_SEC = 10.0
+
+
+def _writer_timeout_error() -> str:
+    """The write_error recorded for a capture whose writer finalize abandoned."""
+    return (
+        "writer timeout: the file writer did not finish within "
+        f"{_WRITER_JOIN_TIMEOUT_SEC:g} s; the .sc16 may be incomplete or keep "
+        "growing after this metadata was written"
+    )
+
+
 # How often a writer waiting on an empty queue checks whether a newer
 # recording has superseded it.
 _WRITER_POLL_SEC = 0.5
@@ -449,6 +460,10 @@ class StreamingProcessor:
         self._writer_gen_lock = threading.Lock()
         # A writer finalize gave up on, kept so the next start can warn.
         self._abandoned_writer: threading.Thread | None = None
+        # Abandoned writers by generation, with the capture path finalize
+        # reported; each logs its bytes on disk when it finally exits.
+        # Guarded by _writer_gen_lock.
+        self._abandoned_paths: dict[int, Path] = {}
 
         # Recording-control thread: runs the blocking finalization work
         # (writer drain, file close, metadata, disk-cap eviction) so the
@@ -1480,6 +1495,19 @@ class StreamingProcessor:
                 if self._writer_thread.is_alive():
                     logger.error("Recording writer did not exit; abandoning writer thread")
                     self._abandoned_writer = self._writer_thread
+                    # The capture is not complete as far as this metadata can
+                    # tell: flag it rather than record a clean short file. This
+                    # generation is still current (the next start bumps it), so
+                    # the flag is this recording's. A writer error already set
+                    # is more specific and is kept.
+                    with self._writer_gen_lock:
+                        if self._writer_error is None:
+                            self._writer_error = _writer_timeout_error()
+                        self._abandoned_paths[self._writer_gen] = self._recording_dir / base_name
+                    if not self._writer_thread.is_alive():
+                        # It exited before the entry above existed; whichever
+                        # side pops the entry logs it.
+                        self._note_abandoned_writer_exit(self._writer_gen)
                 self._writer_thread = None
 
             # Rename file if drops occurred
@@ -1893,6 +1921,27 @@ class StreamingProcessor:
                 # and the receiver thread never sees a full queue.
                 while next_item() is not None:
                     pass
+        finally:
+            self._note_abandoned_writer_exit(gen)
+
+    def _note_abandoned_writer_exit(self, gen: int) -> None:
+        """Writer thread, at exit: if finalize abandoned this writer, say how
+        much it left on disk. The capture's metadata was written at finalize
+        and is not rewritten from here."""
+        with self._writer_gen_lock:
+            path = self._abandoned_paths.pop(gen, None)
+        if path is None:
+            return
+        try:
+            size: int | str = path.stat().st_size
+        except OSError:
+            size = "unknown"
+        logger.warning(
+            "Abandoned recording writer for %s exited; %s bytes on disk. Its metadata "
+            "was written at finalize and is not updated",
+            path.name,
+            size,
+        )
 
     # -- Dispatch thread --
 

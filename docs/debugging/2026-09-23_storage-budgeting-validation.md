@@ -929,3 +929,41 @@ abandoned connection's commit.
 or `rfobserver` process and nothing on 8888; `/` back to 430 G available. `~/rfobs-replay-data`,
 `~/rfobs-stall`, `~/rfobs-stalltest`, `~/GitHub/RFObserver` (branch `feat/averaged-window-store`,
 `stash@{0}` intact) and the `~/rfobs-storage` worktree (clean at `fd4094d`) were not modified.
+
+## 11. FOLLOW-UP 2026-09-24: fixes for section 10.6 findings 1 to 3
+
+Finding 4 (1 to 6.5 s DB operations under real SDR load) is out of scope and still open. The
+other three are fixed in code and covered by unit tests; none was re-run on hardware.
+
+1. **Orphaned `.detections.json`** (`9cad7ce`). `_deferred_sidecar` keeps the pre-check and,
+   after `write_sidecar` / `write_sidecar_from_grid` returns, re-checks the `.sc16`; if it is
+   gone the sidecar is unlinked (OSError suppressed) and a DEBUG line is logged. Test:
+   `test_sidecar_is_removed_when_the_capture_is_evicted_during_its_write` (DB and replay paths),
+   which deletes the `.sc16` inside the stubbed sidecar write. Residual window: an eviction that
+   lands after the re-check but before the function returns is not covered, but the write has
+   already finished by then, so the window is a `stat` call, not the 0.3 to 0.7 s query.
+2. **Abandoned writer recorded as a clean empty capture** (`4f2bcc8`). When finalize's writer
+   join (`_WRITER_JOIN_TIMEOUT_SEC`, 10 s) expires with the thread alive, finalize sets this
+   recording's writer error to `writer timeout: the file writer did not finish within 10 s; the
+   .sc16 may be incomplete or keep growing after this metadata was written` (a writer error
+   already set is kept). The existing path then writes `write_failed: true` and `write_error`
+   to the `.json` and calls `_report_write_error`, which sets the governor's sticky flag;
+   `stopped_reason` is unchanged and the start hold applies as for any write_error. The
+   generation is still current at finalize, so the I2 gating does not suppress it, and the
+   next start still bumps the generation before the abandoned writer can touch its flags. When
+   the abandoned writer exits it logs a WARNING with the file name and bytes on disk; metadata
+   is not rewritten. Test:
+   `test_an_abandoned_writer_flags_its_capture_and_warns_when_it_exits` (a `.sc16` whose first
+   write blocks past a 0.3 s join timeout, then succeeds). The I2 test still passes unchanged.
+   Consequence to know: the `.json`/`iq_captures` row still carry the byte count at finalize
+   (often 0), so an operator must read `write_failed` rather than `total_bytes`.
+3. **`young_evictions` cumulative** (`5f6f603`). The governor keeps a bounded deque of
+   `(time, count)` entries pruned in both `note_young_evictions` and `tick()`;
+   `young_evictions` is the sum over the last `YOUNG_EVICTION_WINDOW_SEC` and `evicting_young`
+   holds while the deque is non-empty (so it clears 30 min after the last young eviction, as
+   before). Logging is unchanged. After the flag clears, `young_evictions` now reads 0 (it used
+   to keep the stale total). Test: `test_young_evictions_is_a_rolling_window_count_not_cumulative`
+   (13 evictions over 60 simulated minutes report 6).
+
+Still open from 10.8: the shipped 30 min clear has not been observed on hardware, and I2 / item
+2 have not been exercised with a writer blocked mid-`write()` on a slow device.

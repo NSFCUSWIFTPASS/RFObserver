@@ -250,4 +250,17 @@ def test_config_page_has_the_isolation_fields():
 
 
 def test_dashboard_draws_attribution_labels():
-    assert "attributions" in _client(None).get("/live/").text
+    html = _client(None).get("/live/").text
+    # Fed from the psd payload, cleared with the waterfall, drawn by model.
+    assert "updateBurstOverlay(data.bursts, data.attributions)" in html
+    assert "attrLabels.set(a.id, a)" in html
+    assert "attrLabels.clear()" in html
+    assert "fillText(text, tx, ty)" in html
+    assert "String(a.model)" in html
+    assert "rgba(255, 214, 10, 0.95)" in html
+
+
+def test_config_page_marks_the_isolation_switches_as_next_start():
+    html = _client(None).get("/config").text
+    assert html.count("Applies at next start") == 2
+    assert 'class="sb-seg sb-bursts"' in html

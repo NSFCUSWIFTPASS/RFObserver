@@ -287,7 +287,7 @@
                 <div class="form-group" style="flex: 1;">
                     <label>Volume</label>
                     <div id="storage-bar" class="storage-bar" role="img" aria-label="Storage volume usage">
-                        <span class="sb-seg sb-manual"></span><span class="sb-seg sb-auto"></span><span class="sb-seg sb-db"></span><span class="sb-seg sb-other"></span>
+                        <span class="sb-seg sb-manual"></span><span class="sb-seg sb-auto"></span><span class="sb-seg sb-bursts"></span><span class="sb-seg sb-db"></span><span class="sb-seg sb-other"></span>
                         <span class="sb-floor" title="Minimum free space"></span>
                     </div>
                     <div id="storage-legend" class="storage-legend">--</div>
@@ -307,6 +307,7 @@
                         <input type="checkbox" id="isolation-enabled" name="isolation_enabled" {% if settings.ISOLATION_ENABLED %}checked{% endif %}>
                         <span class="toggle-text">Isolation</span>
                     </label>
+                    <span style="font-size: 10px; color: var(--text-secondary); margin-top: 2px; display: block;">Applies at next start (turn Sensor Active off and on).</span>
                     <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Cut each strong burst out of the IQ (shift to DC, decimate), save it as SigMF under bursts/ and offer it to modules.</span>
                 </div>
                 <div class="form-group">
@@ -314,6 +315,7 @@
                         <input type="checkbox" id="attribution-enabled" name="attribution_enabled" {% if settings.ATTRIBUTION_ENABLED %}checked{% endif %}>
                         <span class="toggle-text">Attribution</span>
                     </label>
+                    <span style="font-size: 10px; color: var(--text-secondary); margin-top: 2px; display: block;">Applies at next start (turn Sensor Active off and on).</span>
                     <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Decode isolated bursts with rtl_433 and label the detection (turns isolation on).</span>
                 </div>
             </div>
@@ -991,7 +993,7 @@
     }
 })();
 
-// Storage bar: manual, auto, DB and everything else, left to right; the
+// Storage bar: manual, auto, bursts, DB and everything else, left to right; the
 // remainder is free. The red line marks the minimum free space.
 async function refreshStorageBar() {
     let s;
@@ -1012,6 +1014,7 @@ async function refreshStorageBar() {
     const pct = v => (100 * Math.max(0, v) / vol).toFixed(2) + '%';
     bar.querySelector('.sb-manual').style.width = pct(s.manual_gb);
     bar.querySelector('.sb-auto').style.width = pct(s.auto_gb);
+    bar.querySelector('.sb-bursts').style.width = pct(bursts);
     bar.querySelector('.sb-db').style.width = pct(dbHere);
     bar.querySelector('.sb-other').style.width = pct(other);
     bar.querySelector('.sb-floor').style.left = pct(vol - s.floor_gb);

@@ -84,6 +84,26 @@ class BurstArchive:
                 logger.warning("Could not delete burst file %s", f)
         return freed
 
+    @staticmethod
+    def scan_usage(storage_path: str | Path, not_after: float | None = None) -> tuple[int, int]:
+        """(all burst bytes, bytes of bursts last written before ``not_after``)
+        under ``storage_path``/bursts, in one walk. Unlike the constructor this
+        never creates the folder: a missing bursts/ is (0, 0). Blocking."""
+        root = Path(storage_path) / "bursts"
+        if not root.is_dir():
+            return 0, 0
+        total = old = 0
+        for p in root.rglob("*.sigmf-data"):
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            size = BurstArchive._size(p)
+            total += size
+            if not_after is None or mtime < not_after:
+                old += size
+        return total, old
+
     def usage_bytes(self) -> int:
         return sum(self._size(p) for p in self._pairs())
 

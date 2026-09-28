@@ -1840,6 +1840,7 @@ body {
 .sb-seg { height: 100%; }
 .sb-manual { background: #0a84ff; }
 .sb-auto { background: #5e5ce6; }
+.sb-bursts { background: #30b0c7; }
 .sb-db { background: #ff9f0a; }
 .sb-other { background: #8e8e93; }
 .sb-floor {

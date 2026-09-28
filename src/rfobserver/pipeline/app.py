@@ -636,7 +636,7 @@ async def _storage_tick(
         # Isolated bursts go first. The capture eviction below then deletes
         # nothing when they alone met the target: it checks free space before
         # each delete.
-        if sample.bursts_bytes > 0:
+        if sample.old_bursts_bytes > 0:
             await asyncio.to_thread(
                 BurstArchive(local_storage.storage_path).evict_until_free, target
             )

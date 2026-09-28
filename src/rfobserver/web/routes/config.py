@@ -257,6 +257,8 @@ async def apply_config(request: Request) -> dict[str, Any]:
         # Pre-trigger seconds sizes the circular buffer rebuilt in
         # _recompute_chunk_params, so a change must reconfigure the pipeline.
         "TRIGGER_PRE_SEC",
+        # The isolation lookback sizes the same ring.
+        "ISOLATION_LOOKBACK_SEC",
         "BURST_THRESHOLD_HIGH_DB",
         "BURST_THRESHOLD_LOW_RATIO",
     }

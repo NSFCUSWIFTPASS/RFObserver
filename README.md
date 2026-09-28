@@ -187,9 +187,11 @@ Files go under `STORAGE_PATH/bursts/`:
   `attribution.jsonl` there. A replay never writes the database.
 
 `bursts/` is capped at `RFOBS_BURST_ARCHIVE_MAX_GB` (2), oldest first, and
-counts as `bursts_gb` in the health `storage` block. Under the storage floor
-(step 1) burst files are deleted before automatic captures; from step 3 no new
-burst files are saved, but modules and attribution still get the bursts.
+counts as `bursts_gb` in the health `storage` block. Below the storage floor,
+burst files are deleted before automatic captures. Bursts alone hold the ladder
+at step 1 only when deleting them would reach the floor; otherwise it moves on
+to step 2 and 3 as usual, and from step 3 no new burst files are saved (modules
+and attribution still get the bursts).
 
 Isolation reads each burst from the IQ ring after detection finishes, so the
 ring grows to `RFOBS_ISOLATION_LOOKBACK_SEC` (1.5 s) when that is longer than
@@ -197,9 +199,10 @@ the pre-trigger. That costs about 104 MB of RAM per second of lookback at
 26 Msps and 224 MB at 56 Msps. If the ring would take more than a quarter of
 the available RAM, isolation is disabled with an error, and health says why.
 
-The two switches and the lookback take effect the next time the pipeline
-starts (toggle Sensor Active off and on); the SNR, per-second and burst-length
-limits apply at once. `GET /api/health` has an `isolation` block with the
+The two switches take effect the next time the pipeline starts (toggle Sensor
+Active off and on). A lookback change resizes the ring at once, like a
+pre-trigger change; the SNR, per-second and burst-length limits also apply at
+once. `GET /api/health` has an `isolation` block with the
 state, the rtl_433 path and counters for every outcome (isolated, expired, too
 long, queue full, errors, decoded, not decoded, dropped).
 

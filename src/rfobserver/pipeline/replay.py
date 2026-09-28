@@ -48,6 +48,8 @@ async def run_replay(
     center_freq_hz: float = 0.0,
     datatype: str = "ci16_le",
     max_seconds: float | None = None,
+    overrides: dict[str, Any] | None = None,
+    attribution_wait_sec: float = 0.0,
 ) -> dict[str, Any]:
     """Run a recorded capture through the pipeline and return its detections.
 
@@ -55,6 +57,10 @@ async def run_replay(
     sidecar; for a headerless raw ``.dat`` supply ``sample_rate_hz`` (and usually
     ``center_freq_hz``/``datatype``), whose parameters live only in the filename.
     ``max_seconds`` caps how much of the head is replayed (for long captures).
+    ``overrides`` sets further settings on the replay's ``AppSettings`` (e.g.
+    ``ATTRIBUTION_ENABLED``). With ``attribution_wait_sec`` > 0, after the
+    capture has drained the processor is kept running until every isolated
+    burst has an attribution outcome, or that many seconds pass.
 
     Returns ``{capture: {...}, num_bins, detections: [...]}``.
     """
@@ -114,6 +120,8 @@ async def run_replay(
         )
         if threshold_db is not None:
             object.__setattr__(settings, "BURST_THRESHOLD_HIGH_DB", threshold_db)
+        for key, value in (overrides or {}).items():
+            object.__setattr__(settings, key, value)
 
         db = SensorDatabase(settings.DB_PATH)
         await db.connect()
@@ -138,7 +146,7 @@ async def run_replay(
                 settings=settings,
                 drop_on_overflow=False,  # lossless: process every sample of the capture
             )
-            await _drive_to_end(processor, receiver, settings)
+            await _drive_to_end(processor, receiver, settings, attribution_wait_sec)
             detections = await db.query_detections(limit=limit)
         finally:
             await db.close()
@@ -157,10 +165,48 @@ async def run_replay(
     }
 
 
+def _attribution_settled(counts: dict[str, int]) -> bool:
+    """True once the stage has settled every burst it received (gated out,
+    dropped, or in a final state) and every burst handed to attribution has an
+    outcome: decoded, not decoded, failed, or evicted from the attribution
+    queue. The first condition matters: a burst still being isolated is in
+    neither side of the second."""
+    settled = sum(
+        counts.get(k, 0)
+        for k in ("gated_out", "queue_full", "isolated", "iq_expired", "too_long", "error")
+    )
+    if settled < counts.get("received", 0):
+        return False
+    done = sum(
+        counts.get(k, 0)
+        for k in ("attr_decoded", "attr_not_decoded", "attr_failed", "attr_dropped")
+    )
+    handed = counts.get("isolated", 0) + counts.get("too_long", 0) - counts.get("handoff_error", 0)
+    return done >= handed
+
+
+async def _wait_for_attribution(processor: StreamingProcessor, wait_sec: float) -> None:
+    """Poll (every 0.5 s) until attribution has caught up, or wait_sec passes."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + wait_sec
+    while True:
+        status = processor.isolation_status()
+        if not status["attribution"] or _attribution_settled(status["counts"]):
+            return
+        if loop.time() >= deadline:
+            logger.warning("Replay: attribution still pending after %.0fs", wait_sec)
+            return
+        await asyncio.sleep(0.5)
+
+
 async def _drive_to_end(
-    processor: StreamingProcessor, receiver: FileReplayReceiver, settings: AppSettings
+    processor: StreamingProcessor,
+    receiver: FileReplayReceiver,
+    settings: AppSettings,
+    attribution_wait_sec: float = 0.0,
 ) -> None:
-    """Run until the capture is exhausted + the rolling window has flushed, then stop."""
+    """Run until the capture is exhausted + the rolling window has flushed (and,
+    with ``attribution_wait_sec``, attribution has caught up), then stop."""
     # Rows of trailing drain needed for the rolling detector to flush a burst at
     # the very end past its margin, converted to receiver chunks.
     drain_rows = settings.BURST_WINDOW_ROWS + settings.BURST_EVAL_INTERVAL_ROWS + 64
@@ -173,7 +219,18 @@ async def _drive_to_end(
         target = processor._capture_count + drain_chunks
         while processor._capture_count < target:
             await asyncio.sleep(0.02)
+        # The burst thread can trail dispatch; let it finish every grid (and
+        # hand its bursts to the isolation stage) before stopping.
+        # Bounded, in case the burst thread has died.
+        deadline = asyncio.get_running_loop().time() + 120.0
+        while processor._burst_grids_done < processor._burst_grids_in:
+            if asyncio.get_running_loop().time() >= deadline:
+                logger.warning("Replay: burst detection did not catch up; stopping anyway")
+                break
+            await asyncio.sleep(0.02)
         await asyncio.sleep(0.2)
+        if attribution_wait_sec > 0:
+            await _wait_for_attribution(processor, attribution_wait_sec)
         processor.stop()
 
     # Generous ceiling; a 5-minute capture at 40 MS/s is a lot of FFTs.

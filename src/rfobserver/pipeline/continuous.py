@@ -16,7 +16,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from rfobserver.processing.burst import BurstDetectionConfig, detect_bursts
 from rfobserver.processing.iq_utils import calculate_iq_statistics, convert_bytes_to_complex
@@ -26,8 +26,9 @@ if TYPE_CHECKING:
     from rfobserver.capture.receiver import CaptureResult, IReceiver
     from rfobserver.config import AppSettings
     from rfobserver.models import BurstFingerprint, IQStatistics, ProcessedDataEnvelope, PSDData
-    from rfobserver.pipeline.attribution import AttributionItem, AttributionWorker
+    from rfobserver.pipeline.attribution import AttributionWorker
     from rfobserver.pipeline.beacon import ProgressBeacon
+    from rfobserver.pipeline.isolation import IsolationStage
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.storage.local import LocalStorage
     from rfobserver.transport.nats_producer import NatsProducer
@@ -35,49 +36,6 @@ if TYPE_CHECKING:
     from rfobserver.zms.monitor import ZmsMonitor
 
 logger = logging.getLogger(__name__)
-
-
-def select_bursts_for_attribution(
-    bursts: list[BurstFingerprint],
-    noise_floor_db: float,
-    snr_db: float,
-    max_n: int,
-) -> list[BurstFingerprint]:
-    """SNR gate + top-N-by-power. Returns the strongest bursts that clear the
-    gate, most-powerful first, capped at max_n."""
-    gated = [b for b in bursts if (b.peak_power_db - noise_floor_db) >= snr_db]
-    gated.sort(key=lambda b: b.peak_power_db, reverse=True)
-    return gated[:max_n]
-
-
-def _build_attribution_items(
-    iq_bytes: bytes,
-    sample_rate_hz: float,
-    center_freq_hz: float,
-    picked: list[BurstFingerprint],
-) -> list[AttributionItem]:
-    """CPU-bound: IQ conversion + per-burst channelize. No asyncio in here --
-    run this off the event loop (asyncio.to_thread) since it can take seconds
-    for a wideband chunk with several picked bursts."""
-    from rfobserver.pipeline.attribution import AttributionItem
-    from rfobserver.processing.channelize import channelize_to_cs16, select_rate_and_protocols
-
-    data = convert_bytes_to_complex(iq_bytes)
-    items: list[AttributionItem] = []
-    for burst in picked:
-        offset = burst.peak_freq_hz - float(center_freq_hz)
-        rate, passes = select_rate_and_protocols(burst.bandwidth_hz)
-        cs16 = channelize_to_cs16(data, float(sample_rate_hz), offset, rate)
-        items.append(
-            AttributionItem(
-                burst_id=burst.burst_id,
-                cs16=cs16,
-                target_rate_hz=rate,
-                passes=passes,
-                power_db=burst.peak_power_db,
-            )
-        )
-    return items
 
 
 class ContinuousProcessor:
@@ -120,21 +78,14 @@ class ContinuousProcessor:
         self._running = False
         self._excess_ms: float = 0.0
 
+        # Burst isolation + rtl_433 attribution (built in run() when enabled).
+        self._isolation: IsolationStage | None = None
         self._attrib_worker: AttributionWorker | None = None
         self._attrib_task: asyncio.Task[None] | None = None
-        if settings.ATTRIBUTION_ENABLED:
-            from rfobserver.pipeline.attribution import (
-                AttributionWorker,
-                StrongestQueue,
-                find_rtl433,
-            )
-
-            rtl = find_rtl433(settings.ATTRIBUTION_RTL433_PATH or None)
-            if rtl is None:
-                logger.warning("ATTRIBUTION_ENABLED but rtl_433 not found; attribution disabled")
-            else:
-                q = StrongestQueue(maxsize=settings.ISOLATION_QUEUE_MAX)
-                self._attrib_worker = AttributionWorker(database, rtl, queue=q)
+        self._rtl_status: str | None = None
+        # Module manager, attached externally (optional); the stage feeds it
+        # isolated bursts.
+        self._module_manager: Any = None
 
         logger.info(
             "Pipeline: 1 capture thread, %d PSD worker threads (%d cores, 2 reserved)",
@@ -157,8 +108,24 @@ class ContinuousProcessor:
         process_future: asyncio.Future[_ProcessResult] | None = None
         broadcast_task: asyncio.Task[None] | None = None
 
-        if self._attrib_worker is not None:
-            self._attrib_task = asyncio.create_task(self._attrib_worker.run())
+        if s.ISOLATION_ENABLED or s.ATTRIBUTION_ENABLED:
+            from rfobserver.pipeline.isolation import build_isolation
+
+            mm = self._module_manager
+            self._isolation, self._attrib_worker, self._rtl_status = build_isolation(
+                s,
+                database=self._db,
+                storage_path=str(self._storage.storage_path),
+                loop=asyncio.get_running_loop(),
+                module_feed=mm.feed_bursts if mm is not None else None,
+                refuse_saving=lambda: False,
+                replay_source=None,
+                on_label=None,
+            )
+            if self._isolation is not None:
+                self._isolation.start()
+            if self._attrib_worker is not None:
+                self._attrib_task = asyncio.create_task(self._attrib_worker.run())
 
         while self._running:
             for center_freq in freqs:
@@ -225,8 +192,12 @@ class ContinuousProcessor:
         if broadcast_task is not None:
             await broadcast_task
 
-        # Shut down the attribution worker (its queue.get() only unblocks on
-        # cancel, so stop() alone is not enough).
+        # The producer (_store_and_broadcast) is done: stop the stage (its
+        # stop() joins a worker thread, so off the loop), then the attribution
+        # worker (its queue.get() only unblocks on cancel, so stop() alone is
+        # not enough).
+        if self._isolation is not None:
+            await asyncio.to_thread(self._isolation.stop)
         if self._attrib_worker is not None:
             self._attrib_worker.stop()
         if self._attrib_task is not None:
@@ -236,6 +207,21 @@ class ContinuousProcessor:
 
     def stop(self) -> None:
         self._running = False
+
+    def isolation_status(self) -> dict[str, Any]:
+        counts: dict[str, int] = {}
+        if self._isolation is not None:
+            counts = self._isolation.stats.snapshot()
+            if self._attrib_worker is not None:
+                counts["attr_dropped"] = self._attrib_worker.queue.dropped
+        return {
+            "enabled": self._isolation is not None,
+            "attribution": self._attrib_worker is not None,
+            "rtl433": self._rtl_status,
+            "ring_sec": 0.0,
+            "disabled_reason": None,
+            "counts": counts,
+        }
 
     async def _store_and_broadcast(self, pr: _ProcessResult, excess_ms: float) -> None:
         """Save raw file, store detections in SQLite, broadcast to WebSocket."""
@@ -266,27 +252,24 @@ class ContinuousProcessor:
                 pr.capture_num,
             )
 
-        # rtl_433 attribution: gate (cheap, stays on the loop), then channelize
-        # off-loop (CPU-bound: full-chunk IQ conversion + per-burst mixer/
-        # resample, up to ISOLATION_MAX_PER_SEC times), then enqueue
-        # (never blocks) back on the loop.
-        if self._attrib_worker is not None and pr.bursts:
-            picked = select_bursts_for_attribution(
-                pr.bursts,
-                pr.noise_floor_db,
-                self._settings.ISOLATION_SNR_DB,
-                self._settings.ISOLATION_MAX_PER_SEC,
+        # Burst isolation: the stage gates, isolates and fans out on its own
+        # worker thread (the IQ conversion happens there too); submit never
+        # blocks.
+        if self._isolation is not None and pr.bursts:
+            from rfobserver.pipeline.isolation import (
+                BurstCandidate,
+                IsolationBatch,
+                WholeCaptureSource,
             )
-            if picked:
-                items = await asyncio.to_thread(
-                    _build_attribution_items,
-                    pr.iq_bytes,
-                    float(self._settings.BANDWIDTH),
+
+            self._isolation.submit(
+                IsolationBatch(
+                    [BurstCandidate(b, b.peak_power_db - pr.noise_floor_db) for b in pr.bursts],
                     float(pr.center_freq_hz),
-                    picked,
+                    float(self._settings.BANDWIDTH),
+                    WholeCaptureSource(pr.iq_bytes),
                 )
-                for item in items:
-                    self._attrib_worker.queue.put_nowait(item)
+            )
 
         # Build the processed envelope once; fan out to ZMS + NATS.
         if self._zms_monitor is not None or self._nats_producer is not None:

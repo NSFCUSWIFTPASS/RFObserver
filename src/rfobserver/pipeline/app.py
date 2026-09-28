@@ -240,6 +240,10 @@ async def run(settings: AppSettings) -> None:
                 replay_mode=replay_mode,
                 beacon=beacon,
                 storage_governor=storage_governor,
+                # Names the replay-only outputs of isolation / attribution.
+                replay_source=(getattr(receiver, "source_name", "") or "replay")
+                if replay_mode
+                else None,
             )
             # Attach module manager for upstream signal processing
             proc._module_manager = ModuleManager()

@@ -450,3 +450,243 @@ nano-super was left as found:
 - nvpmodel is still 15W.
 
 On the workstation, the bundle was deleted and no server is left on 8888.
+
+## CORRECTION / follow-up 2026-09-28: F3 root cause
+
+This section is appended; sections 1 to 9 above are unchanged. It overturns section 7's
+line "The ring holds 1.5 s, so the samples could not have been overwritten unless the
+positions were wrong" and closes section 9's first open item for the mechanism, not for
+the live instance (see "Open" below).
+
+### Question
+
+Why did the F3 burst (DB row 87, 925.994 MHz, 9.1 ms, detected 345 ms after its stop,
+one of 3 in its batch) end `iq_expired` on nano-super (Jetson Orin Nano, 15W, 6 cores,
+26 Msps, 1.5 s ring), and how is it fixed? Build: `feat/rtl433-burst-attribution` at
+`942899d`.
+
+### Answer
+
+The positions were right; the samples really were overwritten. `IsolationStage.process_batch`
+handled a batch's picked bursts strongest first and read each one from the ring just
+before its own DSP. `channelize_to_cs16` cost about 4.5 s per second of burst IQ on
+nano-super (734 ms for a 160 ms burst), so the stronger bursts' DSP (about 1.5 s here,
+by the controller's analysis of the batch) let the receiver overwrite the weakest burst
+before its turn. More generally the stage saturated once picked burst airtime passed
+about 20% of wall time.
+
+Fixed in three commits plus one follow-up:
+
+- `7223330` Snapshot first: after the gate, every picked ring burst's raw samples are
+  copied before any DSP (bounded at 256 MB of raw ring data per batch; beyond that,
+  bursts are read just before their DSP and one INFO line is logged per batch).
+  `processing/isolate.py` now has `burst_read_range` (the range, guard and truncation)
+  and `isolate_samples` (the DSP); `isolate_burst` composes them and behaves as before.
+- `f1ec477` FFT channelizer: overlap-save frequency-domain channelization (keep the
+  output band's bins around the offset, raised-cosine taper over the outer 5% of the
+  band, inverse FFT, restore one continuous mix's phase, remove the sub-bin residual).
+  Output length is `ceil(n * up / down)`, identical to resample_poly's.
+- `d03f004` Diagnosable expiry: one WARNING per expired ring burst with the reason
+  (`overwritten`, `unwritten` or `nopos`), the read range, the ring's
+  `[oldest, total_written)` right after the failed read and the age from `stop_sample`
+  to `total_written`. The counters `iq_expired_overwritten`, `iq_expired_unwritten` and
+  `iq_expired_nopos` sit alongside `iq_expired` in health and on the Config page.
+  `CircularBuffer.bounds()` returns both ends under the lock.
+- `19986d2` Channelizer follow-up: 32768-sample blocks, transformed 16 at a time straight
+  from the input (no burst-sized padded copy). The RAM guard now budgets 3 complex64
+  copies (measured peak 1.4) plus the snapshot, instead of 6 copies.
+
+### Procedure
+
+1. Reproduce the mechanism deterministically:
+   `test_a_weak_burst_is_not_evicted_by_the_dsp_of_stronger_ones` in
+   `tests/unit/test_isolation_stage.py`. A 400k-sample ring holds 3 picked bursts; a
+   patched `channelize_to_cs16` writes 50k samples into the ring per call (the receiver
+   running during DSP). The weakest, oldest burst's read starts at 16k, so it is gone
+   after one DSP call. This controls for positions: they are exact by construction.
+2. Run that test against the untouched `942899d` source (`git archive 942899d src`,
+   `PYTHONPATH` pointed at it): RED.
+3. Benchmark the channelizer alone and the read plus isolate path on nano-super, old
+   (`942899d`) against new (`19986d2`), in fresh processes, each case once per process,
+   two runs.
+4. Replay both full captures through the offline harness (`full_replay.py`) before and
+   after, and compare every burst's final state and decode by peak frequency, centre
+   frequency and power.
+5. Compare the FFT channelizer against the resample_poly path in band (FSK test signal)
+   and measure tone spurs, alias rejection and output length (unit tests).
+
+### Evidence
+
+RED on the old code (step 2):
+
+```
+E       AssertionError: assert [('b0', 'isol...'iq_expired')] == [('b0', 'isol..., 'isolated')]
+E         At index 2 diff: ('b2', 'iq_expired') != ('b2', 'isolated')
+1 failed, 27 deselected in 0.33s
+```
+
+nano-super, 15W, `bench_isolate.py` (`channelize_to_cs16` on complex64, offset 1.2 MHz,
+26 Msps), second run of each (the first run matched within 3 ms):
+
+```
+== BEFORE (942899d)                         == AFTER (19986d2)
+dur=10ms rate=1000000 isolate=53ms          dur=10ms rate=1000000 isolate=12ms
+dur=10ms rate=1600000 isolate=49ms          dur=10ms rate=1600000 isolate=8ms
+dur=50ms rate=1000000 isolate=239ms         dur=50ms rate=1000000 isolate=33ms
+dur=50ms rate=1600000 isolate=235ms         dur=50ms rate=1600000 isolate=29ms
+dur=160ms rate=1000000 isolate=733ms        dur=160ms rate=1000000 isolate=90ms
+dur=160ms rate=1600000 isolate=732ms        dur=160ms rate=1600000 isolate=86ms
+dur=500ms rate=1000000 isolate=2259ms       dur=500ms rate=1000000 isolate=262ms
+dur=500ms rate=1600000 isolate=2249ms       dur=500ms rate=1600000 isolate=259ms
+```
+
+That is 8.1x to 8.5x at 160 ms and 8.6x to 8.7x at 500 ms. The stage's full per-burst
+cost (int32 read, `iq_to_complex`, channelize, pack; `isolate_burst` from an int32
+array):
+
+```
+== STAGE read+isolate BEFORE                 == STAGE read+isolate AFTER
+dur=10ms rate=1000000 read+isolate=77ms      dur=10ms rate=1000000 read+isolate=21ms
+dur=10ms rate=1600000 read+isolate=73ms      dur=10ms rate=1600000 read+isolate=16ms
+dur=50ms rate=1000000 read+isolate=269ms     dur=50ms rate=1000000 read+isolate=54ms
+dur=50ms rate=1600000 read+isolate=264ms     dur=50ms rate=1600000 read+isolate=47ms
+dur=160ms rate=1000000 read+isolate=803ms    dur=160ms rate=1000000 read+isolate=121ms
+dur=160ms rate=1600000 read+isolate=787ms    dur=160ms rate=1600000 read+isolate=124ms
+dur=500ms rate=1000000 read+isolate=2426ms   dur=500ms rate=1000000 read+isolate=366ms
+dur=500ms rate=1600000 read+isolate=2405ms   dur=500ms rate=1600000 read+isolate=372ms
+```
+
+So the stage now spends about 0.75 s per second of burst IQ, not about 4.8 s. The
+int32 to complex64 conversion is now roughly a third of the per-burst cost.
+
+Full captures on the workstation (offline harness, default 1.5 s lookback), counts:
+
+```
+feb4 before: received 2, picked 2, isolated 2, attr_decoded 1, attr_not_decoded 1
+feb4 after:  received 2, picked 2, isolated 2, attr_decoded 1, attr_not_decoded 1
+feb5 before: received 36, picked 35, isolated 35, gated_out 1, attr_decoded 14, attr_not_decoded 21, iq_expired 0
+feb5 after:  received 36, picked 35, isolated 35, gated_out 1, attr_decoded 14, attr_not_decoded 21, iq_expired 0
+```
+
+Decodes (peak MHz, centre MHz, power dB, model, protocol):
+
+```
+feb4 before and after (identical):
+   (919.431, 914.994, -46.05, 'SilverSpring-Mesh', 383)
+feb5 before:                                              feb5 after:
+   (904.729, 904.774, -71.867, 'ssnmesh', None)              (904.729, 904.774, -71.867, 'ssnmesh', None)
+                                                             (904.729, 904.787, -71.865, 'ssnmesh', None)   gained
+   (911.331, 911.299, -74.671, 'SilverSpring-Mesh', 383)     same
+   (912.194, 912.201, -69.003, 'SilverSpring-Mesh', 383)     same
+   (913.4,   913.312, -71.967, 'SilverSpring-Mesh', 383)     same
+   (913.4,   913.388, -71.805, 'SilverSpring-Mesh', 383)     same
+   (913.4,   913.413, -71.924, 'SilverSpring-Mesh', 383)     same
+   (913.73,  913.737, -69.465, 'SilverSpring-Mesh', 383)     same
+   (916.13,  916.13,  -67.631, 'ssnmesh', None)              same
+   (916.993, 917.0,   -64.246, 'SilverSpring-Mesh', 383)     same
+   (917.031, 917.006, -63.732, 'SilverSpring-Mesh', 383)     same
+   (920.332, 920.326, -70.108, 'SilverSpring-Mesh', 383)     same
+   (920.903, 920.897, -73.101, 'ssnmesh', None)              lost (not decoded)
+   (922.122, 922.128, -66.851, 'SilverSpring-Mesh', 383)     same
+   (922.998, 923.036, -69.245, 'SilverSpring-Mesh', 383)     same
+```
+
+All 11 protocol-383 decodes on feb5 and the feb4 919.43 MHz decode are unchanged. The
+only differences are two `-X ssnmesh` flex decodes (no CRC): 904.787 gained and 920.903
+lost. Before and after were each run 3 times on feb5 and every run matched its own
+kind burst for burst, so the difference is the channelizer's and not run-to-run noise.
+The SSN e2e test (`tests/integration/test_isolation_attribution_e2e.py`, default
+lookback) passes.
+
+Channelizer quality (unit tests in `tests/unit/test_channelize.py`):
+- In band against the resample_poly path, FSK at 20 kbaud with +-50 kHz deviation:
+  -58.2 dB (26 to 1.6 Msps), -54.7 dB (26 to 1.0 Msps, band wrapping past -fs/2),
+  -58.6 dB (56 to 1.6 Msps), -53.3 dB (2 to 1.6 Msps). The test asserts < -40 dB,
+  because the old test's <= 2 LSB bitwise match cannot hold with a different low-pass
+  filter.
+- Tones at offset, including non-bin-aligned, wrapping, odd-rate and upsampling cases:
+  land on DC, worst spur -108 to -143 dB (asserted < -40 dB), and phase continuous
+  across block edges (phase std < 2e-7 rad).
+- An equal-power tone 1.0 MHz from the burst (it would alias to -600 kHz at 1.6 Msps)
+  stays 40 dB down.
+
+Memory, one 0.5 s burst at 26 Msps (`ru_maxrss` over baseline, in complex64 copies of
+the burst): resample_poly path 2.34, one-shot FFT 3.85, first block version (padded
+copy, 64 blocks per call) 2.8, final version 1.39.
+
+Unit suite on nano-super (`PYTHONPATH=/tmp/f3b/src`, clone of `19986d2`):
+`883 passed, 3 warnings in 93.57s`. Workstation: ruff, format, mypy (also clean in the
+CI-like lint venv), 883 unit passed, integration 110 passed and 10 skipped (NATS).
+
+### Measured and REJECTED (do not retry)
+
+- **`scipy.fft` with `workers=-1`.** The task suggested it. On nano-super it gave no
+  speedup: 500 ms burst 230 to 242 ms with `workers=1`, 222 to 249 ms with 2, 251 to
+  269 ms with 3 and 239 to 250 ms with -1. The transforms are memory-bound. The FFTs run
+  on one thread, so they do not compete with the receiver.
+- **One FFT of the whole burst** (the first version): 3.3x on the workstation and 3.4x
+  on nano-super (500 ms burst 678 to 700 ms). A single 13 M point transform is memory-
+  bound. It survives only as the fallback for sample rates whose ratio to the tier rate
+  does not reduce to a short block (for example 26,000,007 Hz), where its output rate is
+  off by less than 1 / output length (12 ppm for the 50 ms unit-test tone, 25 ppm for a
+  500k-sample burst).
+- **Larger blocks.** On nano-super, 65536-sample blocks with a 128-sample edge cost
+  98 to 112 ms (160 ms burst) and 284 to 320 ms (500 ms burst), against 86 to 90 and
+  259 to 266 ms for 32768 / 64. 131072 was slower still (121 / 362 to 381 ms). The
+  factor of 13 in 26 Msps / 1.6 Msps (65) makes every block length 13-smooth:
+  66560-point FFTs cost 16.4 ns per sample against 11.1 for 65536.
+- **A wider taper to raise decode counts** (not adopted, recorded as open below). Same
+  harness, feb5:
+
+  ```
+  taper 0.02: attr_decoded 13, protocol 383 x11, 920.903 flex lost
+  taper 0.05: attr_decoded 14, protocol 383 x11 (shipped)
+  taper 0.10: attr_decoded 14, protocol 383 x13 (904.774 and 916.13 become 383)
+  taper 0.20: attr_decoded 14, protocol 383 x14 (904.787 also 383); feb4 unchanged
+  taper 0.30: attr_decoded 13, protocol 383 x12
+  ```
+
+  A 20% roll-off narrows the flat passband to +-480 kHz of the 1.6 MHz band, which
+  keeps out noise. It was not adopted: it is tuned on one capture, it also changes the
+  1.0 Msps default-decoder tier, and the task asked for a gentle taper.
+
+### Measurement traps
+
+- `bench_isolate.py` makes one call per size in a fresh process, so its "after" numbers
+  are 30 to 40% higher than a loop that runs the old channelizer first (my `cmp.py`
+  showed 69 to 82 ms and 225 to 250 ms for the first FFT version). The old code's
+  allocations warm the allocator. The table above uses `bench_isolate.py` for both
+  sides, which matches the live stage (one burst at a time, fresh buffers).
+- nano-super timings drift by 10 to 20% between sweeps of the same code (for example
+  283 against 339 ms for the same 500 ms case). Compare within one sweep only.
+- Comparing the block path against the one-shot FFT path gives about -19 dB, not a
+  bug: the one-shot fallback's output rate is approximate, so the time axes drift apart.
+  Compare against resample_poly instead.
+- `sumdec.py` first keyed bursts on (peak MHz, power to 2 decimals). Two 904.729 MHz
+  bursts collided and it reported a false swap. The key now includes the centre
+  frequency and 3 decimals.
+
+### Open, not yet answered
+
+- A live re-run on nano-super to confirm no young `iq_expired` under load, and, if any
+  expire, which sub-counter it lands in. This fix has not run live.
+- Whether F3's live batch really held two long bursts. The 1.5 s of competing DSP is the
+  controller's analysis; the live log did not record the other two bursts' durations.
+  The mechanism is reproduced deterministically, but this instance is inferred.
+- The taper sweep above: a 10 to 20% roll-off decodes 2 to 3 more protocol-383 bursts
+  on feb5. It needs a check on more captures and on the 1.0 Msps tier before adopting.
+- The 920.903 MHz flex decode (section 9 already lists it as flaky offline) is lost
+  with every taper tried (0.02 to 0.30). It has no CRC, and it was not investigated
+  further.
+- Bursts past the 256 MB snapshot budget are still read lazily, so they can still
+  expire. At 26 Msps that needs a batch of more than about 5 bursts of 0.5 s (52 MB
+  each) whose DSP ahead of them outlasts the ring. This was not tested live.
+
+### Cleanup (this follow-up)
+
+On nano-super, `/tmp/f3`, `/tmp/f3b`, `/tmp/iso.bundle`, `/tmp/f3b.bundle`,
+`/tmp/bench_isolate.py` and `/tmp/f3b_bench_stage.py` were removed. No process was left
+running. `~/GitHub/RFObserver` is still on `feat/averaged-window-store` with
+`stash@{0}` intact and a clean status. `~/rfobs-*` was not touched. The unit suite's
+`tmp_path` directories went into the existing `/tmp/pytest-of-ocollaco`, which pytest
+rotates.

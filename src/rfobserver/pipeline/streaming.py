@@ -2128,7 +2128,9 @@ class StreamingProcessor:
             self._buf_pool.put_nowait(cr.sc16_buf)
 
         with contextlib.suppress(queue.Full):
-            self._burst_queue.put_nowait((cr.psd_grid, cr.center_freq_hz, cr.capture_num))
+            self._burst_queue.put_nowait(
+                (cr.psd_grid, cr.center_freq_hz, cr.capture_num, cr.chunk_start)
+            )
 
         # Persist PSD grids during recording. Disk mode hands rows to the
         # writer thread via the tagged queue (bounded RAM) — writing them
@@ -2245,7 +2247,7 @@ class StreamingProcessor:
                 if item is _STOP:
                     break
 
-                psd_grid, freq_hz, capture_num = item
+                psd_grid, freq_hz, capture_num, chunk_start = item
 
                 # Skip grids whose bin count doesn't match current config
                 # (stale grids from before a reconfiguration)
@@ -2276,7 +2278,9 @@ class StreamingProcessor:
                 # this commit), so we piggy-back on the detector's existing
                 # work and only refresh when it actually evaluates.
                 prev_rows_since_eval = rolling_detector._rows_since_eval
-                completed_bursts = rolling_detector.feed(psd_grid)
+                completed_bursts = rolling_detector.feed(
+                    psd_grid, chunk_start=chunk_start, slice_samples=self._slice_samples
+                )
                 if rolling_detector._rows_since_eval < prev_rows_since_eval:
                     last_det = rolling_detector._last_detection
                     if last_det is not None and last_det.noise_floor_per_bin is not None:

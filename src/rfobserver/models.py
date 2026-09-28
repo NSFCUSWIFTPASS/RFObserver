@@ -113,6 +113,11 @@ class BurstFingerprint(BaseModel):
     peak_power_db: float
     duration_ms: float = 0.0
     detection_timestamp: datetime = Field(default_factory=datetime.utcnow)
+    # Absolute stream sample range [start_sample, stop_sample) in the streaming
+    # pipeline's IQ ring, so the burst's samples can be read back for
+    # isolation. None where unknown (sweep pipeline, legacy paths).
+    start_sample: int | None = None
+    stop_sample: int | None = None
 
 
 class ChampionRecord(BaseModel):

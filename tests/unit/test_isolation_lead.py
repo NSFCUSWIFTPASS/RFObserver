@@ -349,3 +349,39 @@ async def test_replay_driver_stops_when_a_pipeline_thread_has_died(caplog):
         )
     assert status == {"counts": {}}
     assert "burst" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_replay_driver_waits_for_a_fixed_grid_target_not_the_live_count():
+    # The receiver keeps serving drain noise, so grids keep arriving and the
+    # burst thread is always one grid behind the live count. The driver must
+    # stop once the grids handed over so far are done, not chase the count.
+    from rfobserver.pipeline.replay import _drive_to_end
+
+    stopped = asyncio.Event()
+
+    class _Proc:
+        _capture_count = 0
+        _burst_grids_done = 0
+        _burst_grids_in = 1
+
+        async def run(self):
+            while not stopped.is_set():
+                self._capture_count += 1
+                self._burst_grids_done = self._burst_grids_in
+                self._burst_grids_in += 1
+                await asyncio.sleep(0.005)
+
+        def stop(self):
+            stopped.set()
+
+        def dead_pipeline_threads(self):
+            return []
+
+        def isolation_status(self):
+            return {"counts": {}}
+
+    settings = AppSettings(BURST_WINDOW_ROWS=64, BURST_EVAL_INTERVAL_ROWS=32, _env_file=None)
+    await asyncio.wait_for(
+        _drive_to_end(_Proc(), SimpleNamespace(exhausted=True), settings), timeout=10.0
+    )

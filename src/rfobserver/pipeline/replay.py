@@ -240,11 +240,14 @@ async def _drive_to_end(
             if died():
                 break
             await asyncio.sleep(0.02)
-        # The burst thread can trail dispatch; let it finish every grid (and
-        # hand its bursts to the isolation stage) before stopping.
+        # The burst thread can trail dispatch; let it finish every grid handed
+        # to it so far (and hand its bursts to the isolation stage) before
+        # stopping. A fixed target: the receiver keeps serving drain noise, so
+        # chasing the live count only ends when the two happen to meet.
         # Bounded, in case the burst thread has died.
+        grids_target = processor._burst_grids_in
         deadline = asyncio.get_running_loop().time() + 120.0
-        while processor._burst_grids_done < processor._burst_grids_in:
+        while processor._burst_grids_done < grids_target:
             if died() or asyncio.get_running_loop().time() >= deadline:
                 logger.warning("Replay: burst detection did not catch up; stopping anyway")
                 break

@@ -72,7 +72,7 @@ async def test_ssn_bursts_decode_through_the_streaming_pipeline(tmp_path):
     result = await run_replay(
         base.with_suffix(".sigmf-data"),
         threshold_db=30.0,
-        overrides={"ATTRIBUTION_ENABLED": True, "ISOLATION_LOOKBACK_SEC": 3.0},
+        overrides={"ATTRIBUTION_ENABLED": True},
         attribution_wait_sec=60.0,
     )
     models = {round(d["center_freq_hz"] / 1e5): d.get("model") for d in result["detections"]}

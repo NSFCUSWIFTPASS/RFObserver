@@ -196,15 +196,36 @@ class IsolationStage:
         # the normal case.
         self._drain_remaining_as_queue_full()
 
+    def wait_idle(self, timeout: float) -> bool:
+        """Wait until every accepted batch has been processed (or drained),
+        queue.join style. True once idle or once the stage is stopping (its
+        drain settles whatever is left); False when ``timeout`` passes first.
+        Only lossless replay calls this: live producers never wait."""
+        q = self._queue
+        deadline = time.monotonic() + timeout
+        with q.all_tasks_done:
+            while q.unfinished_tasks:
+                if self._stop_event.is_set():
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                # Short slices so a stop is noticed without a notify.
+                q.all_tasks_done.wait(min(remaining, 0.05))
+        return True
+
     def _loop(self) -> None:
         while not self._stop_event.is_set():
             batch = self._queue.get()
             if batch is _STOP:
+                self._queue.task_done()
                 break
             try:
                 self.process_batch(batch)
             except Exception:
                 logger.exception("Isolation batch failed")
+            finally:
+                self._queue.task_done()
         # Whether we got here via the _STOP sentinel or via the stop event
         # flipping between batches, anything still queued behind us was
         # accepted by submit() but will never be processed now.
@@ -216,6 +237,7 @@ class IsolationStage:
                 batch = self._queue.get_nowait()
             except queue.Empty:
                 return
+            self._queue.task_done()
             if batch is _STOP:
                 continue
             self.stats.count("queue_full", len(batch.candidates))

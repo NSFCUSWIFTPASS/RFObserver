@@ -567,6 +567,19 @@ class StreamingProcessor:
         # last-seen generation and reconfigures when it changes.
         self._config_generation = 0
 
+        # Lossless replay with isolation: the burst thread publishes the stream
+        # position just past the last grid it has finished (stamped with its
+        # config generation), and the receiver keeps at most _lead_limit
+        # samples ahead of it, so no burst leaves the ring before the stage
+        # reads it. None (live, paced replay, isolation off) means no limit.
+        self._burst_done_cv = threading.Condition()
+        self._burst_done_gen = 0
+        self._burst_done_end = 0
+        self._lead_limit: int | None = None
+        self._recv_thread: threading.Thread | None = None
+        self._dispatch_thread: threading.Thread | None = None
+        self._burst_thread: threading.Thread | None = None
+
     def _isolation_wanted(self) -> bool:
         s = self._settings
         return bool(s.ISOLATION_ENABLED or s.ATTRIBUTION_ENABLED)
@@ -666,6 +679,9 @@ class StreamingProcessor:
         )
         recctl_thread = threading.Thread(target=self._recctl_loop, name="recctl", daemon=True)
         self._recctl_thread = recctl_thread
+        self._recv_thread = recv_thread
+        self._dispatch_thread = dispatch_thread
+        self._burst_thread = burst_thread
 
         self._start_isolation()
 
@@ -749,6 +765,83 @@ class StreamingProcessor:
             self._isolation.start()
         if self._attrib_worker is not None:
             self._attrib_task = asyncio.create_task(self._attrib_worker.run())
+        self._lead_limit = self._compute_lead_limit()
+
+    def _compute_lead_limit(self) -> int | None:
+        """How far (samples) the receiver may run ahead of the burst thread in
+        lossless mode with isolation on; None when no limit applies.
+
+        A burst completes at the evaluation after its last row, so when the
+        burst thread has finished the grid ending at done_end, a burst it
+        hands over can start as early as done_end - (eval interval + 3 margin
+        rows) - ISOLATION_MAX_BURST_SEC - the guard band. The ring must still
+        hold that sample when the stage reads it, and the burst thread only
+        publishes done_end once the stage is idle.
+        """
+        if self._drop_on_overflow or self._isolation is None:
+            return None
+        if self._isolation_disabled_reason is not None:
+            return None
+        from rfobserver.processing.isolate import GUARD_SEC
+
+        s = self._settings
+        fs = float(s.BANDWIDTH)
+        guard = int(GUARD_SEC * fs)
+        reserve = (
+            (int(s.BURST_EVAL_INTERVAL_ROWS) + 3) * self._slice_samples
+            + int(float(s.ISOLATION_MAX_BURST_SEC) * fs)
+            + 2 * guard
+        )
+        limit = self._pre_trigger_buf.capacity - reserve
+        floor = 2 * self._chunk_samples
+        if limit < floor:
+            logger.warning(
+                "Isolation ring (%d samples) leaves a lead of %d samples over the burst "
+                "thread; clamped to 2 chunks, so bursts may expire (raise "
+                "ISOLATION_LOOKBACK_SEC)",
+                self._pre_trigger_buf.capacity,
+                limit,
+            )
+            limit = floor
+        return limit
+
+    def _publish_burst_done(self, gen: int, end: int) -> None:
+        """Burst thread: every grid up to stream position ``end`` is done."""
+        with self._burst_done_cv:
+            self._burst_done_gen = gen
+            self._burst_done_end = end
+            self._burst_done_cv.notify_all()
+
+    def _wait_for_burst_lead(self, n: int, my_gen: int) -> None:
+        """Receiver thread, lossless only: before writing ``n`` more samples,
+        wait (50 ms steps) until the burst thread is within the lead limit.
+        Stops waiting on shutdown, a reconfigure, or a dead burst thread."""
+        if self._lead_limit is None:
+            return
+        ring = self._pre_trigger_buf
+        with self._burst_done_cv:
+            while self._running and self._config_generation == my_gen:
+                limit = self._lead_limit
+                if limit is None:
+                    return
+                done = self._burst_done_end if self._burst_done_gen == my_gen else 0
+                if ring.total_written + n - done <= limit:
+                    return
+                bt = self._burst_thread
+                if bt is None or not bt.is_alive():
+                    logger.error(
+                        "Lossless replay: the burst thread has died; no longer holding "
+                        "the receiver back for isolation"
+                    )
+                    self._lead_limit = None
+                    return
+                self._burst_done_cv.wait(0.05)
+
+    def dead_pipeline_threads(self) -> list[str]:
+        """Names of the started recv / dispatch / burst threads that have exited."""
+        threads = (self._recv_thread, self._dispatch_thread, self._burst_thread)
+        started = [t for t in threads if t is not None and t.ident is not None]
+        return [t.name for t in started if not t.is_alive()]
 
     async def _stop_isolation(self) -> None:
         """Stop the stage, then the attribution worker. Call only after the
@@ -1028,6 +1121,7 @@ class StreamingProcessor:
                     my_gen = self._config_generation
                     self._reconfigure_receiver()
                     self._recompute_chunk_params()
+                    self._lead_limit = self._compute_lead_limit()
                     logger.info("Receiver loop reconfigured")
 
                 freqs = self._build_frequency_list()
@@ -1068,6 +1162,12 @@ class StreamingProcessor:
 
                         if n < len(buf):
                             logger.warning("recv_chunk short: %d/%d samples", n, len(buf))
+
+                        # Lossless replay with isolation: hold the ring write
+                        # until the burst thread (and stage) are close enough
+                        # behind that nothing isolation still needs is overwritten.
+                        if not self._drop_on_overflow:
+                            self._wait_for_burst_lead(n, my_gen)
 
                         # Log this chunk's receive gaps at stream positions
                         # BEFORE the ring write, so a pre-roll read that
@@ -2414,7 +2514,9 @@ class StreamingProcessor:
 
                 # Skip grids whose bin count doesn't match current config
                 # (stale grids from before a reconfiguration)
+                done_end = int(chunk_start) + int(psd_grid.grid.shape[0]) * self._slice_samples
                 if psd_grid.grid.shape[1] != s.NUM_FFT_BINS:
+                    self._publish_burst_done(my_gen, done_end)
                     self._burst_grids_done += 1
                     continue
 
@@ -2450,8 +2552,15 @@ class StreamingProcessor:
                     if last_det is not None and last_det.noise_floor_per_bin is not None:
                         self._noise_floor_per_bin = last_det.noise_floor_per_bin.tolist()
 
-                if completed_bursts and self._isolation is not None:
+                stage = self._isolation
+                if completed_bursts and stage is not None:
                     self._submit_isolation(rolling_detector, psd_grid, completed_bursts)
+                    # Lossless: the stage's backlog counts toward the lead, so
+                    # done_end advances only once it has read these bursts.
+                    if not self._drop_on_overflow:
+                        while self._running and not stage.wait_idle(0.5):
+                            pass
+                self._publish_burst_done(my_gen, done_end)
 
                 if completed_bursts and self._loop is not None:
                     self._burst_handoff.submit(self._loop, (completed_bursts, int(freq_hz)))

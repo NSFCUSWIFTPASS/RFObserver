@@ -62,7 +62,8 @@ async def run_replay(
     capture has drained the processor is kept running until every isolated
     burst has an attribution outcome, or that many seconds pass.
 
-    Returns ``{capture: {...}, num_bins, detections: [...]}``.
+    Returns ``{capture: {...}, num_bins, detections: [...], isolation: {...}}``;
+    ``isolation`` is the processor's isolation status taken just before it stops.
     """
     if sample_rate_hz is not None:
         cap = load_raw(
@@ -146,7 +147,7 @@ async def run_replay(
                 settings=settings,
                 drop_on_overflow=False,  # lossless: process every sample of the capture
             )
-            await _drive_to_end(processor, receiver, settings, attribution_wait_sec)
+            isolation = await _drive_to_end(processor, receiver, settings, attribution_wait_sec)
             detections = await db.query_detections(limit=limit)
         finally:
             await db.close()
@@ -162,6 +163,7 @@ async def run_replay(
         },
         "num_bins": n_bins,
         "detections": detections,
+        "isolation": isolation,
     }
 
 
@@ -204,34 +206,55 @@ async def _drive_to_end(
     receiver: FileReplayReceiver,
     settings: AppSettings,
     attribution_wait_sec: float = 0.0,
-) -> None:
+) -> dict[str, Any]:
     """Run until the capture is exhausted + the rolling window has flushed (and,
-    with ``attribution_wait_sec``, attribution has caught up), then stop."""
+    with ``attribution_wait_sec``, attribution has caught up), then stop.
+    Returns the isolation status captured just before the stop (stopping the
+    stage counts anything still queued as queue_full)."""
     # Rows of trailing drain needed for the rolling detector to flush a burst at
     # the very end past its margin, converted to receiver chunks.
     drain_rows = settings.BURST_WINDOW_ROWS + settings.BURST_EVAL_INTERVAL_ROWS + 64
     chunk_slices = max(1, settings.STREAMING_CHUNK_SLICES)
     drain_chunks = drain_rows // chunk_slices + 3
 
+    status: dict[str, Any] = {}
+
+    logged: list[str] = []
+
+    def died() -> bool:
+        # A dead recv, dispatch or burst thread means the counts below never
+        # advance: stop now rather than sit out the 3600 s ceiling.
+        dead = processor.dead_pipeline_threads()
+        if dead and not logged:
+            logged.extend(dead)
+            logger.error("Replay: pipeline thread(s) %s died; stopping", ", ".join(dead))
+        return bool(dead)
+
     async def stopper() -> None:
         while not receiver.exhausted:
+            if died():
+                break
             await asyncio.sleep(0.02)
         target = processor._capture_count + drain_chunks
         while processor._capture_count < target:
+            if died():
+                break
             await asyncio.sleep(0.02)
         # The burst thread can trail dispatch; let it finish every grid (and
         # hand its bursts to the isolation stage) before stopping.
         # Bounded, in case the burst thread has died.
         deadline = asyncio.get_running_loop().time() + 120.0
         while processor._burst_grids_done < processor._burst_grids_in:
-            if asyncio.get_running_loop().time() >= deadline:
+            if died() or asyncio.get_running_loop().time() >= deadline:
                 logger.warning("Replay: burst detection did not catch up; stopping anyway")
                 break
             await asyncio.sleep(0.02)
         await asyncio.sleep(0.2)
         if attribution_wait_sec > 0:
             await _wait_for_attribution(processor, attribution_wait_sec)
+        status.update(processor.isolation_status())
         processor.stop()
 
     # Generous ceiling; a 5-minute capture at 40 MS/s is a lot of FFTs.
     await asyncio.wait_for(asyncio.gather(processor.run(), stopper()), timeout=3600.0)
+    return status

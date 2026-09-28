@@ -342,8 +342,8 @@ def peak_bin_snr(
 # How often the isolation counters are logged (only when they changed).
 _ISOLATION_LOG_INTERVAL_SEC = 60.0
 # Complex64 copies of one ISOLATION_MAX_BURST_SEC burst the RAM guard budgets
-# for the isolation stage's working set (processing/channelize.py mixes in
-# blocks, so this no longer grows with float64/complex128 temporaries).
+# for the isolation stage's working set (processing/channelize.py transforms a
+# few blocks at a time; measured peak about 2.8 copies over the int32 input).
 _ISOLATION_WORKING_SET_FACTOR = 6
 
 
@@ -645,7 +645,7 @@ class StreamingProcessor:
         # _begin_recording). If the grown ring would not fit, isolation is
         # disabled rather than risking OOM on the Jetson. The guard also counts
         # the stage's working set for one burst of ISOLATION_MAX_BURST_SEC
-        # (the ring copy, complex64 IQ, mixed IQ and the resampler's buffers;
+        # (the ring copy, complex64 IQ, its padded copy and the FFT blocks;
         # _ISOLATION_WORKING_SET_FACTOR complex64 copies bounds them), plus
         # the raw ring copies one batch takes before its DSP (at most
         # ISOLATION_MAX_PER_SEC bursts, capped at SNAPSHOT_MAX_BYTES).

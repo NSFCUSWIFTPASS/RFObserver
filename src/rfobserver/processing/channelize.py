@@ -1,8 +1,16 @@
 """Channelize a detected burst out of wideband IQ into a narrowband .cs16 blob
-that rtl_433 can decode. Ported from the validated gr-modules ssn_scan.py:
-frequency-shift the burst to DC, resample to the target rate (resample_poly's
-polyphase FIR is the anti-alias / low-pass stage), and pack as interleaved
-little-endian int16. Pure DSP - no file or subprocess I/O.
+that rtl_433 can decode, and pack it as interleaved little-endian int16. Pure
+DSP - no file or subprocess I/O.
+
+The burst is channelized in the frequency domain, block by block (overlap-save):
+each block's FFT keeps only the output band's bins around the burst's offset (a
+raised-cosine taper on the outer edges limits ringing) and one short inverse
+FFT per block yields the decimated output. That is the same shift-to-DC plus
+low-pass plus decimate as the time-domain mixer and resample_poly it replaced
+(ported from gr-modules ssn_scan.py) at a fraction of the cost: every input
+sample goes through one FFT, where the polyphase filter ran a long FIR over the
+upsampled stream. The FFTs run on one thread: on nano-super, workers=-1 was no
+faster (the transforms are memory-bound) and would compete with the receiver.
 """
 
 from __future__ import annotations
@@ -10,7 +18,7 @@ from __future__ import annotations
 from math import gcd
 
 import numpy as np
-from scipy import signal as sig
+from scipy import fft as sfft
 
 # Bursts at or above this bandwidth take the 1.6 Msps SSN-mesh tier; narrower
 # bursts take the 1.0 Msps full-default-decoder tier. Bandwidth-keyed per the
@@ -19,51 +27,142 @@ TIER_BANDWIDTH_HZ: float = 200_000.0
 
 _SSN_FLEX = "n=ssnmesh,m=FSK_PCM,s=16,l=16,r=8000"
 
+# Fraction of the kept band, on each side, over which the taper rolls off.
+TAPER_FRACTION = 0.05
+# Overlap-save geometry: input samples per block FFT (about), output samples
+# per block (at least), and output samples discarded at each block edge. The
+# taper's impulse response is a few tens of output samples long, well inside
+# the discarded edge.
+BLOCK_IN = 65_536
+BLOCK_OUT_MIN = 2_048
+EDGE_OUT = 128
+# Blocks transformed per FFT call (about 34 MB of spectrum at BLOCK_IN).
+BLOCKS_PER_CALL = 64
+# Rates whose ratio does not reduce to a block of at most this many input
+# samples are channelized with one FFT of the whole burst instead.
+BLOCK_IN_MAX = 1 << 20
+
 
 def resample_ratio(sample_rate_hz: int, target_rate_hz: int) -> tuple[int, int]:
-    """Return the gcd-reduced (up, down) for resample_poly to take
-    sample_rate_hz -> target_rate_hz."""
+    """Return the gcd-reduced (up, down) that takes sample_rate_hz ->
+    target_rate_hz."""
     g = gcd(int(sample_rate_hz), int(target_rate_hz))
     return int(target_rate_hz) // g, int(sample_rate_hz) // g
 
 
-# Samples mixed per block. One block's float64 phase and complex128 exp are
-# about 24 MB, so the mixer's working set no longer scales with burst length
-# (one 0.5 s burst at 26 Msps peaked at 629 MB when mixed in one go).
-MIX_BLOCK_SAMPLES = 1 << 20
+def _taper(n_out: int) -> np.ndarray:
+    """Weights for n_out kept bins in FFT order: 1 in the middle, a raised
+    cosine to near 0 over the outer TAPER_FRACTION on each side."""
+    m = np.abs(np.fft.fftfreq(n_out, 1.0 / n_out))
+    half = n_out / 2.0
+    edge = max(1.0, TAPER_FRACTION * n_out)
+    x = np.clip((m - (half - edge)) / edge, 0.0, 1.0)
+    w: np.ndarray = (0.5 * (1.0 + np.cos(np.pi * x))).astype(np.float32)
+    return w
 
 
-def mix_to_dc(iq: np.ndarray, sample_rate_hz: float, offset_hz: float) -> np.ndarray:
-    """Multiply by exp(-j 2 pi offset/fs n), block by block, into one complex64
-    array. Each block's phase is computed in float64 from the absolute sample
-    index, so the phase is continuous across blocks."""
-    out = np.empty(len(iq), dtype=np.complex64)
-    w = -2.0 * np.pi * (float(offset_hz) / float(sample_rate_hz))
-    for start in range(0, len(iq), MIX_BLOCK_SAMPLES):
-        stop = min(start + MIX_BLOCK_SAMPLES, len(iq))
-        phase = w * np.arange(start, stop, dtype=np.float64)
-        np.multiply(
-            np.asarray(iq[start:stop], dtype=np.complex64),
-            np.exp(1j * phase).astype(np.complex64),
-            out=out[start:stop],
+def _select(spec: np.ndarray, k0: int, n_out: int) -> np.ndarray:
+    """The n_out bins centred on bin k0 (wrapping), tapered, in FFT order."""
+    n_in = spec.shape[-1]
+    m = np.fft.fftfreq(n_out, 1.0 / n_out).astype(np.int64)
+    w = _taper(n_out)
+    if n_out > n_in:  # upsampling: only the input's own bins exist
+        w[2 * np.abs(m) >= n_in] = 0.0
+    sel: np.ndarray = spec[..., (k0 + m) % n_in] * w
+    return sel
+
+
+def _channelize_blocks(
+    iq: np.ndarray, fs: float, offset_hz: float, up: int, down: int, n_keep: int, k: int, j: int
+) -> np.ndarray:
+    """Overlap-save: blocks of k * down input samples, k * up output samples,
+    of which j * up at each edge are discarded."""
+    l_in, l_out = k * down, k * up
+    o_in, o_out = j * down, j * up
+    h_in, h_out = l_in - 2 * o_in, l_out - 2 * o_out
+    nb = -(-n_keep // h_out)
+    xp = np.zeros(nb * h_in + 2 * o_in, dtype=np.complex64)
+    xp[o_in : o_in + len(iq)] = iq
+    blocks = np.lib.stride_tricks.sliding_window_view(xp, l_in)[::h_in]
+    bin_hz = fs / l_in
+    k0 = int(round(offset_hz / bin_hz))
+    out = np.empty((nb, l_out), dtype=np.complex64)
+    # A few blocks at a time, so the FFT working set stays small whatever the
+    # burst length.
+    for c in range(0, nb, BLOCKS_PER_CALL):
+        spec = sfft.fft(blocks[c : c + BLOCKS_PER_CALL], axis=-1)
+        out[c : c + BLOCKS_PER_CALL] = sfft.ifft(
+            _select(spec, k0, l_out), axis=-1, overwrite_x=True
         )
+    del xp, blocks
+    # Each block was shifted by k0 bins with its phase restarting at its own
+    # first sample. Restore the phase of one continuous mix by offset_hz from
+    # the burst's first sample, and remove the residual under half a bin.
+    rate = fs * up / down
+    s_b = np.arange(nb, dtype=np.float64) * h_in - o_in  # block starts, input samples
+    cyc_b = np.mod(s_b * (offset_hz / fs), 1.0)
+    i = np.arange(l_out, dtype=np.float64)
+    phase = -2.0 * np.pi * (cyc_b[:, None] + ((offset_hz - k0 * bin_hz) / rate) * i[None, :])
+    out *= np.exp(1j * phase).astype(np.complex64)
+    out *= np.float32(l_out / l_in)
+    return np.ascontiguousarray(out[:, o_out : l_out - o_out]).reshape(-1)[:n_keep]
+
+
+def _channelize_whole(
+    iq: np.ndarray, fs: float, offset_hz: float, up: int, down: int, n_keep: int
+) -> np.ndarray:
+    """One FFT of the whole burst: for rates that do not block well."""
+    n_in = sfft.next_fast_len(len(iq))
+    n_out = -(-n_in * up // down)  # >= n_keep
+    buf = np.zeros(n_in, dtype=np.complex64)
+    buf[: len(iq)] = iq
+    spec = sfft.fft(buf, overwrite_x=True)
+    del buf
+    bin_hz = fs / n_in
+    k0 = int(round(offset_hz / bin_hz))
+    out: np.ndarray = sfft.ifft(_select(spec, k0, n_out), overwrite_x=True)[:n_keep]
+    rate = fs * n_out / n_in
+    w = -2.0 * np.pi * (offset_hz - k0 * bin_hz) / rate
+    out *= np.exp(1j * w * np.arange(len(out), dtype=np.float64)).astype(np.complex64)
+    out *= np.float32(n_out / n_in)
     return out
+
+
+def channelize(
+    iq: np.ndarray, sample_rate_hz: float, offset_hz: float, target_rate_hz: int
+) -> np.ndarray:
+    """Shift offset_hz to DC and decimate to target_rate_hz, as complex64.
+
+    The output has ceil(len(iq) * up / down) samples, as resample_poly gave.
+    """
+    fs = float(sample_rate_hz)
+    up, down = resample_ratio(int(sample_rate_hz), int(target_rate_hz))
+    n_keep = -(-len(iq) * up // down)
+    if n_keep == 0:
+        return np.zeros(0, dtype=np.complex64)
+    j = -(-EDGE_OUT // up)
+    k = max(-(-BLOCK_IN // down), -(-BLOCK_OUT_MIN // up), 4 * j)
+    k = sfft.next_fast_len(k)
+    if k * down > BLOCK_IN_MAX:
+        res = _channelize_whole(iq, fs, float(offset_hz), up, down, n_keep)
+    else:
+        res = _channelize_blocks(iq, fs, float(offset_hz), up, down, n_keep, k, j)
+    return np.asarray(res, dtype=np.complex64)
 
 
 def channelize_to_cs16(
     iq: np.ndarray, sample_rate_hz: float, offset_hz: float, target_rate_hz: int
 ) -> bytes:
-    """Shift offset_hz to DC, resample to target_rate_hz, pack as <i2 I/Q."""
-    shifted = mix_to_dc(iq, sample_rate_hz, offset_hz)
-    up, down = resample_ratio(int(sample_rate_hz), int(target_rate_hz))
-    res = sig.resample_poly(shifted, up, down)
+    """Shift offset_hz to DC, decimate to target_rate_hz, pack as <i2 I/Q
+    peak-normalized to 30000."""
+    res = channelize(iq, sample_rate_hz, offset_hz, target_rate_hz)
     peak = float(np.max(np.abs(res))) if len(res) else 1.0
-    scale = 30000.0 / (peak or 1.0)
+    scale = np.float32(30000.0 / (peak or 1.0))
     scaled = res * scale
     out = np.empty(len(res) * 2, dtype="<i2")
     out[0::2] = scaled.real.astype("<i2")
     out[1::2] = scaled.imag.astype("<i2")
-    return out.tobytes()
+    return bytes(out.tobytes())
 
 
 def select_rate_and_protocols(bandwidth_hz: float) -> tuple[int, list[list[str]]]:

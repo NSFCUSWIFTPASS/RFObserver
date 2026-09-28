@@ -8,13 +8,29 @@ compressed ``.npz`` which materialized the whole grid.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Write ``text`` to ``<path>.tmp`` and rename it over ``path``. On a full
+    disk the open would otherwise leave a truncated, often 0-byte, file behind;
+    here a failure removes the tmp and leaves no file at all. Raises OSError."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
 
 
 def grid_paths(sc16_path: Path) -> tuple[Path, Path]:
@@ -37,8 +53,18 @@ def write_meta(
     grid_min: float,
     grid_max: float,
     cal_offset_db: float | None,
+    start_sample_offset: int = 0,
+    slice_samples: int = 0,
 ) -> None:
-    """Write the JSON sidecar describing the raw .psd grid."""
+    """Write the JSON sidecar describing the raw .psd grid.
+
+    ``start_sample_offset`` and ``slice_samples`` pin the grid to the companion
+    ``.sc16``: row ``k`` covers IQ samples ``[start_sample_offset +
+    k*slice_samples, start_sample_offset + (k+1)*slice_samples)``. Without them
+    a reader can only assume row 0 starts at the IQ's first sample, which is
+    how a pipeline-latency misalignment stayed invisible for so long (see
+    docs/debugging/2026-09-22_trigger-psd-iq-misalignment.md).
+    """
     meta: dict[str, Any] = {
         "rows": int(rows),
         "num_bins": int(num_bins),
@@ -48,10 +74,13 @@ def write_meta(
         "freq_axis": [float(x) for x in np.asarray(freq_axis).tolist()],
         "grid_min": float(grid_min),
         "grid_max": float(grid_max),
+        # Alignment to the .sc16 (see docstring).
+        "start_sample_offset": int(start_sample_offset),
+        "slice_samples": int(slice_samples),
     }
     if cal_offset_db is not None:
         meta["cal_offset_db"] = float(cal_offset_db)
-    meta_path.write_text(json.dumps(meta))
+    write_text_atomic(meta_path, json.dumps(meta))
 
 
 def load_grid(sc16_path: Path) -> tuple[np.ndarray[Any, np.dtype[Any]], dict[str, Any]] | None:

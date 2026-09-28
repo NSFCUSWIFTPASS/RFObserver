@@ -5,15 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import struct
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from rfobserver.storage import psd_grid
+from rfobserver.storage.sigmf_export import iq_sigmf_meta
 from rfobserver.web.uiprefs import ui_theme
 
 logger = logging.getLogger(__name__)
@@ -68,6 +70,63 @@ def _validate_filename(filename: str, storage: Path) -> Path:
     return (storage / filename).resolve()
 
 
+# Downloadable suffixes. Longest first, so ".psd.json" and ".detections.json"
+# are never mistaken for ".json" when a requested name is parsed. The SigMF pair
+# is served for every capture: the .sc16 bytes are already ci16_le, so
+# .sigmf-data is the same file and .sigmf-meta is generated from the .json.
+_DOWNLOAD_SUFFIXES = (
+    ".detections.json",
+    ".sigmf-data",
+    ".sigmf-meta",
+    ".psd.json",
+    ".sc16",
+    ".json",
+    ".psd",
+)
+
+
+def _capture_files(sc16: Path) -> list[dict[str, Any]]:
+    """The capture's files that exist on disk, with sizes, for download."""
+    base = _strip_suffix(sc16.name, ".sc16")
+    out = []
+    for suffix in (".sc16", ".json", ".psd", ".psd.json", ".detections.json"):
+        path = sc16.with_name(base + suffix)
+        if path.exists():
+            out.append({"name": path.name, "size_bytes": path.stat().st_size})
+    return out
+
+
+def _sigmf_names(sc16: Path) -> dict[str, str]:
+    base = _strip_suffix(sc16.name, ".sc16")
+    return {"meta": base + ".sigmf-meta", "data": base + ".sigmf-data"}
+
+
+def _is_being_recorded(request: Request, sc16: Path) -> bool:
+    """True while the pipeline is still writing (or finalizing) this capture.
+
+    Its files are still growing, so a download would be silently truncated.
+    Finalize may already have renamed the in-memory name to ``<base>_dropN``
+    before the file on disk is renamed, so compare with that stripped.
+    """
+    processor = getattr(request.app.state, "processor", None)
+    if processor is None:
+        return False
+    try:
+        status = processor.recording_status()
+    except Exception:
+        return False
+    if not isinstance(status, dict) or status.get("state") not in ("recording", "finalizing"):
+        return False
+    active = status.get("file")
+    if not isinstance(active, str):
+        return False
+
+    def stem(name: str) -> str:
+        return re.sub(r"_drop\d+$", "", _strip_suffix(name, ".sc16"))
+
+    return stem(active) == stem(sc16.name)
+
+
 @router.get("/", response_class=HTMLResponse)
 async def captures_page(request: Request) -> Any:
     templates = request.app.state.templates
@@ -98,6 +157,8 @@ async def captures_list(request: Request) -> list[dict[str, Any]]:
             "origin": origin,
             "size_bytes": sc16.stat().st_size,
             "has_psd": _has_psd(sc16),
+            "files": _capture_files(sc16),
+            "sigmf": _sigmf_names(sc16),
         }
 
         json_path = sc16.with_suffix(".json")
@@ -106,6 +167,11 @@ async def captures_list(request: Request) -> list[dict[str, Any]]:
                 entry["meta"] = json.loads(json_path.read_text())
             except (json.JSONDecodeError, OSError):
                 entry["meta"] = None
+            else:
+                # The per-gap list can hold up to _MAX_RECORDED_GAPS entries per
+                # capture; keep the list payload small (the .json keeps it).
+                if isinstance(entry["meta"], dict):
+                    entry["meta"].pop("gaps", None)
         else:
             entry["meta"] = None
 
@@ -127,6 +193,8 @@ async def capture_detail(request: Request, filename: str) -> dict[str, Any]:
         "filename": filename,
         "size_bytes": sc16_path.stat().st_size,
         "has_psd": _has_psd(sc16_path),
+        "files": _capture_files(sc16_path),
+        "sigmf": _sigmf_names(sc16_path),
     }
 
     json_path = sc16_path.with_suffix(".json")
@@ -141,13 +209,53 @@ async def capture_detail(request: Request, filename: str) -> dict[str, Any]:
     return result
 
 
+# HEAD too: curl -I, wget --spider and download managers probe the size first.
+@router.api_route("/download/{name}", methods=["GET", "HEAD"], response_model=None)
+async def capture_download(request: Request, name: str) -> FileResponse | JSONResponse:
+    """Download one file of a capture, by ``<base><suffix>``.
+
+    ``.sc16``, ``.json``, ``.psd``, ``.psd.json`` and ``.detections.json`` are
+    served as stored. ``.sigmf-data`` is the ``.sc16`` itself (byte-identical to
+    SigMF ci16_le) and ``.sigmf-meta`` is generated from the ``.json``. File
+    responses honour HTTP Range, so ``curl -C -`` resumes an interrupted pull.
+    A capture still being recorded answers 409 rather than a truncated file.
+    """
+    suffix = next((x for x in _DOWNLOAD_SUFFIXES if name.endswith(x)), None)
+    base = name[: -len(suffix)] if suffix else ""
+    if suffix is None or not base:
+        raise HTTPException(status_code=404, detail="File not found")
+    storage = _get_storage(request)
+    sc16 = _validate_filename(base + ".sc16", storage)
+    if not sc16.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    if _is_being_recorded(request, sc16):
+        raise HTTPException(status_code=409, detail="Capture is still being recorded")
+
+    disposition = {"Content-Disposition": f'attachment; filename="{name}"'}
+    if suffix == ".sigmf-meta":
+        json_path = sc16.with_suffix(".json")
+        try:
+            capture = json.loads(json_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=404, detail="Capture metadata not found") from exc
+        return JSONResponse(iq_sigmf_meta(capture), headers=disposition)
+
+    path = sc16 if suffix in (".sc16", ".sigmf-data") else sc16.with_name(base + suffix)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    media = "application/json" if suffix.endswith(".json") else "application/octet-stream"
+    return FileResponse(path, media_type=media, filename=name)
+
+
 def _open_psd(sc16_path: Path) -> tuple[np.ndarray[Any, np.dtype[Any]], dict[str, Any]] | None:
     """Load the PSD grid (new raw .psd first, then legacy .npz) plus its metadata.
 
     Returns ``(grid, info)`` where ``grid`` may be a read-only memmap (only the
     windowed slice is ever materialized) and ``info`` carries freq_axis (np array),
     time_resolution_s, center_freq_hz, bandwidth_hz, total_rows, num_bins, grid_min,
-    grid_max, and cal_offset_db. Returns ``None`` if no PSD companion exists.
+    grid_max, cal_offset_db, and the alignment pair start_sample_offset /
+    slice_samples that pins row 0 to a position in the .sc16. Returns ``None``
+    if no PSD companion exists.
     """
     loaded = psd_grid.load_grid(sc16_path)
     if loaded is not None:
@@ -162,6 +270,10 @@ def _open_psd(sc16_path: Path) -> tuple[np.ndarray[Any, np.dtype[Any]], dict[str
             "grid_min": float(meta["grid_min"]),
             "grid_max": float(meta["grid_max"]),
             "cal_offset_db": float(meta["cal_offset_db"]) if "cal_offset_db" in meta else None,
+            # Absent on captures recorded before the grid was pinned to the IQ;
+            # the client falls back to assuming row 0 starts the file.
+            "start_sample_offset": int(meta.get("start_sample_offset", 0)),
+            "slice_samples": int(meta.get("slice_samples", 0)),
         }
 
     npz_path = sc16_path.with_suffix(".npz")
@@ -183,6 +295,9 @@ def _open_psd(sc16_path: Path) -> tuple[np.ndarray[Any, np.dtype[Any]], dict[str
         "grid_max": float(grid.max()) if total_rows else -40.0,
         # Display calibration baked in at record time (absent → client uses dBFS).
         "cal_offset_db": float(data["cal_offset_db"]) if "cal_offset_db" in data.files else None,
+        # Legacy .npz never carried alignment metadata.
+        "start_sample_offset": 0,
+        "slice_samples": 0,
     }
 
 
@@ -271,6 +386,8 @@ async def capture_psd(
         "count": int(sliced.shape[0]),
         "center_freq_hz": info["center_freq_hz"],
         "bandwidth_hz": info["bandwidth_hz"],
+        "start_sample_offset": info["start_sample_offset"],
+        "slice_samples": info["slice_samples"],
     }
 
 
@@ -311,11 +428,12 @@ async def capture_detections(request: Request, filename: str) -> dict[str, Any]:
 
     meta = ds._read_json(sc16_path.with_suffix(".json")) or {}
     start_iso = meta.get("start_time")
-    dur = float(meta.get("duration_sec", 0.0))
+    # True time span (samples plus overflow loss); older captures lack it.
+    span = float(meta.get("time_span_sec") or meta.get("duration_sec", 0.0))
     too_new = False
     if start_iso:
         try:
-            end = datetime.fromisoformat(start_iso).timestamp() + dur
+            end = datetime.fromisoformat(start_iso).timestamp() + span
             too_new = (datetime.now(timezone.utc).timestamp() - end) < grace
         except ValueError:
             too_new = False

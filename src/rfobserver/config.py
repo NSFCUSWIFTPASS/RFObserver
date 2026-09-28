@@ -3,7 +3,7 @@ from __future__ import annotations
 import socket
 from dataclasses import dataclass
 
-from pydantic import Field, SecretStr, computed_field
+from pydantic import Field, SecretStr, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -67,7 +67,12 @@ class AppSettings(BaseSettings):
     TRIGGER_CONTINUOUS: bool = False
 
     # Burst detection
-    BURST_THRESHOLD_HIGH_DB: float = 10.0
+    # dB above the noise floor a PSD cell must reach to seed a burst. Each PSD
+    # row is a single unaveraged FFT, so cells are exponentially distributed
+    # noise samples: at 10 dB ~0.1% of cells cleared it, ~7,400 noise "bursts"
+    # per window, which stalled the pipeline. 30 dB yields none on pure noise.
+    # See docs/debugging/2026-09-22_psd-pipeline-latency.md.
+    BURST_THRESHOLD_HIGH_DB: float = 30.0
     BURST_THRESHOLD_LOW_RATIO: float = 0.6
     BURST_MERGE_FREQ_BINS: int = 5
     BURST_MERGE_TIME_MS: float = 3.0
@@ -104,13 +109,36 @@ class AppSettings(BaseSettings):
     STORAGE_PATH: str = "/tmp/rfobserver"
     DB_PATH: str = "/tmp/rfobserver/rfobserver.db"
     ARCHIVE_MAX_GB: float = 50.0
+    # Deprecated: the config page's retention field used to write this, but
+    # nothing ever read it. The page now writes DB_RETENTION_DAYS; a stored
+    # HISTORY_DAYS is carried into it once (see _carry_legacy_history_days) so
+    # an existing deployment's value starts working instead of silently
+    # reverting to the default.
     HISTORY_DAYS: int = 7
     # Scheduled DB retention: PSD blobs of averaged windows older than
-    # DB_RETENTION_DAYS are nulled out (the cheap stats rows, detections, and
-    # tone_checks are kept permanently) every DB_CLEANUP_INTERVAL_SEC
-    # (0 disables the retention loop).
+    # DB_RETENTION_DAYS are nulled out every DB_CLEANUP_INTERVAL_SEC; stats
+    # rows, detections and minute rollups expire after STATS_RETENTION_DAYS
+    # (tone_checks are kept permanently). The loop always runs; the interval
+    # is clamped to at least 60 s (pipeline/app.py:_cleanup_loop).
     DB_RETENTION_DAYS: int = 7
     DB_CLEANUP_INTERVAL_SEC: float = 3600.0
+    # Storage budgeting (docs/superpowers/specs/2026-09-23-storage-budgeting-design.md).
+    # Free space RFObserver defends on STORAGE_PATH's volume (and on DB_PATH's,
+    # if that is a different device). 0 = auto: 5% of the volume, at least 2 GB.
+    # Below it, automatic captures are evicted oldest first, then PSD history and
+    # detections are pruned harder, then recordings are refused, then PSD blobs
+    # stop being written. Manual captures are never deleted.
+    DISK_MIN_FREE_GB: float = 0.0
+    # Rows of avg_windows (stats), detections and avg_minutes older than this
+    # are deleted (0 disables). DB_RETENTION_DAYS still governs the PSD blobs.
+    STATS_RETENTION_DAYS: int = 730
+    # How often the storage governor samples the disk.
+    STORAGE_CHECK_SEC: float = 10.0
+    # How often the avg_minutes rollup folds newly closed minutes and advances
+    # its backfill of older history (0 disables the rollup, which disables the
+    # Dashboard's peak finder). The work per tick is bounded by a span and a
+    # time budget, so this is a latency knob, not a load knob.
+    PEAKS_ROLLUP_INTERVAL_SEC: float = 60.0
     # Grace period after a recording stops before its detections sidecar
     # (<base>.detections.json) is written, so late-arriving burst detections
     # that fall inside the capture window are captured. The captures route
@@ -175,6 +203,25 @@ class AppSettings(BaseSettings):
     ATTRIBUTION_MAX_PER_CHUNK: int = 40  # top-N strongest bursts per chunk
     ATTRIBUTION_QUEUE_MAX: int = 64
 
+    # Pipeline liveness watchdog (thread-based; restarts a stalled pipeline).
+    # Off by default; when enabled, a daemon thread restarts the pipeline (or,
+    # if the loop is wedged, exits the process for systemd) after no forward
+    # progress for WATCHDOG_TIMEOUT_SEC.
+    WATCHDOG_ENABLED: bool = False
+    WATCHDOG_TIMEOUT_SEC: float = 30.0
+    WATCHDOG_RESTART_DEADLINE_SEC: float = 10.0
+    # How long a watchdog-driven restart waits for the stalled task before
+    # cancelling it. This bounds only that wait -- the cancelled pipeline's own
+    # teardown (recording finalize, thread joins, final DB drain) is NOT bounded
+    # by it, so a restart with a recording in progress or a DB backlog can still
+    # exceed WATCHDOG_RESTART_DEADLINE_SEC and escalate to exit 90.
+    WATCHDOG_STOP_TIMEOUT_SEC: float = 5.0
+
+    # After crash auto-restart gives up, exit (code 91) a few seconds later so
+    # systemd's Restart=on-failure starts a fresh process (fresh USB/SDR state)
+    # instead of leaving a live process with the sensor silently inactive.
+    EXIT_ON_CRASH_GIVE_UP: bool = True
+
     # Development
     MOCK_RECEIVER: bool = False
     LOG_LEVEL: str = "INFO"
@@ -196,6 +243,21 @@ class AppSettings(BaseSettings):
     ZMS_MONITOR_NAME: str | None = None
     ZMS_MONITOR_SCHEMA_PATH: str | None = None
     ZMS_METRIC_ID: str | None = None
+
+    @model_validator(mode="after")
+    def _carry_legacy_history_days(self) -> AppSettings:
+        """Let a stored HISTORY_DAYS drive PSD retention.
+
+        The config page's retention field wrote HISTORY_DAYS, which nothing
+        read, so the value looked applied while PSD blobs kept aging out at the
+        DB_RETENTION_DAYS default. The page now writes DB_RETENTION_DAYS; an
+        existing HISTORY_DAYS still in a deployment's .env is honoured here,
+        unless DB_RETENTION_DAYS is set explicitly too.
+        """
+        provided = self.model_fields_set
+        if "HISTORY_DAYS" in provided and "DB_RETENTION_DAYS" not in provided:
+            object.__setattr__(self, "DB_RETENTION_DAYS", self.HISTORY_DAYS)
+        return self
 
     @computed_field  # type: ignore[prop-decorator]
     @property

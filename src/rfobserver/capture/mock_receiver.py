@@ -26,6 +26,10 @@ class MockReceiver:
         self._streaming = False
         self._stream_center_freq: int = 0
         self._closed = False
+        # Synthetic data never overflows; same attributes as Receiver.
+        self.last_gaps: list[tuple[int, int]] = []
+        self.overflow_events = 0
+        self.overflow_lost_samples = 0
 
     @property
     def serial(self) -> str:

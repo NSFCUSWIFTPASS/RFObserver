@@ -17,21 +17,112 @@ rows instead of the whole history.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
 import logging
 import math
-from datetime import datetime, timedelta
+import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 import numpy as np
+
+from rfobserver.storage.rollup import METRICS, PEAK_TIME_COLUMN, MinuteSummary, WindowRow
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
 # A healthy write is single-digit ms; 30 s means the storage device wedged.
 _DB_WRITE_TIMEOUT_SEC = 30.0
+
+# The WAL is truncated back to this size whenever a checkpoint lets it rewind,
+# so a burst of growth (e.g. behind a long reader snapshot) is not kept forever.
+_WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024  # 67108864
+
+# Rows per retention statement. Statement size on the writer connection is what
+# starves the pipeline (the peak-finder rollup, 2026-09-21): keep each one well
+# under the ~300 ms at which chunks begin to drop. Measured on nano-super
+# (15 W, cold page cache, 27.7 GB DB: 20 M avg_windows, 2.2 M PSD blobs,
+# 10 M detections): the largest chunk whose p99 statement time is under 100 ms
+# for every retention statement is 250 (p99 detections 94 ms, blob null 38 ms,
+# avg_windows 21 ms). At 500, detections p99 was 183 ms; at 1000, 529 ms.
+# docs/debugging/2026-09-23_storage-budgeting-validation.md
+RETENTION_CHUNK_ROWS = 250
+# The blob-prune watermark is kept in the config table so a restart resumes the
+# walk instead of rescanning all stats-only history (65 min for 20 M rows on
+# nano-super). Saved at the end of each pass and every this many chunks
+# (10,000 rows at 250) so an interrupted first pass resumes near where it
+# stopped.
+BLOB_PRUNE_MARK_CONFIG_KEY = "blob_prune_mark"
+_BLOB_MARK_SAVE_EVERY_CHUNKS = 40
+# Tables row retention may delete from, and their time column.
+_RETENTION_TABLES = {
+    "avg_windows": "start_time",
+    "detections": "start_time",
+    "avg_minutes": "minute_start",
+}
+
+
+def _retention_cutoff(days: int) -> str:
+    """Same naive-UTC ISO form prune_avg_psd_blobs has always compared with."""
+    return (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)).isoformat()
+
+
+_INSERT_DETECTION_SQL = """INSERT OR IGNORE INTO detections
+   (burst_id, start_time, stop_time, center_freq_hz, bandwidth_hz,
+    peak_power_db, duration_ms, detection_timestamp,
+    sdr_center_freq_hz, sample_rate_hz, lo_offset_hz, analog_bw_hz,
+    gain_db, antenna, device_serial, peak_freq_hz)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+
+_UPSERT_AVG_MINUTE_SQL = """INSERT OR REPLACE INTO avg_minutes
+    (minute_start, sdr_center_freq_hz, n, sample_rate_hz, gain_db,
+     pwr_max, pwr_snr, pwr_avg, peak_max_time, peak_snr_time, peak_avg_time)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+
+
+def _detection_row(
+    burst_id: str,
+    start_time: datetime,
+    stop_time: datetime,
+    center_freq_hz: float,
+    bandwidth_hz: float,
+    peak_power_db: float,
+    duration_ms: float,
+    detection_timestamp: datetime,
+    sdr_center_freq_hz: float | None = None,
+    sample_rate_hz: float | None = None,
+    lo_offset_hz: float | None = None,
+    analog_bw_hz: float | None = None,
+    gain_db: float | None = None,
+    antenna: str | None = None,
+    device_serial: str | None = None,
+    peak_freq_hz: float = 0.0,
+) -> tuple[Any, ...]:
+    return (
+        burst_id,
+        start_time.isoformat(),
+        stop_time.isoformat(),
+        center_freq_hz,
+        bandwidth_hz,
+        peak_power_db,
+        duration_ms,
+        detection_timestamp.isoformat(),
+        sdr_center_freq_hz,
+        sample_rate_hz,
+        lo_offset_hz,
+        analog_bw_hz,
+        gain_db,
+        antenna,
+        device_serial,
+        peak_freq_hz,
+    )
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS detections (
@@ -126,6 +217,29 @@ CREATE TABLE IF NOT EXISTS iq_captures (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+-- One row per minute per centre frequency, summarising avg_windows so the
+-- Dashboard's peak finder can rank a month of history without scanning
+-- millions of rows (43k rows a month here against 5M there). Each metric
+-- carries the start_time of the window that achieved it, so a chosen peak
+-- opens on the real event rather than on a minute boundary. A minute is
+-- always folded from all of its windows at once, so INSERT OR REPLACE is
+-- exact rather than lossy. The primary key's implicit index serves the
+-- range scan; no separate index is needed at this row count.
+CREATE TABLE IF NOT EXISTS avg_minutes (
+    minute_start TEXT NOT NULL,
+    sdr_center_freq_hz REAL NOT NULL,
+    n INTEGER NOT NULL,
+    sample_rate_hz REAL,
+    gain_db REAL,
+    pwr_max REAL,
+    pwr_snr REAL,
+    pwr_avg REAL,
+    peak_max_time TEXT,
+    peak_snr_time TEXT,
+    peak_avg_time TEXT,
+    PRIMARY KEY (minute_start, sdr_center_freq_hz)
+);
+
 CREATE INDEX IF NOT EXISTS idx_detections_time ON detections(start_time);
 CREATE INDEX IF NOT EXISTS idx_detections_freq ON detections(center_freq_hz);
 CREATE INDEX IF NOT EXISTS idx_stats_time ON stats(timestamp);
@@ -186,11 +300,23 @@ def _nice_bin_width(span: float) -> float:
 class SensorDatabase:
     """Async SQLite database for local sensor state."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, *, read_only: bool = False) -> None:
         self._db_path = db_path
+        self._read_only = read_only
         self._db: aiosqlite.Connection | None = None
         self._write_timeout = _DB_WRITE_TIMEOUT_SEC
         self._reconnect_lock = asyncio.Lock()
+        # (start_time, rowid) up to which every avg_windows blob is known to be
+        # pruned, so each hourly pass resumes instead of rescanning history.
+        self._blob_prune_mark: tuple[str, int] = ("", 0)
+        # Loaded from the config table on the first pass in this process.
+        self._blob_prune_mark_loaded = False
+        self._blob_prune_mark_saved: tuple[str, int] = ("", 0)
+
+    @property
+    def read_only(self) -> bool:
+        """True for the web layer's reader: query_only, no schema/migrations."""
+        return self._read_only
 
     async def _reconnect(self, expect: aiosqlite.Connection | None) -> None:
         """Abandon a connection whose write stuck, and open a fresh one.
@@ -207,21 +333,44 @@ class SensorDatabase:
                 return  # another coroutine already reconnected
             self._db = None
             conn = await aiosqlite.connect(self._db_path)
-            await conn.execute("PRAGMA journal_mode=WAL")
-            await conn.execute("PRAGMA synchronous=NORMAL")
-            await conn.execute("PRAGMA busy_timeout=2000")
+            await self._configure_writer(conn)
             self._db = conn
             logger.error("Database reconnected after stuck write")
+
+    async def _configure_writer(self, conn: aiosqlite.Connection) -> None:
+        """Journal/sync pragmas for a writer connection (connect and reconnect)."""
+        async with conn.execute("PRAGMA journal_mode=WAL") as cur:
+            row = await cur.fetchone()
+        mode = str(row[0]).lower() if row else ""
+        if mode != "wal":
+            logger.error(
+                "SQLite journal_mode is %r, not WAL, for %s. The web layer's read-only "
+                "connection and the pipeline writer need WAL to run concurrently: "
+                "without it a long web read blocks pipeline writes with "
+                "'database is locked'.",
+                mode,
+                self._db_path,
+            )
+        await conn.execute(f"PRAGMA journal_size_limit={_WAL_SIZE_LIMIT_BYTES}")
+        await conn.execute("PRAGMA synchronous=NORMAL")
+        await conn.execute("PRAGMA busy_timeout=2000")
+        # Ubuntu's SQLite is built with SECURE_DELETE on, so every freed page is
+        # also overwritten with zeros. Nulling PSD blobs with it on stalled this
+        # writer 10 to 30 s in 4 of 4 runs on nano-super; with it off, 2 of 2
+        # ran with no statement over 200 ms. Spectrum data is not sensitive.
+        # docs/debugging/2026-09-23_storage-budgeting-validation.md, section 4.5
+        await conn.execute("PRAGMA secure_delete=OFF")
 
     @staticmethod
     def _guarded_write(fn: Any) -> Any:
         """Wrap a write method: time out a stuck write, reconnect, retry once.
 
         Without the timeout a device hiccup wedges the writer permanently
-        (see module docstring). The retry runs unguarded on the fresh
-        connection: while the hiccup persists it fails fast via busy_timeout
-        and the exception propagates to the caller (which logs and continues),
-        so the pipeline keeps running and recovers on its own.
+        (see module docstring). The retry on the fresh connection is bounded
+        by the same write timeout so it cannot hang forever either: while the
+        hiccup persists it fails fast via busy_timeout and the exception
+        propagates to the caller (which logs and continues), so the pipeline
+        keeps running and recovers on its own.
         """
 
         @functools.wraps(fn)
@@ -239,16 +388,25 @@ class SensorDatabase:
                     self._write_timeout,
                 )
             await asyncio.wait_for(self._reconnect(expect=conn), timeout=self._write_timeout)
-            return await fn(self, *args, **kwargs)
+            return await asyncio.wait_for(fn(self, *args, **kwargs), timeout=self._write_timeout)
 
         return wrapper
 
     async def connect(self) -> None:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+        if self._read_only:
+            # Web-layer reader (spec Cut 3b): its own connection and worker
+            # thread, so long Dashboard reads never queue pipeline writes. WAL
+            # (set by the writer) gives concurrent read/write. query_only makes
+            # any accidental write fail instead of contending with the pipeline.
+            # The writer must connect first: it owns schema and migrations.
+            self._db = await aiosqlite.connect(self._db_path)
+            await self._db.execute("PRAGMA busy_timeout=2000")
+            await self._db.execute("PRAGMA query_only=ON")
+            logger.info("Database connected read-only: %s", self._db_path)
+            return
         self._db = await aiosqlite.connect(self._db_path)
-        await self._db.execute("PRAGMA journal_mode=WAL")
-        await self._db.execute("PRAGMA synchronous=NORMAL")
-        await self._db.execute("PRAGMA busy_timeout=2000")
+        await self._configure_writer(self._db)
         await self._db.executescript(SCHEMA)
         await self._migrate_detection_columns()
         await self._migrate_avg_windows_psd_nullable()
@@ -370,21 +528,16 @@ class SensorDatabase:
     ) -> None:
         assert self._db is not None
         await self._db.execute(
-            """INSERT OR IGNORE INTO detections
-               (burst_id, start_time, stop_time, center_freq_hz, bandwidth_hz,
-                peak_power_db, duration_ms, detection_timestamp,
-                sdr_center_freq_hz, sample_rate_hz, lo_offset_hz, analog_bw_hz,
-                gain_db, antenna, device_serial, peak_freq_hz)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
+            _INSERT_DETECTION_SQL,
+            _detection_row(
                 burst_id,
-                start_time.isoformat(),
-                stop_time.isoformat(),
+                start_time,
+                stop_time,
                 center_freq_hz,
                 bandwidth_hz,
                 peak_power_db,
                 duration_ms,
-                detection_timestamp.isoformat(),
+                detection_timestamp,
                 sdr_center_freq_hz,
                 sample_rate_hz,
                 lo_offset_hz,
@@ -414,6 +567,20 @@ class SensorDatabase:
             (model, protocol_id, attribution, burst_id),
         )
         await self._db.commit()
+
+    @_guarded_write
+    async def insert_detections(self, detections: Sequence[Mapping[str, Any]]) -> int:
+        """Insert many detections with one executemany and one commit.
+
+        The pipeline persists a whole drain's bursts in one call: one trip
+        through the connection's worker queue instead of two per burst.
+        """
+        if not detections:
+            return 0
+        assert self._db is not None
+        await self._db.executemany(_INSERT_DETECTION_SQL, [_detection_row(**d) for d in detections])
+        await self._db.commit()
+        return len(detections)
 
     @_guarded_write
     async def insert_tone_check(
@@ -478,14 +645,15 @@ class SensorDatabase:
         pwr_median: float,
         pwr_std: float,
         kurtosis: float,
-        powers: list[float],
+        powers: list[float] | None,
         interference: bool | None = None,
         violations: bytes | None = None,
     ) -> None:
         """Persist one DURATION_SEC-averaged window. ``powers`` is stored as a
         little-endian float32 BLOB (raw dBFS)."""
         assert self._db is not None
-        psd_blob = np.asarray(powers, dtype="<f4").tobytes()
+        # None (storage step 4) keeps the stats row but stores no PSD blob.
+        psd_blob = None if powers is None else np.asarray(powers, dtype="<f4").tobytes()
         await self._db.execute(
             """INSERT INTO avg_windows
                (start_time, duration_sec, sdr_center_freq_hz, sample_rate_hz,
@@ -592,24 +760,24 @@ class SensorDatabase:
             f"FROM iq_captures {where} ORDER BY start_time DESC LIMIT ?"
         )
         params.append(limit)
-        out: list[dict[str, Any]] = []
-        async with self._db.execute(query, params) as cursor:
-            async for r in cursor:
-                out.append(
-                    {
-                        "filename": r[0],
-                        "origin": r[1],
-                        "start_time": r[2],
-                        "stop_time": r[3],
-                        "duration_sec": r[4],
-                        "sdr_center_freq_hz": r[5],
-                        "sample_rate_hz": r[6],
-                        "gain_db": r[7],
-                        "total_samples": r[8],
-                        "trigger_initiated": bool(r[9]) if r[9] is not None else None,
-                    }
-                )
-        return out
+        # Drained in one fetchall (LIMITed, light columns): iterating the cursor
+        # would hold the statement, and the reader's snapshot, across awaits.
+        rows = await self._db.execute_fetchall(query, params)
+        return [
+            {
+                "filename": r[0],
+                "origin": r[1],
+                "start_time": r[2],
+                "stop_time": r[3],
+                "duration_sec": r[4],
+                "sdr_center_freq_hz": r[5],
+                "sample_rate_hz": r[6],
+                "gain_db": r[7],
+                "total_samples": r[8],
+                "trigger_initiated": bool(r[9]) if r[9] is not None else None,
+            }
+            for r in rows
+        ]
 
     # Columns returned by the light range query -- everything except the heavy blobs.
     _AVG_LIGHT_COLUMNS = (
@@ -786,6 +954,38 @@ class SensorDatabase:
         gmax = float(np.nanmax(powers))
         return [float(x) for x in powers], gmin, gmax
 
+    async def _scan_avg_windows(
+        self, columns: str, where: str, params: list[Any], chunk: int = 5000
+    ) -> AsyncIterator[list[Any]]:
+        """Yield avg_windows rows in (start_time, id) order, one statement per chunk.
+
+        Each chunk is its own SELECT fully drained with fetchall, so no statement
+        (and no read transaction / WAL snapshot) stays open across the awaits
+        between chunks. A statement held open across awaits pins the reader's
+        snapshot for every other read on this connection and, with back-to-back
+        Dashboard scans, stops the WAL from ever rewinding.
+        The last two columns of every yielded row are start_time and id (the key).
+        """
+        assert self._db is not None
+        # From the second chunk on, the caller's range start (its first
+        # placeholder) is advanced to the last key, rather than ANDing a second
+        # `start_time >= ?`: given two lower bounds on start_time, SQLite 3.37
+        # seeks the index on the first one, so every chunk would rescan the
+        # index from the range start. One lower bound always seeks to the key.
+        assert where.startswith("WHERE start_time >= ?"), where
+        select = f"SELECT {columns}, start_time, id FROM avg_windows {where}"
+        order = " ORDER BY start_time, id LIMIT ?"
+        query, args = select + order, [*params, chunk]
+        while True:
+            rows = list(await self._db.execute_fetchall(query, args))
+            if rows:
+                yield rows
+            if len(rows) < chunk:
+                return
+            last_start, last_id = rows[-1][-2], rows[-1][-1]
+            query = f"{select} AND (start_time > ? OR id > ?){order}"
+            args = [last_start, *params[1:], last_start, last_id, chunk]
+
     async def _waterfall_raw(
         self,
         where: str,
@@ -795,10 +995,9 @@ class SensorDatabase:
     ) -> dict[str, Any]:
         """Raw mode: one row per window (no averaging)."""
         assert self._db is not None
-        query = (
-            "SELECT start_time, duration_sec, num_bins, freq_start_hz, freq_step_hz, "
-            "psd_powers, pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis "
-            f"FROM avg_windows {where} ORDER BY start_time"
+        columns = (
+            "start_time, duration_sec, num_bins, freq_start_hz, freq_step_hz, "
+            "psd_powers, pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis"
         )
         buckets: list[dict[str, Any]] = []
         psd_rows: list[list[float]] = []
@@ -808,40 +1007,36 @@ class SensorDatabase:
         freq_step_hz = 0.0
         first_axis_num_bins = 0
         first_axis = True
-        async with self._db.execute(query, params) as cursor:
-            while True:
-                rows = await cursor.fetchmany(5000)
-                if not rows:
-                    break
-                for r in rows:
-                    t = datetime.fromisoformat(r[0]).timestamp()
-                    num_bins = int(r[2])
-                    if first_axis:
-                        first_axis = False
-                        first_axis_num_bins = num_bins
-                        freq_start_hz = float(r[3])
-                        freq_step_hz = float(r[4])
-                    buckets.append(
-                        {
-                            "start_epoch": t,
-                            "duration_sec": float(r[1]),
-                            "count": 1,
-                            "pwr_avg": float(r[6]),
-                            "pwr_max": float(r[7]) if r[7] is not None else 0.0,
-                            "pwr_median": float(r[8]),
-                            "pwr_std": float(r[9]),
-                            "kurtosis": float(r[10]),
-                        }
-                    )
-                    blob = r[5]
-                    if blob is None:
-                        psd_rows.append([float("nan")] * max_bins)
-                    else:
-                        total_windows += 1
-                        powers, pmin, pmax = self._ds_psd(blob, num_bins, max_bins)
-                        gmin = min(gmin, pmin)
-                        gmax = max(gmax, pmax)
-                        psd_rows.append(powers)
+        async for rows in self._scan_avg_windows(columns, where, params, chunk=5000):
+            for r in rows:
+                t = datetime.fromisoformat(r[0]).timestamp()
+                num_bins = int(r[2])
+                if first_axis:
+                    first_axis = False
+                    first_axis_num_bins = num_bins
+                    freq_start_hz = float(r[3])
+                    freq_step_hz = float(r[4])
+                buckets.append(
+                    {
+                        "start_epoch": t,
+                        "duration_sec": float(r[1]),
+                        "count": 1,
+                        "pwr_avg": float(r[6]),
+                        "pwr_max": float(r[7]) if r[7] is not None else 0.0,
+                        "pwr_median": float(r[8]),
+                        "pwr_std": float(r[9]),
+                        "kurtosis": float(r[10]),
+                    }
+                )
+                blob = r[5]
+                if blob is None:
+                    psd_rows.append([float("nan")] * max_bins)
+                else:
+                    total_windows += 1
+                    powers, pmin, pmax = self._ds_psd(blob, num_bins, max_bins)
+                    gmin = min(gmin, pmin)
+                    gmax = max(gmax, pmax)
+                    psd_rows.append(powers)
         if first_axis_num_bins > max_bins and freq_step_hz > 0:
             factor = first_axis_num_bins // max_bins
             freq_start_hz = freq_start_hz + (factor - 1) * freq_step_hz / 2.0
@@ -876,10 +1071,9 @@ class SensorDatabase:
         ``max_rows + 1`` buckets and stays put while the range slides.
         """
         assert self._db is not None
-        query = (
-            "SELECT start_time, num_bins, freq_start_hz, freq_step_hz, psd_powers, "
-            "pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis "
-            f"FROM avg_windows {where} ORDER BY start_time"
+        columns = (
+            "start_time, num_bins, freq_start_hz, freq_step_hz, psd_powers, "
+            "pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis"
         )
         since_epoch = since.timestamp()
         until_epoch = until.timestamp()
@@ -901,50 +1095,44 @@ class SensorDatabase:
         freq_step_hz = 0.0
         first_axis_num_bins = 0
         first_axis = True
-        async with self._db.execute(query, params) as cursor:
-            while True:
-                rows = await cursor.fetchmany(5000)
-                if not rows:
-                    break
-                for r in rows:
-                    t = datetime.fromisoformat(r[0]).timestamp()
-                    idx = int((t - anchor) / bucket_sec)
-                    idx = max(0, min(idx, n_buckets - 1))
-                    num_bins = int(r[1])
-                    if first_axis:
-                        first_axis = False
-                        first_axis_num_bins = num_bins
-                        freq_start_hz = float(r[2])
-                        freq_step_hz = float(r[3])
-                    stat_n[idx] += 1
-                    stat_avg[idx] += float(r[5])
-                    if r[6] is not None:
-                        stat_max[idx] = max(stat_max[idx], float(r[6]))
-                    stat_med[idx] += float(r[7])
-                    stat_std[idx] += float(r[8])
-                    stat_kurt[idx] += float(r[9])
-                    blob = r[4]
-                    if blob is None:
-                        continue
-                    total_windows += 1
-                    powers = np.frombuffer(blob, dtype="<f4")
-                    if powers.size != num_bins:
-                        num_bins = int(powers.size)
-                    if num_bins > max_bins:
-                        factor = num_bins // max_bins
-                        trim = factor * max_bins
-                        powers = powers[:trim].reshape(max_bins, factor).mean(axis=1)
-                    else:
-                        pad = max_bins - num_bins
-                        if pad > 0:
-                            powers = np.concatenate(
-                                [powers, np.full(pad, np.nan, dtype=np.float32)]
-                            )
-                    gmin = min(gmin, float(np.nanmin(powers)))
-                    gmax = max(gmax, float(np.nanmax(powers)))
-                    valid = ~np.isnan(powers)
-                    psd_sum[idx] += np.where(valid, powers, 0.0)
-                    psd_cnt[idx] += valid
+        async for rows in self._scan_avg_windows(columns, where, params, chunk=5000):
+            for r in rows:
+                t = datetime.fromisoformat(r[0]).timestamp()
+                idx = int((t - anchor) / bucket_sec)
+                idx = max(0, min(idx, n_buckets - 1))
+                num_bins = int(r[1])
+                if first_axis:
+                    first_axis = False
+                    first_axis_num_bins = num_bins
+                    freq_start_hz = float(r[2])
+                    freq_step_hz = float(r[3])
+                stat_n[idx] += 1
+                stat_avg[idx] += float(r[5])
+                if r[6] is not None:
+                    stat_max[idx] = max(stat_max[idx], float(r[6]))
+                stat_med[idx] += float(r[7])
+                stat_std[idx] += float(r[8])
+                stat_kurt[idx] += float(r[9])
+                blob = r[4]
+                if blob is None:
+                    continue
+                total_windows += 1
+                powers = np.frombuffer(blob, dtype="<f4")
+                if powers.size != num_bins:
+                    num_bins = int(powers.size)
+                if num_bins > max_bins:
+                    factor = num_bins // max_bins
+                    trim = factor * max_bins
+                    powers = powers[:trim].reshape(max_bins, factor).mean(axis=1)
+                else:
+                    pad = max_bins - num_bins
+                    if pad > 0:
+                        powers = np.concatenate([powers, np.full(pad, np.nan, dtype=np.float32)])
+                gmin = min(gmin, float(np.nanmin(powers)))
+                gmax = max(gmax, float(np.nanmax(powers)))
+                valid = ~np.isnan(powers)
+                psd_sum[idx] += np.where(valid, powers, 0.0)
+                psd_cnt[idx] += valid
         # The downsampled axis is still uniform: group-mean of a uniform axis
         # shifts the start by (factor-1)*step/2 and multiplies the step.
         if first_axis_num_bins > max_bins and freq_step_hz > 0:
@@ -1027,32 +1215,25 @@ class SensorDatabase:
     async def _stats_raw(self, where: str, params: list[Any], bucket_sec: float) -> dict[str, Any]:
         """Raw stats: one point per window (no averaging)."""
         assert self._db is not None
-        query = (
-            "SELECT start_time, pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis "
-            f"FROM avg_windows {where} ORDER BY start_time"
-        )
+        columns = "start_time, pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis"
         points: list[dict[str, Any]] = []
         gmin, gmax = float("inf"), float("-inf")
-        async with self._db.execute(query, params) as cursor:
-            while True:
-                rows = await cursor.fetchmany(10000)
-                if not rows:
-                    break
-                for r in rows:
-                    points.append(
-                        {
-                            "start_time": r[0],
-                            "count": 1,
-                            "pwr_avg": float(r[1]),
-                            "pwr_max": float(r[2]) if r[2] is not None else None,
-                            "pwr_median": float(r[3]),
-                            "pwr_std": float(r[4]),
-                            "kurtosis": float(r[5]),
-                        }
-                    )
-                    if r[2] is not None:
-                        gmin = min(gmin, float(r[1]))
-                        gmax = max(gmax, float(r[2]))
+        async for rows in self._scan_avg_windows(columns, where, params, chunk=10000):
+            for r in rows:
+                points.append(
+                    {
+                        "start_time": r[0],
+                        "count": 1,
+                        "pwr_avg": float(r[1]),
+                        "pwr_max": float(r[2]) if r[2] is not None else None,
+                        "pwr_median": float(r[3]),
+                        "pwr_std": float(r[4]),
+                        "kurtosis": float(r[5]),
+                    }
+                )
+                if r[2] is not None:
+                    gmin = min(gmin, float(r[1]))
+                    gmax = max(gmax, float(r[2]))
         return {
             "bucket_sec": bucket_sec,
             "min_pwr": gmin if gmin != float("inf") else 0.0,
@@ -1077,10 +1258,7 @@ class SensorDatabase:
         ``max_points + 1`` points.
         """
         assert self._db is not None
-        query = (
-            "SELECT start_time, pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis "
-            f"FROM avg_windows {where} ORDER BY start_time"
-        )
+        columns = "start_time, pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis"
         anchor = math.floor(since.timestamp() / bucket_sec) * bucket_sec
         n_points = max(1, math.ceil((until.timestamp() - anchor) / bucket_sec))
         n = [0] * n_points
@@ -1090,23 +1268,19 @@ class SensorDatabase:
         std = [0.0] * n_points
         kurt = [0.0] * n_points
         gmin, gmax = float("inf"), float("-inf")
-        async with self._db.execute(query, params) as cursor:
-            while True:
-                rows = await cursor.fetchmany(10000)
-                if not rows:
-                    break
-                for r in rows:
-                    idx = int((datetime.fromisoformat(r[0]).timestamp() - anchor) / bucket_sec)
-                    idx = max(0, min(idx, n_points - 1))
-                    n[idx] += 1
-                    avg[idx] += float(r[1])
-                    med[idx] += float(r[3])
-                    std[idx] += float(r[4])
-                    kurt[idx] += float(r[5])
-                    if r[2] is not None:
-                        mx[idx] = max(mx[idx], float(r[2]))
-                        gmin = min(gmin, float(r[1]))
-                        gmax = max(gmax, float(r[2]))
+        async for rows in self._scan_avg_windows(columns, where, params, chunk=10000):
+            for r in rows:
+                idx = int((datetime.fromisoformat(r[0]).timestamp() - anchor) / bucket_sec)
+                idx = max(0, min(idx, n_points - 1))
+                n[idx] += 1
+                avg[idx] += float(r[1])
+                med[idx] += float(r[3])
+                std[idx] += float(r[4])
+                kurt[idx] += float(r[5])
+                if r[2] is not None:
+                    mx[idx] = max(mx[idx], float(r[2]))
+                    gmin = min(gmin, float(r[1]))
+                    gmax = max(gmax, float(r[2]))
         points = [
             {
                 "start_time": datetime.fromtimestamp(
@@ -1127,6 +1301,81 @@ class SensorDatabase:
             "max_pwr": gmax if gmax != float("-inf") else 0.0,
             "points": points,
         }
+
+    @_guarded_write
+    async def upsert_avg_minutes(self, summaries: Sequence[MinuteSummary]) -> int:
+        """Write minute summaries, replacing any existing row for the same key."""
+        if not summaries:
+            return 0
+        assert self._db is not None
+        await self._db.executemany(_UPSERT_AVG_MINUTE_SQL, [tuple(s) for s in summaries])
+        await self._db.commit()
+        return len(summaries)
+
+    async def iter_rollup_windows(
+        self, *, since: datetime, until: datetime, chunk: int = 5000
+    ) -> AsyncIterator[list[WindowRow]]:
+        """Yield the light columns the rollup folds, in chunks."""
+        columns = (
+            "start_time, sdr_center_freq_hz, sample_rate_hz, gain_db, pwr_max, pwr_median, pwr_avg"
+        )
+        where = "WHERE start_time >= ? AND start_time < ?"
+        params: list[Any] = [since.isoformat(), until.isoformat()]
+        async for rows in self._scan_avg_windows(columns, where, params, chunk=chunk):
+            # _scan_avg_windows appends its keyset columns (start_time, id).
+            yield [WindowRow(*r[:7]) for r in rows]
+
+    async def query_avg_minute_peaks(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        metric: str,
+        sdr_center_freq: float | None = None,
+        sample_rate: float | None = None,
+        gain: float | None = None,
+        limit: int = 2000,
+    ) -> list[tuple[str, float, float | None, float | None, float | None]]:
+        """Top rollup minutes for a metric, strongest first.
+
+        `metric` is interpolated into the ORDER BY, so it is whitelisted rather
+        than parameterised. The minute bounds are widened to whole minutes and
+        the caller re-checks each peak timestamp against the true range, since
+        a minute at either edge may straddle it.
+        """
+        if metric not in METRICS:
+            raise ValueError(f"unknown metric {metric!r}, expected one of {METRICS}")
+        assert self._db is not None
+        peak_col = PEAK_TIME_COLUMN[metric]
+        conditions, params = self._sdr_conditions(sdr_center_freq, sample_rate, gain)
+        where = [
+            "minute_start >= ?",
+            "minute_start <= ?",
+            f"{metric} IS NOT NULL",
+            f"{peak_col} IS NOT NULL",
+            *conditions,
+        ]
+        args: list[Any] = [
+            since.isoformat()[:16],
+            until.isoformat()[:16],
+            *params,
+            limit,
+        ]
+        sql = (
+            f"SELECT {peak_col}, {metric}, pwr_max, pwr_snr, pwr_avg FROM avg_minutes "
+            f"WHERE {' AND '.join(where)} ORDER BY {metric} DESC LIMIT ?"
+        )
+        rows = await self._db.execute_fetchall(sql, args)
+        return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
+
+    async def oldest_avg_window_time(self) -> datetime | None:
+        """Start time of the earliest averaged window, or None if there are none."""
+        assert self._db is not None
+        async with self._db.execute("SELECT MIN(start_time) FROM avg_windows") as cursor:
+            row = await cursor.fetchone()
+        if row is None or row[0] is None:
+            return None
+        return datetime.fromisoformat(row[0])
 
     async def avg_window_configs(self) -> dict[str, Any]:
         """Distinct SDR tuning configs present in avg_windows + the most recent.
@@ -1335,25 +1584,151 @@ class SensorDatabase:
         await self._db.commit()
 
     @_guarded_write
-    async def prune_avg_psd_blobs(self, days: int = 7) -> int:
+    async def _prune_blob_chunk(self, cutoff: str, limit: int) -> tuple[int, int]:
+        """Null one chunk of blobs after the watermark. Returns (rows scanned, nulled)."""
+        assert self._db is not None
+        after_time, after_rowid = self._blob_prune_mark
+        async with self._db.execute(
+            "SELECT rowid, start_time FROM avg_windows "
+            "WHERE start_time < ? AND (start_time, rowid) > (?, ?) "
+            "ORDER BY start_time, rowid LIMIT ?",
+            (cutoff, after_time, after_rowid, limit),
+        ) as cur:
+            rows = list(await cur.fetchall())
+        if not rows:
+            return 0, 0
+        ids = [r[0] for r in rows]
+        marks = ",".join("?" * len(ids))
+        cursor = await self._db.execute(
+            "UPDATE avg_windows SET psd_powers = NULL, violations = NULL "
+            f"WHERE rowid IN ({marks}) AND psd_powers IS NOT NULL",
+            ids,
+        )
+        await self._db.commit()
+        self._blob_prune_mark = (rows[-1][1], rows[-1][0])
+        return len(rows), int(cursor.rowcount)
+
+    async def _load_blob_prune_mark(self) -> None:
+        """Read the persisted watermark once per process. A missing or garbled
+        value falls back to a full scan from the start, which is always safe."""
+        self._blob_prune_mark_loaded = True
+        mark: tuple[str, int] = ("", 0)
+        raw = await self.get_config(BLOB_PRUNE_MARK_CONFIG_KEY)
+        if raw:
+            try:
+                value = json.loads(raw)
+                if (
+                    isinstance(value, list)
+                    and len(value) == 2
+                    and isinstance(value[0], str)
+                    and isinstance(value[1], int)
+                    and not isinstance(value[1], bool)
+                ):
+                    mark = (value[0], value[1])
+                else:
+                    logger.warning("Ignoring malformed %s: %r", BLOB_PRUNE_MARK_CONFIG_KEY, raw)
+            except ValueError:
+                logger.warning("Ignoring malformed %s: %r", BLOB_PRUNE_MARK_CONFIG_KEY, raw)
+        self._blob_prune_mark = mark
+        self._blob_prune_mark_saved = mark
+
+    async def _save_blob_prune_mark(self) -> None:
+        """Persist the watermark (one small guarded write), if it moved. A
+        failed save is logged and the pass continues: the stored mark is
+        older but still correct, so a restart merely rescans a little."""
+        mark = self._blob_prune_mark
+        if mark == self._blob_prune_mark_saved:
+            return
+        try:
+            await self.set_config(BLOB_PRUNE_MARK_CONFIG_KEY, json.dumps([mark[0], mark[1]]))
+        except Exception:
+            logger.exception("Could not persist the blob-prune watermark; continuing")
+            return
+        self._blob_prune_mark_saved = mark
+
+    async def prune_avg_psd_blobs(
+        self, days: int = 7, *, chunk: int = RETENTION_CHUNK_ROWS, pause_sec: float = 0.05
+    ) -> int:
         """Evict the PSD blobs of averaged windows older than ``days`` days.
 
         Only the heavy ``psd_powers``/``violations`` blobs are nulled out; the
-        cheap stats row (and detections, stats, tone_checks) is kept
-        permanently. A pruned window still answers the light query and its
-        detail endpoint (with ``powers: null``): at ~8 KB per window the blob
-        is ~98% of the row's storage, so this bounds the DB file without
-        losing any statistics. Returns how many blobs were nulled this pass.
+        cheap stats row is kept (row retention is delete_older_than). Walks the
+        start_time index in chunks from a watermark, so each statement is small
+        and a pass after the first touches only the newly expired rows. The DB
+        file does not shrink (auto_vacuum=0): freed pages are reused by later
+        inserts. Returns how many blobs were nulled this pass.
+
+        The watermark only ever advances past rows whose blobs were nulled and
+        committed, and is persisted (config key ``blob_prune_mark``) so a new
+        process resumes from it.
         """
-        assert self._db is not None
-        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-        cursor = await self._db.execute(
-            "UPDATE avg_windows SET psd_powers = NULL, violations = NULL "
-            "WHERE start_time < ? AND psd_powers IS NOT NULL",
-            (cutoff,),
-        )
-        await self._db.commit()
-        pruned: int = cursor.rowcount
+        if not self._blob_prune_mark_loaded:
+            await self._load_blob_prune_mark()
+        cutoff = _retention_cutoff(days)
+        pruned = 0
+        chunks = 0
+        while True:
+            result: tuple[int, int] = await self._prune_blob_chunk(cutoff, chunk)
+            scanned, nulled = result
+            pruned += nulled
+            chunks += 1
+            if scanned < chunk:
+                break
+            if chunks % _BLOB_MARK_SAVE_EVERY_CHUNKS == 0:
+                await self._save_blob_prune_mark()
+            await asyncio.sleep(pause_sec)
+        await self._save_blob_prune_mark()
         if pruned > 0:
             logger.info("Pruned PSD blobs for %d avg windows (cutoff: %s)", pruned, cutoff)
         return pruned
+
+    @_guarded_write
+    async def _delete_older_chunk(self, table: str, cutoff: str, limit: int) -> int:
+        assert self._db is not None
+        col = _RETENTION_TABLES[table]
+        cursor = await self._db.execute(
+            f"DELETE FROM {table} WHERE rowid IN "
+            f"(SELECT rowid FROM {table} WHERE {col} < ? ORDER BY {col} LIMIT ?)",
+            (cutoff, limit),
+        )
+        await self._db.commit()
+        return int(cursor.rowcount)
+
+    async def delete_older_than(
+        self,
+        table: str,
+        days: int,
+        *,
+        chunk: int = RETENTION_CHUNK_ROWS,
+        pause_sec: float = 0.05,
+    ) -> int:
+        """Delete rows of ``table`` older than ``days`` days, ``chunk`` rows per
+        statement with a pause between, so the pipeline's inserts interleave.
+        Raises KeyError for a table outside _RETENTION_TABLES."""
+        _RETENTION_TABLES[table]  # validate before building any SQL
+        cutoff = _retention_cutoff(days)
+        total = 0
+        while True:
+            n: int = await self._delete_older_chunk(table, cutoff, chunk)
+            total += n
+            if n < chunk:
+                break
+            await asyncio.sleep(pause_sec)
+        if total:
+            logger.info("Retention: deleted %d %s rows older than %d days", total, table, days)
+        return total
+
+    async def file_stats(self) -> tuple[int, int]:
+        """(DB file plus WAL bytes, bytes of free pages reusable without growth)."""
+        assert self._db is not None
+        async with self._db.execute("PRAGMA page_size") as cur:
+            page_row = await cur.fetchone()
+        page_size = int(page_row[0]) if page_row is not None else 0
+        async with self._db.execute("PRAGMA freelist_count") as cur:
+            free_row = await cur.fetchone()
+        free_pages = int(free_row[0]) if free_row is not None else 0
+        size = 0
+        for suffix in ("", "-wal"):
+            with contextlib.suppress(OSError):
+                size += os.stat(self._db_path + suffix).st_size
+        return size, page_size * free_pages

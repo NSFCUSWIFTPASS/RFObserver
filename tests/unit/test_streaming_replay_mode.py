@@ -18,7 +18,7 @@ def _proc(replay_mode: bool, tmp_path):
         _env_file=None, STORAGE_PATH=str(tmp_path), DB_PATH=str(tmp_path / "d.db")
     )
     db = MagicMock()
-    db.insert_detection = AsyncMock()
+    db.insert_detections = AsyncMock()
     storage = MagicMock()
     storage.storage_path = tmp_path
     # Honor the LocalStorage contract: real auto/ and manual/ subdirs so the
@@ -52,7 +52,7 @@ async def test_replay_mode_skips_insert(tmp_path):
     proc._burst_result_queue.put_nowait(([_fake_burst()], 915e6))
     proc._burst_result_queue.put_nowait(None)
     await proc._drain_burst_results()
-    db.insert_detection.assert_not_called()
+    db.insert_detections.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -61,7 +61,7 @@ async def test_normal_mode_inserts(tmp_path):
     proc._burst_result_queue.put_nowait(([_fake_burst()], 915e6))
     proc._burst_result_queue.put_nowait(None)
     await proc._drain_burst_results()
-    db.insert_detection.assert_called()
+    db.insert_detections.assert_called()
 
 
 def test_replay_mode_begin_recording_is_noop(tmp_path):
@@ -110,6 +110,7 @@ async def test_replay_mode_deferred_sidecar_uses_grid_path(tmp_path, monkeypatch
     monkeypatch.setattr(sidecar_mod, "write_sidecar", db_mock)
 
     sc16 = tmp_path / "cap.sc16"
+    sc16.write_bytes(b"")  # the sidecar is skipped for a capture that is gone
     await proc._deferred_sidecar(sc16, 0)
 
     grid_mock.assert_called_once()
@@ -152,7 +153,7 @@ def test_replay_mode_check_trigger_and_record_writes_full_iq_when_recording(tmp_
     assert proc._recording_state == "recording"
 
     calls: list[np.ndarray] = []
-    proc._write_recording_chunk = lambda buf: calls.append(buf)  # type: ignore[method-assign]
+    proc._write_recording_chunk = lambda buf, gaps=(), chunk_start=None: calls.append(buf)  # type: ignore[method-assign]
 
     buf = _above_threshold_buf()
     proc._check_trigger_and_record(buf)
@@ -172,7 +173,7 @@ def test_replay_mode_check_trigger_still_inert_without_opt_in(tmp_path):
     proc._recording_state = "recording"
 
     calls: list[np.ndarray] = []
-    proc._write_recording_chunk = lambda buf: calls.append(buf)  # type: ignore[method-assign]
+    proc._write_recording_chunk = lambda buf, gaps=(), chunk_start=None: calls.append(buf)  # type: ignore[method-assign]
 
     buf = _above_threshold_buf()
     proc._check_trigger_and_record(buf)

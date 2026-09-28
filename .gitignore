@@ -56,3 +56,8 @@ reference_software/
 node_modules/
 npm-cache/
 tests/ui/*.png
+
+# Stray local files swept into bbde569 (2026-08-06): OS screenshots in the root
+# and the Claude Code scheduler lock
+/Screenshot *.png
+.claude/scheduled_tasks.lock

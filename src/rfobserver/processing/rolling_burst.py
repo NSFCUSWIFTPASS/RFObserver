@@ -17,6 +17,7 @@ chunk/evaluation, without being dropped or re-emitted every pass.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
@@ -81,6 +82,16 @@ class RollingBurstDetector:
         bin_hz = abs(float(freq_axis[1] - freq_axis[0])) if len(freq_axis) > 1 else 0.0
         # Frequency slop when matching a re-detected burst to a tracked one.
         self._match_freq_tol_hz = max(bin_hz * 2.0, 1_000.0)
+
+        # Frequency-bucket index over self._tracked, so _absorb examines only
+        # tracks that can possibly match instead of scanning all of them. See
+        # _absorb for why bucket overlap is a guaranteed superset of matches.
+        self._bucket_hz = self._match_freq_tol_hz
+        self._index: dict[int, list[_TrackedBurst]] = {}
+        # Insertion order of each track (by id), so candidates are tried in the
+        # same order the linear scan tried them: first match wins.
+        self._order: dict[int, int] = {}
+        self._next_order = 0
 
     @property
     def last_detection(self) -> BurstDetectionResult | None:
@@ -181,8 +192,19 @@ class RollingBurstDetector:
 
         Matching keeps a burst's identity stable across evaluations so its full
         extent accumulates and it is emitted once.
+
+        Candidates come from a frequency-bucket index rather than a scan of every
+        track: on a noisy band this is called thousands of times per evaluation,
+        and the linear scan held the GIL long enough to starve the PSD workers
+        (docs/debugging/2026-09-22_psd-pipeline-latency.md). The frequency test
+        below is equivalent to "[f_lo, f_hi] overlaps the track's interval widened
+        by the tolerance on each side", and each track is indexed under every
+        bucket that widened interval touches, so bucket overlap returns a superset
+        of the true matches. The original predicate still makes the decision, and
+        candidates are tried in insertion order, so the first match is the same
+        one the linear scan found.
         """
-        for t in self._tracked:
+        for t in self._candidates(f_lo, f_hi):
             freq_close = abs(burst.center_freq_hz - t.center_freq_hz) <= (
                 self._match_freq_tol_hz + (f_hi - f_lo + t.f_hi_hz - t.f_lo_hz) / 2
             )
@@ -191,6 +213,7 @@ class RollingBurstDetector:
             if freq_close and time_close:
                 t.abs_start = min(t.abs_start, abs_start)
                 t.abs_end = max(t.abs_end, abs_end)
+                widened = f_lo < t.f_lo_hz or f_hi > t.f_hi_hz
                 t.f_lo_hz = min(t.f_lo_hz, f_lo)
                 t.f_hi_hz = max(t.f_hi_hz, f_hi)
                 t.center_freq_hz = (t.f_lo_hz + t.f_hi_hz) / 2
@@ -199,21 +222,58 @@ class RollingBurstDetector:
                 t.peak_power_db = max(t.peak_power_db, burst.peak_power_db)
                 t.last_eval = self._eval_count
                 t.still_growing = still_growing
+                if widened:
+                    self._index_track(t)
                 return
 
-        self._tracked.append(
-            _TrackedBurst(
-                abs_start=abs_start,
-                abs_end=abs_end,
-                f_lo_hz=f_lo,
-                f_hi_hz=f_hi,
-                center_freq_hz=burst.center_freq_hz,
-                peak_power_db=burst.peak_power_db,
-                peak_freq_hz=burst.peak_freq_hz,
-                last_eval=self._eval_count,
-                still_growing=still_growing,
-            )
+        t = _TrackedBurst(
+            abs_start=abs_start,
+            abs_end=abs_end,
+            f_lo_hz=f_lo,
+            f_hi_hz=f_hi,
+            center_freq_hz=burst.center_freq_hz,
+            peak_power_db=burst.peak_power_db,
+            peak_freq_hz=burst.peak_freq_hz,
+            last_eval=self._eval_count,
+            still_growing=still_growing,
         )
+        self._tracked.append(t)
+        self._order[id(t)] = self._next_order
+        self._next_order += 1
+        self._index_track(t)
+
+    def _bucket_range(self, lo_hz: float, hi_hz: float) -> range:
+        # One bucket of margin each side absorbs float rounding at the edges;
+        # extra candidates are harmless, the predicate still decides.
+        b = self._bucket_hz
+        return range(math.floor(lo_hz / b) - 1, math.floor(hi_hz / b) + 2)
+
+    def _index_track(self, t: _TrackedBurst) -> None:
+        """Register *t* under every bucket its tolerance-widened interval touches.
+
+        Re-registering after a widening may list *t* twice in a bucket;
+        _candidates de-duplicates.
+        """
+        tol = self._match_freq_tol_hz
+        for k in self._bucket_range(t.f_lo_hz - tol, t.f_hi_hz + tol):
+            self._index.setdefault(k, []).append(t)
+
+    def _candidates(self, f_lo: float, f_hi: float) -> list[_TrackedBurst]:
+        """Tracks that could match a burst spanning [f_lo, f_hi], in insertion order."""
+        seen: dict[int, _TrackedBurst] = {}
+        for k in self._bucket_range(f_lo, f_hi):
+            for t in self._index.get(k, ()):
+                seen[id(t)] = t
+        order = self._order
+        return sorted(seen.values(), key=lambda t: order[id(t)])
+
+    def _rebuild_index(self) -> None:
+        """Rebuild the index from self._tracked (after tracks are dropped)."""
+        self._index = {}
+        self._order = {id(t): i for i, t in enumerate(self._tracked)}
+        self._next_order = len(self._tracked)
+        for t in self._tracked:
+            self._index_track(t)
 
     def _collect_finished(self, window_base_abs: int) -> list[BurstFingerprint]:
         """Emit each tracked burst once it stops growing or scrolls out.
@@ -237,6 +297,7 @@ class RollingBurstDetector:
             if not scrolled_out:
                 keep.append(t)
         self._tracked = keep
+        self._rebuild_index()
         return finished
 
     def _to_fingerprint(self, t: _TrackedBurst) -> BurstFingerprint:
@@ -269,4 +330,5 @@ class RollingBurstDetector:
         self._total_rows_written = 0
         self._eval_count = 0
         self._tracked.clear()
+        self._rebuild_index()
         self._last_detection = None

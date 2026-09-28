@@ -37,6 +37,64 @@ def test_health_endpoint(client):
     assert "version" in data
 
 
+def test_health_without_supervisor_has_no_pipeline_block(client):
+    data = client.get("/api/health").json()
+    assert data["status"] == "ok"
+    assert "pipeline" not in data
+
+
+def test_health_reports_pipeline_and_degrades_on_give_up(settings):
+    app = create_app(settings)
+    sup = MagicMock(active=False, gave_up=True, consecutive_crashes=6, processor=None)
+    app.state.supervisor = sup
+    app.state.beacon = None
+    data = TestClient(app).get("/api/health").json()
+    assert data["status"] == "degraded"
+    assert data["pipeline"] == {
+        "active": False,
+        "gave_up": True,
+        "consecutive_crashes": 6,
+        "beacon_age_sec": None,
+        "overflow_events": None,
+        "overflow_lost_samples": None,
+    }
+
+
+def test_health_active_and_fresh_beacon_reports_ok(settings):
+    from rfobserver.pipeline.beacon import ProgressBeacon
+
+    app = create_app(settings)
+    sup = MagicMock(active=True, gave_up=False, consecutive_crashes=0, processor=None)
+    app.state.supervisor = sup
+    beacon = ProgressBeacon()
+    beacon.mark()
+    app.state.beacon = beacon
+    data = TestClient(app).get("/api/health").json()
+    assert data["status"] == "ok"
+    assert 0.0 <= data["pipeline"]["beacon_age_sec"] < 1.0
+
+
+def test_health_reports_overflow_loss_when_processor_has_receive_loss(settings):
+    app = create_app(settings)
+    sup = MagicMock(active=True, gave_up=False, consecutive_crashes=0)
+    sup.processor.receive_loss.return_value = {"overflow_events": 2, "overflow_lost_samples": 50}
+    app.state.supervisor = sup
+    app.state.beacon = None
+    data = TestClient(app).get("/api/health").json()
+    assert data["pipeline"]["overflow_events"] == 2
+    assert data["pipeline"]["overflow_lost_samples"] == 50
+
+
+def test_health_reports_null_overflow_loss_without_processor(settings):
+    app = create_app(settings)
+    sup = MagicMock(active=True, gave_up=False, consecutive_crashes=0, processor=None)
+    app.state.supervisor = sup
+    app.state.beacon = None
+    data = TestClient(app).get("/api/health").json()
+    assert data["pipeline"]["overflow_events"] is None
+    assert data["pipeline"]["overflow_lost_samples"] is None
+
+
 def test_api_status(client):
     response = client.get("/api/status")
     assert response.status_code == 200
@@ -290,6 +348,20 @@ class TestConfigApply:
         assert resp.status_code == 200
         assert settings.ARCHIVE_MAX_GB == 100.0
         processor.reconfigure.assert_not_called()
+
+    def test_apply_history_days_sets_db_retention(
+        self, client_with_processor, monkeypatch, tmp_path
+    ):
+        # The form field named history_days is the PSD retention control; it
+        # must land on the setting the cleanup loop reads, not the dead
+        # HISTORY_DAYS, and must survive a restart.
+        monkeypatch.chdir(tmp_path)
+        client, settings, processor = client_with_processor
+        resp = client.post("/config/apply", json={"history_days": "30"})
+        assert resp.status_code == 200
+        assert settings.DB_RETENTION_DAYS == 30
+        processor.reconfigure.assert_not_called()
+        assert "RFOBS_DB_RETENTION_DAYS=30" in (tmp_path / ".env").read_text()
 
     def test_apply_trigger_continuous_bool(self, client_with_processor):
         client, settings, processor = client_with_processor
@@ -976,6 +1048,36 @@ def test_post_sensor_toggles_and_confirms(settings, monkeypatch):
     assert settings.SENSOR_ACTIVE is False
 
 
+def test_post_sensor_stop_persists_before_awaiting_set_active(settings, monkeypatch):
+    """The stop intent must be persisted BEFORE set_active(False) is awaited,
+    so a watchdog exit mid-stop can't leave the persisted state stale/active."""
+    import rfobserver.web.routes.config as config_mod
+
+    persist_calls: list[bool] = []
+    monkeypatch.setattr(config_mod, "_persist_settings", lambda s: persist_calls.append(True))
+
+    app = create_app(settings)
+    observed = {}
+
+    class _RecordingSupervisor:
+        active = True
+
+        async def set_active(self, active: bool) -> bool:
+            observed["sensor_active_at_entry"] = app.state.settings.SENSOR_ACTIVE
+            observed["persisted_before_entry"] = bool(persist_calls)
+            self.active = active
+            return active
+
+    app.state.supervisor = _RecordingSupervisor()
+    client = TestClient(app)
+
+    resp = client.post("/api/sensor", json={"active": False})
+
+    assert resp.status_code == 200
+    assert observed["sensor_active_at_entry"] is False
+    assert observed["persisted_before_entry"] is True
+
+
 def test_post_sensor_without_supervisor_is_409(settings):
     client = TestClient(create_app(settings))  # web-only: no supervisor
     resp = client.post("/api/sensor", json={"active": False})
@@ -1124,3 +1226,66 @@ async def test_iq_captures_endpoint(settings, tmp_path):
             assert {c["filename"] for c in r2.json()["captures"]} == {"a.sc16"}
     finally:
         await database.close()
+
+
+@pytest.mark.asyncio
+async def test_ui_prefs_put_uses_write_connection_when_split(settings, tmp_path):
+    from rfobserver.storage.database import SensorDatabase
+
+    path = str(tmp_path / "prefs.sqlite")
+    writer = SensorDatabase(path)
+    await writer.connect()
+    reader = SensorDatabase(path, read_only=True)
+    await reader.connect()
+    try:
+        app = create_app(settings)
+        app.state.database = reader
+        app.state.write_database = writer
+        client = TestClient(app)
+        r = client.put("/api/ui-prefs", json={"theme": "dark"})
+        assert r.status_code == 200, r.text
+        assert client.get("/api/ui-prefs").json()["theme"] == "dark"
+    finally:
+        await reader.close()
+        await writer.close()
+
+
+class _ConfigStore:
+    """Minimal get_config/set_config double for the ui-prefs routes."""
+
+    def __init__(self, stored: dict[str, str]) -> None:
+        self.stored = dict(stored)
+
+    async def get_config(self, key: str) -> str | None:
+        return self.stored.get(key)
+
+    async def set_config(self, key: str, value: str) -> None:
+        self.stored[key] = value
+
+
+def test_ui_prefs_put_merges_into_the_writers_current_document(settings):
+    """The merge must read the writer's current document, not the reader's: a
+    reader on an older snapshot would otherwise merge a stale document and
+    write it back, silently undoing the other preference (lost update)."""
+    import json
+
+    from rfobserver.web.uiprefs import UI_PREFS_KEY
+
+    current = json.dumps({"scale": {}, "theme": "dark"})
+    stale = json.dumps({"scale": {}, "theme": "light"})
+    writer = _ConfigStore({UI_PREFS_KEY: current})
+    app = create_app(settings)
+    app.state.database = _ConfigStore({UI_PREFS_KEY: stale})
+    app.state.write_database = writer
+    r = TestClient(app).put("/api/ui-prefs", json={"scale": {"wf_lo": -100, "wf_hi": -20}})
+    assert r.status_code == 200, r.text
+    assert r.json()["theme"] == "dark", "stale reader document was merged"
+    assert json.loads(writer.stored[UI_PREFS_KEY]) == {
+        "scale": {"wf_lo": -100.0, "wf_hi": -20.0},
+        "theme": "dark",
+    }
+
+
+def test_ui_prefs_put_503_without_a_database(settings):
+    r = TestClient(create_app(settings)).put("/api/ui-prefs", json={"theme": "dark"})
+    assert r.status_code == 503

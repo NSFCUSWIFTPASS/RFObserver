@@ -132,6 +132,38 @@ async def test_write_sidecar_filters_by_window_and_tuning(tmp_path, db):
     assert written == payload
 
 
+async def test_window_and_row_mapping_use_the_true_time_span(tmp_path, db):
+    # Overflow gaps: the file holds DURATION_SEC of samples, but the capture
+    # covers SPAN of wall time, and the grid rows span it too.
+    span = 12.0
+    sc16 = tmp_path / "gappy.sc16"
+    _write_capture_meta(sc16, time_span_sec=span)
+    _write_psd_meta(sc16)
+
+    # Past duration_sec but inside the true span: kept.
+    await _insert(
+        db,
+        "late-in-span",
+        CAP_START + timedelta(seconds=10.5),
+        CAP_START + timedelta(seconds=11.0),
+    )
+    # At the end of the true span: excluded (until is half-open).
+    await _insert(
+        db,
+        "after-span",
+        CAP_START + timedelta(seconds=span),
+        CAP_START + timedelta(seconds=span + 1.0),
+    )
+
+    payload = await ds.write_sidecar(sc16, db)
+
+    assert payload["time_resolution_s"] == span / ROWS
+    assert len(payload["detections"]) == 1
+    det = payload["detections"][0]
+    assert det["row_start"] == 35  # round(10.5 / 12.0 * 40)
+    assert det["row_stop"] == 37  # round(11.0 / 12.0 * 40)
+
+
 async def test_build_sidecar_payload_missing_capture_meta_is_empty(tmp_path, db):
     sc16 = tmp_path / "nometa.sc16"
     # No .json / .psd.json companions written at all.

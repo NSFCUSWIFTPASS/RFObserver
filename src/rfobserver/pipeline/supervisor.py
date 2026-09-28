@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -22,6 +23,15 @@ logger = logging.getLogger(__name__)
 # cancelling it, so a wedged pipeline can't hang the toggle forever.
 _STOP_TIMEOUT_SEC = 15.0
 
+# Crash-restart flap protection: without this, a persistent processor.run()
+# crash would thrash receiver.initialize()/close() on the real SDR in a tight
+# loop. A crash streak that goes quiet for _CRASH_RESET_WINDOW_SEC resets;
+# otherwise each restart backs off (capped) and the streak gives up entirely
+# past _MAX_CONSECUTIVE_CRASH_RESTARTS, leaving the sensor inactive.
+_CRASH_RESET_WINDOW_SEC = 120.0
+_MAX_CONSECUTIVE_CRASH_RESTARTS = 5
+_CRASH_BACKOFF_CAP_SEC = 30.0
+
 
 class PipelineSupervisor:
     """Starts/stops the capture pipeline and releases the SDR when inactive."""
@@ -31,10 +41,12 @@ class PipelineSupervisor:
         build_receiver: Callable[[], IReceiver],
         build_processor: Callable[..., Any],
         on_processor_change: Callable[[Any | None], None] | None = None,
+        on_give_up: Callable[[], None] | None = None,
     ) -> None:
         self._build_receiver = build_receiver
         self._build_processor = build_processor
         self._on_processor_change = on_processor_change
+        self._on_give_up = on_give_up
         self._receiver: IReceiver | None = None
         self._processor: Any | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -42,6 +54,10 @@ class PipelineSupervisor:
         self._lock = asyncio.Lock()
         self._receiver_override: IReceiver | None = None
         self._replay = False
+        self._stopping = False
+        self._consecutive_crashes = 0
+        self._last_crash_ts = 0.0
+        self._gave_up = False
 
     @property
     def active(self) -> bool:
@@ -55,6 +71,15 @@ class PipelineSupervisor:
     def receiver(self) -> IReceiver | None:
         return self._receiver
 
+    @property
+    def gave_up(self) -> bool:
+        """True once crash auto-restart gave up; cleared by a manual activation."""
+        return self._gave_up
+
+    @property
+    def consecutive_crashes(self) -> int:
+        return self._consecutive_crashes
+
     async def set_active(self, active: bool) -> bool:
         """Transition to ``active`` and return the actual resulting state.
 
@@ -63,6 +88,9 @@ class PipelineSupervisor:
         """
         async with self._lock:
             if active and not self._active:
+                # A deliberate manual activation clears any prior crash streak.
+                self._consecutive_crashes = 0
+                self._gave_up = False
                 await self._start()
             elif not active and self._active:
                 await self._stop()
@@ -75,6 +103,9 @@ class PipelineSupervisor:
         async with self._lock:
             self._receiver_override = receiver
             self._replay = True
+            # A deliberate replay start is an operator action, like manual
+            # activation, so it clears any prior crash-restart give-up.
+            self._gave_up = False
             await self._start()
 
     async def stop_replay(self) -> None:
@@ -104,38 +135,136 @@ class PipelineSupervisor:
         self._receiver = receiver
         self._processor = processor
         self._task = asyncio.create_task(processor.run())
+        self._task.add_done_callback(self._on_task_done)
         self._active = True
         logger.info("Sensor activated")
         self._notify(processor)
 
-    async def _stop(self) -> None:
-        loop = asyncio.get_running_loop()
-        processor, task, receiver = self._processor, self._task, self._receiver
-        if processor is not None:
-            processor.stop()
-        if task is not None:
-            try:
-                await asyncio.wait_for(task, timeout=_STOP_TIMEOUT_SEC)
-            except TimeoutError:
-                logger.warning("Processor did not stop in time; cancelling")
-                task.cancel()
+    async def _stop(self, timeout: float | None = None) -> None:
+        self._stopping = True
+        try:
+            stop_timeout = _STOP_TIMEOUT_SEC if timeout is None else timeout
+            loop = asyncio.get_running_loop()
+            processor, task, receiver = self._processor, self._task, self._receiver
+            if processor is not None:
+                processor.stop()
+            if task is not None:
                 try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+                    await asyncio.wait_for(task, timeout=stop_timeout)
+                except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041 - not the builtin on 3.10
+                    logger.warning("Processor did not stop in time; cancelling")
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        logger.exception("Processor raised during cancellation")
                 except Exception:
-                    logger.exception("Processor raised during cancellation")
-        if receiver is not None:
-            await loop.run_in_executor(None, receiver.close)
-        self._processor = None
-        self._receiver = None
-        self._task = None
-        self._active = False
-        self._receiver_override = None
-        self._replay = False
-        logger.info("Sensor deactivated (SDR released)")
-        self._notify(None)
+                    # The task may already be done-with-exception (e.g. we are
+                    # stopping it after a crash, from _restart_after_crash) --
+                    # already logged by _on_task_done, so don't let it escape.
+                    logger.debug(
+                        "Stop observed an already-raised task exception (already reported)",
+                        exc_info=True,
+                    )
+            if receiver is not None:
+                await loop.run_in_executor(None, receiver.close)
+            self._processor = None
+            self._receiver = None
+            self._task = None
+            self._active = False
+            self._receiver_override = None
+            self._replay = False
+            logger.info("Sensor deactivated (SDR released)")
+            self._notify(None)
+        finally:
+            self._stopping = False
 
     def _notify(self, processor: Any | None) -> None:
         if self._on_processor_change is not None:
             self._on_processor_change(processor)
+
+    def _on_task_done(self, task: asyncio.Task[Any]) -> None:
+        """Detect an unexpected pipeline-task death and schedule a restart.
+
+        Runs for every task completion, including the deliberate cancel/await
+        inside `_stop()` -- `_stopping` is what tells those apart from a crash.
+        """
+        if task.cancelled() or self._stopping:
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        logger.error("Pipeline task died unexpectedly; restarting", exc_info=exc)
+        if self._active:
+            asyncio.get_running_loop().create_task(self._restart_after_crash())
+
+    async def _restart_after_crash(self) -> None:
+        now = time.monotonic()
+        if now - self._last_crash_ts > _CRASH_RESET_WINDOW_SEC:
+            self._consecutive_crashes = 0
+        self._last_crash_ts = now
+        self._consecutive_crashes += 1
+
+        if self._consecutive_crashes > _MAX_CONSECUTIVE_CRASH_RESTARTS:
+            logger.error(
+                "Pipeline crashed %d times within %.0fs; giving up auto-restart, "
+                "leaving sensor inactive",
+                self._consecutive_crashes,
+                _CRASH_RESET_WINDOW_SEC,
+            )
+            # Per-call local flag: only fire the hook if THIS call actually
+            # stopped the sensor, so a stale or concurrent _gave_up (e.g. set
+            # by another give-up path) never re-fires it.
+            stopped = False
+            async with self._lock:
+                if self._active and not self._replay:
+                    await self._stop()
+                    self._gave_up = True
+                    stopped = True
+            if stopped and self._on_give_up is not None:
+                self._on_give_up()
+            return
+
+        backoff = min(2.0 ** (self._consecutive_crashes - 1), _CRASH_BACKOFF_CAP_SEC)
+        logger.warning(
+            "Restarting pipeline after crash in %.1fs (attempt %d)",
+            backoff,
+            self._consecutive_crashes,
+        )
+        # Sleep BEFORE acquiring the lock so a concurrent deliberate stop can
+        # win the race: it stops the sensor while we wait, and when we wake we
+        # see _active False (or _replay True) and no-op instead of restarting.
+        await asyncio.sleep(backoff)
+        stopped = False
+        async with self._lock:
+            if not self._active or self._replay:
+                return
+            await self._stop()
+            try:
+                await self._start()
+            except Exception:
+                # _start() failed (e.g. receiver.initialize() on USB
+                # re-enumeration) -- the sensor is already stopped above, so
+                # without this it would escape as an unretrieved task
+                # exception, leaving _active False, _gave_up False, the
+                # give-up hook never fired, and health reporting ok.
+                logger.exception("Pipeline restart failed to re-initialize; giving up")
+                self._gave_up = True
+                stopped = True
+        if stopped and self._on_give_up is not None:
+            self._on_give_up()
+
+    async def restart(self, stop_timeout: float | None = None) -> None:
+        """Stop then start the live pipeline. No-op if inactive or replaying.
+
+        ``stop_timeout`` bounds how long to wait for the old task before
+        cancelling it; the watchdog passes a value well inside its restart
+        deadline so a hung-but-cancellable pipeline restarts in-process.
+        """
+        async with self._lock:
+            if not self._active or self._replay:
+                return
+            await self._stop(timeout=stop_timeout)
+            await self._start()

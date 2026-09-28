@@ -1,5 +1,7 @@
 """Tests for the raw+sidecar PSD grid on-disk format."""
 
+import json
+
 import numpy as np
 
 from rfobserver.storage import psd_grid
@@ -59,3 +61,49 @@ def test_cal_offset_included_when_set(tmp_path) -> None:
     assert loaded is not None
     _, m = loaded
     assert m["cal_offset_db"] == -12.5
+
+
+def test_write_meta_records_alignment_to_the_iq(tmp_path) -> None:
+    """The sidecar must pin row 0 to a position in the .sc16.
+
+    Without these fields a reader can only assume row 0 is the IQ's first
+    sample, which is how a ~820 ms pipeline-latency misalignment stayed
+    invisible (docs/debugging/2026-09-22_trigger-psd-iq-misalignment.md).
+    """
+    meta_path = tmp_path / "cap.psd.json"
+    psd_grid.write_meta(
+        meta_path,
+        rows=10,
+        num_bins=4,
+        time_resolution_s=0.001024,
+        center_freq_hz=100_000_000,
+        bandwidth_hz=2_000_000,
+        freq_axis=np.arange(4, dtype=np.float64),
+        grid_min=-160.0,
+        grid_max=-40.0,
+        cal_offset_db=None,
+        start_sample_offset=1234,
+        slice_samples=2048,
+    )
+    meta = json.loads(meta_path.read_text())
+    assert meta["start_sample_offset"] == 1234
+    assert meta["slice_samples"] == 2048
+
+
+def test_write_meta_alignment_fields_default_to_zero(tmp_path) -> None:
+    meta_path = tmp_path / "cap.psd.json"
+    psd_grid.write_meta(
+        meta_path,
+        rows=0,
+        num_bins=4,
+        time_resolution_s=0.001024,
+        center_freq_hz=100_000_000,
+        bandwidth_hz=2_000_000,
+        freq_axis=np.arange(4, dtype=np.float64),
+        grid_min=0.0,
+        grid_max=0.0,
+        cal_offset_db=None,
+    )
+    meta = json.loads(meta_path.read_text())
+    assert meta["start_sample_offset"] == 0
+    assert meta["slice_samples"] == 0

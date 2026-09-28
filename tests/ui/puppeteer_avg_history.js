@@ -39,9 +39,35 @@
  *     legend shows them, power trace re-scales), persist them across a page
  *     reload (stored in the DB config table), reject inverted bounds, and
  *     clearing them returns to auto
+ *   - the Peaks button opens a popover that searches on open, re-searches
+ *     when a control changes, and closes on Escape (like the range picker)
+ *   - picking a peak navigates the Dashboard to it and closes the popover;
+ *     the arrows step between peaks without another search; choosing a
+ *     preset clears peak mode (the label reverts to "Peaks")
+ *   - a control change that re-runs the search re-reconciles the open peak
+ *     against the new results by peak_time; if it falls out of the new list
+ *     (e.g. narrowing "Show top" past its rank) peak mode clears itself
  *
  * Assumes the instance has accrued >600 averaged windows in the last day
  * (any instance up for ~10+ minutes at the default window rate).
+ *
+ * REQUIRED SETUP -- run this against the instance before this file, every
+ * time, including a freshly started one with an empty database:
+ *   PYTHONPATH= .venv/bin/python tests/ui/seed_peaks.py
+ * It seeds two things this file depends on and a fresh instance does not
+ * have yet:
+ *   - six well-separated loud windows for the peaks section. A freshly
+ *     started mock instance's data is all more recent than one peak-search
+ *     window, so the separation rule correctly collapses it into a single
+ *     event; after seeding, wait for the rollup loop to fold it in -- poll
+ *     /api/averaged/peaks until it returns enough peaks rather than
+ *     sleeping a fixed amount.
+ *   - ~20 minutes of continuous recent history, which the drag-zoom and raw
+ *     -mode sections below need: they zoom into / inspect a sub-range of the
+ *     default "Last 15 minutes" view, which is empty on a freshly started
+ *     instance. Skipping this step does not fail loudly -- the drag-zoom
+ *     assertions just fail because the zoomed range has no data, which reads
+ *     like a product bug rather than a missing setup step.
  *
  * Usage:
  *   NODE_PATH=<dir-with-puppeteer-core> node tests/ui/puppeteer_avg_history.js
@@ -576,6 +602,119 @@ async function main() {
     assert(/windows/.test(status), "preset " + preset + " loaded");
   }
 
+  // Regression: a preset picked while a Now poll for the previous span is
+  // still in flight must keep the spinner on until the NEW span has rendered.
+  // The bug: pollTick deferred to the next 2 s tick when a load was in flight,
+  // so the old-span poll (still the latest load) cleared the spinner and the
+  // picked span only appeared seconds later. Waterfall responses are slowed
+  // here so a poll is reliably in flight; the status text at the moment the
+  // spinner turns off shows which span was rendered.
+  await page.evaluate(() => {
+    const orig = window.fetch;
+    const probe = { orig: orig, inflight: 0, offStatus: [] };
+    window.__spinProbe = probe;
+    window.fetch = function (url) {
+      if (!String(url).includes("/api/averaged/waterfall")) return orig.apply(this, arguments);
+      probe.inflight++;
+      return orig
+        .apply(this, arguments)
+        .then((r) => new Promise((res) => setTimeout(() => res(r), 1500)))
+        .finally(() => { probe.inflight--; });
+    };
+    const sp = document.getElementById("avg-spinner");
+    probe.obs = new MutationObserver(() => {
+      if (!sp.classList.contains("on")) {
+        probe.offStatus.push(document.getElementById("avg-status").textContent);
+      }
+    });
+    probe.obs.observe(sp, { attributes: true, attributeFilter: ["class"] });
+  });
+  await page.waitForFunction(() => window.__spinProbe.inflight > 0, { timeout: 30000, polling: 20 });
+  await page.click("#avg-picker-btn");
+  await page.click('[data-preset="day"]');
+  await page.waitForFunction(() => window.__spinProbe.offStatus.length > 0, { timeout: 90000, polling: 50 });
+  const offStatus = await page.evaluate(() => {
+    const probe = window.__spinProbe;
+    probe.obs.disconnect();
+    window.fetch = probe.orig;
+    return probe.offStatus[0];
+  });
+  console.log("spinner turned off with status:", offStatus);
+  assert(
+    offStatus.includes("2.4 min/row"),
+    "spinner stays on until the picked span (24 h) renders, not the in-flight 7-day poll (got '"
+      + offStatus + "')"
+  );
+
+  // A failed load must name the request that died, the reason, the elapsed
+  // time, and whether the server is back and freshly restarted. A watchdog
+  // escalation or an OOM kill ends the process under the request, which is
+  // otherwise invisible: the UI only said "Load failed".
+  await page.evaluate(() => {
+    const orig = window.fetch;
+    window.__failProbe = { orig: orig };
+    window.fetch = function (url) {
+      if (String(url).includes("/api/averaged/waterfall")) {
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      return orig.apply(this, arguments);
+    };
+  });
+  await page.click("#avg-refresh");
+  await page.waitForFunction(
+    () => /failed:/i.test(document.getElementById("avg-status").textContent),
+    { timeout: 30000, polling: 100 }
+  );
+  const failMsg = await page.$eval("#avg-status", (el) => el.textContent);
+  await page.evaluate(() => { window.fetch = window.__failProbe.orig; });
+  console.log("failed-load status:", failMsg);
+  assert(
+    /waterfall \(Failed to fetch\) after \d+s/.test(failMsg),
+    "failed load names the endpoint, reason and elapsed time (got '" + failMsg + "')"
+  );
+  assert(
+    /server (up|up [\d.]+ ?(s|min|h)|restarted during the load \(up \d+s\)|unreachable)/.test(failMsg),
+    "failed load reports whether the server is back (got '" + failMsg + "')"
+  );
+  await waitStatusContains(page, "windows", 90000); // recovers on the next poll
+
+  // The signature that matters in the field: the process died under the
+  // request (watchdog escalation, OOM kill) and came back. Health is stubbed so
+  // the branch is deterministic rather than racing a real restart.
+  for (const [health, needle, label] of [
+    [JSON.stringify({ status: "ok", uptime_sec: 2.0 }), "server restarted during the load (up 2s)", "restarted"],
+    [null, "server unreachable", "down"],
+  ]) {
+    await page.evaluate((healthBody) => {
+      const orig = window.fetch;
+      window.__failProbe = { orig: orig };
+      window.fetch = function (url) {
+        const u = String(url);
+        if (u.includes("/api/averaged/waterfall")) {
+          return Promise.reject(new TypeError("Failed to fetch"));
+        }
+        if (u.includes("/api/health")) {
+          return healthBody === null
+            ? Promise.reject(new TypeError("Failed to fetch"))
+            : Promise.resolve(new Response(healthBody, {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              }));
+        }
+        return orig.apply(this, arguments);
+      };
+    }, health);
+    await page.click("#avg-refresh");
+    await page.waitForFunction(
+      (n) => document.getElementById("avg-status").textContent.includes(n),
+      { timeout: 30000, polling: 100 },
+      needle
+    );
+    await page.evaluate(() => { window.fetch = window.__failProbe.orig; });
+    console.log("failed-load (" + label + "):", await page.$eval("#avg-status", (el) => el.textContent));
+    await waitStatusContains(page, "windows", 90000);
+  }
+
   // Changing a tuning select reloads the range immediately (spinner cycle).
   await page.select("#avg-gain", "");
   await waitSpinnerCycle(page);
@@ -647,6 +786,103 @@ async function main() {
   }));
   assert(th.attr === "auto" && th.sel === "auto", "theme back to Auto after reload");
   assert(th.bg === "rgb(245, 245, 247)", "Auto resolves to the OS theme (light here)");
+
+  // Peak finder: the panel opens, searches, and lists what it found.
+  await page.click("#avg-peaks-btn");
+  await page.waitForSelector("#avg-peaks-panel:not([hidden])");
+  await page.waitForFunction(function () {
+    const el = document.getElementById("avg-peaks-list");
+    return el && !el.textContent.includes("Searching...");
+  }, { timeout: 15000 });
+  const peaksFoot = await page.$eval("#avg-peaks-foot", function (e) { return e.textContent; });
+  console.log("peaks footer:", peaksFoot);
+  assert(/searched .* in \d/.test(peaksFoot), "peaks footer should report the search: " + peaksFoot);
+  const peakCount = await page.$$eval("#avg-peaks-list .avg-peaks-item", function (els) {
+    return els.length;
+  });
+  console.log("peaks listed:", peakCount);
+  assert(
+    peakCount >= 5,
+    "peaks list should show the seeded well-separated events (got " + peakCount + "); " +
+      "run tests/ui/seed_peaks.py against this instance first"
+  );
+
+  // Changing a control re-runs the search against the new parameters. The
+  // active class alone only proves the click handler ran, not that the
+  // search did, so also wait for the footer (which carries a fresh elapsed
+  // time on every completed search) to move off the text captured above.
+  await page.click('#avg-peaks-panel button[data-peaks-window="3600"]');
+  await page.waitForFunction(function (prevFoot) {
+    const b = document.querySelector('#avg-peaks-panel button[data-peaks-window="3600"]');
+    const foot = document.getElementById("avg-peaks-foot").textContent;
+    return b && b.classList.contains("active") && foot !== prevFoot && foot.length > 0;
+  }, {}, peaksFoot);
+
+  // Escape closes it, like the range picker.
+  await page.keyboard.press("Escape");
+  await page.waitForSelector("#avg-peaks-panel[hidden]");
+
+  // Picking a peak closes the panel and navigates the Dashboard to it.
+  await page.click("#avg-peaks-btn");
+  await page.waitForFunction(function () {
+    return document.querySelectorAll("#avg-peaks-list .avg-peaks-item").length > 0;
+  }, { timeout: 15000 });
+  const firstWhen = await page.$eval(".avg-peaks-item .avg-peaks-when",
+    function (e) { return e.textContent; });
+  await page.click(".avg-peaks-item");
+  await page.waitForSelector("#avg-peaks-panel[hidden]");
+  await page.waitForFunction(function () {
+    return document.getElementById("avg-peaks-label").textContent.startsWith("Peak 1/");
+  });
+  assert(firstWhen.length > 0, "peak row should show a timestamp");
+
+  // The arrows step without reopening the panel.
+  await page.click("#avg-peaks-next");
+  await page.waitForFunction(function () {
+    return document.getElementById("avg-peaks-label").textContent.startsWith("Peak 2/");
+  });
+
+  // Choosing a preset means the range is no longer a peak, so the label resets.
+  await page.click("#avg-picker-btn");
+  await page.click('#avg-picker button[data-preset="15m"]');
+  await page.waitForFunction(function () {
+    return document.getElementById("avg-peaks-label").textContent === "Peaks";
+  });
+
+  // A new search replaces state.peaks.items wholesale, so the open peak's
+  // index must be re-reconciled against it (matched by peak_time), not left
+  // pointing at a stale position. Pin this down deterministically: pick the
+  // weakest of the six seeded peaks (rank 6), then narrow "Show top" to 5.
+  // Rank 6 cannot survive in a top-5 list, so peak mode must clear itself.
+  // Window is reset to the default 30 min first -- the "changing a control"
+  // check above left it at 1 hour, which merges the seeded peaks (spaced 40
+  // min apart) down to 3 and there would be no rank 6 to click.
+  await page.click("#avg-peaks-btn");
+  await page.click('#avg-peaks-panel button[data-peaks-window="1800"]');
+  await page.waitForFunction(function () {
+    return document.querySelectorAll('.avg-peaks-item[data-peak-rank="6"]').length > 0;
+  }, { timeout: 15000 });
+  await page.click('.avg-peaks-item[data-peak-rank="6"]');
+  await page.waitForSelector("#avg-peaks-panel[hidden]");
+  await page.waitForFunction(function () {
+    return document.getElementById("avg-peaks-label").textContent.startsWith("Peak 6/");
+  });
+  await page.click("#avg-peaks-btn");
+  await page.waitForFunction(function () {
+    return document.querySelectorAll("#avg-peaks-list .avg-peaks-item").length > 0;
+  }, { timeout: 15000 });
+  await page.click('#avg-peaks-panel button[data-peaks-count="5"]');
+  await page.waitForFunction(function () {
+    return document.getElementById("avg-peaks-label").textContent === "Peaks";
+  }, { timeout: 15000 });
+  const prevHiddenAfterNarrow = await page.$eval("#avg-peaks-prev", function (el) { return el.hidden; });
+  const nextHiddenAfterNarrow = await page.$eval("#avg-peaks-next", function (el) { return el.hidden; });
+  assert(
+    prevHiddenAfterNarrow && nextHiddenAfterNarrow,
+    "the nav arrows must hide once the open peak falls out of a narrower search"
+  );
+  await page.keyboard.press("Escape");
+  await page.waitForSelector("#avg-peaks-panel[hidden]");
 
   await page.screenshot({ path: SHOT });
   console.log("screenshot saved to", SHOT);

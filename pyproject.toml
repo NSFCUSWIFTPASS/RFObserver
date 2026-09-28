@@ -61,10 +61,10 @@ integration = "pytest tests/integration {args}"
 all = "pytest tests {args}"
 
 [[tool.hatch.envs.test.matrix]]
-python = ["3.11", "3.12"]
+python = ["3.10", "3.11", "3.12"]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py310"
 line-length = 100
 src = ["src"]
 
@@ -87,7 +87,7 @@ ignore = [
 known-first-party = ["rfobserver"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.10"
 strict = true
 warn_return_any = true
 warn_unused_configs = true

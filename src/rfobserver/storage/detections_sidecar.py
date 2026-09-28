@@ -61,15 +61,19 @@ async def build_sidecar_payload(sc16_path: Path, db: SensorDatabase) -> dict[str
     psd_meta = _read_json(psd_meta_path) or {}
 
     start_iso = meta.get("start_time")
-    dur = float(meta.get("duration_sec", 0.0))
+    # The capture's wall-time window is start_time + time_span_sec (samples
+    # plus the samples UHD overflows removed). Captures recorded before
+    # time_span_sec existed fall back to duration_sec, which is exact for
+    # them: their start_time was computed as now minus duration_sec.
+    span = float(meta.get("time_span_sec") or meta.get("duration_sec", 0.0))
     grid_rows = int(psd_meta.get("rows", 0))
     # Effective time resolution: the PSD grid's nominal `time_resolution_s` does
-    # NOT satisfy rows * tres == duration_sec, so a nominal-tres row mapping
-    # places detections far outside the grid. Use a consistent effective
-    # resolution (duration / rows) for BOTH row placement here and the waterfall
-    # time axis, so detections queried within [start, start+dur] always land in
+    # NOT satisfy rows * tres == span, so a nominal-tres row mapping places
+    # detections far outside the grid. Use a consistent effective resolution
+    # (span / rows) for BOTH row placement here and the waterfall time axis,
+    # so detections queried within [start, start+span] always land in
     # [0, rows] and align with the grid the viewer shows.
-    eff_tres = (dur / grid_rows) if (dur and grid_rows > 0) else None
+    eff_tres = (span / grid_rows) if (span and grid_rows > 0) else None
     center = meta.get("center_freq_hz")
     sample_rate = meta.get("sample_rate_hz")
     gain = meta.get("gain_db")
@@ -82,13 +86,13 @@ async def build_sidecar_payload(sc16_path: Path, db: SensorDatabase) -> dict[str
         "gain_db": gain,
         "detections": [],
     }
-    if not (start_iso and dur and grid_rows):
+    if not (start_iso and span and grid_rows):
         return out
 
     start = datetime.fromisoformat(start_iso)
     rows = await db.query_detections(
         since=start,
-        until=start + timedelta(seconds=dur),
+        until=start + timedelta(seconds=span),
         sdr_center_freq=center,
         sample_rate=sample_rate,
         gain=gain,
@@ -101,8 +105,8 @@ async def build_sidecar_payload(sc16_path: Path, db: SensorDatabase) -> dict[str
         det_stop = datetime.fromisoformat(row["stop_time"]).timestamp()
         # Clamp to [0, grid_rows]: a burst that starts in-window but ends after
         # the capture's last row would otherwise map row_stop past the grid.
-        row_start = int(round((det_start - cap_start) / dur * grid_rows))
-        row_stop = int(round((det_stop - cap_start) / dur * grid_rows))
+        row_start = int(round((det_start - cap_start) / span * grid_rows))
+        row_stop = int(round((det_stop - cap_start) / span * grid_rows))
         row_start = max(0, min(grid_rows, row_start))
         row_stop = max(0, min(grid_rows, row_stop))
         detections.append(

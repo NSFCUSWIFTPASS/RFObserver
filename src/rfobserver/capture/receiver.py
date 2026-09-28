@@ -60,6 +60,12 @@ class IReceiver(Protocol):
     def recv_chunk(self, out_buf: np.ndarray) -> int: ...
     def stop_streaming(self) -> None: ...
 
+    # UHD overflow loss: gaps from the last recv_chunk() as
+    # (offset_in_out_buf, lost_samples), and cumulative counters.
+    last_gaps: list[tuple[int, int]]
+    overflow_events: int
+    overflow_lost_samples: int
+
     # Lifecycle
     def initialize(self) -> None: ...
     def close(self) -> None: ...
@@ -88,6 +94,12 @@ class Receiver:
         # UHD handles — created in initialize(), dropped in close().
         self.usrp: Any = None
         self.rx_streamer: Any = None
+        # Overflow gap tracking (see recv_chunk). Tick = sample at the stream rate.
+        self.last_gaps: list[tuple[int, int]] = []
+        self.overflow_events = 0
+        self.overflow_lost_samples = 0
+        self._stream_rate = float(receiver_config.bandwidth_hz)
+        self._next_tick: int | None = None
 
     @property
     def serial(self) -> str:
@@ -103,6 +115,8 @@ class Receiver:
         logger.info("Initializing USRP hardware...")
         self.usrp = uhd.usrp.MultiUSRP("num_recv_frames=1024")
         self.usrp.set_rx_rate(self._config.bandwidth_hz, 0)
+        # Hardware may coerce the requested rate; gap ticks must use the real one.
+        self._stream_rate = float(self.usrp.get_rx_rate(0))
         self.usrp.set_rx_gain(self._config.gain_db, 0)
         self.usrp.set_rx_antenna("RX2", 0)
 
@@ -134,6 +148,7 @@ class Receiver:
             self._serial,
             n,
         )
+        self._reset_gap_tracking()
 
     async def reconfigure(self, new_config: ReceiverConfig) -> None:
         loop = asyncio.get_running_loop()
@@ -200,6 +215,10 @@ class Receiver:
 
     # -- Streaming methods (called from a dedicated receiver thread) --
 
+    def _reset_gap_tracking(self) -> None:
+        """Forget where the last samples ended (a new stream is not a gap)."""
+        self._next_tick = None
+
     def start_streaming(self, center_freq_hz: int) -> None:
         """Tune to *center_freq_hz* and begin continuous streaming."""
         import uhd
@@ -217,6 +236,7 @@ class Receiver:
                     logger.error("LO failed to lock within %.1fs", max_wait)
                     break
 
+            self._reset_gap_tracking()
             stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.start_cont)
             stream_cmd.stream_now = True
             self.rx_streamer.issue_stream_cmd(stream_cmd)
@@ -227,9 +247,14 @@ class Receiver:
     def recv_chunk(self, out_buf: np.ndarray) -> int:
         """Fill *out_buf* (int32, SC16) with samples from the running stream.
 
-        Calls ``rx_streamer.recv()`` in a loop until the buffer is full.
-        Returns the number of samples actually received.  Overflow errors
-        are logged but not raised so the pipeline can keep running.
+        Calls ``rx_streamer.recv()`` in a loop until the buffer is full and
+        returns the number of samples received. A UHD overflow ("O") drops
+        samples between packets; every packet carries a time_spec, so the loss
+        before a packet is measured exactly in integer ticks and reported via
+        ``last_gaps`` (offsets into *out_buf*) and the cumulative
+        ``overflow_events`` / ``overflow_lost_samples``. Float seconds are not
+        precise enough at epoch device time (off by up to 13 samples at
+        56 MS/s). See docs/debugging/2026-09-14_recording-overflow-accounting.md.
         """
         import uhd
 
@@ -237,16 +262,29 @@ class Receiver:
         total = 0
         target = len(out_buf)
         rx_md = uhd.types.RXMetadata()
+        gaps: list[tuple[int, int]] = []
 
         while total < target:
             n = self.rx_streamer.recv(out_buf[total:], rx_md, timeout=1.0)
             if rx_md.error_code == uhd.types.RXMetadataErrorCode.overflow:
-                logger.warning("UHD overflow (O) — lost samples")
+                logger.warning("UHD overflow (O): lost samples")
             elif rx_md.error_code != uhd.types.RXMetadataErrorCode.none:
                 logger.error("UHD recv error: %s", rx_md.strerror())
                 break
+            if n > 0:
+                if rx_md.has_time_spec:
+                    tick = int(rx_md.time_spec.to_ticks(self._stream_rate))
+                    if self._next_tick is not None and tick > self._next_tick:
+                        lost = tick - self._next_tick
+                        gaps.append((total, lost))
+                        self.overflow_events += 1
+                        self.overflow_lost_samples += lost
+                    self._next_tick = tick + n
+                else:
+                    self._next_tick = None
             total += n
 
+        self.last_gaps = gaps
         return total
 
     def stop_streaming(self) -> None:
@@ -259,6 +297,7 @@ class Receiver:
         stream_cmd.stream_now = True
         self.rx_streamer.issue_stream_cmd(stream_cmd)
         self._streaming = False
+        self._reset_gap_tracking()
         logger.info("Stopped continuous streaming")
 
     def close(self) -> None:

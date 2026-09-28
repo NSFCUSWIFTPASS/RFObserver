@@ -43,7 +43,7 @@ async def app_and_db(settings):
     await db.close()
 
 
-def _seed_capture(settings, base, cap_start):
+def _seed_capture(settings, base, cap_start, **extra_meta):
     from pathlib import Path
 
     storage = Path(settings.STORAGE_PATH)
@@ -56,6 +56,7 @@ def _seed_capture(settings, base, cap_start):
         "center_freq_hz": CENTER,
         "sample_rate_hz": SAMPLE_RATE,
         "gain_db": GAIN,
+        **extra_meta,
     }
     sc16.with_suffix(".json").write_text(json.dumps(meta))
     _raw, psd_meta_path = psd_grid.grid_paths(sc16)
@@ -140,6 +141,19 @@ async def test_recent_capture_without_sidecar_is_pending(app_and_db):
     payload = r.json()
     assert payload["detections"] == []
     assert payload["pending"] is True
+
+
+@pytest.mark.asyncio
+async def test_capture_is_pending_until_its_true_time_span_has_ended(app_and_db):
+    app, db, settings = app_and_db
+    # The file holds DURATION_SEC of samples, but overflow gaps stretch the
+    # wall time it covers to 59 s: it ended 1 s ago, inside the grace period.
+    cap_start = datetime.now(timezone.utc) - timedelta(seconds=60.0)
+    _seed_capture(settings, "gappy-cap", cap_start, time_span_sec=59.0)
+
+    r = await _get(app, "/captures/detections/gappy-cap.sc16")
+    assert r.status_code == 200
+    assert r.json()["pending"] is True
 
 
 @pytest.mark.asyncio

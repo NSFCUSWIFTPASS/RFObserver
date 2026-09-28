@@ -809,6 +809,49 @@ body {
     word-break: break-all;
 }
 
+/* Capture download links (detail panel) */
+.dl-section {
+    margin-top: 14px;
+    font-size: 12px;
+}
+
+.dl-title {
+    color: var(--text-secondary);
+    font-weight: 600;
+    margin-bottom: 6px;
+}
+
+.dl-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 12px;
+    padding: 4px 0;
+    border-bottom: 1px solid var(--divider);
+}
+
+.dl-kind {
+    color: var(--text-secondary);
+    font-weight: 500;
+    width: 108px;
+    flex-shrink: 0;
+}
+
+.dl-link {
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 500;
+}
+
+.dl-link:hover {
+    text-decoration: underline;
+}
+
+.dl-size {
+    color: var(--text-secondary);
+    margin-left: -8px;
+}
+
 /* Capture viewer */
 .capture-viewer {
     margin-top: 16px;
@@ -1453,6 +1496,110 @@ body {
     display: none; /* display:flex above would otherwise override [hidden] */
 }
 
+/* Peak finder popover: reuses .avg-picker (position/hidden/shadow), becomes
+   a column, and sits under its own button on the left. */
+.avg-peaks-panel {
+    flex-direction: column;
+    left: 16px;
+    right: auto;
+    padding: 14px;
+    min-width: 380px;
+}
+
+.avg-peaks-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-bottom: 6px;
+}
+
+.avg-peaks-key {
+    width: 74px;
+    font-size: 11px;
+    opacity: 0.7;
+}
+
+.avg-peaks-row button {
+    padding: 3px 8px;
+    border: none;
+    border-radius: 6px;
+    background: none;
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-family: inherit;
+    cursor: pointer;
+}
+
+.avg-peaks-row button:hover {
+    background: rgba(0, 113, 227, 0.08);
+    color: var(--text-primary);
+}
+
+.avg-peaks-row button.active {
+    background: rgba(0, 113, 227, 0.12);
+    color: var(--accent);
+    font-weight: 600;
+}
+
+.avg-peaks-list {
+    max-height: 260px;
+    overflow-y: auto;
+    margin-top: 8px;
+    border-top: 1px solid var(--border);
+}
+
+.avg-peaks-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 4px 6px;
+    font-size: 11px;
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: var(--radius);
+    cursor: pointer;
+    color: inherit;
+    font-family: inherit;
+}
+
+.avg-peaks-item:hover {
+    background: var(--border);
+}
+
+.avg-peaks-rank {
+    width: 18px;
+    opacity: 0.6;
+}
+
+.avg-peaks-when {
+    width: 120px;
+}
+
+.avg-peaks-value {
+    width: 64px;
+    text-align: right;
+}
+
+.avg-peaks-bar {
+    flex: 1;
+    font-family: monospace;
+    opacity: 0.5;
+    letter-spacing: -1px;
+}
+
+.avg-peaks-tag {
+    font-size: 10px;
+    opacity: 0.6;
+}
+
+.avg-peaks-empty {
+    font-size: 11px;
+    opacity: 0.7;
+    padding: 8px 6px;
+}
+
 .avg-picker-abs {
     display: flex;
     flex-direction: column;
@@ -1651,3 +1798,55 @@ body {
     gap: 16px;
     flex-wrap: wrap;
 }
+
+/* Storage governor banner (dashboard): amber while RFObserver is freeing
+   space on its own (steps 1-2), red once recordings are refused or a write
+   failed. */
+.storage-banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+    padding: 8px 14px;
+    border-radius: var(--radius);
+    background: rgba(255, 159, 10, 0.12);
+    color: var(--text-primary);
+    font-size: 13px;
+}
+.storage-banner-critical { background: rgba(255, 59, 48, 0.12); }
+.storage-banner-label { font-weight: 600; }
+.storage-banner-text { flex: 1; }
+.storage-banner-clear {
+    border: none;
+    border-radius: 8px;
+    padding: 4px 12px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 12px;
+    cursor: pointer;
+}
+.rec-notice { margin-left: 8px; font-size: 11px; color: #ff3b30; }
+
+/* Config page storage bar */
+.storage-bar {
+    position: relative;
+    display: flex;
+    height: 14px;
+    border-radius: 7px;
+    overflow: hidden;
+    background: var(--divider);
+    border: 1px solid var(--border);
+}
+.sb-seg { height: 100%; }
+.sb-manual { background: #0a84ff; }
+.sb-auto { background: #5e5ce6; }
+.sb-db { background: #ff9f0a; }
+.sb-other { background: #8e8e93; }
+.sb-floor {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: #ff3b30;
+}
+.storage-legend { margin-top: 4px; font-size: 10px; color: var(--text-secondary); }

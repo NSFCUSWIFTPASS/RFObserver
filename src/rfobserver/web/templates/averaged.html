@@ -13,6 +13,19 @@
                 <select id="avg-gain" title="Gain"></select>
             </div>
             <div class="avg-time">
+                <button type="button" id="avg-peaks-prev" class="btn-preset avg-nav"
+                        title="Previous peak" hidden>&#8249;</button>
+                <button type="button" id="avg-peaks-btn" class="btn-preset avg-picker-btn"
+                        title="Find the strongest events in recent history">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
+                         stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                        <path d="M3 18l5-9 4 6 3-4 6 7z"/>
+                    </svg>
+                    <span id="avg-peaks-label">Peaks</span>
+                    <span class="avg-caret">&#9662;</span>
+                </button>
+                <button type="button" id="avg-peaks-next" class="btn-preset avg-nav"
+                        title="Next peak" hidden>&#8250;</button>
                 <button type="button" id="avg-back" class="btn-preset avg-nav"
                         title="Back to the previous time range" disabled>&#8249;</button>
                 <button type="button" id="avg-picker-btn" class="btn-preset avg-picker-btn"
@@ -61,6 +74,38 @@
                 <button type="button" data-preset="2day">Last 2 days</button>
                 <button type="button" data-preset="week">Last 7 days</button>
             </div>
+        </div>
+        <div id="avg-peaks-panel" class="avg-picker avg-peaks-panel" hidden>
+            <div class="avg-picker-title">Find peaks</div>
+            <div class="avg-peaks-row" role="group" aria-label="Look back">
+                <span class="avg-peaks-key">Look back</span>
+                <button type="button" data-peaks-lookback="3day">3 days</button>
+                <button type="button" data-peaks-lookback="week">7 days</button>
+                <button type="button" data-peaks-lookback="2week">2 weeks</button>
+                <button type="button" data-peaks-lookback="month">1 month</button>
+            </div>
+            <div class="avg-peaks-row" role="group" aria-label="Window">
+                <span class="avg-peaks-key">Window</span>
+                <button type="button" data-peaks-window="900">15 min</button>
+                <button type="button" data-peaks-window="1800">30 min</button>
+                <button type="button" data-peaks-window="3600">1 hour</button>
+                <button type="button" data-peaks-window="10800">3 hours</button>
+            </div>
+            <div class="avg-peaks-row" role="group" aria-label="Show top">
+                <span class="avg-peaks-key">Show top</span>
+                <button type="button" data-peaks-count="5">5</button>
+                <button type="button" data-peaks-count="10">10</button>
+                <button type="button" data-peaks-count="15">15</button>
+                <button type="button" data-peaks-count="20">20</button>
+            </div>
+            <div class="avg-peaks-row" role="group" aria-label="Rank by">
+                <span class="avg-peaks-key">Rank by</span>
+                <button type="button" data-peaks-metric="pwr_max">Peak power</button>
+                <button type="button" data-peaks-metric="pwr_snr">Above noise</button>
+                <button type="button" data-peaks-metric="pwr_avg">Band average</button>
+            </div>
+            <div id="avg-peaks-list" class="avg-peaks-list"></div>
+            <div class="avg-hint" id="avg-peaks-foot"></div>
         </div>
         <div class="avg-status-row">
             <span class="avg-status" id="avg-status"></span>

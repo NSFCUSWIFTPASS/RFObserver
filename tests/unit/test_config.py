@@ -74,6 +74,27 @@ def test_toggle_persists_to_env_and_reloads(monkeypatch, tmp_path):
     assert AppSettings().SENSOR_ACTIVE is False
 
 
+def test_retention_defaults_to_seven_days():
+    settings = AppSettings(_env_file=None)
+    assert settings.DB_RETENTION_DAYS == 7
+
+
+def test_legacy_history_days_drives_retention(monkeypatch):
+    # The config page used to write HISTORY_DAYS, which nothing read: a field
+    # deployment set 30 and still lost PSD blobs after 7 days. A stored
+    # HISTORY_DAYS now carries into the setting that actually prunes.
+    monkeypatch.setenv("RFOBS_HISTORY_DAYS", "30")
+    settings = AppSettings(_env_file=None)
+    assert settings.DB_RETENTION_DAYS == 30
+
+
+def test_explicit_retention_beats_legacy_history_days(monkeypatch):
+    monkeypatch.setenv("RFOBS_HISTORY_DAYS", "30")
+    monkeypatch.setenv("RFOBS_DB_RETENTION_DAYS", "14")
+    settings = AppSettings(_env_file=None)
+    assert settings.DB_RETENTION_DAYS == 14
+
+
 def test_trigger_continuous_defaults_false():
     settings = AppSettings(_env_file=None)
     assert settings.TRIGGER_CONTINUOUS is False

@@ -8,7 +8,7 @@ import logging
 import math
 import struct
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 from rfobserver.__about__ import __version__
+from rfobserver.storage.rollup import METRICS, ROLLUP_OLDEST_KEY, Candidate, select_peaks
 from rfobserver.web.routes.config import _persist_settings
 from rfobserver.web.uiprefs import THEME_VALUES, UI_PREFS_KEY
 
@@ -39,6 +40,14 @@ _WATERFALL_VERSION = 2
 _WATERFALL_CACHE: OrderedDict[tuple[Any, ...], bytes] = OrderedDict()
 _WATERFALL_CACHE_MAX = 8
 
+_PEAKS_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
+_PEAKS_CACHE_MAX = 8
+# At minute resolution this covers 33 hours of one event dominating the range
+# before the separation rule can run out of candidates.
+_PEAKS_CANDIDATE_LIMIT = 2000
+_PEAK_WINDOW_SEC = (900, 1800, 3600, 10800)
+_PEAK_COUNT_MAX = 20
+
 
 def _get_processor(request: Request) -> Any:
     return getattr(request.app.state, "processor", None)
@@ -46,6 +55,14 @@ def _get_processor(request: Request) -> Any:
 
 def _get_db(request: Request) -> Any:
     return getattr(request.app.state, "database", None)
+
+
+def _get_write_db(request: Request) -> Any:
+    """The pipeline's write connection; the web layer's reader is query_only.
+
+    Falls back to ``database`` when no split is configured (tests, tools).
+    """
+    return getattr(request.app.state, "write_database", None) or _get_db(request)
 
 
 @router.get("/status")
@@ -221,6 +238,15 @@ async def sensor_set(request: Request) -> dict[str, Any]:
     if not isinstance(body, dict) or "active" not in body:
         raise HTTPException(status_code=400, detail="Missing 'active'")
     want = bool(body["active"])
+    settings = request.app.state.settings
+
+    if not want:
+        # Persist the stop intent BEFORE awaiting set_active: if a manual stop
+        # of a hung pipeline takes long enough for the watchdog to exit the
+        # process (code 90), systemd must still restart into Standby rather
+        # than override this stop with the last-persisted active state.
+        settings.SENSOR_ACTIVE = False
+        _persist_settings(settings)
 
     try:
         confirmed = await supervisor.set_active(want)
@@ -228,7 +254,7 @@ async def sensor_set(request: Request) -> dict[str, Any]:
         logger.exception("Sensor toggle failed")
         raise HTTPException(status_code=500, detail=f"toggle failed: {exc}") from exc
 
-    settings = request.app.state.settings
+    # Idempotent for both directions: reconfirms the final state either way.
     settings.SENSOR_ACTIVE = confirmed
     _persist_settings(settings)
     logger.info("Sensor set active=%s via API (persisted)", confirmed)
@@ -406,9 +432,9 @@ async def replay_record(request: Request) -> dict[str, Any]:
         proc.set_replay_recording(True)
         # begin() snapshots the pre-trigger buffer — keep it off the event loop.
         await asyncio.to_thread(proc.start_recording)
-    else:
-        await asyncio.to_thread(proc.stop_recording)
-        proc.set_replay_recording(False)
+        return _raise_if_refused(proc)
+    await asyncio.to_thread(proc.stop_recording)
+    proc.set_replay_recording(False)
     return _rec_status(proc)
 
 
@@ -418,6 +444,7 @@ async def trigger_capture(request: Request) -> dict[str, str]:
     proc = _get_processor(request)
     if proc is not None and hasattr(proc, "manual_trigger"):
         await asyncio.to_thread(proc.manual_trigger)
+        _raise_if_refused(proc)
         return {"status": "triggered"}
     return {"status": "not_supported", "detail": "Streaming mode not active"}
 
@@ -446,6 +473,16 @@ def _rec_status(proc: Any) -> dict[str, Any]:
     return result
 
 
+def _raise_if_refused(proc: Any) -> dict[str, Any]:
+    """The recording status, or 409 when storage refused the start/arm."""
+    st = _rec_status(proc)
+    refused = st.get("refused")
+    # isinstance: a MagicMock processor (web route tests) returns a truthy mock.
+    if isinstance(refused, str) and st.get("state") not in ("recording", "finalizing", "armed"):
+        raise HTTPException(status_code=409, detail=refused)
+    return st
+
+
 @router.get("/recording/status")
 async def recording_status(request: Request) -> dict[str, Any]:
     """Get current recording state."""
@@ -462,7 +499,7 @@ async def recording_start(request: Request) -> dict[str, Any]:
     if proc is not None and hasattr(proc, "start_recording"):
         # begin() snapshots the pre-trigger buffer — keep it off the event loop.
         await asyncio.to_thread(proc.start_recording)
-        return _rec_status(proc)
+        return _raise_if_refused(proc)
     return _idle_status()
 
 
@@ -472,7 +509,7 @@ async def recording_arm(request: Request) -> dict[str, Any]:
     proc = _get_processor(request)
     if proc is not None and hasattr(proc, "arm_trigger"):
         proc.arm_trigger()
-        return _rec_status(proc)
+        return _raise_if_refused(proc)
     return _idle_status()
 
 
@@ -546,6 +583,32 @@ async def set_storage_path(request: Request) -> dict[str, Any]:
 
     logger.info("Storage path set to: %s", new_path)
     return {"status": "ok", "path": new_path, "message": f"Storage path set to {new_path}"}
+
+
+@router.post("/storage/clear-degraded")
+async def storage_clear_degraded(request: Request) -> dict[str, Any]:
+    """Acknowledge a storage failure: clears the sticky degraded flag (and the
+    last write error). The flag stays set after space recovers until this is
+    called, so the evidence survives until someone has seen it.
+
+    Persisted at once (a restart right after a clear must not bring the flag
+    back), with the governor's values after the clear rather than blanks: a
+    write error reported in between is kept. A failed write is retried by the
+    next storage tick."""
+    from rfobserver.storage.governor import persist_degraded_change
+
+    gov = getattr(request.app.state, "storage_governor", None)
+    if gov is None:
+        raise HTTPException(status_code=409, detail="Storage governor not running")
+    gov.clear_degraded()
+    wdb = getattr(request.app.state, "write_database", None)
+    if wdb is not None:
+        try:
+            await persist_degraded_change(gov, wdb)
+        except Exception:
+            logger.exception("Could not persist the cleared storage flag; retrying next tick")
+    result: dict[str, Any] = gov.state.to_health()
+    return result
 
 
 # -- ZMS status/toggle --
@@ -729,6 +792,22 @@ def _format_capture(r: dict[str, Any]) -> str:
     if gain is not None:
         parts.append(f"{gain:.0f} dB")
     return " / ".join(parts)
+
+
+def _int_param(raw: str | None, default: int, name: str) -> int:
+    """Parse an integer query param, or answer 400 if it is not one.
+
+    A bare int() here raises ValueError, which Starlette turns into a 500, so a
+    typo in a URL reads as a server fault. Unlike _opt_float below, a bad value
+    is not silently treated as absent: these bound how much work the query does,
+    so quietly substituting a default would hide the mistake.
+    """
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{name} must be an integer") from exc
 
 
 def _opt_float(raw: str | None) -> float | None:
@@ -947,25 +1026,31 @@ async def averaged_waterfall(
     if db is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     since_dt, until_dt = _parse_range(since, until)
-    mr = max(1, min(2000, int(max_rows) if max_rows else 600))
-    mb = max(2, min(2048, int(max_bins) if max_bins else 512))
+    mr = max(1, min(2000, _int_param(max_rows, 600, "max_rows")))
+    mb = max(2, min(2048, _int_param(max_bins, 512, "max_bins")))
     key = (since, until, sdr_center, sample_rate, gain, mr, mb)
     cached = _WATERFALL_CACHE.get(key)
     if cached is not None:
         return Response(content=cached, media_type="application/octet-stream")
-    result = await db.query_avg_waterfall(
-        since=since_dt,
-        until=until_dt,
-        sdr_center_freq=_opt_float(sdr_center),
-        sample_rate=_opt_float(sample_rate),
-        gain=_opt_float(gain),
-        max_rows=mr,
-        max_bins=mb,
-    )
+    async with request.app.state.waterfall_sem:
+        if await request.is_disconnected():
+            return Response(status_code=499)
+        cached = _WATERFALL_CACHE.get(key)
+        if cached is not None:
+            return Response(content=cached, media_type="application/octet-stream")
+        result = await db.query_avg_waterfall(
+            since=since_dt,
+            until=until_dt,
+            sdr_center_freq=_opt_float(sdr_center),
+            sample_rate=_opt_float(sample_rate),
+            gain=_opt_float(gain),
+            max_rows=mr,
+            max_bins=mb,
+        )
     return Response(content=_waterfall_cached(key, result), media_type="application/octet-stream")
 
 
-@router.get("/averaged/stats")
+@router.get("/averaged/stats", response_model=None)
 async def averaged_stats(
     request: Request,
     since: str,
@@ -974,22 +1059,150 @@ async def averaged_stats(
     sample_rate: str | None = None,
     gain: str | None = None,
     max_points: str | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | Response:
     """Scalar stats timeline for a range (blob-independent, works after PSD
     retention prunes the blobs)."""
     db = _get_db(request)
     if db is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     since_dt, until_dt = _parse_range(since, until)
-    result: dict[str, Any] = await db.query_avg_stats(
-        since=since_dt,
-        until=until_dt,
-        sdr_center_freq=_opt_float(sdr_center),
-        sample_rate=_opt_float(sample_rate),
-        gain=_opt_float(gain),
-        max_points=int(max_points) if max_points else 600,
-    )
+    async with request.app.state.stats_sem:
+        if await request.is_disconnected():
+            return Response(status_code=499)
+        result: dict[str, Any] = await db.query_avg_stats(
+            since=since_dt,
+            until=until_dt,
+            sdr_center_freq=_opt_float(sdr_center),
+            sample_rate=_opt_float(sample_rate),
+            gain=_opt_float(gain),
+            max_points=_int_param(max_points, 600, "max_points"),
+        )
     return result
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Treat a naive datetime as UTC.
+
+    Stored timestamps are timezone-aware, query parameters may not be, and
+    comparing the two raises TypeError.
+    """
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+# Must stay registered before the parameterised `/averaged/{window_id}` route
+# below: Starlette matches routes in registration order, and `{window_id}` is
+# typed int, so a later registration here would 422 on the literal "peaks".
+@router.get("/averaged/peaks", response_model=None)
+async def averaged_peaks(
+    request: Request,
+    since: str,
+    until: str,
+    window_sec: str | None = None,
+    count: str | None = None,
+    metric: str | None = None,
+    sdr_center: str | None = None,
+    sample_rate: str | None = None,
+    gain: str | None = None,
+) -> dict[str, Any] | Response:
+    """Strongest separated events in a range, for the Dashboard's peak finder.
+
+    Reads the avg_minutes rollup, so cost depends on the number of minutes in
+    the range rather than on the number of windows.
+    """
+    db = _get_db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    since_dt, until_dt = _parse_range(since, until)
+    since_dt, until_dt = _as_utc(since_dt), _as_utc(until_dt)
+
+    window = _int_param(window_sec, 1800, "window_sec")
+    if window not in _PEAK_WINDOW_SEC:
+        raise HTTPException(
+            status_code=400, detail=f"window_sec must be one of {list(_PEAK_WINDOW_SEC)}"
+        )
+    n = _int_param(count, 10, "count")
+    if not 1 <= n <= _PEAK_COUNT_MAX:
+        raise HTTPException(status_code=400, detail=f"count must be 1 to {_PEAK_COUNT_MAX}")
+    metric_name = metric or "pwr_max"
+    if metric_name not in METRICS:
+        raise HTTPException(status_code=400, detail=f"metric must be one of {list(METRICS)}")
+
+    # Both `since` and `until` are quantised to the minute in the key (matching
+    # the rollup's own minute buckets). averaged.js derives `since` from
+    # `Date.now() - lookback`, so it is just as fresh to the millisecond as
+    # `until` on every search; quantising only `until` left the key changing on
+    # every request and the cache never hit. The exact since_dt/until_dt are
+    # still what gets queried below.
+    since_minute = since[:16]
+    until_minute = until[:16]
+    key = (since_minute, until_minute, window, n, metric_name, sdr_center, sample_rate, gain)
+    hit = _PEAKS_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    async with request.app.state.peaks_sem:
+        if await request.is_disconnected():
+            return Response(status_code=499)
+        hit = _PEAKS_CACHE.get(key)
+        if hit is not None:
+            return hit
+        rows = await db.query_avg_minute_peaks(
+            since=since_dt,
+            until=until_dt,
+            metric=metric_name,
+            sdr_center_freq=_opt_float(sdr_center),
+            sample_rate=_opt_float(sample_rate),
+            gain=_opt_float(gain),
+            limit=_PEAKS_CANDIDATE_LIMIT,
+        )
+        covered_key = await db.get_config(ROLLUP_OLDEST_KEY)
+
+    candidates: list[Candidate] = []
+    for peak_time, value, pwr_max, pwr_snr, pwr_avg in rows:
+        when = _as_utc(datetime.fromisoformat(peak_time))
+        # An edge minute can straddle the requested range.
+        if when < since_dt or when >= until_dt:
+            continue
+        candidates.append(
+            Candidate(
+                peak_time=when, value=value, pwr_max=pwr_max, pwr_snr=pwr_snr, pwr_avg=pwr_avg
+            )
+        )
+
+    now = datetime.now(timezone.utc)
+    peaks = select_peaks(candidates, window_sec=window, count=n, now=now)
+    settings = request.app.state.settings
+    psd_cutoff = now - timedelta(days=settings.DB_RETENTION_DAYS)
+    covered = since_dt
+    if covered_key:
+        covered = max(covered, _as_utc(datetime.fromisoformat(covered_key + ":00")))
+
+    payload: dict[str, Any] = {
+        "metric": metric_name,
+        "window_sec": window,
+        "peaks": [
+            {
+                "rank": p.rank,
+                "peak_time": p.peak_time.isoformat(),
+                "since": p.since.isoformat(),
+                "until": p.until.isoformat(),
+                "value": p.value,
+                "pwr_max": p.pwr_max,
+                "pwr_snr": p.pwr_snr,
+                "pwr_avg": p.pwr_avg,
+                "psd_available": p.peak_time >= psd_cutoff,
+            }
+            for p in peaks
+        ],
+        "covered_since": covered.isoformat(),
+        "psd_cutoff": psd_cutoff.isoformat(),
+        "truncated": len(peaks) < n and len(rows) >= _PEAKS_CANDIDATE_LIMIT,
+    }
+    _PEAKS_CACHE[key] = payload
+    _PEAKS_CACHE.move_to_end(key)
+    while len(_PEAKS_CACHE) > _PEAKS_CACHE_MAX:
+        _PEAKS_CACHE.popitem(last=False)
+    return payload
 
 
 @router.get("/iq-captures")
@@ -1106,8 +1319,12 @@ async def put_ui_prefs(request: Request) -> dict[str, Any]:
     into the stored document, so a scale change keeps the stored theme and a
     theme change keeps the stored scale. Scale values are per-chart low/high
     bounds (dBFS for waterfall/PSD, dB for power, unitless for kurtosis); null
-    or omitted means auto-scale from the data. Theme is auto/light/dark."""
-    db = _get_db(request)
+    or omitted means auto-scale from the data. Theme is auto/light/dark.
+
+    The read and the write both go through the writer: merging a document read
+    from the reader (possibly an older snapshot) and writing it back would
+    silently undo a newer change to the other key."""
+    db = _get_write_db(request)
     if db is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     try:

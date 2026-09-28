@@ -132,12 +132,21 @@ class IsolationStage:
     # -- producer side (burst thread / sweep loop): never blocks --
 
     def submit(self, batch: IsolationBatch) -> bool:
-        self.stats.count("received", len(batch.candidates))
+        n = len(batch.candidates)
+        self.stats.count("received", n)
+        # Checked up front: once stop() has requested a shutdown, a newly
+        # submitted batch must not be allowed to land in the queue behind
+        # the worker's back (see stop()/_loop() for the rest of this
+        # defense -- a batch that slips through the tiny window between
+        # this check and put_nowait is still caught by the drains there).
+        if self._stop_event.is_set():
+            self.stats.count("queue_full", n)
+            return False
         try:
             self._queue.put_nowait(batch)
             return True
         except queue.Full:
-            self.stats.count("queue_full", len(batch.candidates))
+            self.stats.count("queue_full", n)
             return False
 
     # -- worker --
@@ -154,34 +163,50 @@ class IsolationStage:
         if self._thread is None:
             return
         self._stop_event.set()
-        # Drain whatever is already queued: it will never be processed now,
-        # so count it as queue_full rather than silently dropping it (keeps
-        # received == gated_out + queue_full + picked holding after stop()).
-        while True:
-            try:
-                batch = self._queue.get_nowait()
-            except queue.Empty:
-                break
-            if batch is _STOP:
-                continue
-            self.stats.count("queue_full", len(batch.candidates))
+        # Drain whatever is already queued before the worker even learns to
+        # stop: it will never be processed now, so count it as queue_full
+        # rather than silently dropping it.
+        self._drain_remaining_as_queue_full()
         with contextlib.suppress(queue.Full):
             self._queue.put_nowait(_STOP)
         self._thread.join(timeout=5.0)
         if self._thread.is_alive():
             logger.warning("Isolation worker thread did not stop within the timeout")
-        else:
-            self._thread = None
+            return
+        self._thread = None
+        # If the worker was busy inside process_batch when the event was
+        # set, it exits the loop (and drains behind itself, see _loop())
+        # only after that batch finishes -- meanwhile a batch submitted in
+        # that window could have slipped past submit()'s stop-event check
+        # and landed in the queue after our drain above but is still
+        # accounted for by _loop()'s own exit-time drain. This final pass
+        # is belt-and-suspenders for anything left after the join; empty is
+        # the normal case.
+        self._drain_remaining_as_queue_full()
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
             batch = self._queue.get()
             if batch is _STOP:
-                return
+                break
             try:
                 self.process_batch(batch)
             except Exception:
                 logger.exception("Isolation batch failed")
+        # Whether we got here via the _STOP sentinel or via the stop event
+        # flipping between batches, anything still queued behind us was
+        # accepted by submit() but will never be processed now.
+        self._drain_remaining_as_queue_full()
+
+    def _drain_remaining_as_queue_full(self) -> None:
+        while True:
+            try:
+                batch = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            if batch is _STOP:
+                continue
+            self.stats.count("queue_full", len(batch.candidates))
 
     def _gate(self, cands: list[BurstCandidate]) -> list[BurstCandidate]:
         """SNR gate, then cap to ISOLATION_MAX_PER_SEC, strongest first.

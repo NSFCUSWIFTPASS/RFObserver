@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -277,6 +278,53 @@ def test_stop_on_a_full_queue_returns_promptly_and_counts_consistently(tmp_path,
         assert snap["isolated"] == 1
         assert snap["received"] == snap.get("gated_out", 0) + snap["queue_full"] + snap["picked"]
     finally:
+        if st._thread is not None:
+            st.stop()
+
+
+def test_a_batch_submitted_during_stop_while_the_worker_is_busy_is_not_lost(tmp_path, monkeypatch):
+    """Reproduces the race: stop() drains an empty queue while the worker is
+    still inside process_batch(); a batch submitted in that window must not
+    vanish uncounted once the worker exits its loop without ever draining."""
+    import rfobserver.pipeline.isolation as iso_mod
+
+    real = iso_mod.isolate_burst
+    worker_inside = threading.Event()
+    release_worker = threading.Event()
+
+    def blocking(*a, **k):
+        worker_inside.set()
+        release_worker.wait(timeout=5.0)
+        return real(*a, **k)
+
+    monkeypatch.setattr(iso_mod, "isolate_burst", blocking)
+
+    st, *_ = _stage(tmp_path, ISOLATION_QUEUE_MAX=2)
+    st.start()
+    try:
+        st.submit(IsolationBatch([_cand(0, 30)], 915e6, FS, RingSource(_ring())))
+        assert worker_inside.wait(timeout=5.0)  # worker is now stuck inside process_batch(batch 0)
+
+        stop_thread = threading.Thread(target=st.stop)
+        stop_thread.start()
+        time.sleep(0.05)  # let stop() set the event and run its drain loop
+
+        # Races stop()'s drain: with the fix this is either rejected
+        # outright (stop event already set) or, if it slips into the queue,
+        # drained and counted by _loop()'s exit-time drain rather than lost.
+        st.submit(IsolationBatch([_cand(1, 30)], 915e6, FS, RingSource(_ring())))
+
+        release_worker.set()  # let batch 0 finish so the worker (and stop()) can exit
+        stop_thread.join(timeout=5.0)
+        assert not stop_thread.is_alive()
+
+        snap = st.stats.snapshot()
+        assert snap["received"] == 2
+        assert snap["received"] == (
+            snap.get("gated_out", 0) + snap.get("queue_full", 0) + snap.get("picked", 0)
+        )
+    finally:
+        release_worker.set()
         if st._thread is not None:
             st.stop()
 

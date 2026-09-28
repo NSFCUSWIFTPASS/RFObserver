@@ -646,14 +646,21 @@ class StreamingProcessor:
         # disabled rather than risking OOM on the Jetson. The guard also counts
         # the stage's working set for one burst of ISOLATION_MAX_BURST_SEC
         # (the ring copy, complex64 IQ, mixed IQ and the resampler's buffers;
-        # _ISOLATION_WORKING_SET_FACTOR complex64 copies bounds them).
+        # _ISOLATION_WORKING_SET_FACTOR complex64 copies bounds them), plus
+        # the raw ring copies one batch takes before its DSP (at most
+        # ISOLATION_MAX_PER_SEC bursts, capped at SNAPSHOT_MAX_BYTES).
         ring_sec = float(s.TRIGGER_PRE_SEC)
         if self._isolation_on:
+            from rfobserver.pipeline.isolation import SNAPSHOT_MAX_BYTES
+
             self._isolation_disabled_reason = None
             want = max(ring_sec, float(s.ISOLATION_LOOKBACK_SEC))
             ring_bytes = int(want * s.BANDWIDTH) * 4
             max_burst_samples = int(float(s.ISOLATION_MAX_BURST_SEC) * s.BANDWIDTH)
             work_bytes = _ISOLATION_WORKING_SET_FACTOR * max_burst_samples * 8
+            work_bytes += min(
+                SNAPSHOT_MAX_BYTES, int(s.ISOLATION_MAX_PER_SEC) * max_burst_samples * 4
+            )
             avail = _mem_available_bytes()
             if avail is not None and ring_bytes + work_bytes > 0.25 * avail:
                 self._isolation_disabled_reason = (

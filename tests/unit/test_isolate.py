@@ -6,7 +6,13 @@ import numpy as np
 
 from rfobserver.capture.buffer import CircularBuffer
 from rfobserver.models import BurstFingerprint
-from rfobserver.processing.isolate import GUARD_SEC, iq_to_complex, isolate_burst
+from rfobserver.processing.isolate import (
+    GUARD_SEC,
+    burst_read_range,
+    iq_to_complex,
+    isolate_burst,
+    isolate_samples,
+)
 
 FS = 8_000_000.0
 CENTER = 915e6
@@ -145,3 +151,39 @@ def test_iq_to_complex_unpacks_sc16():
     out = iq_to_complex(packed)
     assert out.dtype == np.complex64
     assert abs(out[0] - (10000 + 5000j) / 32768) < 1e-3
+
+
+def test_burst_read_range_adds_the_guard_and_truncates():
+    guard = int(GUARD_SEC * FS)
+    r = burst_read_range(_burst(20_000, 30_000, CENTER), sample_rate_hz=FS, max_burst_sec=0.5)
+    assert (r.start, r.stop, r.truncated) == (20_000 - guard, 30_000 + guard, False)
+    assert r.num_samples == 10_000 + 2 * guard
+    r = burst_read_range(_burst(20_000, 380_000, CENTER), sample_rate_hz=FS, max_burst_sec=0.01)
+    assert (r.stop, r.truncated) == (20_000 + int(0.01 * FS) + guard, True)
+    r = burst_read_range(_burst(1_000, 5_000, CENTER), sample_rate_hz=FS, max_burst_sec=0.5)
+    assert r.start == 0  # the guard never reaches before the stream start
+    no_pos = _burst(None, None, CENTER)
+    assert burst_read_range(no_pos, sample_rate_hz=FS, max_burst_sec=0.5) is None
+
+
+def test_isolate_samples_is_the_dsp_of_isolate_burst():
+    ring = _ring_with_tone(400_000, (100_000, 180_000), 700_000.0)
+    b = _burst(100_000, 180_000, CENTER + 700_000.0)
+    via_ring = isolate_burst(
+        b,
+        read_range=ring.read_range,
+        read_all=None,
+        sample_rate_hz=FS,
+        center_freq_hz=CENTER,
+        max_burst_sec=0.5,
+    )
+    r = burst_read_range(b, sample_rate_hz=FS, max_burst_sec=0.5)
+    direct = isolate_samples(
+        b,
+        ring.read_range(r.start, r.stop),
+        start_sample=r.start,
+        truncated=r.truncated,
+        sample_rate_hz=FS,
+        center_freq_hz=CENTER,
+    )
+    assert direct == via_ring

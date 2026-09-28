@@ -30,7 +30,12 @@ from rfobserver.pipeline.attribution import (
     db_sink,
     find_rtl433,
 )
-from rfobserver.processing.isolate import iq_to_complex, isolate_burst
+from rfobserver.processing.isolate import (
+    BurstRange,
+    burst_read_range,
+    iq_to_complex,
+    isolate_samples,
+)
 from rfobserver.storage.burst_archive import BurstArchive
 
 if TYPE_CHECKING:
@@ -50,6 +55,12 @@ _STOP = object()
 # 112 MB), so at most this many may be queued or in flight at once; further
 # ones are dropped as queue_full.
 MAX_WHOLE_CAPTURE_BATCHES = 2
+# Raw ring bytes one batch may copy out before any of its DSP runs. Every
+# picked burst's IQ is copied first because the receiver keeps writing the
+# ring while earlier bursts are channelized (F3: the weakest of three bursts
+# was overwritten while the other two were processed). Bursts beyond this are
+# read just before their own DSP instead, as before.
+SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
 
 
 @dataclass
@@ -61,6 +72,10 @@ class BurstCandidate:
 class RingSource:
     def __init__(self, ring: CircularBuffer) -> None:
         self._ring = ring
+
+    @property
+    def itemsize(self) -> int:
+        return self._ring.itemsize
 
     def read_range(self, start: int, end: int) -> np.ndarray[Any, np.dtype[Any]] | None:
         return self._ring.read_range(start, end)
@@ -91,6 +106,17 @@ class IsolationBatch:
     center_freq_hz: float
     sample_rate_hz: float
     source: RingSource | WholeCaptureSource
+
+
+@dataclass
+class _Work:
+    """One picked burst, its read range and (when snapshotted) its samples."""
+
+    cand: BurstCandidate
+    rng: BurstRange | None  # None: no stream positions (whole capture)
+    data: np.ndarray[Any, np.dtype[Any]] | None = None
+    snapped: bool = False  # data was read up front (None then means expired)
+    read_failed: bool = False  # the snapshot read raised
 
 
 class IsolationStats:
@@ -295,28 +321,79 @@ class IsolationStage:
 
     def process_batch(self, batch: IsolationBatch) -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = []
-        for cand in self._gate(batch.candidates, batch.sample_rate_hz):
-            state = self._one(cand, batch)
+        picked = self._gate(batch.candidates, batch.sample_rate_hz)
+        for work in self._snapshot(picked, batch):
+            state = self._one(work, batch)
             self.stats.count(state)
-            out.append((cand.burst.burst_id, state))
+            out.append((work.cand.burst.burst_id, state))
         return out
 
-    def _one(self, cand: BurstCandidate, batch: IsolationBatch) -> str:
+    def _snapshot(self, picked: list[BurstCandidate], batch: IsolationBatch) -> list[_Work]:
+        """Copy every picked ring burst's samples before any DSP runs, up to
+        SNAPSHOT_MAX_BYTES per batch; the rest are read lazily in _one."""
+        max_sec = float(self._s.ISOLATION_MAX_BURST_SEC)
+        src = batch.source
+        works: list[_Work] = []
+        used = 0
+        lazy = 0
+        for cand in picked:
+            rng = burst_read_range(
+                cand.burst, sample_rate_hz=batch.sample_rate_hz, max_burst_sec=max_sec
+            )
+            work = _Work(cand, rng)
+            works.append(work)
+            if rng is None or not isinstance(src, RingSource):
+                continue
+            nbytes = rng.num_samples * src.itemsize
+            if used + nbytes > SNAPSHOT_MAX_BYTES:
+                lazy += 1
+                continue
+            used += nbytes
+            work.snapped = True
+            try:
+                work.data = src.read_range(rng.start, rng.stop)
+            except Exception:
+                logger.exception("Isolation read failed for burst %s", cand.burst.burst_id)
+                work.read_failed = True
+        if lazy:
+            logger.info(
+                "Isolation batch of %d bursts exceeds the %d MB snapshot budget; "
+                "%d read just before their DSP",
+                len(picked),
+                SNAPSHOT_MAX_BYTES // (1024 * 1024),
+                lazy,
+            )
+        return works
+
+    def _read(self, work: _Work, batch: IsolationBatch) -> np.ndarray[Any, np.dtype[Any]] | None:
+        if work.snapped:
+            return work.data
+        if work.rng is not None:
+            return batch.source.read_range(work.rng.start, work.rng.stop)
+        return batch.source.read_all()
+
+    def _one(self, work: _Work, batch: IsolationBatch) -> str:
+        cand = work.cand
         b = cand.burst
+        if work.read_failed:
+            return "error"
         try:
-            iso = isolate_burst(
+            data = self._read(work, batch)
+            work.data = None  # the snapshot is not needed past its DSP
+            if data is None or len(data) == 0:
+                return "iq_expired"
+            iso = isolate_samples(
                 b,
-                read_range=batch.source.read_range,
-                read_all=batch.source.read_all,
+                data,
+                start_sample=work.rng.start if work.rng is not None else None,
+                truncated=work.rng.truncated if work.rng is not None else False,
                 sample_rate_hz=batch.sample_rate_hz,
                 center_freq_hz=batch.center_freq_hz,
-                max_burst_sec=float(self._s.ISOLATION_MAX_BURST_SEC),
             )
+            del data
         except Exception:
             logger.exception("Isolation failed for burst %s", b.burst_id)
             return "error"
-        if isinstance(iso, str):
-            return iso
         meta: dict[str, Any] = {
             "burst_id": b.burst_id,
             "freq_hz": iso.freq_hz,
@@ -328,7 +405,7 @@ class IsolationStage:
         }
         # Each fan-out consumer gets its own try/except: one consumer's
         # failure must not hide the burst from the others, and (unlike a
-        # failure in isolate_burst itself) must not change the burst's
+        # failure in isolate_samples itself) must not change the burst's
         # state -- the burst *was* isolated, only its delivery to one
         # consumer failed.
         if self._archive is not None and not self._refuse_saving():

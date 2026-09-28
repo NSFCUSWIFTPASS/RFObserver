@@ -219,6 +219,11 @@ class CircularBuffer:
         return self._max_samples
 
     @property
+    def itemsize(self) -> int:
+        """Bytes per sample."""
+        return int(self._buffer.itemsize)
+
+    @property
     def filled(self) -> int:
         return min(self._total_written, self._max_samples)
 

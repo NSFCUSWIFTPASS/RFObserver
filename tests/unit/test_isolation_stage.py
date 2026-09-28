@@ -151,12 +151,88 @@ def test_every_picked_burst_gets_exactly_one_state(tmp_path):
     assert snap["too_long"] == 1 and snap["iq_expired"] == 1
 
 
+def test_a_weak_burst_is_not_evicted_by_the_dsp_of_stronger_ones(tmp_path, monkeypatch):
+    """F3: bursts are handled strongest first, and the receiver keeps writing
+    the ring while each one is channelized. If every burst were read only
+    just before its own DSP, the stronger bursts' DSP time would push the
+    weakest one's samples out of the ring. Its IQ is copied before any DSP."""
+    import rfobserver.processing.isolate as isolate_mod
+
+    ring = CircularBuffer(400_000, dtype=np.int32)
+    ring.write(np.random.default_rng(0).integers(-2000, 2000, 400_000, dtype=np.int32))
+    real = isolate_mod.channelize_to_cs16
+    dsp_calls = []
+
+    def slow_dsp(*a, **k):
+        # Stands in for the receiver writing 50k samples (25 ms at 2 Msps)
+        # while one burst is channelized: after one call the ring no longer
+        # holds position 16k, where b2's read starts.
+        dsp_calls.append(ring.oldest_position)
+        ring.write(np.zeros(50_000, dtype=np.int32))
+        return real(*a, **k)
+
+    monkeypatch.setattr(isolate_mod, "channelize_to_cs16", slow_dsp)
+    st, *_ = _stage(tmp_path)
+    cands = [
+        _cand(0, 40, 350_000, 360_000),
+        _cand(1, 30, 300_000, 310_000),
+        _cand(2, 20, 20_000, 30_000),  # weakest, oldest: handled last
+    ]
+    out = st.process_batch(IsolationBatch(cands, 915e6, FS, RingSource(ring)))
+    assert out == [("b0", "isolated"), ("b1", "isolated"), ("b2", "isolated")]
+    assert len(dsp_calls) == 3
+    assert ring.oldest_position > 20_000  # b2's samples really are gone from the ring now
+
+
+def test_bursts_past_the_snapshot_budget_are_read_just_before_their_dsp(
+    tmp_path, monkeypatch, caplog
+):
+    import rfobserver.pipeline.isolation as iso_mod
+    import rfobserver.processing.isolate as isolate_mod
+
+    ring = CircularBuffer(400_000, dtype=np.int32)
+    ring.write(np.zeros(400_000, dtype=np.int32))
+    real = isolate_mod.channelize_to_cs16
+
+    def slow_dsp(*a, **k):
+        ring.write(np.zeros(50_000, dtype=np.int32))
+        return real(*a, **k)
+
+    monkeypatch.setattr(isolate_mod, "channelize_to_cs16", slow_dsp)
+    # Room for one 18k-sample read (10k burst + 2 x 4k guard) of int32.
+    monkeypatch.setattr(iso_mod, "SNAPSHOT_MAX_BYTES", 18_000 * 4)
+    st, *_ = _stage(tmp_path)
+    cands = [
+        _cand(0, 40, 20_000, 30_000),  # snapshotted
+        _cand(1, 30, 350_000, 360_000),  # lazy, still held when its turn comes
+        _cand(2, 20, 60_000, 70_000),  # lazy, overwritten by then
+    ]
+    with caplog.at_level("INFO", logger="rfobserver.pipeline.isolation"):
+        out = st.process_batch(IsolationBatch(cands, 915e6, FS, RingSource(ring)))
+    assert out == [("b0", "isolated"), ("b1", "isolated"), ("b2", "iq_expired")]
+    budget_logs = [r for r in caplog.records if "snapshot budget" in r.getMessage()]
+    assert len(budget_logs) == 1 and "2 read just before" in budget_logs[0].getMessage()
+
+
+def test_a_snapshot_read_that_raises_is_the_error_state(tmp_path):
+    class Boom(RingSource):
+        def read_range(self, start, end):
+            if start < 100_000:
+                raise OSError("read failed")
+            return super().read_range(start, end)
+
+    st, *_ = _stage(tmp_path)
+    cands = [_cand(0, 40, 10_000, 20_000), _cand(1, 30, 200_000, 210_000)]
+    out = st.process_batch(IsolationBatch(cands, 915e6, FS, Boom(_ring())))
+    assert out == [("b0", "error"), ("b1", "isolated")]
+
+
 def test_an_exception_is_the_error_state_and_does_not_stop_the_batch(tmp_path, monkeypatch):
     st, *_ = _stage(tmp_path)
     calls = {"n": 0}
     import rfobserver.pipeline.isolation as iso_mod
 
-    real = iso_mod.isolate_burst
+    real = iso_mod.isolate_samples
 
     def flaky(*a, **k):
         calls["n"] += 1
@@ -164,7 +240,7 @@ def test_an_exception_is_the_error_state_and_does_not_stop_the_batch(tmp_path, m
             raise ValueError("bad burst")
         return real(*a, **k)
 
-    monkeypatch.setattr(iso_mod, "isolate_burst", flaky)
+    monkeypatch.setattr(iso_mod, "isolate_samples", flaky)
     batch = IsolationBatch([_cand(0, 40), _cand(1, 30)], 915e6, FS, RingSource(_ring()))
     out = dict(st.process_batch(batch))
     assert out == {"b0": "error", "b1": "isolated"}
@@ -184,14 +260,14 @@ def test_full_queue_counts_queue_full(tmp_path):
 def test_received_and_picked_counters_satisfy_the_accounting_invariants(tmp_path, monkeypatch):
     import rfobserver.pipeline.isolation as iso_mod
 
-    real = iso_mod.isolate_burst
+    real = iso_mod.isolate_samples
 
-    def flaky(burst, **kw):
+    def flaky(burst, data, **kw):
         if burst.burst_id == "b6":
             raise ValueError("bad burst")
-        return real(burst, **kw)
+        return real(burst, data, **kw)
 
-    monkeypatch.setattr(iso_mod, "isolate_burst", flaky)
+    monkeypatch.setattr(iso_mod, "isolate_samples", flaky)
 
     st, *_ = _stage(
         tmp_path, ISOLATION_MAX_PER_SEC=3, ISOLATION_MAX_BURST_SEC=0.001, ISOLATION_QUEUE_MAX=1
@@ -282,13 +358,13 @@ def test_thread_drains_submitted_batches(tmp_path):
 def test_stop_on_a_full_queue_returns_promptly_and_counts_consistently(tmp_path, monkeypatch):
     import rfobserver.pipeline.isolation as iso_mod
 
-    real = iso_mod.isolate_burst
+    real = iso_mod.isolate_samples
 
     def slow(*a, **k):
         time.sleep(0.3)
         return real(*a, **k)
 
-    monkeypatch.setattr(iso_mod, "isolate_burst", slow)
+    monkeypatch.setattr(iso_mod, "isolate_samples", slow)
 
     st, *_ = _stage(tmp_path, ISOLATION_QUEUE_MAX=1)
     st.start()
@@ -320,7 +396,7 @@ def test_a_batch_submitted_during_stop_while_the_worker_is_busy_is_not_lost(tmp_
     vanish uncounted once the worker exits its loop without ever draining."""
     import rfobserver.pipeline.isolation as iso_mod
 
-    real = iso_mod.isolate_burst
+    real = iso_mod.isolate_samples
     worker_inside = threading.Event()
     release_worker = threading.Event()
 
@@ -329,7 +405,7 @@ def test_a_batch_submitted_during_stop_while_the_worker_is_busy_is_not_lost(tmp_
         release_worker.wait(timeout=5.0)
         return real(*a, **k)
 
-    monkeypatch.setattr(iso_mod, "isolate_burst", blocking)
+    monkeypatch.setattr(iso_mod, "isolate_samples", blocking)
 
     st, *_ = _stage(tmp_path, ISOLATION_QUEUE_MAX=2)
     st.start()

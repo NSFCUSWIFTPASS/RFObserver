@@ -439,7 +439,6 @@ async def _heartbeat_loop(
     from pathlib import Path
 
     from rfobserver.web.routes.api import (
-        build_nats_status_payload,
         build_status_bar_html,
         build_zms_status_payload,
     )
@@ -478,7 +477,6 @@ async def _heartbeat_loop(
                     "recording": rec_status,
                     "replay": supervisor.replay_status(),
                     "zms": build_zms_status_payload(settings, processor),
-                    "nats": build_nats_status_payload(settings, processor),
                     "modules": build_modules_payload(module_manager),
                     "detection_count": detection_count,
                     "capture_count": capture_count,

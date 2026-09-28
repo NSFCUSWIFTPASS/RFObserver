@@ -361,38 +361,6 @@
 
 <div class="card" style="margin-bottom: 16px;">
     <div class="card-header">
-        RFS NATS
-        <span style="flex:1;"></span>
-        <label class="toggle-label" title="Enable/disable NATS publishing">
-            <input type="checkbox" id="nats-toggle" {% if settings.NATS_ENABLED %}checked{% endif %}>
-            <span class="toggle-text">Enabled</span>
-        </label>
-        <span id="nats-status" style="font-size:10px;opacity:0.6;margin-left:8px;">--</span>
-    </div>
-    <div class="card-body">
-        <div class="config-form">
-            <div class="form-row">
-                <div class="form-group">
-                    <label for="nats-host">Host</label>
-                    <input type="text" id="nats-host" name="nats_host" value="{{ settings.NATS_HOST }}">
-                </div>
-                <div class="form-group">
-                    <label for="nats-port">Port</label>
-                    <input type="number" id="nats-port" name="nats_port" value="{{ settings.NATS_PORT }}">
-                </div>
-            </div>
-            <div class="form-row">
-                <div class="form-group" style="flex:2;">
-                    <label for="nats-token">Token</label>
-                    <input type="password" id="nats-token" name="nats_token" value="" placeholder="(unchanged)">
-                </div>
-            </div>
-        </div>
-    </div>
-</div>
-
-<div class="card" style="margin-bottom: 16px;">
-    <div class="card-header">
         OpenZMS
         <span style="flex:1;"></span>
         <label class="toggle-label" title="Enable/disable ZMS submissions">
@@ -659,29 +627,13 @@
         setPathBtn.disabled = false;
     });
 
-    // --- ZMS / NATS status: pushed over /ws/live as a 1 Hz heartbeat ---
+    // --- ZMS status: pushed over /ws/live as a 1 Hz heartbeat ---
     function renderZmsStatus(d) {
         const el = document.getElementById('zms-status');
         if (!el || !d) return;
         if (d.enabled) {
             el.textContent = d.last_sent || 'enabled';
             el.style.color = d.connected ? '#34c759' : '#ff9f0a';
-        } else {
-            el.textContent = 'disabled';
-            el.style.color = '';
-        }
-    }
-    function renderNatsStatus(d) {
-        const el = document.getElementById('nats-status');
-        if (!el || !d) return;
-        if (d.enabled) {
-            if (d.connected) {
-                el.textContent = (d.stats_count || 0) + ' stats sent';
-                el.style.color = '#34c759';
-            } else {
-                el.textContent = 'disconnected';
-                el.style.color = '#ff9f0a';
-            }
         } else {
             el.textContent = 'disabled';
             el.style.color = '';
@@ -697,7 +649,6 @@
                 const data = JSON.parse(evt.data);
                 if (data.type !== "heartbeat") return;
                 renderZmsStatus(data.zms);
-                renderNatsStatus(data.nats);
             } catch (_) {}
         };
         statusWs.onclose = function() {
@@ -716,10 +667,6 @@
             const r = await fetch('/api/zms/status');
             if (r.ok) renderZmsStatus(await r.json());
         } catch (_) {}
-        try {
-            const r = await fetch('/api/nats/status');
-            if (r.ok) renderNatsStatus(await r.json());
-        } catch (_) {}
     }
     pollStatus();
 
@@ -728,23 +675,6 @@
     zmsToggle.addEventListener('change', async function() {
         const endpoint = this.checked ? '/api/zms/enable' : '/api/zms/disable';
         await fetch(endpoint, {method: 'POST'});
-        pollStatus();
-    });
-
-    // --- NATS toggle ---
-    const natsToggle = document.getElementById('nats-toggle');
-    natsToggle.addEventListener('change', async function() {
-        const endpoint = this.checked ? '/api/nats/enable' : '/api/nats/disable';
-        const r = await fetch(endpoint, {method: 'POST'});
-        if (!r.ok) {
-            this.checked = !this.checked;
-        } else {
-            const d = await r.json();
-            if (d.status === 'error') {
-                alert(d.detail || 'NATS toggle failed');
-                this.checked = !this.checked;
-            }
-        }
         pollStatus();
     });
 

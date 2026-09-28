@@ -142,9 +142,6 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "cal_offset_db": ("CAL_OFFSET_DB", float),
         "psd_scale_min_db": ("PSD_SCALE_MIN_DB", float),
         "psd_scale_max_db": ("PSD_SCALE_MAX_DB", float),
-        # NATS
-        "nats_host": ("NATS_HOST", str),
-        "nats_port": ("NATS_PORT", int),
         # ZMS
         "zms_zmc_http": ("ZMS_ZMC_HTTP", str),
         "zms_dst_http": ("ZMS_DST_HTTP", str),
@@ -156,7 +153,6 @@ async def apply_config(request: Request) -> dict[str, Any]:
     # Tokens are SecretStr and use a "(unchanged)" placeholder in the UI;
     # only update when a non-empty value is submitted.
     secret_map: dict[str, str] = {
-        "nats_token": "NATS_TOKEN",
         "zms_token": "ZMS_TOKEN",
     }
 

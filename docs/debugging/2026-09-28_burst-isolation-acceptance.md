@@ -1,0 +1,452 @@
+# Burst isolation and rtl_433 attribution: acceptance on the workstation and nano-super
+
+## 1. The question
+
+Date: 2026-09-28. Asked by the user: "We also also run the full 26Msps files that the
+bursts were derived from so we know the full pipeline works". It is checked against the
+spec's success criteria (`docs/superpowers/specs/2026-09-28-burst-isolation-streaming-design.md`):
+
+> with the switches on, a replayed wideband SSN capture on nano-super yields
+> SilverSpring-Mesh / protocol 383 on its strong bursts, isolated bursts are saved and
+> handed to modules, the live B200mini pipeline keeps its latency and drops nothing
+> because of the stage, and every burst the gate picks ends in exactly one reported state.
+
+Build: branch `feat/rtl433-burst-attribution`, HEAD `ea82ffd` (the final fix wave).
+
+Hardware:
+- Workstation: x86_64, Python 3.11 venv, rtl_433 at `~/rtl_433_build/build/src/rtl_433`.
+- nano-super: "NVIDIA Jetson Orin Nano Developer Kit", L4T R36.5.0, kernel 5.15.185-tegra,
+  6 cores, 7607 MB RAM, Python 3.10 (aarch64). Power mode **15W; MAXN unavailable
+  (non-Super device tree, the firmware caps it)**, so nvpmodel was not touched. B200mini
+  serial 322750B, antenna RX2, gain 40 dB.
+
+Captures: `/mnt/storage/ssn-wide/feb4_19-39-48_915MHz_26Msps_cf32.dat` and
+`feb5_05-29-58_915MHz_26Msps_cf32.dat`. Each is raw cf32_le, 26 Msps, 915 MHz center,
+1,248,000,000 bytes = 156 M samples = 6.0 s. The nano-super copies have the same md5
+(`4d7512f6...`, `328ddae3...`).
+
+## 2. The answer
+
+Yes: the full pipeline works on both hosts. Both full captures, replayed through the
+offline harness and through the UI replay path (`POST /api/replay/start`), decode
+SilverSpring-Mesh / 383 at 919.43 MHz (feb4) and at 917.03 / 916.99, 913.4 (x3) and
+seven more channels (feb5). 904.73 MHz decodes as the `ssnmesh` flex decoder on the
+first pass and as 383 on later passes. Every picked burst ends in exactly one state, and
+the replay writes SigMF files and `attribution.jsonl` but no DB rows. The nano-super
+results match the workstation's burst for burst.
+
+Live on nano-super, the stage costs nothing measurable. Steady-state latency (`excess_ms`)
+p50 is 110.6 ms with the switches off and 110.6 ms with them on. There were 0 overflows
+in either mode. Dropped chunks happened only in the first 2 s after start (2 with the
+switches off, 5 and 6 with them on). RSS went up by about 130 MB and peak RSS by
+230 MB, inside the guard's 780 MB budget. The M-5 concern (the read_range copy under
+the ring lock) did not show: the longest read_range was 4.4 ms, and ring writes looked
+the same in both modes.
+
+Two things are not settled. One live burst out of 95 ended `iq_expired` although it was
+only 345 ms old, and this was not reproduced in 143 bursts on a rerun (F3). All the
+on-air decodes are `ssnmesh` flex decodes with no CRC; none is protocol 383 (F6).
+
+## 3. The procedure
+
+The probes, in the order they were run, and what each one isolates:
+
+1. **Offline harness, workstation** (done before this task, in `final-fix-report.md`).
+   `run_replay(..., datatype="cf32_le", overrides={"ATTRIBUTION_ENABLED": True})` is
+   lossless: it is not paced and the receiver waits for detection. This isolates the
+   DSP, isolation and attribution chain from any real-time pressure.
+2. **UI replay, workstation.** The server ran from a scratch dir (cwd, `.env`,
+   STORAGE_PATH and DB_PATH all in the scratchpad) with `RFOBS_ATTRIBUTION_ENABLED=true`,
+   `RFOBS_MOCK_RECEIVER=true`, `RFOBS_SENSOR_ACTIVE=false`,
+   `RFOBS_REPLAY_SOURCE_DIR=/mnt/storage/ssn-wide`, on port 8888. Each capture was replayed
+   with body `{"path", "sample_rate_hz": 26e6, "center_freq_hz": 915e6, "datatype": "cf32_le", "speed": 1.0}`.
+   This adds real-time pacing, the drop-on-overflow receiver, the replay-only output
+   routing (`bursts/replay-<stem>/`) and the no-DB rule. The API hardcodes `loop=True`
+   (see F2), so each run was stopped after one or more passes. Rows were split into
+   passes by `start_time_ms` relative to the time of the start request. Checks:
+   - `/api/health` isolation counts;
+   - `attribution.jsonl`;
+   - every `.sigmf-meta` loaded with `sigmf.sigmffile.fromfile` (sigmf 1.13.0);
+   - the `detections` row count before and after the replay.
+3. **Unit suite and e2e on nano-super.** The branch was shipped as a git bundle and
+   fetched into a detached worktree `~/rfobs-attrib`. No ref or branch was created and
+   nothing was pushed. It ran with `PYTHONPATH=~/rfobs-attrib/src`, and
+   `rfobserver.__file__` was confirmed to be `/home/ocollaco/rfobs-attrib/src/rfobserver/__init__.py`.
+   This isolates Python 3.10 / aarch64 portability. The e2e test's decodes were printed
+   through a wrapper around the test body. sigmf is not in the Jetson venv, so it was
+   installed with `pip --target ~/rfobs-attr-val/pylib` (with jsonschema) and put on the
+   path only for the tests that need it. The venv itself was not modified.
+4. **Offline harness, nano-super** (the scratchpad `full_replay.py`, unchanged). This
+   isolates the 6-core aarch64 box for the lossless path. It prints `isolation_status()`
+   just before the stage stops, which is the value `result["isolation"]` carries.
+5. **UI replay, nano-super.** Same as probe 2, with the real UHD build (sensor inactive)
+   and captures in `~/rfobs-attr-val`.
+6. **Live, nano-super.** B200mini, 915 MHz, 26 Msps, streaming (STEP 0), `SENSOR_ACTIVE=true`,
+   scratch STORAGE_PATH and DB_PATH, port 8888. Three runs of 10 minutes each. Sampling
+   began 20 s after the server came up.
+   - `live_off`: ISOLATION and ATTRIBUTION both false. This is the baseline.
+   - `live_on`: ATTRIBUTION_ENABLED=true, which turns isolation on as well.
+   - `live_on2`: a repeat of `live_on`, adding a log line for every `read_range` that
+     returns None, to chase F3. A browser was on the Live page from about 21:48:30 to
+     21:49:00 for the screenshot check.
+
+   Instrumentation for the live runs came from a wrapper runner (`val_run.py`). It
+   monkeypatches, and no product code was changed:
+   - `CircularBuffer.write`: this time includes any wait for the ring lock, so a
+     read_range copy that holds the lock would show here as a slow write (M-5).
+   - `CircularBuffer.read_range`: duration and size.
+   - `_LoopHandoff.submit`: the per-chunk `latency_ms`, which is the value broadcast as
+     `excess_ms`.
+
+   Every 60 s it logged a `VALTRACE` line with those numbers plus VmRSS and VmHWM. Also
+   every 60 s, `poll.py` read `/api/health` and checked both invariants:
+   - `received == gated_out + queue_full + picked`
+   - `picked - (isolated + iq_expired + too_long + error) == 0`
+
+   Dropped chunks and overflows come from the pipeline's own `TIMING recv#` log lines
+   and from `/api/health` `pipeline.overflow_events`.
+
+## 4. Evidence
+
+### 4.1 Offline harness (lossless)
+
+Workstation, from `final-fix-report.md` (final tree):
+```
+feb4 FINAL_STATUS counts {"received": 2, "picked": 2, "isolated": 2, "attr_decoded": 1, "attr_not_decoded": 1, "attr_dropped": 0}
+     919.431 SilverSpring-Mesh 383 -46.0
+feb5 FINAL_STATUS counts {"received": 36, "picked": 35, "isolated": 35, "attr_not_decoded": 22, "attr_decoded": 13, "gated_out": 1, "attr_dropped": 0}
+```
+
+nano-super, the same script:
+```
+feb4 FINAL_STATUS {"enabled": true, "attribution": true, "rtl433": "/home/ocollaco/rtl_433_build/build/src/rtl_433", "ring_sec": 1.5, "disabled_reason": null, "counts": {"received": 2, "picked": 2, "isolated": 2, "attr_decoded": 1, "attr_not_decoded": 1, "attr_dropped": 0}}
+ELAPSED 8.0
+feb5 FINAL_STATUS {"enabled": true, "attribution": true, "rtl433": "/home/ocollaco/rtl_433_build/build/src/rtl_433", "ring_sec": 1.5, "disabled_reason": null, "counts": {"received": 36, "picked": 35, "isolated": 35, "attr_not_decoded": 21, "attr_decoded": 14, "gated_out": 1, "attr_dropped": 0}}
+ELAPSED 10.7
+```
+nano-super decodes (peak MHz, model, protocol, peak dB):
+```
+feb4  919.431 SilverSpring-Mesh 383 -46.0
+feb5  904.729 ssnmesh None -71.9        913.73  SilverSpring-Mesh 383 -69.5
+      911.331 SilverSpring-Mesh 383 -74.7  916.13 ssnmesh None -67.6
+      912.194 SilverSpring-Mesh 383 -69.0  916.993 SilverSpring-Mesh 383 -64.2
+      913.4   SilverSpring-Mesh 383 -71.8  917.031 SilverSpring-Mesh 383 -63.7
+      913.4   SilverSpring-Mesh 383 -71.9  920.332 SilverSpring-Mesh 383 -70.1
+      913.4   SilverSpring-Mesh 383 -72.0  920.903 ssnmesh None -73.1
+      922.122 SilverSpring-Mesh 383 -66.9  922.998 SilverSpring-Mesh 383 -69.2
+```
+iq_expired is 0 on both hosts. nano-super decoded 14: the same 11 protocol-383 decodes
+plus 3 ssnmesh, including the 920.903 flex decode that the workstation's final run did
+not get (it got it in an earlier run; see §6).
+
+### 4.2 UI replay (paced, drop-on-overflow)
+
+Workstation feb4 (stopped during pass 2):
+```
+{"received": 4, "picked": 4, "isolated": 4, "attr_decoded": 2, "attr_not_decoded": 2, "attr_dropped": 0}
+919.430664 MHz  SilverSpring-Mesh 383 decoded   snr 67.8   (pass 1)  freq_low 902.0 / freq_high 927.99 MHz
+926.032    MHz  not_decoded                     snr 51.1   (pass 1)
+919.430664 MHz  SilverSpring-Mesh 383 decoded   snr 67.9   (pass 2)
+926.032    MHz  not_decoded                     snr 51.7   (pass 2)
+frame: "model": "SilverSpring-Mesh", "src_id": "00135003004b9712", "channel": 57, "len": 111, "mic": "CRC"
+```
+
+nano-super feb4 (identical):
+```
+  1.024   919.431 bw=25.987 snr= 67.8 decoded      SilverSpring-Mesh 383
+  1.335   926.032 bw= 0.927 snr= 51.1 not_decoded  None None
+  8.525   919.431 bw=25.987 snr= 67.9 decoded      SilverSpring-Mesh 383
+  8.916   926.032 bw= 1.231 snr= 51.7 not_decoded  None None
+```
+
+feb5 pass 1, which is **identical row for row on both hosts** (columns: seconds from the
+start request on nano-super, peak MHz, detected bandwidth, SNR, outcome):
+```
+  0.558   918.771 bw=18.611 snr= 57.9 not_decoded  None None
+  1.393   911.331 bw= 0.216 snr= 39.2 decoded      SilverSpring-Mesh 383
+  1.540   921.830 bw= 0.127 snr= 33.1 not_decoded  None None
+  1.697   919.672 bw=15.882 snr= 57.8 not_decoded  None None
+  1.707   919.723 bw=15.666 snr= 58.6 not_decoded  None None
+  5.856   920.903 bw= 0.216 snr= 39.9 decoded      ssnmesh None
+  5.863   909.173 bw= 0.127 snr= 33.5 not_decoded  None None
+  5.871   909.173 bw= 0.127 snr= 32.7 not_decoded  None None
+  5.875   920.929 bw= 0.203 snr= 39.9 not_decoded  None None
+  5.884   920.332 bw= 0.292 snr= 42.8 decoded      SilverSpring-Mesh 383
+  5.925   909.528 bw= 0.241 snr= 39.6 not_decoded  None None
+  5.945   909.528 bw= 0.203 snr= 38.8 not_decoded  None None
+  5.964   909.528 bw= 0.203 snr= 39.6 not_decoded  None None
+  5.969   904.729 bw= 0.394 snr= 41.6 not_decoded  None None
+  5.977   904.729 bw= 0.368 snr= 41.6 decoded      ssnmesh None
+  6.144   916.130 bw= 0.279 snr= 45.8 decoded      ssnmesh None
+  6.218   902.927 bw= 0.470 snr= 45.1 not_decoded  None None
+  6.324   913.400 bw= 0.305 snr= 41.9 decoded      SilverSpring-Mesh 383
+  6.332   913.400 bw= 0.254 snr= 41.7 decoded      SilverSpring-Mesh 383
+  6.352   913.400 bw= 0.457 snr= 41.7 decoded      SilverSpring-Mesh 383
+  6.518   911.572 bw= 0.114 snr= 31.1 not_decoded  None None
+  6.942   913.730 bw= 0.355 snr= 44.4 not_decoded  None None
+  6.959   913.730 bw= 0.343 snr= 44.1 decoded      SilverSpring-Mesh 383
+  7.014   917.031 bw= 0.330 snr= 49.3 decoded      SilverSpring-Mesh 383
+  7.021   916.993 bw= 0.419 snr= 48.8 decoded      SilverSpring-Mesh 383
+  7.242   919.101 bw= 0.495 snr= 44.0 not_decoded  None None
+  7.360   915.521 bw= 0.292 snr= 47.4 not_decoded  None None
+  7.508   922.122 bw= 0.292 snr= 46.3 decoded      SilverSpring-Mesh 383
+  7.820   913.096 bw= 0.432 snr= 43.5 not_decoded  None None
+  7.948   922.998 bw= 0.305 snr= 44.3 decoded      SilverSpring-Mesh 383
+  7.968   922.998 bw= 0.419 snr= 44.2 not_decoded  None None
+  7.986   922.998 bw= 0.254 snr= 44.2 not_decoded  None None
+  7.991   912.194 bw= 0.229 snr= 44.8 decoded      SilverSpring-Mesh 383
+  8.040   907.129 bw= 0.254 snr= 47.8 not_decoded  None None
+  8.088   913.730 bw= 0.254 snr= 43.9 not_decoded  None None
+```
+That is 35 rows (35 picked, as offline), with 14 decoded: 11 x 383 and 3 x ssnmesh.
+Pass 2 is also identical on both hosts, and it differs from pass 1 in the same way on
+both:
+- 920.929 decodes as 383, and 920.903 is not decoded;
+- 904.704 decodes as 383;
+- 916.104 decodes as 383 (it was ssnmesh in pass 1);
+- 916.993 is not decoded, while 916.968 decodes.
+
+Final health snapshots (taken just before `/replay/stop`):
+```
+workstation feb5 (about 3 passes): {"received": 110, "picked": 105, "isolated": 103, "attr_not_decoded": 59, "attr_decoded": 44, "gated_out": 5, "attr_dropped": 0}
+   attribution.jsonl rows: 105; sigmf-meta 105, sigmf-data 105
+nano-super feb5 (2+ passes):       {"received": 78, "picked": 75, "isolated": 75, "attr_not_decoded": 45, "attr_decoded": 30, "gated_out": 3, "attr_dropped": 0}
+   attribution.jsonl rows: 75; sigmf-meta 75, sigmf-data 75
+```
+On the workstation, 2 of the 105 picked bursts were in flight when the snapshot was
+taken. All 105 reached `attribution.jsonl` as `isolated`, so the invariant holds once the
+stage is idle (see §6).
+
+SigMF load, sigmf 1.13.0 (a sample; every file loaded):
+```
+9a6a9192 sigmf 1.13.0 ci16_le 1600000 919430664.0625 n 23100 complex64 ann []
+d34c6809 sigmf 1.13.0 ci16_le 1600000 926032226.5625 n 22784 complex64 ann []
+08384875 sigmf 1.13.0 ci16_le 1600000 912194335.9375 n 11757 complex64 ann []
+```
+DB: `detections` was 0 before and 0 after all four UI replays on both hosts.
+
+Pacing (workstation server log): the IQ per chunk is 39.4 ms, but chunks were delivered
+every 43 to 49 ms:
+```
+15:16:47,853 TIMING recv#50: recv=46.1ms dropped=0 (IQ=39.4ms) handoff_dropped=0/0 ovf=0 lost=0
+15:16:50,115 TIMING recv#100: recv=42.4ms dropped=0 (IQ=39.4ms) ...
+PROC chunk#100: process=54.2ms latency=104.6ms (IQ=39.4ms)
+```
+50 chunks (1.97 s of IQ) took about 2.27 s. nano-super: pass period 7.5 s for a 6.0 s
+file. See F1.
+
+### 4.3 Unit and e2e on nano-super
+
+```
+FAILED tests/unit/test_burst_archive.py::test_save_writes_a_loadable_sigmf_pair
+1 failed, 861 passed, 3 warnings in 93.54s
+>       import sigmf  # the official library
+E       ModuleNotFoundError: No module named 'sigmf'
+```
+With sigmf from the scratch target dir on the path: `7 passed` for that file.
+```
+test_isolation_attribution_e2e.py::test_ssn_bursts_decode_through_the_streaming_pipeline PASSED
+test_isolation_replay_lookback.py::test_lossless_replay_isolates_every_picked_burst_at_the_default_lookback PASSED
+2 passed in 13.06s
+```
+e2e decodes (from the wrapper):
+```
+ISOLATION counts {'received': 3, 'picked': 3, 'isolated': 3, 'attr_decoded': 2, 'attr_not_decoded': 1, 'attr_dropped': 0}
+DET 913.4   None None
+DET 917.901 SilverSpring-Mesh 383
+DET 919.405 SilverSpring-Mesh 383
+```
+This matches the known behaviour of the 913.4 fixture (Task 7 minor: pedestal from the
+synthetic construction). The three `~/ssn_bursts` fixtures on nano-super are byte
+identical to the workstation's (md5 `cd2011d7...`, `558b47cc...`, `79164b39...`).
+
+### 4.4 Live, nano-super, 915 MHz / 26 Msps
+
+Chunk: `chunk=1024000 samples (39.4 ms), 3 PSD workers`. Ring:
+- off: `pre-trigger=1.00s (26000000 samples)`, which is 104 MB;
+- on: `pre-trigger=1.50s (39000000 samples)`, which is 156 MB.
+
+Per-minute VALTRACE (latency = `excess_ms`; wr = ring write including lock wait; rr =
+read_range):
+
+| run | minute | lat p50 | lat p99 | lat max | wr mean | wr max | wr>5ms | rr n | rr max ms | rr max samples | RSS MB | HWM MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| off | 1 (startup) | 110.7 | 190.9 | 343.0 | 0.82 | 24.1 | 6 | 0 | - | - | 534 | 534 |
+| off | 2-10 range | 110.4-110.6 | 134.3-135.2 | 140.0-163.5 | 0.75-0.78 | 2.9-9.5 | 0-1 | 0 | - | - | 495-543 | 537-543 |
+| on | 1 (startup) | 110.8 | 175.3 | 461.0 | 0.84 | 27.2 | 8 | 7 | 1.3 | 1,476,160 | 627 | 670 |
+| on | 2-10 range | 110.5-110.8 | 130.5-139.9 | 144.3-181.7 | 0.76-0.78 | 2.7-6.7 | 0-1 | 6-12 | 0.5-4.4 | up to 4,153,920 | 598-705 | 744-769 |
+| on2 | 1 (startup) | 110.7 | 218.7 | 444.3 | 0.84 | 18.4 | 11 | 10 | 1.2 | 1,476,160 | 635 | 684 |
+| on2 | 10 | 110.4 | 134.6 | 151.6 | 0.76 | 3.8 | 0 | 9 | 0.6 | 339,520 | 700 | 777 |
+
+Raw lines (first and last of `live_on`):
+```
+VALTRACE lat_n=1433 lat_p50=110.8 lat_p99=175.3 lat_max=461.0 wr_n=1440 wr_mean=0.84 wr_max=27.2 wr_over5=8 wr_over20=1 rr_n=7 rr_mean=0.66 rr_max=1.3 rr_max_samples=1476160 rss_mb=627 hwm_mb=670 ring_caps=[39000000] ...
+VALTRACE lat_n=1524 lat_p50=110.6 lat_p99=138.9 lat_max=181.7 wr_n=1525 wr_mean=0.76 wr_max=6.7 wr_over5=1 wr_over20=0 rr_n=9 rr_mean=0.76 rr_max=3.0 rr_max_samples=4153920 rss_mb=663 hwm_mb=769 ring_caps=[39000000] all_wr_max=27.2 all_rr_max=4.4 all_lat_max=461.0 all_wr_over20=1
+```
+
+Dropped chunks: every drop happened in the first 50 chunks (the first 2 s), and the
+counter never moved after that in any run:
+```
+live_off  21:22:55,334 TIMING recv#50: recv=38.5ms dropped=2 (IQ=39.4ms) handoff_dropped=0/0 ovf=0 lost=0
+live_on   21:33:34,942 TIMING recv#50: recv=38.6ms dropped=5 (IQ=39.4ms) handoff_dropped=0/0 ovf=0 lost=0
+live_on2  21:45:50,055 TIMING recv#50: recv=38.5ms dropped=6 (IQ=39.4ms) handoff_dropped=0/0 ovf=0 lost=0
+last line of each run: recv#15900 (live_off, live_on) / recv#15750 (live_on2): dropped unchanged, ovf=0 lost=0
+```
+`/api/health` `overflow_events` was 0 in all 33 samples.
+
+`/api/health` per minute, `live_on` (`inv` is the received invariant, followed by picked
+minus the terminal states):
+```
+21:33:54 0 {"received": 1, "picked": 1, "isolated": 1, "attr_not_decoded": 1} inv True 0 rss 621
+21:34:54 1 {"received": 11, "picked": 11, "isolated": 11, "attr_not_decoded": 10, "attr_decoded": 1} inv True 0 rss 626
+21:35:54 2 {"received": 23, "picked": 23, "isolated": 23, ...} inv True 0 rss 648
+21:36:54 3 {"received": 33, "picked": 33, "isolated": 33, ...} inv True 0 rss 662
+21:37:54 4 {"received": 40, "picked": 40, "isolated": 40, ...} inv True 0 rss 662
+21:38:54 5 {"received": 49, "picked": 49, "isolated": 49, ...} inv True 0 rss 598
+21:39:54 6 {"received": 54, "picked": 54, "isolated": 54, ...} inv True 0 rss 662
+21:40:54 7 {"received": 63, "picked": 63, "isolated": 63, ...} inv True 0 rss 662
+21:41:54 8 {"received": 75, "picked": 75, "isolated": 75, ...} inv True 0 rss 705
+21:42:55 9 {"received": 86, "picked": 86, "isolated": 86, "attr_not_decoded": 84, "attr_decoded": 2} inv True 0 rss 705
+21:43:55 10 {"received": 95, "picked": 95, "isolated": 94, "attr_not_decoded": 91, "attr_decoded": 3, "iq_expired": 1, "attr_dropped": 0} inv True 0 rss 674
+```
+`live_on2`: all 11 samples `inv True 0`, ending at
+`{"received": 143, "picked": 143, "isolated": 143, "attr_not_decoded": 133, "attr_decoded": 10}`.
+There were no `VALNONE` lines, so no read_range returned None in that run.
+`live_off`: `iso_enabled False`, `ring_sec 1.0`, empty counts.
+
+In both modes, gated_out and queue_full were 0 live and attr_dropped was 0.
+
+On-air decodes (all `ssnmesh`, the `-X` flex pass, and none is protocol 383):
+```
+live_on   917.603 -75.8 dB 16.3 ms {814 bits}; 905.199 -68.5 dB 6.7 ms {343}; 921.602 -67.6 dB 12.6 ms {615}
+live_on2  912.804, 907.599, 926.400, 920.002, 923.595, 910.404, 909.604, 915.203 (each 36.4-36.6 ms, about every 20 s, -66.6 to -74.7 dB),
+          916.003 (27.4 ms), 907.205 (12.6 ms)
+```
+In `live_on`, the DB had 95 detections and 94 with attribution. The one without is the
+`iq_expired` burst (F3). In `live_off` there were 92 detections and 0 with attribution.
+`bursts/20260928/` in `live_on` held 94 SigMF pairs (9.6 MB).
+
+Dashboard: the Live page waterfall showed an `ssnmesh` label at the top right (on2,
+about 21:48:40, with High Res off). A screenshot was taken in the session, but it was
+not saved to disk.
+
+## 5. Measured and REJECTED (do not retry)
+
+- **"The stage's read_range copy under the ring lock stalls the receiver" (M-5).** Rejected.
+  The longest read_range over 30 minutes was 4.4 ms, for 4,153,920 samples (a 155 ms
+  burst plus guard). Steady-state ring writes (the time includes waiting for the lock)
+  averaged 0.76 to 0.78 ms both on and off. The worst steady-state write was 9.5 ms
+  with the switches off and 6.7 ms with them on. There were 0 overflows. Do not
+  re-measure this at 26 Msps. At 56 Msps the copy doubles, which is still far below the
+  39 ms chunk.
+- **"Isolation raises pipeline latency".** Rejected at 26 Msps. The steady p50 is
+  110.4 to 110.8 ms in both modes, and p99 is 130 to 140 ms in both.
+- **"The 6-core box outruns detection and expires bursts in lossless replay".** Rejected:
+  iq_expired is 0 on nano-super offline, and 35 of 35 picked bursts are isolated on feb5.
+- **"The Jetson decodes differently from the workstation".** Rejected. UI pass 1 and
+  pass 2 are row-for-row identical, and offline gives the same 11 protocol-383 decodes.
+
+## 6. Measurement traps
+
+- **A health snapshot during activity is not a check of the invariant.** The workstation
+  feb5 snapshot shows `picked 105, isolated 103` with no other terminal state, because 2
+  bursts were being processed. Check the invariant only at 1-minute polls (where it
+  held every time) or after the stage is idle. The jsonl had all 105 rows.
+- **The brief's invariant differs from the code's.** The brief writes "picked =
+  isolated + iq_expired + too_long + queue_full + error". The code counts queue_full
+  before picking: `received = gated_out + queue_full + picked` and
+  `picked = isolated + iq_expired + too_long + error`. This record checks the code's
+  form.
+- **UI replay loops.** `/api/replay/start` always passes `loop=True`, so the counts
+  include later passes. Split by `start_time_ms` against the start time. Pass boundaries
+  are not at 6.0 s intervals (F1).
+- **The ssnmesh flex decode of 920.903 MHz varies.** The workstation offline run got 13
+  (without it) in one run and 14 in another; nano-super offline and both UI pass-1 runs
+  got it. The protocol-383 set is stable. Compare 383 counts, not attr_decoded.
+- **The first minute of every live run carries startup costs**: p99 175 to 219 ms, a
+  max of 343 to 461 ms, and write spikes up to 27 ms, in both modes. Compare minutes 2
+  to 10.
+- **Pytest's default basetemp** (`/tmp/pytest-of-ocollaco`) was used by the first Jetson
+  unit run. This run's `pytest-10` was deleted afterwards and `pytest-current` was
+  repointed to `pytest-9`. Pytest's own 3-dir rotation may have removed an older
+  `pytest-7`. Later runs used `--basetemp` under the scratch dir.
+
+## 7. Findings (not fixed here; product code unchanged)
+
+- **F1 (Minor): paced replay runs slower than real time.** `FileReplayReceiver.recv_chunk`
+  converts the chunk and then sleeps a full chunk duration (`time.sleep(n / (fs * speed))`),
+  so the conversion time adds to every period. Measured: 0.86x real time on the
+  workstation (43 to 49 ms per 39.4 ms chunk) and 0.80x on nano-super (a 7.5 s pass for
+  6.0 s of IQ). Wall-clock burst timestamps in replay are stretched to match. This does
+  not hurt isolation: it gives the stage more wall time, not less.
+- **F2 (Minor, known as M-2): UI replay cannot be single-pass.** `loop=True` is hardcoded
+  in `replay_start`. Each pass re-isolates and re-decodes the same bursts.
+  Loop-to-loop decode differences are deterministic and the same on both hosts, which
+  points to the burst boundaries changing when the loop splice shifts the chunk grid.
+- **F3 (Open): one live `iq_expired` for a young burst.** DB row 87, start
+  21:43:03.479, stop +9.1 ms, detected 21:43:03.824 (345 ms later), 925.994 MHz,
+  76 kHz, -87.7 dB. It was one of 3 bursts in one batch ("Detected 3 bursts" at
+  21:43:03,849). The ring holds 1.5 s, so the samples could not have been overwritten
+  unless the positions were wrong. `isolate_burst` returns `"iq_expired"` whenever
+  `read_range` returns None. That covers both "overwritten" (`start < oldest`) and "not
+  yet written" (`stop + guard > total_written`), so the state name cannot tell the two
+  apart. The rerun (`live_on2`, 143 bursts, None-read logging) did not reproduce it.
+  The cause is not determined.
+- **F4 (Observation): the strongest bursts are detected as very wide.**
+  - feb4 919.43 MHz is detected as 902.0 to 927.99 MHz (25.99 MHz wide).
+  - feb5 has 918.77 / 919.67 / 919.72 MHz at 15.7 to 18.6 MHz wide, SNR 58.
+  - Isolation cuts at the peak frequency at the tier rate (1.6 Msps here), and feb4
+    still decodes.
+  - The feb5 wide ones do not decode, except one pass-3 row (919.723 as 383). The same
+    happens offline.
+  - Whether these are splatter from strong SSN bursts or something else was not checked.
+- **F5 (Minor, test hygiene): the unit test needs sigmf.**
+  `tests/unit/test_burst_archive.py::test_save_writes_a_loadable_sigmf_pair` imports
+  `sigmf` unconditionally and fails on a host without it (nano-super's venv). It passes
+  when sigmf is present.
+- **F6 (Observation): on-air decodes are flex only.** There were 13 on-air
+  `ssnmesh` decodes (3 + 10) and no protocol-383 decode. In `live_on2`, eight were 36.4
+  to 36.6 ms bursts hopping about every 20 s. Flex decodes have no CRC, so these are
+  not confirmed SSN.
+- **F7 (Observation): startup drops are slightly higher with the stage on.** 5 and 6
+  chunks were dropped with the switches on, against 2 with them off. All of them were in
+  the first 2 s and none came later. The likely cause is the larger ring allocation and
+  the stage starting up, but this was not isolated.
+
+## 8. Corrections
+
+- The controller's note said nano-super's `~/ssn_bursts` was missing
+  `burst_feb5_917MHz_56dB.cs16`. It was present, and all three fixtures matched the
+  workstation's md5, so nothing was copied and the e2e test used its fixed path.
+- Spec §Acceptance says "nano-super, MAXN" and "baseline (about 270 ms)". The run was at
+  15W because MAXN is unavailable. The measured 26 Msps baseline is 110.6 ms p50, so the
+  270 ms figure does not apply to this configuration.
+
+## 9. Open, not yet answered
+
+- The cause of F3's live `iq_expired`: overwritten, not yet written, or a stale position.
+  Next probe: log `start - oldest` and `end - total_written` for every None read (the
+  `VALNONE` wrapper does this) over a longer live run, or split the state into two
+  counters.
+- Latency and lookback at 56 Msps under load (spec open item): not measured. This run was
+  26 Msps only.
+- MAXN behaviour: not possible on this board.
+- Whether the wide (15 to 26 MHz) detections in F4 are real signals or detector artefacts
+  around strong bursts.
+- Whether the live 36.4 ms, about 20 s periodic flex decodes (F6) are SSN at all.
+- Why the 920.903 MHz flex decode comes and goes offline on the workstation. It was
+  stable in every nano-super and UI pass-1 run here.
+
+## Cleanup
+
+nano-super was left as found:
+- `~/rfobs-attrib` (worktree) and `~/rfobs-attr-val` (captures, bundle, scratch runs,
+  pylib) were removed, followed by `git worktree prune`;
+- no branch or ref was created, and no process is running;
+- `~/GitHub/RFObserver` is still on `feat/averaged-window-store` with `stash@{0}`
+  intact;
+- `~/rfobs-replay-data`, `~/rfobs-stall`, `~/rfobs-stalltest` and `~/ssn_bursts` were
+  untouched;
+- nvpmodel is still 15W.
+
+On the workstation, the bundle was deleted and no server is left on 8888.

@@ -558,15 +558,17 @@ class SensorDatabase:
         model: str | None,
         protocol_id: int | None,
         attribution: str,
-    ) -> None:
+    ) -> int:
         """Merge an rtl_433 result onto an existing detection. No-op if the
-        burst_id is absent (e.g. pruned)."""
+        burst_id is absent (e.g. pruned). Returns the number of rows updated
+        (0 or 1), so a caller can retry when the detection row is not there yet."""
         assert self._db is not None
-        await self._db.execute(
+        cursor = await self._db.execute(
             "UPDATE detections SET model = ?, protocol_id = ?, attribution = ? WHERE burst_id = ?",
             (model, protocol_id, attribution, burst_id),
         )
         await self._db.commit()
+        return int(cursor.rowcount)
 
     @_guarded_write
     async def insert_detections(self, detections: Sequence[Mapping[str, Any]]) -> int:

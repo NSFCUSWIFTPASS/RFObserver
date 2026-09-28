@@ -124,6 +124,7 @@ class IsolationStage:
         self._clock = clock
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, settings.ISOLATION_QUEUE_MAX))
         self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
         self._window_start = -1e18
         self._window_count = 0
         self.stats = IsolationStats()
@@ -131,6 +132,7 @@ class IsolationStage:
     # -- producer side (burst thread / sweep loop): never blocks --
 
     def submit(self, batch: IsolationBatch) -> bool:
+        self.stats.count("received", len(batch.candidates))
         try:
             self._queue.put_nowait(batch)
             return True
@@ -141,19 +143,38 @@ class IsolationStage:
     # -- worker --
 
     def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            logger.warning("Isolation stage start() called while the worker thread is running")
+            return
+        self._stop_event.clear()
         self._thread = threading.Thread(target=self._loop, name="isolation", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         if self._thread is None:
             return
+        self._stop_event.set()
+        # Drain whatever is already queued: it will never be processed now,
+        # so count it as queue_full rather than silently dropping it (keeps
+        # received == gated_out + queue_full + picked holding after stop()).
+        while True:
+            try:
+                batch = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if batch is _STOP:
+                continue
+            self.stats.count("queue_full", len(batch.candidates))
         with contextlib.suppress(queue.Full):
-            self._queue.put(_STOP, timeout=1.0)
+            self._queue.put_nowait(_STOP)
         self._thread.join(timeout=5.0)
-        self._thread = None
+        if self._thread.is_alive():
+            logger.warning("Isolation worker thread did not stop within the timeout")
+        else:
+            self._thread = None
 
     def _loop(self) -> None:
-        while True:
+        while not self._stop_event.is_set():
             batch = self._queue.get()
             if batch is _STOP:
                 return
@@ -163,6 +184,12 @@ class IsolationStage:
                 logger.exception("Isolation batch failed")
 
     def _gate(self, cands: list[BurstCandidate]) -> list[BurstCandidate]:
+        """SNR gate, then cap to ISOLATION_MAX_PER_SEC, strongest first.
+
+        The per-second budget is a fixed 1 s window measured from the first
+        candidate seen after the previous window expired (not aligned to
+        wall-clock second boundaries).
+        """
         s = self._s
         passed = sorted(
             (c for c in cands if c.snr_db >= s.ISOLATION_SNR_DB),
@@ -175,6 +202,8 @@ class IsolationStage:
         room = max(0, int(s.ISOLATION_MAX_PER_SEC) - self._window_count)
         picked = passed[:room]
         self._window_count += len(picked)
+        if picked:
+            self.stats.count("picked", len(picked))
         gated_out = len(cands) - len(picked)
         if gated_out:
             self.stats.count("gated_out", gated_out)
@@ -213,8 +242,13 @@ class IsolationStage:
             "stop_time_ms": b.stop_time.timestamp() * 1000.0,
             "snr_db": round(cand.snr_db, 1),
         }
-        try:
-            if self._archive is not None and not self._refuse_saving():
+        # Each fan-out consumer gets its own try/except: one consumer's
+        # failure must not hide the burst from the others, and (unlike a
+        # failure in isolate_burst itself) must not change the burst's
+        # state -- the burst *was* isolated, only its delivery to one
+        # consumer failed.
+        if self._archive is not None and not self._refuse_saving():
+            try:
                 self._archive.save(
                     iso,
                     {
@@ -225,10 +259,18 @@ class IsolationStage:
                     },
                     subdir=self._archive_subdir,
                 )
-            if self._module_feed is not None:
+            except Exception:
+                logger.exception("Archive save failed for burst %s", b.burst_id)
+                self.stats.count("archive_error")
+        if self._module_feed is not None:
+            try:
                 v = np.frombuffer(iso.cs16, dtype="<i2").astype(np.float32) / 32768.0
                 self._module_feed((v[0::2] + 1j * v[1::2]).astype(np.complex64), iso.rate_hz, meta)
-            if self._handoff is not None:
+            except Exception:
+                logger.exception("Module feed failed for burst %s", b.burst_id)
+                self.stats.count("module_error")
+        if self._handoff is not None:
+            try:
                 self._handoff(
                     AttributionItem(
                         burst_id=b.burst_id,
@@ -239,9 +281,9 @@ class IsolationStage:
                         meta=meta,
                     )
                 )
-        except Exception:
-            logger.exception("Isolation fan-out failed for burst %s", b.burst_id)
-            return "error"
+            except Exception:
+                logger.exception("Attribution handoff failed for burst %s", b.burst_id)
+                self.stats.count("handoff_error")
         return "too_long" if iso.truncated else "isolated"
 
 
@@ -287,21 +329,14 @@ def build_isolation(
     archive = BurstArchive(storage_path)
     subdir = f"replay-{Path(replay_source).stem}" if replay_source else None
 
-    # The stage is built first, without an attribution handoff; when
-    # attribution is on, the worker's on_outcome closes over this same stage
-    # (already bound, so no late-binding hazard) and the handoff is wired in
-    # afterward.
-    stage = IsolationStage(
-        settings,
-        archive=archive,
-        module_feed=module_feed,
-        attribution_handoff=None,
-        refuse_saving=refuse_saving,
-        archive_subdir=subdir,
-    )
-
-    worker: AttributionWorker | None = None
+    # The queue and its handoff closure are built first (when attribution is
+    # on) so the handoff can be passed straight into the IsolationStage
+    # constructor -- no reaching into a private attribute afterward.
     rtl_status: str | None = None
+    rtl: str | None = None
+    q: StrongestQueue | None = None
+    handoff: Callable[[AttributionItem], None] | None = None
+    sinks: list[Any] = []
     if settings.ATTRIBUTION_ENABLED:
         rtl = find_rtl433(settings.ATTRIBUTION_RTL433_PATH or None)
         if rtl is None:
@@ -309,7 +344,6 @@ def build_isolation(
             logger.warning("ATTRIBUTION_ENABLED but %s", rtl_status)
         else:
             rtl_status = rtl
-            sinks: list[Any] = []
             if subdir is not None:
                 sinks.append(ReplayFileSink(archive.root / subdir / "attribution.jsonl"))
             else:
@@ -317,12 +351,24 @@ def build_isolation(
             if on_label is not None:
                 sinks.append(_make_label_sink(on_label))
             q = StrongestQueue(maxsize=max(1, settings.ISOLATION_QUEUE_MAX))
-            worker = AttributionWorker(
-                database,
-                rtl,
-                queue=q,
-                sinks=sinks,
-                on_outcome=lambda outcome: stage.stats.count(f"attr_{outcome}"),
-            )
-            stage._handoff = _make_attribution_handoff(q, loop)
+            handoff = _make_attribution_handoff(q, loop)
+
+    stage = IsolationStage(
+        settings,
+        archive=archive,
+        module_feed=module_feed,
+        attribution_handoff=handoff,
+        refuse_saving=refuse_saving,
+        archive_subdir=subdir,
+    )
+
+    worker: AttributionWorker | None = None
+    if q is not None and rtl is not None:
+        worker = AttributionWorker(
+            database,
+            rtl,
+            queue=q,
+            sinks=sinks,
+            on_outcome=lambda outcome: stage.stats.count(f"attr_{outcome}"),
+        )
     return stage, worker, rtl_status

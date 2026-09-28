@@ -58,7 +58,7 @@ def test_preroll_reads_only_trigger_pre_sec_from_a_grown_ring(tmp_path):
 
 def test_ram_guard_counts_the_isolation_working_set(tmp_path, monkeypatch):
     # The ring alone (0.01 s at 1 Msps = 40 kB) fits in 25% of 1 MB, but one
-    # 0.5 s burst being channelized (6 * 500k samples * 8 B = 24 MB) does not.
+    # 0.5 s burst being channelized (3 * 500k samples * 8 B = 12 MB) does not.
     monkeypatch.setattr("rfobserver.pipeline.streaming._mem_available_bytes", lambda: 1_000_000)
     proc = _proc(
         tmp_path,
@@ -72,7 +72,8 @@ def test_ram_guard_counts_the_isolation_working_set(tmp_path, monkeypatch):
 
 
 def test_ram_guard_passes_when_ring_and_working_set_fit(tmp_path, monkeypatch):
-    # 40 kB ring + 6 * 1000 * 8 B working set (0.001 s bursts) = 88 kB < 250 kB.
+    # 40 kB ring + 3 * 1000 * 8 B working set (0.001 s bursts) + 20 * 1000 * 4 B
+    # of snapshots = 144 kB < 250 kB.
     monkeypatch.setattr("rfobserver.pipeline.streaming._mem_available_bytes", lambda: 1_000_000)
     proc = _proc(
         tmp_path,

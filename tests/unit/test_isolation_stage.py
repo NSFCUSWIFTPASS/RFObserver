@@ -489,3 +489,53 @@ async def test_replay_routes_results_to_a_file_not_the_db(tmp_path, monkeypatch)
     # Assert the same intent directly: replay's only sink is the ReplayFileSink
     # (db_sink is never added when replay_source is set).
     assert worker._sinks == [k for k in worker._sinks if isinstance(k, ReplayFileSink)]
+
+
+def _whole(i):
+    # Each sweep batch pins its whole capture's IQ bytes.
+    cands = [_no_pos(_cand(10 * i + k, 30)) for k in range(2)]
+    return IsolationBatch(cands, 915e6, FS, WholeCaptureSource(np.zeros(4000, np.int32).tobytes()))
+
+
+def test_sweep_batches_are_capped_at_two_queued_or_in_flight(tmp_path):
+    st, *_ = _stage(tmp_path, ISOLATION_QUEUE_MAX=64)
+    assert st.submit(_whole(0)) and st.submit(_whole(1))
+    assert not st.submit(_whole(2))  # a third capture would pin a third buffer
+    snap = st.stats.snapshot()
+    assert snap["received"] == 6 and snap["queue_full"] == 2
+    # Ring batches carry no capture buffer and are not limited by it.
+    assert st.submit(IsolationBatch([_cand(99, 30)], 915e6, FS, RingSource(_ring())))
+    st.start()
+    try:
+        assert st.wait_idle(5.0)
+        assert st.submit(_whole(3))  # the earlier captures are released
+        assert st.wait_idle(5.0)
+    finally:
+        st.stop()
+    snap = st.stats.snapshot()
+    assert snap["queue_full"] == 2
+    assert snap["received"] == snap["gated_out"] + snap["queue_full"] + snap["picked"]
+
+
+def test_a_sweep_batch_in_flight_counts_toward_the_cap(tmp_path, monkeypatch):
+    st, *_ = _stage(tmp_path, ISOLATION_QUEUE_MAX=64)
+    busy, release = threading.Event(), threading.Event()
+    orig = st.process_batch
+
+    def slow(batch):
+        busy.set()
+        release.wait(5)
+        return orig(batch)
+
+    monkeypatch.setattr(st, "process_batch", slow)
+    st.start()
+    try:
+        assert st.submit(_whole(0))
+        assert busy.wait(2)  # taken off the queue, now being processed
+        assert st.submit(_whole(1))
+        assert not st.submit(_whole(2))
+        release.set()
+        assert st.wait_idle(5.0)
+    finally:
+        release.set()
+        st.stop()

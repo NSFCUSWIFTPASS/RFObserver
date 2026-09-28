@@ -83,6 +83,8 @@ class ContinuousProcessor:
         self._attrib_worker: AttributionWorker | None = None
         self._attrib_task: asyncio.Task[None] | None = None
         self._rtl_status: str | None = None
+        # Why isolation is off although switched on (a build failure).
+        self._isolation_disabled_reason: str | None = None
         # Module manager, attached externally (optional); the stage feeds it
         # isolated bursts.
         self._module_manager: Any = None
@@ -105,27 +107,40 @@ class ContinuousProcessor:
             s.BANDWIDTH,
         )
 
-        process_future: asyncio.Future[_ProcessResult] | None = None
-        broadcast_task: asyncio.Task[None] | None = None
-
         if s.ISOLATION_ENABLED or s.ATTRIBUTION_ENABLED:
             from rfobserver.pipeline.isolation import build_isolation
 
             mm = self._module_manager
-            self._isolation, self._attrib_worker, self._rtl_status = build_isolation(
-                s,
-                database=self._db,
-                storage_path=str(self._storage.storage_path),
-                loop=asyncio.get_running_loop(),
-                module_feed=mm.feed_bursts if mm is not None else None,
-                refuse_saving=lambda: False,
-                replay_source=None,
-                on_label=None,
-            )
+            try:
+                self._isolation, self._attrib_worker, self._rtl_status = build_isolation(
+                    s,
+                    database=self._db,
+                    storage_path=str(self._storage.storage_path),
+                    loop=asyncio.get_running_loop(),
+                    module_feed=mm.feed_bursts if mm is not None else None,
+                    refuse_saving=lambda: False,
+                    replay_source=None,
+                    on_label=None,
+                )
+            except Exception as exc:
+                # Isolation is an add-on (e.g. an unwritable STORAGE_PATH): the
+                # sweep runs without it rather than crash-looping.
+                logger.exception("Burst isolation could not start; continuing without it")
+                self._isolation = self._attrib_worker = None
+                self._isolation_disabled_reason = f"isolation could not start: {exc}"
             if self._isolation is not None:
                 self._isolation.start()
             if self._attrib_worker is not None:
                 self._attrib_task = asyncio.create_task(self._attrib_worker.run())
+
+        try:
+            await self._sweep_loop(freqs)
+        finally:
+            await self._stop_isolation()
+
+    async def _sweep_loop(self, freqs: list[int]) -> None:
+        process_future: asyncio.Future[_ProcessResult] | None = None
+        broadcast_task: asyncio.Task[None] | None = None
 
         while self._running:
             for center_freq in freqs:
@@ -192,18 +207,24 @@ class ContinuousProcessor:
         if broadcast_task is not None:
             await broadcast_task
 
-        # The producer (_store_and_broadcast) is done: stop the stage (its
-        # stop() joins a worker thread, so off the loop), then the attribution
-        # worker (its queue.get() only unblocks on cancel, so stop() alone is
-        # not enough).
+    async def _stop_isolation(self) -> None:
+        """Run on every exit from run(), including an exception or a cancel.
+        The producer (_store_and_broadcast) is done: stop the stage (its
+        stop() joins a worker thread, so off the loop), then the attribution
+        worker (its queue.get() only unblocks on cancel, so stop() alone is
+        not enough)."""
         if self._isolation is not None:
-            await asyncio.to_thread(self._isolation.stop)
+            try:
+                await asyncio.to_thread(self._isolation.stop)
+            except Exception:
+                logger.exception("Isolation stage stop failed")
         if self._attrib_worker is not None:
             self._attrib_worker.stop()
         if self._attrib_task is not None:
             self._attrib_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._attrib_task
+            self._attrib_task = None
 
     def stop(self) -> None:
         self._running = False
@@ -219,7 +240,7 @@ class ContinuousProcessor:
             "attribution": self._attrib_worker is not None,
             "rtl433": self._rtl_status,
             "ring_sec": 0.0,
-            "disabled_reason": None,
+            "disabled_reason": self._isolation_disabled_reason,
             "counts": counts,
         }
 

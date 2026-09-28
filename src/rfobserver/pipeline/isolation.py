@@ -46,6 +46,10 @@ logger = logging.getLogger(__name__)
 
 STATES = ("isolated", "iq_expired", "too_long", "queue_full", "error")
 _STOP = object()
+# Sweep batches each pin their whole capture's IQ bytes (0.5 s at 56 Msps is
+# 112 MB), so at most this many may be queued or in flight at once; further
+# ones are dropped as queue_full.
+MAX_WHOLE_CAPTURE_BATCHES = 2
 
 
 @dataclass
@@ -132,6 +136,8 @@ class IsolationStage:
         # drain) or see the event already set and refuse. Held only very
         # briefly in both places -- no blocking calls under it.
         self._submit_lock = threading.Lock()
+        # WholeCaptureSource batches queued or in flight (under _submit_lock).
+        self._whole_pending = 0
         self._window_start = -1e18
         self._window_count = 0
         self.stats = IsolationStats()
@@ -145,12 +151,24 @@ class IsolationStage:
             if self._stop_event.is_set():
                 self.stats.count("queue_full", n)
                 return False
+            whole = isinstance(batch.source, WholeCaptureSource)
+            if whole and self._whole_pending >= MAX_WHOLE_CAPTURE_BATCHES:
+                self.stats.count("queue_full", n)
+                return False
             try:
                 self._queue.put_nowait(batch)
-                return True
             except queue.Full:
                 self.stats.count("queue_full", n)
                 return False
+            if whole:
+                self._whole_pending += 1
+            return True
+
+    def _release(self, batch: IsolationBatch) -> None:
+        """A batch has been processed or drained: free its capture slot."""
+        if isinstance(batch.source, WholeCaptureSource):
+            with self._submit_lock:
+                self._whole_pending -= 1
 
     # -- worker --
 
@@ -225,6 +243,7 @@ class IsolationStage:
             except Exception:
                 logger.exception("Isolation batch failed")
             finally:
+                self._release(batch)
                 self._queue.task_done()
         # Whether we got here via the _STOP sentinel or via the stop event
         # flipping between batches, anything still queued behind us was
@@ -240,6 +259,7 @@ class IsolationStage:
             self._queue.task_done()
             if batch is _STOP:
                 continue
+            self._release(batch)
             self.stats.count("queue_full", len(batch.candidates))
 
     def _gate(self, cands: list[BurstCandidate], sample_rate_hz: float) -> list[BurstCandidate]:

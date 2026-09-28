@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from rfobserver.storage.psd_grid import write_text_atomic
 from rfobserver.storage.sigmf_export import SIGMF_VERSION
 
 if TYPE_CHECKING:
@@ -47,9 +48,13 @@ class BurstArchive:
         capture: dict[str, Any] = {"core:sample_start": 0, "core:frequency": iso.freq_hz}
         for k, v in meta.items():
             (capture if k == "core:datetime" else glob)[k] = v
+        # Data first, meta last (atomically): a meta file must never exist
+        # without its data, and a crash or full disk must never leave a
+        # truncated meta next to a complete data file.
         data.write_bytes(iso.cs16)
-        data.with_suffix(".sigmf-meta").write_text(
-            json.dumps({"global": glob, "captures": [capture], "annotations": []}, indent=2)
+        write_text_atomic(
+            data.with_suffix(".sigmf-meta"),
+            json.dumps({"global": glob, "captures": [capture], "annotations": []}, indent=2),
         )
         return data
 

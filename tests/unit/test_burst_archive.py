@@ -34,6 +34,12 @@ def test_save_writes_a_loadable_sigmf_pair(tmp_path):
     assert rec.get_global_field("core:sample_rate") == 1_600_000
 
 
+def test_save_leaves_no_tmp_file_behind(tmp_path):
+    a = BurstArchive(tmp_path)
+    a.save(_iso("b1"), {})
+    assert list(a.root.rglob("*.tmp")) == []
+
+
 def test_replay_bursts_go_to_their_own_subdir(tmp_path):
     a = BurstArchive(tmp_path)
     p = a.save(_iso("b2"), {}, subdir="replay-feb4")

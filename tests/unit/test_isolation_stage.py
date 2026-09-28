@@ -98,14 +98,46 @@ def test_gate_takes_strongest_first_and_respects_the_per_second_limit(tmp_path):
     assert st.stats.snapshot()["gated_out"] == 2
 
 
+def _no_pos(c):
+    # Sweep-style candidate: no stream sample positions.
+    c.burst.start_sample = c.burst.stop_sample = None
+    return c
+
+
 def test_rate_limit_window_resets_after_a_second(tmp_path):
+    # Without stop_sample (sweep pipeline) the gate falls back to the monotonic clock.
     clock = _Clock()
     st, *_ = _stage(tmp_path, clock=clock, ISOLATION_MAX_PER_SEC=1)
-    src = RingSource(_ring())
-    assert len(st.process_batch(IsolationBatch([_cand(0, 30)], 915e6, FS, src))) == 1
-    assert st.process_batch(IsolationBatch([_cand(1, 30)], 915e6, FS, src)) == []
+    src = WholeCaptureSource(np.zeros(1000, dtype=np.int32).tobytes())
+    assert len(st.process_batch(IsolationBatch([_no_pos(_cand(0, 30))], 915e6, FS, src))) == 1
+    assert st.process_batch(IsolationBatch([_no_pos(_cand(1, 30))], 915e6, FS, src)) == []
     clock.t += 1.01
-    assert len(st.process_batch(IsolationBatch([_cand(2, 30)], 915e6, FS, src))) == 1
+    assert len(st.process_batch(IsolationBatch([_no_pos(_cand(2, 30))], 915e6, FS, src))) == 1
+
+
+def test_rate_limit_runs_on_stream_time_when_bursts_carry_positions(tmp_path):
+    # The wall clock never moves (replay faster than real time): the window
+    # follows the bursts' stop_sample / sample rate instead.
+    st, *_ = _stage(tmp_path, clock=_Clock(), ISOLATION_MAX_PER_SEC=1)
+    src = RingSource(_ring(4_000_000))
+
+    def at(i, sec):
+        stop = int(sec * FS)
+        return IsolationBatch([_cand(i, 30, stop - 1000, stop)], 915e6, FS, src)
+
+    assert len(st.process_batch(at(0, 0.10))) == 1
+    assert st.process_batch(at(1, 0.60)) == []  # same stream second
+    assert len(st.process_batch(at(2, 1.11))) == 1  # 1.01 s of stream later
+
+
+def test_rate_limit_window_resets_when_stream_time_goes_backwards(tmp_path):
+    # A ring rebuild (or a replay loop) restarts stream positions at 0.
+    st, *_ = _stage(tmp_path, clock=_Clock(), ISOLATION_MAX_PER_SEC=1)
+    src = RingSource(_ring(4_000_000))
+    b0 = IsolationBatch([_cand(0, 30, 1_599_000, 1_600_000)], 915e6, FS, src)  # 0.8 s
+    b1 = IsolationBatch([_cand(1, 30, 99_000, 100_000)], 915e6, FS, src)  # 0.05 s
+    assert len(st.process_batch(b0)) == 1
+    assert len(st.process_batch(b1)) == 1
 
 
 def test_every_picked_burst_gets_exactly_one_state(tmp_path):

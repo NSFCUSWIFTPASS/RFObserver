@@ -242,12 +242,16 @@ class IsolationStage:
                 continue
             self.stats.count("queue_full", len(batch.candidates))
 
-    def _gate(self, cands: list[BurstCandidate]) -> list[BurstCandidate]:
+    def _gate(self, cands: list[BurstCandidate], sample_rate_hz: float) -> list[BurstCandidate]:
         """SNR gate, then cap to ISOLATION_MAX_PER_SEC, strongest first.
 
         The per-second budget is a fixed 1 s window measured from the first
         candidate seen after the previous window expired (not aligned to
-        wall-clock second boundaries).
+        second boundaries). When the bursts carry stream positions the clock
+        is stream time (the newest stop_sample / sample rate), so an offline
+        or sped-up replay picks the same bursts on any host; otherwise (sweep
+        pipeline) it is the monotonic clock. A clock that goes backwards (ring
+        rebuild, replay loop) starts a new window.
         """
         s = self._s
         passed = sorted(
@@ -255,8 +259,9 @@ class IsolationStage:
             key=lambda c: c.snr_db,
             reverse=True,
         )
-        now = self._clock()
-        if now - self._window_start >= 1.0:
+        stops = [c.burst.stop_sample for c in cands if c.burst.stop_sample is not None]
+        now = max(stops) / float(sample_rate_hz) if stops and sample_rate_hz > 0 else self._clock()
+        if now < self._window_start or now - self._window_start >= 1.0:
             self._window_start, self._window_count = now, 0
         room = max(0, int(s.ISOLATION_MAX_PER_SEC) - self._window_count)
         picked = passed[:room]
@@ -270,7 +275,7 @@ class IsolationStage:
 
     def process_batch(self, batch: IsolationBatch) -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = []
-        for cand in self._gate(batch.candidates):
+        for cand in self._gate(batch.candidates, batch.sample_rate_hz):
             state = self._one(cand, batch)
             self.stats.count(state)
             out.append((cand.burst.burst_id, state))

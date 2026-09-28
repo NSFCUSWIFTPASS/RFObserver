@@ -330,10 +330,11 @@ async def replay_start(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="sample_rate_hz must be positive")
 
     speed = float(body.get("speed", 1.0))
+    loop = bool(body.get("loop", False))
     cap = load_raw(path, datatype=datatype, sample_rate_hz=sample_rate, center_freq_hz=center)
     rx_cfg = ReceiverConfig(gain_db=int(gain), bandwidth_hz=int(sample_rate), duration_sec=1.0)
     receiver = FileReplayReceiver(
-        cap, rx_cfg, paced=True, loop=True, speed=speed, source_name=Path(path).name
+        cap, rx_cfg, paced=True, loop=loop, speed=speed, source_name=Path(path).name
     )
 
     # Snapshot the pre-replay tuning only on the first start of a replay session.

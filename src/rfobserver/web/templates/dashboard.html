@@ -50,7 +50,7 @@
                 <canvas id="burst-tuning-canvas" width="920" height="140" style="width: 100%; height: 140px;"></canvas>
             </div>
             <div id="replay-banner" style="display: none;">
-                <span class="replay-banner-label">Replaying</span>
+                <span id="replay-banner-label" class="replay-banner-label">Replaying</span>
                 <span id="replay-banner-source" class="replay-banner-source">--</span>
                 <span id="replay-banner-looping" class="replay-banner-loop" style="display: none;">Looping</span>
                 <span style="flex: 1;"></span>
@@ -1120,6 +1120,7 @@
     // Shown only while the pipeline is being driven by a capture/raw-file
     // replay in place of the live SDR (data.replay on the heartbeat).
     const replayBanner = document.getElementById("replay-banner");
+    const replayBannerLabel = document.getElementById("replay-banner-label");
     const replayBannerSource = document.getElementById("replay-banner-source");
     const replayBannerLooping = document.getElementById("replay-banner-looping");
     const replayBannerSpeed = document.getElementById("replay-banner-speed");
@@ -1138,6 +1139,8 @@
         }
         document.body.classList.add("replaying");
         replayBanner.style.display = "";
+        replayBanner.classList.toggle("replay-banner-done", !!replay.finished);
+        replayBannerLabel.textContent = replay.finished ? "Replay finished" : "Replaying";
         replayBannerSource.textContent = replay.source || "replay";
         replayBannerLooping.style.display = replay.looping ? "" : "none";
         if (document.activeElement !== replayBannerSpeed && typeof replay.speed === "number") {

@@ -124,6 +124,11 @@ class PipelineSupervisor:
             "source": getattr(rx, "source_name", "") or "replay",
             "speed": float(getattr(rx, "speed", 1.0)),
             "looping": bool(getattr(rx, "loop", False)),
+            # Only ever True for a non-looping replay that has served every
+            # sample in the capture (see FileReplayReceiver.exhausted) -- the
+            # UI uses it to show "finished" instead of leaving the banner
+            # looking like a stuck/live replay of trailing drain noise.
+            "finished": bool(getattr(rx, "exhausted", False)),
         }
 
     async def _start(self) -> None:

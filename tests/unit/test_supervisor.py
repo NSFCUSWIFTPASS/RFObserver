@@ -97,6 +97,7 @@ class _FakeReplayReceiver:
         self.source_name = name
         self.speed = 1.0
         self.loop = True
+        self.exhausted = False
 
     def initialize(self) -> None:  # off-loop in _start
         pass
@@ -138,11 +139,35 @@ async def test_start_replay_uses_override_and_reports_status() -> None:
     assert seen["replay_mode"] is True
     assert seen["receiver"] is rx
     st = sup.replay_status()
-    assert st == {"source": "ssm_fhss_OVF.dat", "speed": 2.0, "looping": True}
+    assert st == {
+        "source": "ssm_fhss_OVF.dat",
+        "speed": 2.0,
+        "looping": True,
+        "finished": False,
+    }
 
     await sup.stop_replay()
     assert sup.replay_status() is None
     assert not sup.active
+
+
+@pytest.mark.asyncio
+async def test_replay_status_reports_finished_when_receiver_exhausted() -> None:
+    """A non-looping replay that has drained its capture reports finished=True
+    so the UI can show it as done rather than a perpetually-running replay."""
+
+    def build_receiver() -> _FakeReplayReceiver:
+        return _FakeReplayReceiver("SDR")
+
+    sup = PipelineSupervisor(build_receiver, lambda r, **kwargs: _FakeReplayProc())
+
+    rx = _FakeReplayReceiver("capture.dat")
+    rx.loop = False
+    await sup.start_replay(rx)
+    assert sup.replay_status()["finished"] is False
+
+    rx.exhausted = True
+    assert sup.replay_status()["finished"] is True
 
 
 @pytest.mark.asyncio

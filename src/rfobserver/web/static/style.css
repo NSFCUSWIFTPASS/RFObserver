@@ -1250,6 +1250,17 @@ body {
     color: var(--accent);
 }
 
+/* A non-looping replay that has drained its capture: same layout, muted to
+   a neutral gray so it reads as "done" rather than a stuck/live replay. */
+#replay-banner.replay-banner-done {
+    background: rgba(142, 142, 147, 0.1);
+    border-color: rgba(142, 142, 147, 0.25);
+}
+
+#replay-banner.replay-banner-done .replay-banner-label {
+    color: var(--text-secondary);
+}
+
 .replay-banner-source {
     color: var(--text-primary);
     font-weight: 500;

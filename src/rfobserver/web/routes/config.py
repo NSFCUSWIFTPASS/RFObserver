@@ -126,6 +126,14 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "disk_min_free_gb": ("DISK_MIN_FREE_GB", float),
         "stats_retention_days": ("STATS_RETENTION_DAYS", int),
         "storage_check_sec": ("STORAGE_CHECK_SEC", float),
+        # Burst isolation and attribution
+        "isolation_enabled": ("ISOLATION_ENABLED", _to_bool),
+        "attribution_enabled": ("ATTRIBUTION_ENABLED", _to_bool),
+        "isolation_snr_db": ("ISOLATION_SNR_DB", float),
+        "isolation_max_per_sec": ("ISOLATION_MAX_PER_SEC", int),
+        "isolation_lookback_sec": ("ISOLATION_LOOKBACK_SEC", float),
+        "isolation_max_burst_sec": ("ISOLATION_MAX_BURST_SEC", float),
+        "burst_archive_max_gb": ("BURST_ARCHIVE_MAX_GB", float),
         # Sensor identity + location (all optional — empty input clears)
         "sensor_name": ("SENSOR_NAME", str),
         "latitude": ("LATITUDE", float),

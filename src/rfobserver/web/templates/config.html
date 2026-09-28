@@ -298,6 +298,66 @@
 </div>
 
 <div class="card" style="margin-bottom: 16px;">
+    <div class="card-header">Burst Isolation</div>
+    <div class="card-body">
+        <div class="config-form">
+            <div class="form-row" style="align-items: flex-start;">
+                <div class="form-group">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="isolation-enabled" name="isolation_enabled" {% if settings.ISOLATION_ENABLED %}checked{% endif %}>
+                        <span class="toggle-text">Isolation</span>
+                    </label>
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Cut each strong burst out of the IQ (shift to DC, decimate), save it as SigMF under bursts/ and offer it to modules.</span>
+                </div>
+                <div class="form-group">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="attribution-enabled" name="attribution_enabled" {% if settings.ATTRIBUTION_ENABLED %}checked{% endif %}>
+                        <span class="toggle-text">Attribution</span>
+                    </label>
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Decode isolated bursts with rtl_433 and label the detection (turns isolation on).</span>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="isolation-snr">SNR (dB)</label>
+                    <input type="number" id="isolation-snr" name="isolation_snr_db" value="{{ settings.ISOLATION_SNR_DB }}" step="1" min="0">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Bursts must be this many dB over the noise floor at their peak.</span>
+                </div>
+                <div class="form-group">
+                    <label for="isolation-max-per-sec">Max per Second</label>
+                    <input type="number" id="isolation-max-per-sec" name="isolation_max_per_sec" value="{{ settings.ISOLATION_MAX_PER_SEC }}" step="1" min="1">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">At most this many bursts isolated per second, strongest first.</span>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="isolation-lookback">Lookback (s)</label>
+                    <input type="number" id="isolation-lookback" name="isolation_lookback_sec" value="{{ settings.ISOLATION_LOOKBACK_SEC }}" step="0.1" min="0.1">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">IQ kept for isolation; costs about 104 MB per second at 26 Msps, 224 MB at 56 Msps.</span>
+                </div>
+                <div class="form-group">
+                    <label for="isolation-max-burst">Max Burst (s)</label>
+                    <input type="number" id="isolation-max-burst" name="isolation_max_burst_sec" value="{{ settings.ISOLATION_MAX_BURST_SEC }}" step="0.1" min="0.01">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Longer bursts are isolated only up to this length.</span>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="burst-archive-max">Archive Max (GB)</label>
+                    <input type="number" id="burst-archive-max" name="burst_archive_max_gb" value="{{ settings.BURST_ARCHIVE_MAX_GB }}" step="0.5" min="0">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Saved burst files are capped at this size, oldest deleted first.</span>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Status</label>
+                <div id="isolation-state" style="font-size: 12px; color: var(--text-primary);">--</div>
+                <div id="isolation-counts" style="display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 4px; font-size: 11px; color: var(--text-secondary);"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card" style="margin-bottom: 16px;">
     <div class="card-header">
         RFS NATS
         <span style="flex:1;"></span>
@@ -423,7 +483,7 @@
     // Checkboxes are tracked by .checked, not FormData: an unchecked box is
     // absent from FormData, so the entries() loop below cannot see a
     // checked -> unchecked change.
-    const boolIds = ['trigger-continuous', 'recording-ram-buffer'];
+    const boolIds = ['trigger-continuous', 'recording-ram-buffer', 'isolation-enabled', 'attribution-enabled'];
     let initialChecks = {};
     function snapshotChecks() {
         boolIds.forEach(id => {
@@ -937,7 +997,9 @@ async function refreshStorageBar() {
     let s;
     try {
         const r = await fetch('/api/health', {cache: 'no-store'});
-        s = (await r.json()).storage;
+        const body = await r.json();
+        s = body.storage;
+        renderIsolation(body.isolation);
     } catch (e) { return; }
     const bar = document.getElementById('storage-bar');
     const legend = document.getElementById('storage-legend');
@@ -945,7 +1007,8 @@ async function refreshStorageBar() {
     const vol = s.volume_gb;
     const dbHere = s.db_volume ? 0 : s.db_gb;
     const used = vol - s.free_gb;
-    const other = Math.max(0, used - s.manual_gb - s.auto_gb - dbHere);
+    const bursts = s.bursts_gb || 0;
+    const other = Math.max(0, used - s.manual_gb - s.auto_gb - dbHere - bursts);
     const pct = v => (100 * Math.max(0, v) / vol).toFixed(2) + '%';
     bar.querySelector('.sb-manual').style.width = pct(s.manual_gb);
     bar.querySelector('.sb-auto').style.width = pct(s.auto_gb);
@@ -953,13 +1016,53 @@ async function refreshStorageBar() {
     bar.querySelector('.sb-other').style.width = pct(other);
     bar.querySelector('.sb-floor').style.left = pct(vol - s.floor_gb);
     const parts = [
-        `Manual ${s.manual_gb} GB`, `Automatic ${s.auto_gb} GB`,
+        `Manual ${s.manual_gb} GB`, `Automatic ${s.auto_gb} GB`, `Bursts ${bursts} GB`,
         s.db_volume ? `Database ${s.db_gb} GB (other volume, ${s.db_volume.free_gb} GB free)` : `Database ${s.db_gb} GB`,
         `Other ${other.toFixed(1)} GB`, `Free ${s.free_gb} of ${vol} GB`, `Minimum free ${s.floor_gb} GB`,
     ];
     if (s.step > 0) parts.push(`Step ${s.step}: ${s.step_text}`);
     if (s.evicting_young) parts.push('Deleting captures soon after recording');
     legend.textContent = parts.join('  ·  ');
+}
+// Burst isolation status from /api/health: state line plus the counters that
+// have been counted so far, under human labels.
+const ISOLATION_COUNT_LABELS = [
+    ['received', 'Received'], ['picked', 'Picked'], ['gated_out', 'Below SNR'],
+    ['isolated', 'Isolated'], ['iq_expired', 'Expired'], ['too_long', 'Too long'],
+    ['queue_full', 'Queue full'], ['error', 'Errors'], ['archive_error', 'Save errors'],
+    ['module_error', 'Module errors'], ['handoff_error', 'Handoff errors'],
+    ['attr_decoded', 'Decoded'], ['attr_not_decoded', 'Not decoded'],
+    ['attr_failed', 'Decode failed'], ['attr_dropped', 'Dropped (attribution)'],
+];
+function renderIsolation(iso) {
+    const state = document.getElementById('isolation-state');
+    const counts = document.getElementById('isolation-counts');
+    if (!state || !counts) return;
+    counts.replaceChildren();
+    if (!iso) { state.textContent = 'No pipeline running'; return; }
+    let text;
+    if (iso.disabled_reason) text = 'Disabled: ' + iso.disabled_reason;
+    else if (!iso.enabled) text = 'Off';
+    else {
+        text = `On, ${iso.ring_sec} s lookback`;
+        text += iso.attribution ? ', attribution on' : ', attribution off';
+    }
+    // rtl433 is the binary's path, or a reason it is unavailable.
+    if (iso.rtl433) {
+        text += iso.rtl433.includes('not found') ? '. ' + iso.rtl433 : ` (rtl_433 at ${iso.rtl433})`;
+    }
+    state.textContent = text;
+    const c = iso.counts || {};
+    for (const [key, label] of ISOLATION_COUNT_LABELS) {
+        if (!(key in c)) continue;
+        const item = document.createElement('span');
+        const value = document.createElement('span');
+        value.style.color = 'var(--text-primary)';
+        value.style.fontVariantNumeric = 'tabular-nums';
+        value.textContent = String(c[key]);
+        item.append(label + ' ', value);
+        counts.appendChild(item);
+    }
 }
 refreshStorageBar();
 setInterval(refreshStorageBar, 30000);

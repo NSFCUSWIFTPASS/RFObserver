@@ -118,6 +118,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             }
             if sup.gave_up:
                 body["status"] = "degraded"
+            if proc is not None and hasattr(proc, "isolation_status"):
+                body["isolation"] = proc.isolation_status()
         gov = getattr(app.state, "storage_governor", None)
         if gov is not None:
             st = gov.state

@@ -88,8 +88,10 @@ class StorageSample:
     db_reusable_bytes: int
     auto_bytes: int
     manual_bytes: int
-    # Any auto/ capture other than the one being recorded.
+    # Any auto/ capture other than the one being recorded, or any isolated
+    # burst file (bursts/ is evicted before automatic captures).
     evictable_auto: bool
+    bursts_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -163,6 +165,7 @@ class StorageState:
             "db_reusable_gb": _gb(s.db_reusable_bytes) if s else None,
             "auto_gb": _gb(s.auto_bytes) if s else None,
             "manual_gb": _gb(s.manual_bytes) if s else None,
+            "bursts_gb": _gb(s.bursts_bytes) if s else None,
             "step": self.step,
             "step_text": step_text,
             "step_since": self.step_since.isoformat(),

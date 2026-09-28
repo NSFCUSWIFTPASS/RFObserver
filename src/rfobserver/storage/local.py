@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from rfobserver.storage.burst_archive import BurstArchive
 from rfobserver.storage.governor import StorageSample, VolumeSample
 
 if TYPE_CHECKING:
@@ -227,7 +228,8 @@ class LocalStorage:
 
         A capture counts as evictable when it is not active and, given
         ``not_after``, was last written before it (evict_until_free skips the
-        rest, so they must not make step 1 look possible)."""
+        rest, so they must not make step 1 look possible). Any isolated burst
+        file under bursts/ also counts: the storage loop evicts those first."""
         du = shutil.disk_usage(self.storage_path)
         db_volume = None
         db_dir = Path(db_path).resolve().parent
@@ -238,6 +240,9 @@ class LocalStorage:
         except OSError:
             db_volume = None
         autos = list(self.auto_dir.glob("*.sc16"))
+        # The one walk of bursts/ per tick; the storage loop reuses it for the
+        # cap check.
+        bursts_bytes = BurstArchive(self.storage_path).usage_bytes()
         return StorageSample(
             data=VolumeSample(du.free, du.total),
             db_volume=db_volume,
@@ -249,5 +254,7 @@ class LocalStorage:
                 not is_active_capture(c.name, active_names)
                 and (not_after is None or self._mtime_or_zero(c) < not_after)
                 for c in autos
-            ),
+            )
+            or bursts_bytes > 0,
+            bursts_bytes=bursts_bytes,
         )

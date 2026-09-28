@@ -588,7 +588,8 @@ async def _storage_tick(
     retention_wake: asyncio.Event,
 ) -> None:
     """One governor tick: sample, decide, act, persist the sticky flag."""
-    from rfobserver.storage.governor import YOUNG_CAPTURE_SEC, persist_degraded_change
+    from rfobserver.storage.burst_archive import BurstArchive
+    from rfobserver.storage.governor import GB, YOUNG_CAPTURE_SEC, persist_degraded_change
 
     # The active-capture snapshot and the tick's start time are taken together.
     # A capture begun after this point (file_stats can queue behind the writer
@@ -625,7 +626,20 @@ async def _storage_tick(
             sample.data.free_bytes / 1024**3,
             st.floor_bytes / 1024**3,
         )
+    # The burst cap and step-1 eviction reuse the sample's walk of bursts/:
+    # bursts/ is walked again only when there is something in it to delete.
+    burst_cap = int(float(settings.BURST_ARCHIVE_MAX_GB) * GB)
+    if sample.bursts_bytes > burst_cap:
+        await asyncio.to_thread(BurstArchive(local_storage.storage_path).enforce_cap, burst_cap)
     if actions.evict_to_free_bytes is not None:
+        target = actions.evict_to_free_bytes
+        # Isolated bursts go first. The capture eviction below then deletes
+        # nothing when they alone met the target: it checks free space before
+        # each delete.
+        if sample.bursts_bytes > 0:
+            await asyncio.to_thread(
+                BurstArchive(local_storage.storage_path).evict_until_free, target
+            )
         # on_evict runs on the worker thread; only collect ages there and call
         # the governor once the thread returns.
         young: list[tuple[str, float]] = []
@@ -636,7 +650,7 @@ async def _storage_tick(
 
         await asyncio.to_thread(
             local_storage.evict_until_free,
-            actions.evict_to_free_bytes,
+            target,
             exclude=active,
             exclude_fn=lambda: _active_capture_names(supervisor),
             not_after=started,

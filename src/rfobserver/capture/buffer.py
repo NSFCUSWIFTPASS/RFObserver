@@ -293,6 +293,14 @@ class CircularBuffer:
         with self._lock:
             return self._total_written - min(self._total_written, self._max_samples)
 
+    def bounds(self) -> tuple[int, int]:
+        """(oldest held position, total_written) at one instant: the stream
+        samples ``[oldest, total_written)`` are readable."""
+        with self._lock:
+            return self._total_written - min(self._total_written, self._max_samples), (
+                self._total_written
+            )
+
     def _copy_range_locked(self, start: int, end: int) -> np.ndarray:
         # The newest sample (position total-1) sits at index write_pos-1. This
         # holds after an oversized write too (write_pos resets to 0 while

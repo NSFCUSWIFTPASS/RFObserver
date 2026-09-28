@@ -50,6 +50,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 STATES = ("isolated", "iq_expired", "too_long", "queue_full", "error")
+# Why a ring burst was iq_expired, counted as iq_expired_<reason> alongside it:
+# its start was overwritten, its end not yet written, or it had no position.
+EXPIRY_REASONS = ("overwritten", "unwritten", "nopos")
 _STOP = object()
 # Sweep batches each pin their whole capture's IQ bytes (0.5 s at 56 Msps is
 # 112 MB), so at most this many may be queued or in flight at once; further
@@ -82,6 +85,10 @@ class RingSource:
 
     def read_all(self) -> np.ndarray[Any, np.dtype[Any]] | None:
         return None
+
+    def bounds(self) -> tuple[int, int]:
+        """(oldest held position, total_written)."""
+        return self._ring.bounds()
 
 
 class WholeCaptureSource:
@@ -117,6 +124,7 @@ class _Work:
     data: np.ndarray[Any, np.dtype[Any]] | None = None
     snapped: bool = False  # data was read up front (None then means expired)
     read_failed: bool = False  # the snapshot read raised
+    bounds: tuple[int, int] | None = None  # the ring's bounds just after a failed read
 
 
 class IsolationStats:
@@ -352,6 +360,8 @@ class IsolationStage:
             work.snapped = True
             try:
                 work.data = src.read_range(rng.start, rng.stop)
+                if work.data is None:
+                    work.bounds = src.bounds()
             except Exception:
                 logger.exception("Isolation read failed for burst %s", cand.burst.burst_id)
                 work.read_failed = True
@@ -368,9 +378,45 @@ class IsolationStage:
     def _read(self, work: _Work, batch: IsolationBatch) -> np.ndarray[Any, np.dtype[Any]] | None:
         if work.snapped:
             return work.data
+        src = batch.source
         if work.rng is not None:
-            return batch.source.read_range(work.rng.start, work.rng.stop)
-        return batch.source.read_all()
+            data = src.read_range(work.rng.start, work.rng.stop)
+            if data is None and isinstance(src, RingSource):
+                work.bounds = src.bounds()
+            return data
+        return src.read_all()
+
+    def _expired(self, work: _Work, batch: IsolationBatch) -> str:
+        """Count and log why a burst's IQ could not be read; return the state."""
+        if not isinstance(batch.source, RingSource):
+            return "iq_expired"  # the sweep's whole capture: no ring to explain
+        b = work.cand.burst
+        if work.rng is None:
+            reason = "nopos"
+            logger.warning(
+                "Burst %s iq_expired (nopos): no start/stop sample on a ring source",
+                b.burst_id,
+            )
+        else:
+            oldest, total = work.bounds if work.bounds is not None else batch.source.bounds()
+            # The ring only moves forward, so a read that failed with its
+            # start still held failed because its end was not yet written.
+            reason = "overwritten" if work.rng.start < oldest else "unwritten"
+            stop = b.stop_sample if b.stop_sample is not None else work.rng.stop
+            age_ms = (total - stop) / float(batch.sample_rate_hz) * 1000.0
+            logger.warning(
+                "Burst %s iq_expired (%s): read [%d, %d), ring holds [%d, %d), "
+                "age %.0f ms (stop_sample to total_written)",
+                b.burst_id,
+                reason,
+                work.rng.start,
+                work.rng.stop,
+                oldest,
+                total,
+                age_ms,
+            )
+        self.stats.count(f"iq_expired_{reason}")
+        return "iq_expired"
 
     def _one(self, work: _Work, batch: IsolationBatch) -> str:
         cand = work.cand
@@ -381,7 +427,7 @@ class IsolationStage:
             data = self._read(work, batch)
             work.data = None  # the snapshot is not needed past its DSP
             if data is None or len(data) == 0:
-                return "iq_expired"
+                return self._expired(work, batch)
             iso = isolate_samples(
                 b,
                 data,

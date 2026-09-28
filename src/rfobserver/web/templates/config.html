@@ -1031,7 +1031,10 @@ async function refreshStorageBar() {
 // have been counted so far, under human labels.
 const ISOLATION_COUNT_LABELS = [
     ['received', 'Received'], ['picked', 'Picked'], ['gated_out', 'Below SNR'],
-    ['isolated', 'Isolated'], ['iq_expired', 'Expired'], ['too_long', 'Too long'],
+    ['isolated', 'Isolated'], ['iq_expired', 'Expired'],
+    ['iq_expired_overwritten', 'Expired: overwritten'],
+    ['iq_expired_unwritten', 'Expired: not yet written'],
+    ['iq_expired_nopos', 'Expired: no position'], ['too_long', 'Too long'],
     ['queue_full', 'Queue full'], ['error', 'Errors'], ['archive_error', 'Save errors'],
     ['module_error', 'Module errors'], ['handoff_error', 'Handoff errors'],
     ['attr_decoded', 'Decoded'], ['attr_not_decoded', 'Not decoded'],

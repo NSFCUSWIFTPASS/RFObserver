@@ -227,6 +227,93 @@ def test_a_snapshot_read_that_raises_is_the_error_state(tmp_path):
     assert out == [("b0", "error"), ("b1", "isolated")]
 
 
+def _expiry_warnings(caplog):
+    return [r.getMessage() for r in caplog.records if "iq_expired" in r.getMessage()]
+
+
+def test_an_overwritten_burst_is_logged_and_counted_as_overwritten(tmp_path, caplog):
+    st, *_ = _stage(tmp_path)
+    ring = CircularBuffer(100_000, dtype=np.int32)
+    ring.write(np.zeros(300_000, dtype=np.int32))  # holds 200k..300k
+    guard = int(0.002 * FS)
+    with caplog.at_level("WARNING", logger="rfobserver.pipeline.isolation"):
+        out = st.process_batch(
+            IsolationBatch([_cand(0, 30, 190_000, 210_000)], 915e6, FS, RingSource(ring))
+        )
+    assert out == [("b0", "iq_expired")]
+    snap = st.stats.snapshot()
+    assert snap["iq_expired"] == 1 and snap["iq_expired_overwritten"] == 1
+    assert "iq_expired_unwritten" not in snap and "iq_expired_nopos" not in snap
+    (msg,) = _expiry_warnings(caplog)
+    assert "b0 iq_expired (overwritten)" in msg
+    assert f"read [{190_000 - guard}, {210_000 + guard})" in msg
+    assert "ring holds [200000, 300000)" in msg
+    assert "age 45 ms" in msg  # (300k - 210k) / 2 Msps
+
+
+def test_a_burst_past_the_newest_sample_is_counted_as_unwritten(tmp_path, caplog):
+    st, *_ = _stage(tmp_path)
+    ring = CircularBuffer(100_000, dtype=np.int32)
+    ring.write(np.zeros(300_000, dtype=np.int32))
+    with caplog.at_level("WARNING", logger="rfobserver.pipeline.isolation"):
+        out = st.process_batch(
+            IsolationBatch([_cand(0, 30, 290_000, 299_000)], 915e6, FS, RingSource(ring))
+        )
+    assert out == [("b0", "iq_expired")]  # the end guard is not written yet
+    snap = st.stats.snapshot()
+    assert snap["iq_expired"] == 1 and snap["iq_expired_unwritten"] == 1
+    (msg,) = _expiry_warnings(caplog)
+    assert "(unwritten)" in msg and "ring holds [200000, 300000)" in msg
+    assert "age 0 ms" in msg
+
+
+def test_a_ring_burst_without_positions_is_counted_as_nopos(tmp_path, caplog):
+    st, *_ = _stage(tmp_path)
+    with caplog.at_level("WARNING", logger="rfobserver.pipeline.isolation"):
+        out = st.process_batch(
+            IsolationBatch([_cand(0, 30, None, None)], 915e6, FS, RingSource(_ring()))
+        )
+    assert out == [("b0", "iq_expired")]
+    snap = st.stats.snapshot()
+    assert snap["iq_expired"] == 1 and snap["iq_expired_nopos"] == 1
+    (msg,) = _expiry_warnings(caplog)
+    assert "b0 iq_expired (nopos)" in msg
+
+
+def test_a_lazy_read_is_classified_by_the_ring_just_after_it(tmp_path, monkeypatch, caplog):
+    # Past the snapshot budget, the burst is read just before its DSP; the
+    # reason and numbers come from the ring at that read.
+    import rfobserver.pipeline.isolation as iso_mod
+    import rfobserver.processing.isolate as isolate_mod
+
+    ring = CircularBuffer(400_000, dtype=np.int32)
+    ring.write(np.zeros(400_000, dtype=np.int32))
+    real = isolate_mod.channelize_to_cs16
+
+    def slow_dsp(*a, **k):
+        ring.write(np.zeros(50_000, dtype=np.int32))
+        return real(*a, **k)
+
+    monkeypatch.setattr(isolate_mod, "channelize_to_cs16", slow_dsp)
+    monkeypatch.setattr(iso_mod, "SNAPSHOT_MAX_BYTES", 18_000 * 4)
+    st, *_ = _stage(tmp_path)
+    cands = [_cand(0, 40, 350_000, 360_000), _cand(1, 20, 20_000, 30_000)]
+    with caplog.at_level("WARNING", logger="rfobserver.pipeline.isolation"):
+        out = st.process_batch(IsolationBatch(cands, 915e6, FS, RingSource(ring)))
+    assert out == [("b0", "isolated"), ("b1", "iq_expired")]
+    assert st.stats.snapshot()["iq_expired_overwritten"] == 1
+    (msg,) = _expiry_warnings(caplog)
+    assert "ring holds [50000, 450000)" in msg and "age 210 ms" in msg
+
+
+def test_a_sweep_capture_has_no_expiry_sub_counter(tmp_path):
+    st, *_ = _stage(tmp_path)
+    src = WholeCaptureSource(b"")
+    out = st.process_batch(IsolationBatch([_cand(0, 30, None, None)], 915e6, FS, src))
+    assert out == [("b0", "iq_expired")]
+    assert not [k for k in st.stats.snapshot() if k.startswith("iq_expired_")]
+
+
 def test_an_exception_is_the_error_state_and_does_not_stop_the_batch(tmp_path, monkeypatch):
     st, *_ = _stage(tmp_path)
     calls = {"n": 0}

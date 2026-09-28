@@ -97,3 +97,13 @@ def test_read_tail_with_position():
     assert end == 14 and list(data) == [11, 12, 13]
     data, end = buf.read_tail_with_position(100)  # clamps to what is held
     assert list(data) == list(range(4, 14))
+
+
+def test_bounds_is_oldest_and_total_written():
+    buf = CircularBuffer(10, dtype=np.int32)
+    assert buf.bounds() == (0, 0)
+    buf.write(np.arange(4, dtype=np.int32))
+    assert buf.bounds() == (0, 4)
+    buf.write(np.arange(22, dtype=np.int32))
+    assert buf.bounds() == (16, 26)
+    assert buf.bounds()[0] == buf.oldest_position

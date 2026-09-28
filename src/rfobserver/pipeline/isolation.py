@@ -125,6 +125,13 @@ class IsolationStage:
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, settings.ISOLATION_QUEUE_MAX))
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        # Serializes submit()'s stop-event check + put_nowait + counting
+        # against stop() setting the event, so a submit that is already
+        # mid-flight when stop() is called is guaranteed to either finish
+        # its put before the event is set (and so be seen by stop()'s
+        # drain) or see the event already set and refuse. Held only very
+        # briefly in both places -- no blocking calls under it.
+        self._submit_lock = threading.Lock()
         self._window_start = -1e18
         self._window_count = 0
         self.stats = IsolationStats()
@@ -133,21 +140,17 @@ class IsolationStage:
 
     def submit(self, batch: IsolationBatch) -> bool:
         n = len(batch.candidates)
-        self.stats.count("received", n)
-        # Checked up front: once stop() has requested a shutdown, a newly
-        # submitted batch must not be allowed to land in the queue behind
-        # the worker's back (see stop()/_loop() for the rest of this
-        # defense -- a batch that slips through the tiny window between
-        # this check and put_nowait is still caught by the drains there).
-        if self._stop_event.is_set():
-            self.stats.count("queue_full", n)
-            return False
-        try:
-            self._queue.put_nowait(batch)
-            return True
-        except queue.Full:
-            self.stats.count("queue_full", n)
-            return False
+        with self._submit_lock:
+            self.stats.count("received", n)
+            if self._stop_event.is_set():
+                self.stats.count("queue_full", n)
+                return False
+            try:
+                self._queue.put_nowait(batch)
+                return True
+            except queue.Full:
+                self.stats.count("queue_full", n)
+                return False
 
     # -- worker --
 
@@ -162,7 +165,16 @@ class IsolationStage:
     def stop(self) -> None:
         if self._thread is None:
             return
-        self._stop_event.set()
+        # Only the event flip is serialized against submit(): if a submit is
+        # currently mid-flight (holding _submit_lock, e.g. blocked inside
+        # put_nowait), this waits for it to finish first, so that submit
+        # either completes its put before the event is set below (and is
+        # therefore in the queue for the drain that follows) or observes the
+        # event already set and refuses. The lock is released immediately
+        # after, before draining or joining, per the "no blocking calls
+        # under the lock" rule.
+        with self._submit_lock:
+            self._stop_event.set()
         # Drain whatever is already queued before the worker even learns to
         # stop: it will never be processed now, so count it as queue_full
         # rather than silently dropping it.

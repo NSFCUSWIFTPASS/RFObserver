@@ -329,6 +329,79 @@ def test_a_batch_submitted_during_stop_while_the_worker_is_busy_is_not_lost(tmp_
             st.stop()
 
 
+def test_stop_waits_for_an_in_flight_submit_before_setting_the_stop_event(tmp_path):
+    """Closes the last race: submit() reads stop_event (False), is
+    preempted before put_nowait, and stop() finishes its whole teardown
+    while the worker is idle -- then the late put lands in a queue nobody
+    reads. _submit_lock forces stop() to wait for a submit that is already
+    mid-flight before it can even flip the stop event.
+
+    Proven by monkeypatching the queue's put_nowait to block on an Event for
+    its first call only (the submitted batch -- stop()'s own later push of
+    the _STOP sentinel must not be blocked by this, or the test would be
+    proving something else): while a submit is stuck inside it (so
+    _submit_lock is held), a concurrent stop() must still be waiting on the
+    lock -- it cannot have returned. Releasing the block lets both finish,
+    and the received invariant must hold no matter which of {the worker,
+    stop()'s drain} ends up handling the now-enqueued batch.
+    """
+    st, *_ = _stage(tmp_path, ISOLATION_QUEUE_MAX=4)
+    st.start()
+    try:
+        real_put_nowait = st._queue.put_nowait
+        put_called = threading.Event()
+        release_put = threading.Event()
+
+        def blocking_put_nowait(item):
+            if not put_called.is_set():
+                put_called.set()
+                release_put.wait(timeout=5.0)
+            return real_put_nowait(item)
+
+        st._queue.put_nowait = blocking_put_nowait
+
+        submitted = {}
+
+        def do_submit():
+            submitted["ok"] = st.submit(
+                IsolationBatch([_cand(0, 30)], 915e6, FS, RingSource(_ring()))
+            )
+
+        submit_thread = threading.Thread(target=do_submit)
+        submit_thread.start()
+        # submit() is now blocked inside put_nowait, still holding _submit_lock.
+        assert put_called.wait(timeout=5.0)
+
+        stopped = threading.Event()
+
+        def do_stop():
+            st.stop()
+            stopped.set()
+
+        stop_thread = threading.Thread(target=do_stop)
+        stop_thread.start()
+        time.sleep(0.1)
+        # stop() needs _submit_lock to set the stop event; the in-flight
+        # submit still holds it, so stop() must still be blocked on it.
+        assert not stopped.is_set()
+
+        release_put.set()  # let the blocked submit finish, then stop() can proceed
+        submit_thread.join(timeout=5.0)
+        stop_thread.join(timeout=5.0)
+        assert not submit_thread.is_alive()
+        assert not stop_thread.is_alive()
+        assert submitted["ok"] is True
+
+        snap = st.stats.snapshot()
+        assert snap["received"] == 1
+        assert snap["received"] == (
+            snap.get("gated_out", 0) + snap.get("queue_full", 0) + snap.get("picked", 0)
+        )
+    finally:
+        if st._thread is not None:
+            st.stop()
+
+
 async def test_attribution_without_rtl433_keeps_isolation(tmp_path, monkeypatch):
     monkeypatch.setattr("rfobserver.pipeline.isolation.find_rtl433", lambda override=None: None)
     s = _settings(ISOLATION_ENABLED=False, ATTRIBUTION_ENABLED=True, STORAGE_PATH=str(tmp_path))

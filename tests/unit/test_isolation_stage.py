@@ -155,18 +155,33 @@ def test_a_weak_burst_is_not_evicted_by_the_dsp_of_stronger_ones(tmp_path, monke
     """F3: bursts are handled strongest first, and the receiver keeps writing
     the ring while each one is channelized. If every burst were read only
     just before its own DSP, the stronger bursts' DSP time would push the
-    weakest one's samples out of the ring. Its IQ is copied before any DSP."""
+    weakest one's samples out of the ring. Its IQ is copied before any DSP.
+
+    A mere reorder of which state gets which burst would also pass the
+    end-state assertions below, so this also records the order of ring
+    reads vs. DSP calls directly and proves every read precedes the first
+    DSP call (under budget: all three are snapshotted up front)."""
     import rfobserver.processing.isolate as isolate_mod
 
     ring = CircularBuffer(400_000, dtype=np.int32)
     ring.write(np.random.default_rng(0).integers(-2000, 2000, 400_000, dtype=np.int32))
     real = isolate_mod.channelize_to_cs16
+    real_read_range = ring.read_range
+    events: list[str] = []  # "read" / "dsp" in call order
+
+    def tracking_read_range(start, end):
+        events.append("read")
+        return real_read_range(start, end)
+
+    monkeypatch.setattr(ring, "read_range", tracking_read_range)
+
     dsp_calls = []
 
     def slow_dsp(*a, **k):
         # Stands in for the receiver writing 50k samples (25 ms at 2 Msps)
         # while one burst is channelized: after one call the ring no longer
         # holds position 16k, where b2's read starts.
+        events.append("dsp")
         dsp_calls.append(ring.oldest_position)
         ring.write(np.zeros(50_000, dtype=np.int32))
         return real(*a, **k)
@@ -182,6 +197,62 @@ def test_a_weak_burst_is_not_evicted_by_the_dsp_of_stronger_ones(tmp_path, monke
     assert out == [("b0", "isolated"), ("b1", "isolated"), ("b2", "isolated")]
     assert len(dsp_calls) == 3
     assert ring.oldest_position > 20_000  # b2's samples really are gone from the ring now
+    # All three snapshot reads (the fix under test) happen before the first
+    # DSP call, not just before their own.
+    assert events.count("read") == 3
+    first_dsp = events.index("dsp")
+    assert events[:first_dsp] == ["read", "read", "read"]
+
+
+def test_over_budget_lazy_bursts_are_read_before_any_dsp(tmp_path, monkeypatch):
+    """Item 2: the snapshot budget is filled strongest first, so whatever is
+    left for a lazy read is always the weakest of the batch -- the exact
+    bursts F3 hit. Prove the fix directly, tagging both the ring reads and
+    the DSP calls (by burst id) with their call order: both lazy bursts'
+    reads happen before b0's DSP -- even though b0 is strongest, was
+    snapshotted first, and used to be processed (and DSP'd) first."""
+    import rfobserver.pipeline.isolation as iso_mod
+
+    ring = CircularBuffer(400_000, dtype=np.int32)
+    ring.write(np.zeros(400_000, dtype=np.int32))
+    real_isolate = iso_mod.isolate_samples
+    real_read_range = ring.read_range
+    events: list[tuple] = []  # ("read", start, end) / ("dsp", burst_id)
+
+    def tracking_read_range(start, end):
+        events.append(("read", start, end))
+        return real_read_range(start, end)
+
+    monkeypatch.setattr(ring, "read_range", tracking_read_range)
+
+    def tracking_isolate(burst, data, **kw):
+        events.append(("dsp", burst.burst_id))
+        # Stands in for the receiver writing while this burst is channelized.
+        ring.write(np.zeros(50_000, dtype=np.int32))
+        return real_isolate(burst, data, **kw)
+
+    monkeypatch.setattr(iso_mod, "isolate_samples", tracking_isolate)
+    # Room for exactly one 18k-sample read; the other two must go lazy.
+    monkeypatch.setattr(iso_mod, "SNAPSHOT_MAX_BYTES", 18_000 * 4)
+    st, *_ = _stage(tmp_path)
+    cands = [
+        _cand(0, 40, 20_000, 30_000),  # strongest: snapshotted, fills the budget
+        _cand(1, 30, 350_000, 360_000),  # lazy
+        _cand(2, 20, 60_000, 70_000),  # lazy, weakest
+    ]
+    out = st.process_batch(IsolationBatch(cands, 915e6, FS, RingSource(ring)))
+    assert dict(out) == {"b0": "isolated", "b1": "isolated", "b2": "isolated"}
+    reads = [e for e in events if e[0] == "read"]
+    dsps = [e for e in events if e[0] == "dsp"]
+    assert len(reads) == 3 and len(dsps) == 3  # b0's snapshot read + 2 lazy reads
+    b1_read_idx = events.index(("read", 350_000 - 4_000, 360_000 + 4_000))
+    b2_read_idx = events.index(("read", 60_000 - 4_000, 70_000 + 4_000))
+    b0_dsp_idx = events.index(("dsp", "b0"))
+    # The bug: with the budget filled strongest-first, b0 (snapshotted) used
+    # to be processed -- and DSP'd -- before either lazy read ran. The fix:
+    # both lazy reads now happen strictly before b0's DSP.
+    assert b1_read_idx < b0_dsp_idx
+    assert b2_read_idx < b0_dsp_idx
 
 
 def test_bursts_past_the_snapshot_budget_are_read_just_before_their_dsp(
@@ -204,12 +275,14 @@ def test_bursts_past_the_snapshot_budget_are_read_just_before_their_dsp(
     st, *_ = _stage(tmp_path)
     cands = [
         _cand(0, 40, 20_000, 30_000),  # snapshotted
-        _cand(1, 30, 350_000, 360_000),  # lazy, still held when its turn comes
-        _cand(2, 20, 60_000, 70_000),  # lazy, overwritten by then
+        _cand(1, 30, 350_000, 360_000),  # lazy, read before b0's DSP
+        _cand(2, 20, 60_000, 70_000),  # lazy, also read before b0's DSP
     ]
     with caplog.at_level("INFO", logger="rfobserver.pipeline.isolation"):
         out = st.process_batch(IsolationBatch(cands, 915e6, FS, RingSource(ring)))
-    assert out == [("b0", "isolated"), ("b1", "isolated"), ("b2", "iq_expired")]
+    # Both lazy bursts are now read before b0's (snapshotted) DSP runs, not
+    # after it, so neither is pushed out of the ring: all three survive.
+    assert out == [("b1", "isolated"), ("b2", "isolated"), ("b0", "isolated")]
     budget_logs = [r for r in caplog.records if "snapshot budget" in r.getMessage()]
     assert len(budget_logs) == 1 and "2 read just before" in budget_logs[0].getMessage()
 
@@ -228,7 +301,21 @@ def test_a_snapshot_read_that_raises_is_the_error_state(tmp_path):
 
 
 def _expiry_warnings(caplog):
-    return [r.getMessage() for r in caplog.records if "iq_expired" in r.getMessage()]
+    """The one per-batch WARNING summary (count, reasons, worst age)."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "WARNING" and "iq_expired" in r.getMessage()
+    ]
+
+
+def _expiry_debug_logs(caplog):
+    """The per-burst DEBUG detail (reason, read/ring range, age)."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "DEBUG" and "iq_expired" in r.getMessage()
+    ]
 
 
 def test_an_overwritten_burst_is_logged_and_counted_as_overwritten(tmp_path, caplog):
@@ -236,7 +323,7 @@ def test_an_overwritten_burst_is_logged_and_counted_as_overwritten(tmp_path, cap
     ring = CircularBuffer(100_000, dtype=np.int32)
     ring.write(np.zeros(300_000, dtype=np.int32))  # holds 200k..300k
     guard = int(0.002 * FS)
-    with caplog.at_level("WARNING", logger="rfobserver.pipeline.isolation"):
+    with caplog.at_level("DEBUG", logger="rfobserver.pipeline.isolation"):
         out = st.process_batch(
             IsolationBatch([_cand(0, 30, 190_000, 210_000)], 915e6, FS, RingSource(ring))
         )
@@ -244,45 +331,72 @@ def test_an_overwritten_burst_is_logged_and_counted_as_overwritten(tmp_path, cap
     snap = st.stats.snapshot()
     assert snap["iq_expired"] == 1 and snap["iq_expired_overwritten"] == 1
     assert "iq_expired_unwritten" not in snap and "iq_expired_nopos" not in snap
-    (msg,) = _expiry_warnings(caplog)
-    assert "b0 iq_expired (overwritten)" in msg
-    assert f"read [{190_000 - guard}, {210_000 + guard})" in msg
-    assert "ring holds [200000, 300000)" in msg
-    assert "age 45 ms" in msg  # (300k - 210k) / 2 Msps
+    # One batch-level WARNING: count, reasons, worst age.
+    (warn,) = _expiry_warnings(caplog)
+    assert "1 burst(s) iq_expired (overwritten=1)" in warn
+    assert "age 45 ms" in warn  # (300k - 210k) / 2 Msps
+    # The per-burst detail is at DEBUG, not WARNING.
+    (debug,) = _expiry_debug_logs(caplog)
+    assert "b0 iq_expired (overwritten)" in debug
+    assert f"read [{190_000 - guard}, {210_000 + guard})" in debug
+    assert "ring holds [200000, 300000)" in debug
 
 
 def test_a_burst_past_the_newest_sample_is_counted_as_unwritten(tmp_path, caplog):
     st, *_ = _stage(tmp_path)
     ring = CircularBuffer(100_000, dtype=np.int32)
     ring.write(np.zeros(300_000, dtype=np.int32))
-    with caplog.at_level("WARNING", logger="rfobserver.pipeline.isolation"):
+    with caplog.at_level("DEBUG", logger="rfobserver.pipeline.isolation"):
         out = st.process_batch(
             IsolationBatch([_cand(0, 30, 290_000, 299_000)], 915e6, FS, RingSource(ring))
         )
     assert out == [("b0", "iq_expired")]  # the end guard is not written yet
     snap = st.stats.snapshot()
     assert snap["iq_expired"] == 1 and snap["iq_expired_unwritten"] == 1
-    (msg,) = _expiry_warnings(caplog)
-    assert "(unwritten)" in msg and "ring holds [200000, 300000)" in msg
-    assert "age 0 ms" in msg
+    (warn,) = _expiry_warnings(caplog)
+    assert "unwritten=1" in warn and "age 0 ms" in warn
+    (debug,) = _expiry_debug_logs(caplog)
+    assert "(unwritten)" in debug and "ring holds [200000, 300000)" in debug
 
 
 def test_a_ring_burst_without_positions_is_counted_as_nopos(tmp_path, caplog):
     st, *_ = _stage(tmp_path)
-    with caplog.at_level("WARNING", logger="rfobserver.pipeline.isolation"):
+    with caplog.at_level("DEBUG", logger="rfobserver.pipeline.isolation"):
         out = st.process_batch(
             IsolationBatch([_cand(0, 30, None, None)], 915e6, FS, RingSource(_ring()))
         )
     assert out == [("b0", "iq_expired")]
     snap = st.stats.snapshot()
     assert snap["iq_expired"] == 1 and snap["iq_expired_nopos"] == 1
-    (msg,) = _expiry_warnings(caplog)
-    assert "b0 iq_expired (nopos)" in msg
+    (warn,) = _expiry_warnings(caplog)
+    assert "nopos=1" in warn and "worst age n/a" in warn  # no age: no rng at all
+    (debug,) = _expiry_debug_logs(caplog)
+    assert "b0 iq_expired (nopos)" in debug
+
+
+def test_expiry_warnings_are_batched_not_one_per_burst(tmp_path, caplog):
+    """Under overload a batch can carry many iq_expired bursts; only one
+    WARNING is logged for the whole batch, not one per burst."""
+    st, *_ = _stage(tmp_path, ISOLATION_MAX_PER_SEC=10)
+    ring = CircularBuffer(100_000, dtype=np.int32)
+    ring.write(np.zeros(300_000, dtype=np.int32))  # holds 200k..300k
+    cands = [_cand(i, 30, 100_000 + i, 100_100 + i) for i in range(5)]  # all overwritten
+    with caplog.at_level("DEBUG", logger="rfobserver.pipeline.isolation"):
+        out = st.process_batch(IsolationBatch(cands, 915e6, FS, RingSource(ring)))
+    assert all(state == "iq_expired" for _, state in out)
+    assert st.stats.snapshot()["iq_expired"] == 5
+    warnings = _expiry_warnings(caplog)
+    assert len(warnings) == 1
+    assert "5 burst(s) iq_expired (overwritten=5)" in warnings[0]
+    # Every burst still gets its own DEBUG line.
+    assert len(_expiry_debug_logs(caplog)) == 5
 
 
 def test_a_lazy_read_is_classified_by_the_ring_just_after_it(tmp_path, monkeypatch, caplog):
-    # Past the snapshot budget, the burst is read just before its DSP; the
-    # reason and numbers come from the ring at that read.
+    # Past the snapshot budget, a burst is read just before its DSP (lazy
+    # bursts run first, but a lazy burst's own DSP can still evict another,
+    # weaker lazy burst processed right after it); the reason and numbers
+    # come from the ring at that read, not at batch start.
     import rfobserver.pipeline.isolation as iso_mod
     import rfobserver.processing.isolate as isolate_mod
 
@@ -297,13 +411,17 @@ def test_a_lazy_read_is_classified_by_the_ring_just_after_it(tmp_path, monkeypat
     monkeypatch.setattr(isolate_mod, "channelize_to_cs16", slow_dsp)
     monkeypatch.setattr(iso_mod, "SNAPSHOT_MAX_BYTES", 18_000 * 4)
     st, *_ = _stage(tmp_path)
-    cands = [_cand(0, 40, 350_000, 360_000), _cand(1, 20, 20_000, 30_000)]
-    with caplog.at_level("WARNING", logger="rfobserver.pipeline.isolation"):
+    cands = [
+        _cand(0, 50, 200_000, 210_000),  # strongest: snapshotted, fills the budget
+        _cand(1, 30, 350_000, 360_000),  # lazy, read (and survives) before b0's DSP
+        _cand(2, 20, 20_000, 30_000),  # weakest lazy: evicted by b1's own DSP write
+    ]
+    with caplog.at_level("DEBUG", logger="rfobserver.pipeline.isolation"):
         out = st.process_batch(IsolationBatch(cands, 915e6, FS, RingSource(ring)))
-    assert out == [("b0", "isolated"), ("b1", "iq_expired")]
+    assert out == [("b1", "isolated"), ("b2", "iq_expired"), ("b0", "isolated")]
     assert st.stats.snapshot()["iq_expired_overwritten"] == 1
-    (msg,) = _expiry_warnings(caplog)
-    assert "ring holds [50000, 450000)" in msg and "age 210 ms" in msg
+    (debug,) = _expiry_debug_logs(caplog)
+    assert "ring holds [50000, 450000)" in debug and "age 210 ms" in debug
 
 
 def test_a_sweep_capture_has_no_expiry_sub_counter(tmp_path):

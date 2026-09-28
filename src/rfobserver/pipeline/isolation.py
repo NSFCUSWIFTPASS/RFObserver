@@ -329,19 +329,29 @@ class IsolationStage:
 
     def process_batch(self, batch: IsolationBatch) -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = []
+        expiries: list[tuple[str, float | None]] = []
         picked = self._gate(batch.candidates, batch.sample_rate_hz)
         for work in self._snapshot(picked, batch):
-            state = self._one(work, batch)
+            state = self._one(work, batch, expiries)
             self.stats.count(state)
             out.append((work.cand.burst.burst_id, state))
+        self._log_expiries(expiries)
         return out
 
     def _snapshot(self, picked: list[BurstCandidate], batch: IsolationBatch) -> list[_Work]:
         """Copy every picked ring burst's samples before any DSP runs, up to
-        SNAPSHOT_MAX_BYTES per batch; the rest are read lazily in _one."""
+        SNAPSHOT_MAX_BYTES per batch; the rest are read lazily in _one.
+
+        The budget is filled strongest first, so whatever is left over for a
+        lazy read is always the weakest of the batch -- exactly what F3 hit.
+        The snapshotted bursts are already safe (their bytes are copied), so
+        the lazy ones are returned first: their reads happen before any
+        snapshotted burst's DSP runs, instead of after it.
+        """
         max_sec = float(self._s.ISOLATION_MAX_BURST_SEC)
         src = batch.source
-        works: list[_Work] = []
+        snapped_works: list[_Work] = []
+        lazy_works: list[_Work] = []
         used = 0
         lazy = 0
         for cand in picked:
@@ -349,12 +359,13 @@ class IsolationStage:
                 cand.burst, sample_rate_hz=batch.sample_rate_hz, max_burst_sec=max_sec
             )
             work = _Work(cand, rng)
-            works.append(work)
             if rng is None or not isinstance(src, RingSource):
+                lazy_works.append(work)
                 continue
             nbytes = rng.num_samples * src.itemsize
             if used + nbytes > SNAPSHOT_MAX_BYTES:
                 lazy += 1
+                lazy_works.append(work)
                 continue
             used += nbytes
             work.snapped = True
@@ -365,6 +376,7 @@ class IsolationStage:
             except Exception:
                 logger.exception("Isolation read failed for burst %s", cand.burst.burst_id)
                 work.read_failed = True
+            snapped_works.append(work)
         if lazy:
             logger.info(
                 "Isolation batch of %d bursts exceeds the %d MB snapshot budget; "
@@ -373,7 +385,7 @@ class IsolationStage:
                 SNAPSHOT_MAX_BYTES // (1024 * 1024),
                 lazy,
             )
-        return works
+        return lazy_works + snapped_works
 
     def _read(self, work: _Work, batch: IsolationBatch) -> np.ndarray[Any, np.dtype[Any]] | None:
         if work.snapped:
@@ -386,14 +398,19 @@ class IsolationStage:
             return data
         return src.read_all()
 
-    def _expired(self, work: _Work, batch: IsolationBatch) -> str:
-        """Count and log why a burst's IQ could not be read; return the state."""
+    def _expired(
+        self, work: _Work, batch: IsolationBatch, expiries: list[tuple[str, float | None]]
+    ) -> str:
+        """Count, log the per-burst detail at DEBUG, and record the reason
+        (plus age, when known) for the batch-level WARNING; return the
+        state."""
         if not isinstance(batch.source, RingSource):
             return "iq_expired"  # the sweep's whole capture: no ring to explain
         b = work.cand.burst
         if work.rng is None:
             reason = "nopos"
-            logger.warning(
+            age_ms = None
+            logger.debug(
                 "Burst %s iq_expired (nopos): no start/stop sample on a ring source",
                 b.burst_id,
             )
@@ -404,7 +421,7 @@ class IsolationStage:
             reason = "overwritten" if work.rng.start < oldest else "unwritten"
             stop = b.stop_sample if b.stop_sample is not None else work.rng.stop
             age_ms = (total - stop) / float(batch.sample_rate_hz) * 1000.0
-            logger.warning(
+            logger.debug(
                 "Burst %s iq_expired (%s): read [%d, %d), ring holds [%d, %d), "
                 "age %.0f ms (stop_sample to total_written)",
                 b.burst_id,
@@ -416,9 +433,34 @@ class IsolationStage:
                 age_ms,
             )
         self.stats.count(f"iq_expired_{reason}")
+        expiries.append((reason, age_ms))
         return "iq_expired"
 
-    def _one(self, work: _Work, batch: IsolationBatch) -> str:
+    def _log_expiries(self, expiries: list[tuple[str, float | None]]) -> None:
+        """At most one WARNING per batch for iq_expired bursts (an overload
+        can otherwise log dozens a second): the count, the reasons, and the
+        worst (largest) age in ms. Per-burst detail is logged at DEBUG in
+        _expired."""
+        if not expiries:
+            return
+        reasons: dict[str, int] = {}
+        worst_age: float | None = None
+        for reason, age_ms in expiries:
+            reasons[reason] = reasons.get(reason, 0) + 1
+            if age_ms is not None and (worst_age is None or age_ms > worst_age):
+                worst_age = age_ms
+        reason_str = ", ".join(f"{r}={n}" for r, n in sorted(reasons.items()))
+        age_str = f"{worst_age:.0f} ms" if worst_age is not None else "n/a"
+        logger.warning(
+            "Isolation batch: %d burst(s) iq_expired (%s), worst age %s",
+            len(expiries),
+            reason_str,
+            age_str,
+        )
+
+    def _one(
+        self, work: _Work, batch: IsolationBatch, expiries: list[tuple[str, float | None]]
+    ) -> str:
         cand = work.cand
         b = cand.burst
         if work.read_failed:
@@ -427,7 +469,7 @@ class IsolationStage:
             data = self._read(work, batch)
             work.data = None  # the snapshot is not needed past its DSP
             if data is None or len(data) == 0:
-                return self._expired(work, batch)
+                return self._expired(work, batch, expiries)
             iso = isolate_samples(
                 b,
                 data,

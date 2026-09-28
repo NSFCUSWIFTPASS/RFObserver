@@ -122,7 +122,17 @@ def _channelize_blocks(
 def _channelize_whole(
     iq: np.ndarray, fs: float, offset_hz: float, up: int, down: int, n_keep: int
 ) -> np.ndarray:
-    """One FFT of the whole burst: for rates that do not block well."""
+    """One FFT of the whole burst: for rates that do not block well.
+
+    n_out is rounded to next_fast_len rather than an exact up/down multiple,
+    so the actual output rate is about 12-25 ppm off target_rate_hz depending
+    on burst length; harmless for rtl_433's decoders.
+
+    Working-set note: the RAM guard's _ISOLATION_WORKING_SET_FACTOR (3, in
+    streaming.py) was measured on the block path above (_channelize_blocks,
+    ~1.4 copies); this whole-burst fallback holds the full FFT/IFFT arrays at
+    once and measured about 2.3 copies instead.
+    """
     n_in = sfft.next_fast_len(len(iq))
     n_out = -(-n_in * up // down)  # >= n_keep
     buf = np.zeros(n_in, dtype=np.complex64)

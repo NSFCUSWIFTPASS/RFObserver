@@ -401,6 +401,13 @@ class StreamingProcessor:
         # fire site (receiver thread or a web worker) snapshots it.
         self._stream_gaps_lock = threading.Lock()
 
+        # Whether isolation is on for this run: a snapshot of the switches,
+        # re-taken at run() and cleared if isolation cannot run (RAM guard
+        # trip mid-run, build failure). The ring is sized from it, so flipping
+        # the switches mid-run changes nothing until the next start.
+        self._isolation_on = self._isolation_wanted()
+        self._isolation_disabled_reason: str | None = None
+
         # Compute chunk sizing from current settings
         self._recompute_chunk_params()
 
@@ -588,6 +595,20 @@ class StreamingProcessor:
         s = self._settings
         return bool(s.ISOLATION_ENABLED or s.ATTRIBUTION_ENABLED)
 
+    def _halt_isolation(self) -> None:
+        """A running stage whose ring no longer fits (a mid-run reconfigure):
+        stop it (on the calling thread; it joins the worker) and keep it off
+        for the rest of the run. Its counters stay visible in the status."""
+        stage = getattr(self, "_isolation", None)
+        if stage is None:
+            return
+        self._isolation_on = False
+        self._lead_limit = None
+        try:
+            stage.stop()
+        except Exception:
+            logger.exception("Isolation stage stop failed")
+
     def _recompute_chunk_params(self) -> None:
         """(Re)compute chunk sizing, buffer pool, and pre-trigger buffer from settings."""
         s = self._settings
@@ -626,9 +647,9 @@ class StreamingProcessor:
         # the stage's working set for one burst of ISOLATION_MAX_BURST_SEC
         # (the ring copy, complex64 IQ, mixed IQ and the resampler's buffers;
         # _ISOLATION_WORKING_SET_FACTOR complex64 copies bounds them).
-        self._isolation_disabled_reason: str | None = None
         ring_sec = float(s.TRIGGER_PRE_SEC)
-        if self._isolation_wanted():
+        if self._isolation_on:
+            self._isolation_disabled_reason = None
             want = max(ring_sec, float(s.ISOLATION_LOOKBACK_SEC))
             ring_bytes = int(want * s.BANDWIDTH) * 4
             max_burst_samples = int(float(s.ISOLATION_MAX_BURST_SEC) * s.BANDWIDTH)
@@ -641,6 +662,7 @@ class StreamingProcessor:
                     f"RAM ({avail / 1e6:.0f} MB); isolation disabled"
                 )
                 logger.error(self._isolation_disabled_reason)
+                self._halt_isolation()
             else:
                 ring_sec = want
         self._ring_sec = ring_sec
@@ -681,6 +703,11 @@ class StreamingProcessor:
         self._loop = asyncio.get_running_loop()
         if self._beacon is not None:
             self._beacon.mark()
+        # Snapshot the isolation switches for this run (see __init__).
+        want = self._isolation_wanted()
+        if want != self._isolation_on:
+            self._isolation_on = want
+            self._recompute_chunk_params()
 
         recv_thread = threading.Thread(target=self._receiver_loop, name="recv", daemon=True)
         dispatch_thread = threading.Thread(target=self._dispatch_loop, name="dispatch", daemon=True)
@@ -742,7 +769,11 @@ class StreamingProcessor:
 
     def _start_isolation(self) -> None:
         """Build and start the isolation stage (and rtl_433 worker) if enabled."""
-        if not self._isolation_wanted() or self._isolation_disabled_reason is not None:
+        if not self._isolation_on:
+            return
+        if self._isolation_disabled_reason is not None:
+            # The RAM guard refused it: off for this run.
+            self._isolation_on = False
             return
         from rfobserver.pipeline.isolation import build_isolation
 
@@ -766,10 +797,13 @@ class StreamingProcessor:
                 replay_source=replay_source,
                 on_label=self._add_label,
             )
-        except Exception:
-            # Isolation is an add-on: the pipeline runs without it.
+        except Exception as exc:
+            # Isolation is an add-on: the pipeline runs without it. Say why in
+            # the health block and the config card.
             logger.exception("Burst isolation could not start; continuing without it")
             self._isolation = self._attrib_worker = None
+            self._isolation_on = False
+            self._isolation_disabled_reason = f"isolation could not start: {exc}"
             return
         if self._isolation is not None:
             self._isolation.start()
@@ -898,7 +932,7 @@ class StreamingProcessor:
 
     def isolation_status(self) -> dict[str, Any]:
         return {
-            "enabled": self._isolation is not None,
+            "enabled": self._isolation is not None and self._isolation_disabled_reason is None,
             "attribution": self._attrib_worker is not None,
             "rtl433": self._rtl_status,
             "ring_sec": self._ring_sec,
@@ -2562,7 +2596,7 @@ class StreamingProcessor:
                     if last_det is not None and last_det.noise_floor_per_bin is not None:
                         self._noise_floor_per_bin = last_det.noise_floor_per_bin.tolist()
 
-                stage = self._isolation
+                stage = self._isolation if self._isolation_on else None
                 if completed_bursts and stage is not None:
                     self._submit_isolation(rolling_detector, psd_grid, completed_bursts)
                     # Lossless: the stage's backlog counts toward the lead, so

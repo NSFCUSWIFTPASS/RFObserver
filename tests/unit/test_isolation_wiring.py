@@ -128,3 +128,75 @@ def test_status_counts_include_attribution_queue_drops(tmp_path):
     st = proc.isolation_status()
     assert st["enabled"] and st["attribution"]
     assert st["counts"] == {"isolated": 3, "attr_dropped": 2}
+
+
+# -- M-1: the switches take effect at the next start, not mid-run --
+
+
+def test_turning_isolation_off_mid_run_keeps_the_ring_until_the_next_start(tmp_path):
+    proc = _proc(
+        tmp_path, TRIGGER_PRE_SEC=0.001, ISOLATION_ENABLED=True, ISOLATION_LOOKBACK_SEC=0.01
+    )
+    assert proc._pre_trigger_buf.capacity == 10_000
+    object.__setattr__(proc._settings, "ISOLATION_ENABLED", False)
+    proc._recompute_chunk_params()  # what a mid-run reconfigure does
+    assert proc._pre_trigger_buf.capacity == 10_000
+
+
+def test_turning_isolation_on_mid_run_does_not_grow_the_ring(tmp_path):
+    proc = _proc(tmp_path, TRIGGER_PRE_SEC=0.001, ISOLATION_LOOKBACK_SEC=0.01)
+    object.__setattr__(proc._settings, "ISOLATION_ENABLED", True)
+    proc._recompute_chunk_params()
+    assert proc._pre_trigger_buf.capacity == 1000
+    assert proc._isolation_disabled_reason is None
+
+
+class _Stage:
+    def __init__(self):
+        from rfobserver.pipeline.isolation import IsolationStats
+
+        self.stats = IsolationStats()
+        self.stats.count("isolated", 2)
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+
+
+def test_a_mid_run_ram_guard_trip_stops_the_stage(tmp_path, monkeypatch):
+    proc = _proc(
+        tmp_path, TRIGGER_PRE_SEC=0.001, ISOLATION_ENABLED=True, ISOLATION_LOOKBACK_SEC=0.01
+    )
+    stage = _Stage()
+    proc._isolation = stage
+    monkeypatch.setattr("rfobserver.pipeline.streaming._mem_available_bytes", lambda: 100_000)
+    proc._recompute_chunk_params()  # e.g. a reconfigure to a wider band
+    st = proc.isolation_status()
+    assert stage.stopped
+    assert st["enabled"] is False and "RAM" in st["disabled_reason"]
+    assert st["counts"] == {"isolated": 2}  # counts are kept for health
+    assert proc._pre_trigger_buf.capacity == 1000
+    # A later reconfigure that would fit again does not revive it mid-run.
+    monkeypatch.setattr("rfobserver.pipeline.streaming._mem_available_bytes", lambda: None)
+    proc._recompute_chunk_params()
+    assert proc._pre_trigger_buf.capacity == 1000
+    assert proc.isolation_status()["disabled_reason"] is not None
+
+
+# -- M-7: a build failure is visible --
+
+
+async def test_a_build_failure_sets_a_readable_disabled_reason(tmp_path, monkeypatch):
+    import asyncio
+
+    def boom(*a, **k):
+        raise PermissionError("bursts/ is not writable")
+
+    monkeypatch.setattr("rfobserver.pipeline.isolation.build_isolation", boom)
+    proc = _proc(tmp_path, ISOLATION_ENABLED=True, ISOLATION_LOOKBACK_SEC=0.01)
+    proc._loop = asyncio.get_running_loop()
+    proc._start_isolation()
+    st = proc.isolation_status()
+    assert st["enabled"] is False
+    assert "could not start" in st["disabled_reason"]
+    assert "not writable" in st["disabled_reason"]

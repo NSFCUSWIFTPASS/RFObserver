@@ -43,7 +43,68 @@ async def test_db_sink_retries_once_when_the_row_is_not_there_yet():
     db = _DB(rows_first=0)
     sink = db_sink(db, retry_delay_sec=0.01)
     await sink(AttributionResult(_item(), "SilverSpring-Mesh", 383, "{}", "decoded"))
+    await asyncio.sleep(0.1)  # the retry runs as its own task
     assert len(db.calls) == 2 and db.calls[0]["burst_id"] == "b1"
+
+
+async def test_db_sink_retry_does_not_block_the_next_result():
+    db = _DB(rows_first=0)
+    sink = db_sink(db, retry_delay_sec=0.3)
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    await sink(AttributionResult(_item(), "SilverSpring-Mesh", 383, "{}", "decoded"))
+    assert loop.time() - t0 < 0.1  # returned without sitting out the retry delay
+    assert len(db.calls) == 1
+    await asyncio.sleep(0.5)
+    assert len(db.calls) == 2
+
+
+async def test_db_sink_close_lets_a_pending_retry_finish():
+    db = _DB(rows_first=0)
+    sink = db_sink(db, retry_delay_sec=0.2)
+    await sink(AttributionResult(_item(), None, None, "{}", "not_decoded"))
+    assert len(sink.pending) == 1 and len(db.calls) == 1
+    await sink.aclose()
+    assert not sink.pending and len(db.calls) == 2  # the retry landed
+
+
+async def test_db_sink_close_cancels_a_retry_that_hangs():
+    class _HangingDB(_DB):
+        async def update_detection_attribution(self, **kw):
+            if self.calls:
+                await asyncio.Event().wait()  # the retry never returns
+            return await super().update_detection_attribution(**kw)
+
+    db = _HangingDB(rows_first=0)
+    sink = db_sink(db, retry_delay_sec=0.05)
+    await sink(AttributionResult(_item(), None, None, "{}", "not_decoded"))
+    retry = next(iter(sink.pending))
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    await sink.aclose()
+    assert loop.time() - t0 < 2.0  # bounded: one delay plus a second
+    assert retry.cancelled() and not sink.pending
+
+
+async def test_worker_stop_settles_the_db_sinks_pending_retries(monkeypatch):
+    monkeypatch.setattr(attr, "decode_cs16", lambda *a, **k: [])
+    db = _DB(rows_first=0)
+    sink = db_sink(db, retry_delay_sec=0.2)
+    q = StrongestQueue(4)
+    w = AttributionWorker(db, "/bin/true", queue=q, sinks=[sink])
+    q.put_nowait(_item())
+    task = asyncio.create_task(w.run())
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if sink.pending:
+            break
+    retry = next(iter(sink.pending))
+    w.stop()
+    task.cancel()  # as _stop_isolation does
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert retry.done() and not sink.pending
+    assert len(db.calls) == 2
 
 
 async def test_db_sink_no_retry_when_updated():
@@ -120,3 +181,33 @@ async def test_update_detection_attribution_returns_rowcount(tmp_path):
         assert n == 0
     finally:
         await db.close()
+
+
+async def test_a_decode_timeout_is_not_decoded_and_the_pass_timeout_is_5s(monkeypatch):
+    import subprocess
+
+    seen = []
+
+    def slow(cmd, **kw):
+        seen.append(kw["timeout"])
+        raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+
+    monkeypatch.setattr(attr.subprocess, "run", slow)
+    assert attr.decode_cs16("/bin/true", b"\0\0" * 8, 1_600_000, [["-R", "383"], []]) == []
+    assert seen == [5.0, 5.0]  # every pass, 5 s each
+
+    got, outcomes = [], []
+
+    async def sink(r):
+        got.append(r)
+
+    q = StrongestQueue(4)
+    w = AttributionWorker(None, "/bin/true", queue=q, sinks=[sink], on_outcome=outcomes.append)
+    q.put_nowait(_item())
+    task = asyncio.create_task(w.run())
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if got:
+            break
+    task.cancel()
+    assert outcomes == ["not_decoded"] and got[0].outcome == "not_decoded"

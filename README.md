@@ -196,8 +196,12 @@ and attribution still get the bursts).
 Isolation reads each burst from the IQ ring after detection finishes, so the
 ring grows to `RFOBS_ISOLATION_LOOKBACK_SEC` (1.5 s) when that is longer than
 the pre-trigger. That costs about 104 MB of RAM per second of lookback at
-26 Msps and 224 MB at 56 Msps. If the ring would take more than a quarter of
-the available RAM, isolation is disabled with an error, and health says why.
+26 Msps and 224 MB at 56 Msps. If the ring plus the working set for one
+`RFOBS_ISOLATION_MAX_BURST_SEC` burst would take more than a quarter of the
+available RAM, isolation is disabled with an error, and health says why.
+Paced UI replay at speed > 1 shortens the effective isolation lookback by that
+factor (1.5 s at 3x holds 0.5 s of real time); offline replay is lossless and
+holds the receiver back until isolation has read each burst.
 
 The two switches take effect the next time the pipeline starts (toggle Sensor
 Active off and on). A lookback change resizes the ring at once, like a

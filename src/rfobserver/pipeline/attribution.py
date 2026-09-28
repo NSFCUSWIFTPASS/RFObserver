@@ -38,7 +38,7 @@ def decode_cs16(
     cs16_bytes: bytes,
     target_rate_hz: int,
     passes: list[list[str]],
-    timeout_sec: float = 30.0,
+    timeout_sec: float = 5.0,
 ) -> list[dict]:
     """Run rtl_433 over the .cs16 blob, one pass at a time, returning the first
     pass that decodes anything. Empty list if nothing decodes."""
@@ -86,24 +86,56 @@ class AttributionResult:
 Sink = Callable[[AttributionResult], Awaitable[None]]
 
 
-def db_sink(database: Any, retry_delay_sec: float = 2.0) -> Sink:
+class DbSink:
     """Merge a result onto its detections row. The row is normally inserted
     within the same drain as the burst was detected; if it is not there yet,
-    retry once after ``retry_delay_sec``."""
+    retry once after ``retry_delay_sec``. The retry runs as its own task so it
+    never holds up the decodes queued behind it; ``aclose`` (called when the
+    worker stops) waits for pending retries, bounded, then cancels the rest."""
 
-    async def sink(r: AttributionResult) -> None:
+    def __init__(self, database: Any, retry_delay_sec: float = 2.0) -> None:
+        self._db = database
+        self._delay = retry_delay_sec
+        # Strong references: the loop keeps only weak ones to tasks.
+        self.pending: set[asyncio.Task[None]] = set()
+
+    async def __call__(self, r: AttributionResult) -> None:
         kw = {
             "burst_id": r.item.burst_id,
             "model": r.model,
             "protocol_id": r.protocol_id,
             "attribution": r.attribution,
         }
-        if await database.update_detection_attribution(**kw) == 0:
-            await asyncio.sleep(retry_delay_sec)
-            if await database.update_detection_attribution(**kw) == 0:
-                logger.debug("attribution: no detection row for burst %s", r.item.burst_id)
+        if await self._db.update_detection_attribution(**kw) == 0:
+            task = asyncio.create_task(self._retry(kw))
+            self.pending.add(task)
+            task.add_done_callback(self.pending.discard)
 
-    return sink
+    async def _retry(self, kw: dict[str, Any]) -> None:
+        await asyncio.sleep(self._delay)
+        try:
+            if await self._db.update_detection_attribution(**kw) == 0:
+                logger.debug("attribution: no detection row for burst %s", kw["burst_id"])
+        except Exception:
+            logger.exception("attribution: retry failed for burst %s", kw["burst_id"])
+
+    async def aclose(self) -> None:
+        """Let pending retries finish (a replay stops right after its last
+        decode, before the rows those retries wait for would be updated), but
+        for no longer than one retry delay plus a second; cancel the rest."""
+        tasks = list(self.pending)
+        if not tasks:
+            return
+        _, late = await asyncio.wait(tasks, timeout=self._delay + 1.0)
+        for t in late:
+            t.cancel()
+        await asyncio.gather(*late, return_exceptions=True)
+        self.pending.clear()
+
+
+def db_sink(database: Any, retry_delay_sec: float = 2.0) -> DbSink:
+    """The live sink: results onto the detections row (see DbSink)."""
+    return DbSink(database, retry_delay_sec)
 
 
 class ReplayFileSink:
@@ -197,6 +229,20 @@ class AttributionWorker:
             self._on_outcome(outcome)
 
     async def run(self) -> None:
+        try:
+            await self._drain()
+        finally:
+            # Runs on cancel too (the normal way the worker stops): a sink's
+            # background work (the DB sink's pending retries) goes with it.
+            for sink in self._sinks:
+                aclose = getattr(sink, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()
+                    except Exception:
+                        logger.exception("attribution sink close failed")
+
+    async def _drain(self) -> None:
         while not self._stop:
             item = await self.queue.get()
             now_iso = datetime.now(timezone.utc).isoformat()

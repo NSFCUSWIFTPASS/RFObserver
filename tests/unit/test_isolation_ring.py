@@ -54,3 +54,32 @@ def test_preroll_reads_only_trigger_pre_sec_from_a_grown_ring(tmp_path):
         assert list(proc._recording_buf[:3]) == [7000, 7001, 7002]
     finally:
         proc.stop_recording()
+
+
+def test_ram_guard_counts_the_isolation_working_set(tmp_path, monkeypatch):
+    # The ring alone (0.01 s at 1 Msps = 40 kB) fits in 25% of 1 MB, but one
+    # 0.5 s burst being channelized (6 * 500k samples * 8 B = 24 MB) does not.
+    monkeypatch.setattr("rfobserver.pipeline.streaming._mem_available_bytes", lambda: 1_000_000)
+    proc = _proc(
+        tmp_path,
+        TRIGGER_PRE_SEC=0.001,
+        ISOLATION_ENABLED=True,
+        ISOLATION_LOOKBACK_SEC=0.01,
+        ISOLATION_MAX_BURST_SEC=0.5,
+    )
+    assert proc._pre_trigger_buf.capacity == 1000
+    assert "working set" in proc._isolation_disabled_reason
+
+
+def test_ram_guard_passes_when_ring_and_working_set_fit(tmp_path, monkeypatch):
+    # 40 kB ring + 6 * 1000 * 8 B working set (0.001 s bursts) = 88 kB < 250 kB.
+    monkeypatch.setattr("rfobserver.pipeline.streaming._mem_available_bytes", lambda: 1_000_000)
+    proc = _proc(
+        tmp_path,
+        TRIGGER_PRE_SEC=0.001,
+        ISOLATION_ENABLED=True,
+        ISOLATION_LOOKBACK_SEC=0.01,
+        ISOLATION_MAX_BURST_SEC=0.001,
+    )
+    assert proc._isolation_disabled_reason is None
+    assert proc._pre_trigger_buf.capacity == 10_000

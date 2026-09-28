@@ -27,13 +27,34 @@ def resample_ratio(sample_rate_hz: int, target_rate_hz: int) -> tuple[int, int]:
     return int(target_rate_hz) // g, int(sample_rate_hz) // g
 
 
+# Samples mixed per block. One block's float64 phase and complex128 exp are
+# about 24 MB, so the mixer's working set no longer scales with burst length
+# (one 0.5 s burst at 26 Msps peaked at 629 MB when mixed in one go).
+MIX_BLOCK_SAMPLES = 1 << 20
+
+
+def mix_to_dc(iq: np.ndarray, sample_rate_hz: float, offset_hz: float) -> np.ndarray:
+    """Multiply by exp(-j 2 pi offset/fs n), block by block, into one complex64
+    array. Each block's phase is computed in float64 from the absolute sample
+    index, so the phase is continuous across blocks."""
+    out = np.empty(len(iq), dtype=np.complex64)
+    w = -2.0 * np.pi * (float(offset_hz) / float(sample_rate_hz))
+    for start in range(0, len(iq), MIX_BLOCK_SAMPLES):
+        stop = min(start + MIX_BLOCK_SAMPLES, len(iq))
+        phase = w * np.arange(start, stop, dtype=np.float64)
+        np.multiply(
+            np.asarray(iq[start:stop], dtype=np.complex64),
+            np.exp(1j * phase).astype(np.complex64),
+            out=out[start:stop],
+        )
+    return out
+
+
 def channelize_to_cs16(
     iq: np.ndarray, sample_rate_hz: float, offset_hz: float, target_rate_hz: int
 ) -> bytes:
     """Shift offset_hz to DC, resample to target_rate_hz, pack as <i2 I/Q."""
-    n = np.arange(len(iq))
-    mixer = np.exp(-2j * np.pi * (offset_hz / sample_rate_hz) * n).astype(np.complex64)
-    shifted = iq.astype(np.complex64) * mixer
+    shifted = mix_to_dc(iq, sample_rate_hz, offset_hz)
     up, down = resample_ratio(int(sample_rate_hz), int(target_rate_hz))
     res = sig.resample_poly(shifted, up, down)
     peak = float(np.max(np.abs(res))) if len(res) else 1.0

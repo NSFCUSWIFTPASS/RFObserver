@@ -341,6 +341,10 @@ def peak_bin_snr(
 
 # How often the isolation counters are logged (only when they changed).
 _ISOLATION_LOG_INTERVAL_SEC = 60.0
+# Complex64 copies of one ISOLATION_MAX_BURST_SEC burst the RAM guard budgets
+# for the isolation stage's working set (processing/channelize.py mixes in
+# blocks, so this no longer grows with float64/complex128 temporaries).
+_ISOLATION_WORKING_SET_FACTOR = 6
 
 
 class StreamingProcessor:
@@ -618,16 +622,22 @@ class StreamingProcessor:
         # lookback isolation reads bursts from after detection completes. A
         # recording still pre-rolls only TRIGGER_PRE_SEC (read_tail in
         # _begin_recording). If the grown ring would not fit, isolation is
-        # disabled rather than risking OOM on the Jetson.
+        # disabled rather than risking OOM on the Jetson. The guard also counts
+        # the stage's working set for one burst of ISOLATION_MAX_BURST_SEC
+        # (the ring copy, complex64 IQ, mixed IQ and the resampler's buffers;
+        # _ISOLATION_WORKING_SET_FACTOR complex64 copies bounds them).
         self._isolation_disabled_reason: str | None = None
         ring_sec = float(s.TRIGGER_PRE_SEC)
         if self._isolation_wanted():
             want = max(ring_sec, float(s.ISOLATION_LOOKBACK_SEC))
             ring_bytes = int(want * s.BANDWIDTH) * 4
+            max_burst_samples = int(float(s.ISOLATION_MAX_BURST_SEC) * s.BANDWIDTH)
+            work_bytes = _ISOLATION_WORKING_SET_FACTOR * max_burst_samples * 8
             avail = _mem_available_bytes()
-            if avail is not None and ring_bytes > 0.25 * avail:
+            if avail is not None and ring_bytes + work_bytes > 0.25 * avail:
                 self._isolation_disabled_reason = (
-                    f"isolation ring of {ring_bytes / 1e6:.0f} MB exceeds 25% of available "
+                    f"isolation ring of {ring_bytes / 1e6:.0f} MB plus a working set of "
+                    f"{work_bytes / 1e6:.0f} MB exceeds 25% of available "
                     f"RAM ({avail / 1e6:.0f} MB); isolation disabled"
                 )
                 logger.error(self._isolation_disabled_reason)

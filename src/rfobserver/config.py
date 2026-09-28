@@ -196,12 +196,27 @@ class AppSettings(BaseSettings):
     METRICS_ENABLED: bool = False
     METRICS_PORT: int = 9090
 
-    # rtl_433 per-burst attribution (off by default)
+    # Burst isolation: cut each picked burst out of the wideband IQ (shift its
+    # peak to DC and decimate), save it as SigMF under STORAGE_PATH/bursts/ and
+    # offer it to add-on modules. Off by default.
+    ISOLATION_ENABLED: bool = False
+    # rtl_433 attribution of isolated bursts (model / protocol onto the
+    # detection). Turning it on forces isolation on. Off by default.
     ATTRIBUTION_ENABLED: bool = False
     ATTRIBUTION_RTL433_PATH: str = ""  # "" -> auto-discover via find_rtl433
-    ATTRIBUTION_SNR_DB: float = 13.0  # skip bursts below this many dB over noise
-    ATTRIBUTION_MAX_PER_CHUNK: int = 40  # top-N strongest bursts per chunk
-    ATTRIBUTION_QUEUE_MAX: int = 64
+    # While isolation is on, the IQ ring keeps at least this many seconds so a
+    # burst's samples are still there when detection completes.
+    ISOLATION_LOOKBACK_SEC: float = 1.5
+    # Longer bursts are isolated only up to this length.
+    ISOLATION_MAX_BURST_SEC: float = 0.5
+    # Gate: dB over the noise floor at the burst's peak bin, and the most bursts
+    # isolated per second (strongest first).
+    ISOLATION_SNR_DB: float = 13.0
+    ISOLATION_MAX_PER_SEC: int = 20
+    # Bounded queues into the isolation worker and the rtl_433 worker.
+    ISOLATION_QUEUE_MAX: int = 64
+    # Cap on saved isolated-burst files (oldest deleted first).
+    BURST_ARCHIVE_MAX_GB: float = 2.0
 
     # Pipeline liveness watchdog (thread-based; restarts a stalled pipeline).
     # Off by default; when enabled, a daemon thread restarts the pipeline (or,

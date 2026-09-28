@@ -527,6 +527,10 @@ class StreamingProcessor:
         # last-seen generation and reconfigures when it changes.
         self._config_generation = 0
 
+    def _isolation_wanted(self) -> bool:
+        s = self._settings
+        return bool(s.ISOLATION_ENABLED or s.ATTRIBUTION_ENABLED)
+
     def _recompute_chunk_params(self) -> None:
         """(Re)compute chunk sizing, buffer pool, and pre-trigger buffer from settings."""
         s = self._settings
@@ -557,11 +561,32 @@ class StreamingProcessor:
             new_pool.put_nowait(np.zeros(self._chunk_samples, dtype=np.int32))
         self._buf_pool = new_pool
 
+        # The ring is the pre-trigger buffer and, when isolation is on, also the
+        # lookback isolation reads bursts from after detection completes. A
+        # recording still pre-rolls only TRIGGER_PRE_SEC (read_tail in
+        # _begin_recording). If the grown ring would not fit, isolation is
+        # disabled rather than risking OOM on the Jetson.
+        self._isolation_disabled_reason: str | None = None
+        ring_sec = float(s.TRIGGER_PRE_SEC)
+        if self._isolation_wanted():
+            want = max(ring_sec, float(s.ISOLATION_LOOKBACK_SEC))
+            ring_bytes = int(want * s.BANDWIDTH) * 4
+            avail = _mem_available_bytes()
+            if avail is not None and ring_bytes > 0.25 * avail:
+                self._isolation_disabled_reason = (
+                    f"isolation ring of {ring_bytes / 1e6:.0f} MB exceeds 25% of available "
+                    f"RAM ({avail / 1e6:.0f} MB); isolation disabled"
+                )
+                logger.error(self._isolation_disabled_reason)
+            else:
+                ring_sec = want
+        self._ring_sec = ring_sec
+        pre_trigger_samples = int(ring_sec * s.BANDWIDTH)
+
         # Pre-trigger circular buffer (int32 = SC16). Its total_written is the
         # stream position; a new ring restarts positions at 0, so the gap log
         # logged against them restarts with it. Swapped together under the lock
         # so a recording start never pairs one ring with the other's gaps.
-        pre_trigger_samples = int(s.TRIGGER_PRE_SEC * s.BANDWIDTH)
         with self._stream_gaps_lock:
             self._pre_trigger_buf = CircularBuffer(max(1, pre_trigger_samples), dtype=np.int32)
             self._stream_gaps: collections.deque[tuple[int, int]] = collections.deque(
@@ -581,7 +606,7 @@ class StreamingProcessor:
             self._chunk_duration * 1000,
             self._num_proc_workers,
             self._fft_workers,
-            s.TRIGGER_PRE_SEC,
+            ring_sec,
             pre_trigger_samples,
         )
 
@@ -1259,7 +1284,9 @@ class StreamingProcessor:
 
         s = self._settings
         ring = self._pre_trigger_buf
-        pre_data, pre_end = ring.read_with_position()
+        # The ring may be longer than TRIGGER_PRE_SEC (isolation lookback); the
+        # pre-roll is only the newest TRIGGER_PRE_SEC of it.
+        pre_data, pre_end = ring.read_tail_with_position(int(s.TRIGGER_PRE_SEC * s.BANDWIDTH))
         t_read = time.time()
         pre_start = pre_end - len(pre_data)
         # Take only the buffered grid rows that actually cover this recording's

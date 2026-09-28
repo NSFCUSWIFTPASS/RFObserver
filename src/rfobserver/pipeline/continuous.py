@@ -133,7 +133,7 @@ class ContinuousProcessor:
             if rtl is None:
                 logger.warning("ATTRIBUTION_ENABLED but rtl_433 not found; attribution disabled")
             else:
-                q = StrongestQueue(maxsize=settings.ATTRIBUTION_QUEUE_MAX)
+                q = StrongestQueue(maxsize=settings.ISOLATION_QUEUE_MAX)
                 self._attrib_worker = AttributionWorker(database, rtl, queue=q)
 
         logger.info(
@@ -268,14 +268,14 @@ class ContinuousProcessor:
 
         # rtl_433 attribution: gate (cheap, stays on the loop), then channelize
         # off-loop (CPU-bound: full-chunk IQ conversion + per-burst mixer/
-        # resample, up to ATTRIBUTION_MAX_PER_CHUNK times), then enqueue
+        # resample, up to ISOLATION_MAX_PER_SEC times), then enqueue
         # (never blocks) back on the loop.
         if self._attrib_worker is not None and pr.bursts:
             picked = select_bursts_for_attribution(
                 pr.bursts,
                 pr.noise_floor_db,
-                self._settings.ATTRIBUTION_SNR_DB,
-                self._settings.ATTRIBUTION_MAX_PER_CHUNK,
+                self._settings.ISOLATION_SNR_DB,
+                self._settings.ISOLATION_MAX_PER_SEC,
             )
             if picked:
                 items = await asyncio.to_thread(

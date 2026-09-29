@@ -239,6 +239,8 @@ async def test_normal_mode_tone_check_inserts(tmp_path):
     await proc._run_tone_check(
         [-90.0, -80.0, -70.0, -80.0, -90.0], _tone_check_result(), datetime.now(timezone.utc)
     )
+    # The insert runs on the processor's background DB writer.
+    await proc._db_writer.drain(5.0)
 
     db.insert_tone_check.assert_called_once()
 

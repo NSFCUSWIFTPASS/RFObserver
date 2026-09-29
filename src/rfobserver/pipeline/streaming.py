@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import functools
 import logging
 import math
 import os
@@ -56,7 +57,7 @@ from rfobserver.storage.governor import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Awaitable, Callable, Iterable, Sequence
     from pathlib import Path
 
     from rfobserver.capture.receiver import IReceiver
@@ -344,6 +345,106 @@ class _LoopHandoff:
         _put_nowait_drop_full(self._q, item)
 
 
+# The consumer loop's per-window DB writes (averaged window, tone check) run on
+# one background task. The bound is in writes, about two minutes of windows at
+# DURATION_SEC=0.5 with the tone check on; past it a write is dropped rather
+# than blocking the loop. The drain bound keeps a stop inside the watchdog's
+# default 5 s stop timeout (WATCHDOG_STOP_TIMEOUT_SEC).
+_DB_WRITE_QUEUE_MAX = 256
+_DB_WRITE_DRAIN_SEC = 3.0
+_DB_WRITE_DROP_LOG_SEC = 60.0
+
+
+class _OrderedDbWriter:
+    """Runs DB writes on one background task, in submission order.
+
+    The consumer loop used to await its per-window inserts inline. aiosqlite
+    runs every statement on the writer connection through one thread, so an
+    insert that waits behind other statements (the minute rollup, a slow disk)
+    stalled the averaging loop: results were dropped at the bounded result
+    queue and windows averaged fewer chunks. ``submit`` never waits: when the
+    queue is full the write is dropped, counted in ``dropped``, and a WARNING
+    is logged at most once per ``_DB_WRITE_DROP_LOG_SEC``.
+
+    Each job handles and logs its own errors (disk-full reporting included);
+    the worker also logs anything that escapes, per item, and carries on.
+    """
+
+    def __init__(self, maxsize: int = _DB_WRITE_QUEUE_MAX) -> None:
+        self._q: asyncio.Queue[Callable[[], Awaitable[None]]] = asyncio.Queue(maxsize=maxsize)
+        self._task: asyncio.Task[None] | None = None
+        self._busy = False
+        self.dropped = 0
+        self._warned_at: float | None = None
+        self._dropped_at_warn = 0
+
+    @property
+    def idle(self) -> bool:
+        """No worker task is running."""
+        return self._task is None or self._task.done()
+
+    def submit(self, job: Callable[[], Awaitable[None]]) -> bool:
+        """Queue ``job`` (called with no arguments on the worker). Must run on
+        the event loop. Returns False when it was dropped (queue full)."""
+        try:
+            self._q.put_nowait(job)
+        except asyncio.QueueFull:
+            self.dropped += 1
+            now = time.monotonic()
+            if self._warned_at is None or now - self._warned_at >= _DB_WRITE_DROP_LOG_SEC:
+                logger.warning(
+                    "DB write queue full (%d pending): dropped %d write(s) since the last"
+                    " warning, %d in total",
+                    self._q.qsize(),
+                    self.dropped - self._dropped_at_warn,
+                    self.dropped,
+                )
+                self._warned_at = now
+                self._dropped_at_warn = self.dropped
+            return False
+        if self.idle:
+            self._task = asyncio.get_running_loop().create_task(self._run(), name="db-writer")
+        return True
+
+    async def _run(self) -> None:
+        while True:
+            job = await self._q.get()
+            self._busy = True
+            try:
+                await job()
+            except Exception:
+                logger.exception("Background DB write failed")
+            finally:
+                self._busy = False
+                self._q.task_done()
+
+    async def drain(self, timeout: float) -> int:
+        """Wait up to ``timeout`` s for the queued writes, then stop the
+        worker. Returns how many writes were discarded (0 if all finished)."""
+        discarded = 0
+        try:
+            if not self.idle:
+                try:
+                    await asyncio.wait_for(self._q.join(), timeout=timeout)
+                except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
+                    discarded = self._q.qsize() + (1 if self._busy else 0)
+                    logger.warning(
+                        "DB writer did not drain within %.1f s: discarded %d write(s)",
+                        timeout,
+                        discarded,
+                    )
+        finally:
+            task, self._task = self._task, None
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            while not self._q.empty():
+                self._q.get_nowait()
+                self._q.task_done()
+        return discarded
+
+
 def _signal_stop(q: queue.Queue[Any]) -> None:
     """Enqueue the ``_STOP`` sentinel without ever blocking.
 
@@ -496,6 +597,8 @@ class StreamingProcessor:
         self._dropped_chunks = 0
         self._result_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=8)
         self._result_handoff = _LoopHandoff(self._result_queue)
+        # Per-window DB writes, off the consumer loop (see _OrderedDbWriter).
+        self._db_writer = _OrderedDbWriter()
         self._loop: asyncio.AbstractEventLoop | None = None
 
         # Recording state machine: "idle" | "armed" | "recording" | "finalizing".
@@ -812,6 +915,12 @@ class StreamingProcessor:
             await self._result_consumer_loop()
         finally:
             self._running = False
+            # The consumer loop has queued its last windows: write them now,
+            # bounded, before the steps below that can block the loop.
+            try:
+                await self._db_writer.drain(_DB_WRITE_DRAIN_SEC)
+            except Exception:
+                logger.exception("DB write drain failed during shutdown")
             # Stop any active recording, waiting for the finalize job so the
             # capture files are properly closed before threads exit.
             if self._recording_state == "recording":
@@ -845,6 +954,12 @@ class StreamingProcessor:
 
     def stop(self) -> None:
         self._running = False
+
+    @property
+    def db_writes_dropped(self) -> int:
+        """Per-window DB writes dropped because the background writer's queue
+        was full (see _OrderedDbWriter)."""
+        return self._db_writer.dropped
 
     # -- Burst isolation / attribution --
 
@@ -2862,8 +2977,11 @@ class StreamingProcessor:
                 # so it is non-None whenever accum_powers is non-empty.
                 assert accum_moments is not None
                 interval_stats = finalize_moments(accum_moments)
-                # Close before the awaited work below: results that arrive
-                # during it belong to the next window, which starts now.
+                # Close before the per-window work below: results that arrive
+                # during it belong to the next window, which starts now. That
+                # work only queues: the DB writes go to _OrderedDbWriter, ZMS
+                # and NATS to tasks, and the broadcast is a put_nowait per
+                # client, so a slow insert no longer delays the next window.
                 win_start, win_dur = window_clock.close()
 
                 if self._settings.TONE_CHECK_ENABLED:
@@ -3016,8 +3134,9 @@ class StreamingProcessor:
     async def _run_tone_check(
         self, avg_powers: list[float], result: _StreamResult, window_start: datetime
     ) -> None:
-        """Evaluate the tone check on the averaged PSD and persist + log it,
-        stamped with the averaged window's start."""
+        """Evaluate the tone check on the averaged PSD and log it; its row,
+        stamped with the averaged window's start, is queued on the background
+        DB writer."""
         if self._replay_mode:
             return
         from rfobserver.processing.tone_check import evaluate_tone_check
@@ -3028,19 +3147,26 @@ class StreamingProcessor:
             tone_freq_hz=self._settings.TONE_CHECK_FREQ_HZ,
             threshold_db=self._settings.TONE_CHECK_THRESHOLD_DB,
         )
-        try:
-            await self._db.insert_tone_check(
-                timestamp=window_start,
-                tone_freq_hz=tc["tone_freq_hz"],
-                sdr_center_freq_hz=result.center_freq_hz,
-                in_band=tc["in_band"],
-                tone_power_db=tc["tone_power_db"],
-                noise_floor_db=tc["noise_floor_db"],
-                snr_db=tc["snr_db"],
-                detected=tc["detected"],
-            )
-        except Exception:
-            logger.exception("tone-check insert failed")
+        row = dict(
+            timestamp=window_start,
+            tone_freq_hz=tc["tone_freq_hz"],
+            sdr_center_freq_hz=result.center_freq_hz,
+            in_band=tc["in_band"],
+            tone_power_db=tc["tone_power_db"],
+            noise_floor_db=tc["noise_floor_db"],
+            snr_db=tc["snr_db"],
+            detected=tc["detected"],
+        )
+
+        async def insert() -> None:
+            try:
+                await self._db.insert_tone_check(**row)
+            except Exception:
+                logger.exception("tone-check insert failed")
+
+        # The evaluation above is cheap (one pass over the bins); only the
+        # insert goes to the background writer.
+        self._db_writer.submit(insert)
         state = "DETECTED" if tc["detected"] else ("out-of-band" if not tc["in_band"] else "absent")
         snr = tc["snr_db"]
         logger.info(
@@ -3107,17 +3233,26 @@ class StreamingProcessor:
         start_time: datetime,
         duration_sec: float,
     ) -> None:
-        """Build the per-window envelope once, fan out to ZMS + NATS.
+        """Queue the window's DB insert, build the envelope once, fan out to
+        ZMS + NATS.
 
-        Both fanouts run as background tasks so the consumer loop returns
-        immediately. ZMS POSTs and NATS publishes can take 10-25 ms each;
-        awaiting them inline previously blocked the next high-res FFT
+        Nothing here is awaited, so the consumer loop returns immediately. The
+        insert goes to the ordered background writer (_OrderedDbWriter). ZMS
+        POSTs and NATS publishes can take 10-25 ms each and run as background
+        tasks; awaiting them inline previously blocked the next high-res FFT
         broadcast every DURATION_SEC, which the user saw as a stutter.
         """
         if self._replay_mode:
             return
-        await self._persist_avg_window(
-            avg_powers, result, iq_stats, start_time=start_time, duration_sec=duration_sec
+        self._db_writer.submit(
+            functools.partial(
+                self._persist_avg_window,
+                avg_powers,
+                result,
+                iq_stats,
+                start_time=start_time,
+                duration_sec=duration_sec,
+            )
         )
         if self._zms_monitor is None and self._nats_producer is None:
             return

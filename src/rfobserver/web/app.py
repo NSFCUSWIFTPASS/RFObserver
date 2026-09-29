@@ -115,6 +115,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             # supervisor rebuilds the receiver.
             has_loss = proc is not None and hasattr(proc, "receive_loss")
             loss = proc.receive_loss() if has_loss else None
+            # Averaged-window / tone-check writes dropped at the processor's
+            # background DB writer queue (full).
+            db_drops = getattr(proc, "db_writes_dropped", None) if proc is not None else None
             body["pipeline"] = {
                 "active": sup.active,
                 "gave_up": sup.gave_up,
@@ -125,6 +128,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 else None,
                 "overflow_events": loss["overflow_events"] if loss else None,
                 "overflow_lost_samples": loss["overflow_lost_samples"] if loss else None,
+                "db_writes_dropped": db_drops if isinstance(db_drops, int) else None,
             }
             if sup.gave_up:
                 body["status"] = "degraded"

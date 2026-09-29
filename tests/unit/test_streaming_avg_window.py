@@ -84,6 +84,7 @@ async def test_publish_persists_even_with_no_sinks(tmp_path):
     await proc._publish_processed(
         [-80.0, -70.0, -60.0, -50.0], _result(), _stats(), start_time=_T0, duration_sec=0.5
     )
+    await _drain(proc)
     db.insert_avg_window.assert_called_once()
 
 
@@ -165,10 +166,18 @@ def _stream_result():
     return r
 
 
+async def _drain(proc) -> None:
+    """Wait for the processor's background DB writes (a no-op before they existed)."""
+    writer = getattr(proc, "_db_writer", None)
+    if writer is not None:
+        await writer.drain(5.0)
+
+
 async def _run_loop(proc, clock: _FakeClock, arrivals: list[float]) -> None:
     proc._result_queue = _ScheduledQueue(clock, arrivals, _stream_result)
     proc._running = True
     await proc._result_consumer_loop()
+    await _drain(proc)
 
 
 @pytest.mark.asyncio
@@ -180,11 +189,13 @@ async def test_stored_windows_have_real_start_and_duration_and_tile(tmp_path, mo
 
     stored: list[dict] = []
 
-    async def slow_insert(**kw):
+    async def insert(**kw):
+        # The insert runs on the background writer, concurrently with the loop,
+        # so its cost does not move the loop's clock (see
+        # test_slow_db_insert_does_not_bend_windows_or_drop_results).
         stored.append(kw)
-        clock.t += 0.25  # the awaited DB insert takes time
 
-    db.insert_avg_window = slow_insert
+    db.insert_avg_window = insert
     # One result every 0.1 s, the first at t=0.1.
     await _run_loop(proc, clock, [0.1 * (i + 1) for i in range(40)])
 
@@ -230,6 +241,7 @@ async def test_flushed_window_ends_at_its_last_result(tmp_path, monkeypatch):
     proc._result_queue = _IdleThenStop(clock, [0.1, 0.2, 0.3], _stream_result)
     proc._running = True
     await proc._result_consumer_loop()
+    await _drain(proc)
 
     assert len(stored) == 1
     assert stored[0]["start_time"] == _BASE + timedelta(seconds=0.1)
@@ -248,13 +260,6 @@ async def test_detection_joins_the_window_whose_real_span_contains_it(tmp_path, 
     real_db = SensorDatabase(str(tmp_path / "join.db"))
     await real_db.connect()
     try:
-        orig_insert = real_db.insert_avg_window
-
-        async def slow_insert(**kw):
-            await orig_insert(**kw)
-            clock.t += 0.25
-
-        real_db.insert_avg_window = slow_insert  # type: ignore[method-assign]
         proc._db = real_db
         await _run_loop(proc, clock, [0.1 * (i + 1) for i in range(20)])
 
@@ -330,6 +335,7 @@ async def _collect(tmp_path, monkeypatch, queue_cls, arrivals, factory=_stream_r
     proc._result_queue = queue_cls(clock, arrivals, factory)
     proc._running = True
     await proc._result_consumer_loop()
+    await _drain(proc)
     return stored
 
 
@@ -384,3 +390,287 @@ async def test_tone_check_is_stamped_with_the_window_start(tmp_path, monkeypatch
     db.insert_avg_window = insert
     await _run_loop(proc, clock, [0.1 * (i + 1) for i in range(6)])
     assert db.insert_tone_check.call_args.kwargs["timestamp"] == stored[0]["start_time"]
+
+
+# --- per-window DB writes run off the averaging loop (2026-09-29) ---
+#
+# The consumer loop used to await the avg-window insert (and the tone-check
+# insert) inline. aiosqlite runs every statement on the writer connection
+# through one thread, so a slow insert stalled the loop: results piled up in
+# the bounded result queue (8) and were dropped, and each window averaged fewer
+# chunks. The writes now go through one ordered background writer.
+
+_CHUNK = 0.0366  # 2,048,000 samples at 56 Msps, the default chunk
+
+
+class _CappedQueue:
+    """The real result queue's shape: bounded (8), a result arriving while it
+    is full is dropped. Results arrive every chunk. Fake time advances only
+    while the consumer waits in get(), and get() yields once so concurrent
+    tasks (the DB writer) run while it waits."""
+
+    def __init__(self, clock: _FakeClock, arrivals: list[float], cap: int = 8) -> None:
+        self._clock = clock
+        self._pending = list(arrivals)
+        self._buf: list[float] = []
+        self._cap = cap
+        self.taken = 0
+        self.dropped = 0
+
+    def _admit(self) -> None:
+        while self._pending and self._pending[0] <= self._clock.t:
+            a = self._pending.pop(0)
+            if len(self._buf) < self._cap:
+                self._buf.append(a)
+            else:
+                self.dropped += 1
+
+    async def get(self):
+        from rfobserver.pipeline.streaming import _STOP
+
+        await asyncio.sleep(0)
+        self._admit()
+        if not self._buf:
+            if not self._pending:
+                return _STOP
+            nxt = self._pending[0]
+            if nxt - self._clock.t > 0.5:
+                self._clock.t += 0.5
+                raise asyncio.TimeoutError
+            self._clock.t = nxt
+            self._admit()
+        self._buf.pop(0)
+        self.taken += 1
+        return _stream_result()
+
+
+async def _run_with_insert_cost(tmp_path, monkeypatch, cost: float):
+    """Run 60 s of results at one per chunk with DURATION_SEC=1.0 through the
+    consumer loop, where each avg-window insert takes ``cost`` seconds.
+
+    An insert awaited by the consumer task itself blocks the loop, so it moves
+    fake time on by ``cost``. An insert on another task (the background writer)
+    runs concurrently: it finishes once fake time has passed ``cost``."""
+    clock = _FakeClock()
+    _install_fake_clock(monkeypatch, clock)
+    proc, db = _proc(tmp_path, with_sinks=False)
+    proc._settings.DURATION_SEC = 1.0
+    stored: list[dict] = []
+    consumer: asyncio.Task | None = None
+
+    async def insert(**kw):
+        stored.append(kw)
+        if asyncio.current_task() is consumer:
+            clock.t += cost
+            return
+        deadline = clock.t + cost
+        while clock.t < deadline and consumer is not None and not consumer.done():
+            await asyncio.sleep(0)
+
+    db.insert_avg_window = insert
+    q = _CappedQueue(clock, [_CHUNK * (i + 1) for i in range(int(60 / _CHUNK))])
+    proc._result_queue = q
+    proc._running = True
+    consumer = asyncio.create_task(proc._result_consumer_loop())
+    await consumer
+    await _drain(proc)
+    return stored, q
+
+
+@pytest.mark.asyncio
+async def test_slow_db_insert_does_not_bend_windows_or_drop_results(tmp_path, monkeypatch):
+    """The reviewer's scenario: 0.85 s per insert at DURATION_SEC=1.0."""
+    base, base_q = await _run_with_insert_cost(tmp_path, monkeypatch, 0.0)
+    slow, slow_q = await _run_with_insert_cost(tmp_path, monkeypatch, 0.85)
+
+    assert slow_q.dropped == base_q.dropped
+    assert abs(len(slow) - len(base)) <= 1
+    # Every closed window (the last is a flush) lasts DURATION_SEC, plus at
+    # most one chunk: the first result at or past it closes the window.
+    for w in slow[:-1]:
+        assert 1.0 - 1e-9 <= w["duration_sec"] <= 1.0 + _CHUNK + 1e-9
+    # And averages as many chunks as with a free insert.
+    assert slow_q.taken / len(slow) == pytest.approx(base_q.taken / len(base), rel=0.05)
+
+
+@pytest.mark.asyncio
+async def test_background_writes_keep_insertion_order(tmp_path):
+    """Avg-window and tone-check inserts that take varying time still land in
+    the order the windows closed."""
+    import random
+
+    proc, db = _proc(tmp_path, with_sinks=False)
+    proc._settings.TONE_CHECK_ENABLED = True
+    log: list[tuple[str, datetime]] = []
+    rng = random.Random(7)
+
+    async def avg(**kw):
+        await asyncio.sleep(rng.choice([0.0, 0.001, 0.003]))
+        log.append(("avg", kw["start_time"]))
+
+    async def tone(**kw):
+        await asyncio.sleep(rng.choice([0.0, 0.002]))
+        log.append(("tone", kw["timestamp"]))
+
+    db.insert_avg_window = avg
+    db.insert_tone_check = tone
+    expected = []
+    for i in range(20):
+        t = _T0 + timedelta(seconds=i)
+        await proc._run_tone_check([-80.0, -70.0, -60.0, -50.0], _result(), t)
+        await proc._publish_processed(
+            [-80.0, -70.0, -60.0, -50.0], _result(), _stats(), start_time=t, duration_sec=1.0
+        )
+        expected += [("tone", t), ("avg", t)]
+    await _drain(proc)
+    assert log == expected
+
+
+@pytest.mark.asyncio
+async def test_full_write_queue_drops_counts_and_rate_limits_the_warning(
+    tmp_path, monkeypatch, caplog
+):
+    import logging
+
+    from rfobserver.pipeline.streaming import _OrderedDbWriter
+
+    clock = _FakeClock()
+    _install_fake_clock(monkeypatch, clock)
+    proc, db = _proc(tmp_path, with_sinks=False)
+    proc._db_writer = _OrderedDbWriter(maxsize=2)
+    gate = asyncio.Event()
+    written: list[datetime] = []
+
+    async def blocked(**kw):
+        await gate.wait()
+        written.append(kw["start_time"])
+
+    db.insert_avg_window = blocked
+    caplog.set_level(logging.WARNING, logger="rfobserver.pipeline.streaming")
+
+    def warnings() -> int:
+        return sum("DB write queue full" in r.getMessage() for r in caplog.records)
+
+    async def publish(i: int) -> None:
+        # Never blocks, however far behind the writer is.
+        await asyncio.wait_for(
+            proc._publish_processed(
+                [-80.0, -70.0, -60.0, -50.0],
+                _result(),
+                _stats(),
+                start_time=_T0 + timedelta(seconds=i),
+                duration_sec=1.0,
+            ),
+            timeout=0.5,
+        )
+
+    await publish(0)
+    for _ in range(3):
+        await asyncio.sleep(0)  # the writer takes window 0 and blocks on it
+    for i in range(1, 6):  # 1 and 2 queue, 3-5 are dropped
+        await publish(i)
+    assert proc.db_writes_dropped == 3
+    assert warnings() == 1
+    clock.t += 30.0
+    await publish(6)
+    assert proc.db_writes_dropped == 4
+    assert warnings() == 1  # rate-limited
+    clock.t += 31.0
+    await publish(7)
+    assert proc.db_writes_dropped == 5
+    assert warnings() == 2
+
+    gate.set()
+    await _drain(proc)
+    assert written == [_T0, _T0 + timedelta(seconds=1), _T0 + timedelta(seconds=2)]
+
+
+@pytest.mark.asyncio
+async def test_drain_writes_everything_queued(tmp_path):
+    proc, db = _proc(tmp_path, with_sinks=False)
+    written: list[datetime] = []
+
+    async def insert(**kw):
+        await asyncio.sleep(0.005)
+        written.append(kw["start_time"])
+
+    db.insert_avg_window = insert
+    times = [_T0 + timedelta(seconds=i) for i in range(10)]
+    for t in times:
+        await proc._publish_processed(
+            [-80.0, -70.0, -60.0, -50.0], _result(), _stats(), start_time=t, duration_sec=1.0
+        )
+    assert await proc._db_writer.drain(5.0) == 0
+    assert written == times
+
+
+@pytest.mark.asyncio
+async def test_drain_times_out_and_reports_discarded_writes(tmp_path, caplog):
+    import logging
+
+    proc, db = _proc(tmp_path, with_sinks=False)
+
+    async def stuck(**kw):
+        await asyncio.Event().wait()
+
+    db.insert_avg_window = stuck
+    for i in range(3):
+        await proc._publish_processed(
+            [-80.0, -70.0, -60.0, -50.0],
+            _result(),
+            _stats(),
+            start_time=_T0 + timedelta(seconds=i),
+            duration_sec=1.0,
+        )
+    await asyncio.sleep(0)
+    caplog.set_level(logging.WARNING, logger="rfobserver.pipeline.streaming")
+    # One in flight plus two queued.
+    assert await proc._db_writer.drain(0.1) == 3
+    assert any("discarded 3" in r.getMessage() for r in caplog.records)
+    assert proc._db_writer.idle
+
+
+@pytest.mark.asyncio
+async def test_processor_stop_drains_pending_writes(tmp_path, monkeypatch):
+    """run() drains the writer once the consumer loop exits, so the last
+    windows before a stop are stored."""
+    import threading as _real_threading
+
+    from rfobserver.pipeline import streaming
+
+    class _NoThread:
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def join(self, timeout=None) -> None:
+            pass
+
+    class _Threading:
+        Thread = _NoThread
+
+        def __getattr__(self, name):
+            return getattr(_real_threading, name)
+
+    monkeypatch.setattr(streaming, "threading", _Threading())
+    proc, db = _proc(tmp_path, with_sinks=False)
+    written: list[datetime] = []
+
+    async def insert(**kw):
+        await asyncio.sleep(0.01)
+        written.append(kw["start_time"])
+
+    db.insert_avg_window = insert
+    times = [_T0 + timedelta(seconds=i) for i in range(5)]
+
+    async def loop() -> None:
+        for t in times:
+            await proc._publish_processed(
+                [-80.0, -70.0, -60.0, -50.0], _result(), _stats(), start_time=t, duration_sec=1.0
+            )
+
+    proc._result_consumer_loop = loop  # type: ignore[method-assign]
+    await asyncio.wait_for(proc.run(), timeout=10)
+    assert written == times

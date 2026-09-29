@@ -208,6 +208,8 @@ async def test_publish_processed_persists_and_is_queryable(app_with_db):
         start_time=datetime.now(timezone.utc),
         duration_sec=0.5,
     )
+    # The insert runs on the processor's background DB writer.
+    assert await proc._db_writer.drain(5.0) == 0
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         windows = (await c.get("/api/averaged")).json()["windows"]

@@ -41,12 +41,13 @@ _WEB_SHUTDOWN_TIMEOUT_SEC = 5.0
 _WEB_GRACEFUL_SHUTDOWN_SEC = 3  # int: uvicorn types it as int | None
 # iter_rollup_windows chunks each span into execute_fetchall calls on the writer
 # connection, and aiosqlite serialises all operations on that connection through
-# one worker thread. The streaming pipeline awaits insert_avg_window inline on
-# that same connection, feeding a bounded queue that drops (rather than blocks)
-# once the pipeline falls behind, so one oversized rollup statement can stall
-# the writer long enough to lose live data. The span here is only an indirect
-# cap on rows per statement; the explicit chunk= passed to iter_rollup_windows
-# below is what actually bounds it regardless of span or DURATION_SEC.
+# one worker thread. The streaming pipeline's insert_avg_window runs on that
+# same connection, through a bounded background writer queue that drops
+# (rather than blocks) once it falls behind, so one oversized rollup statement
+# can stall the writer long enough to lose averaged windows. The span here is
+# only an indirect cap on rows per statement; the explicit chunk= passed to
+# iter_rollup_windows below is what actually bounds it regardless of span or
+# DURATION_SEC.
 _ROLLUP_SPAN = timedelta(minutes=15)
 # Wall-clock budget per pass, so a cold backfill of a month finishes in minutes
 # without any single pass blocking the loop.

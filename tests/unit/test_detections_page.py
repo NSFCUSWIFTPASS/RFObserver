@@ -387,3 +387,102 @@ async def test_csv_without_db_is_503(settings):
     ) as ac:
         r = await ac.get("/api/detections.csv")
     assert r.status_code == 503
+
+
+# -- Review follow-ups --------------------------------------------------------
+
+
+async def test_full_view_time_column_is_start_time(settings, db):
+    row = _det("s", T0)
+    row["detection_timestamp"] = T0 + timedelta(seconds=9)
+    await db.insert_detection(**row)
+    async with await _client(settings, db) as ac:
+        full = (await ac.get("/api/detections?view=full")).text
+        dash = (await ac.get("/api/detections")).text
+        page = (await ac.get("/detections")).text
+    assert "<td>2026-03-01T12:00:00+00:00</td>" in full
+    assert "12:00:09" not in full
+    # The dashboard view keeps the detection timestamp.
+    assert "<td>2026-03-01T12:00:09+00:00</td>" in dash
+    assert "<th>Start (UTC)</th>" in page
+
+
+async def test_model_filter_uses_partial_index(tmp_path):
+    import sqlite3
+
+    path = str(tmp_path / "plan.db")
+    database = SensorDatabase(path)
+    await database.connect()
+    await database.close()
+    conds, params = SensorDatabase._detection_conditions(model="SilverSpring-Mesh")
+    with sqlite3.connect(path) as conn:
+        for select in ("SELECT * FROM detections", "SELECT duration_ms FROM detections"):
+            plan = conn.execute(
+                f"EXPLAIN QUERY PLAN {select} WHERE {' AND '.join(conds)}", params
+            ).fetchall()
+            assert any("idx_detections_model" in str(step[-1]) for step in plan), plan
+
+
+async def test_explicit_offset_is_converted_to_utc(settings, seeded):
+    # 14:01+02:00 is 12:01 UTC; 14:03+02:00 is 12:03 UTC (exclusive).
+    q = "start=2026-03-01T14:01:00%2B02:00&stop=2026-03-01T14:03:00%2B02:00"
+    async with await _client(settings, seeded) as ac:
+        rows = _parse_csv((await ac.get(f"/api/detections.csv?{q}")).text)
+        frag = (await ac.get(f"/api/detections?view=full&{q}")).text
+    assert {r["burst_id"] for r in rows} == {"b", "c"}
+    assert frag.count("<tr>") == 2
+
+
+@pytest.mark.parametrize("frac", ["5", "5000000", "50"])
+async def test_fractional_seconds_any_length(settings, seeded, frac):
+    # 12:00:59.5 excludes a (12:00:00) and keeps b (12:01:00) onwards.
+    async with await _client(settings, seeded) as ac:
+        r = await ac.get(f"/api/detections.csv?start=2026-03-01T12:00:59.{frac}")
+    assert r.status_code == 200
+    assert {x["burst_id"] for x in _parse_csv(r.text)} == {"b", "c", "d", "e"}
+
+
+@pytest.mark.parametrize("param", ["start", "stop"])
+async def test_bad_dates_are_rejected(settings, seeded, param):
+    async with await _client(settings, seeded) as ac:
+        csv_r = await ac.get(f"/api/detections.csv?{param}=not-a-date")
+        hist_r = await ac.get(f"/api/detections/histogram?{param}=2026-13-45T99:00")
+        frag_r = await ac.get(f"/api/detections?view=full&{param}=garbage")
+    assert csv_r.status_code == 400
+    assert hist_r.status_code == 400
+    assert "Invalid start/stop time" in frag_r.text
+    assert 'colspan="8"' in frag_r.text
+
+
+async def test_csv_marks_truncation_on_mid_stream_error(settings, db, monkeypatch):
+    from rfobserver.web.routes import api
+
+    for i in range(6):
+        await _add(db, f"q{i}", T0 + timedelta(seconds=i))
+    monkeypatch.setattr(api, "CSV_PAGE_SIZE", 2)
+    real = db.query_detections
+    calls = 0
+
+    async def flaky(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("disk I/O error")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(db, "query_detections", flaky)
+    async with await _client(settings, db) as ac:
+        r = await ac.get("/api/detections.csv")
+    lines = r.text.strip().splitlines()
+    assert len(lines) == 4  # header, first page of 2, marker
+    assert lines[-1] == "# export truncated: error"
+
+
+async def test_csv_guard_catches_leading_space_formula(settings, db):
+    await _add(db, "sp", T0, model=" =1+1")
+    await _add(db, "tab", T0 + timedelta(seconds=1), model="\t@x")
+    async with await _client(settings, db) as ac:
+        rows = {r["burst_id"]: r for r in _parse_csv((await ac.get("/api/detections.csv")).text)}
+    assert rows["sp"]["model"] == "' =1+1"
+    assert rows["sp"]["burst_attribution"] == "' =1+1"
+    assert rows["tab"]["model"] == "'\t@x"

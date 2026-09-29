@@ -1501,7 +1501,9 @@ class SensorDatabase:
         elif attributed is False:
             conditions.append("(model IS NULL OR model = '')")
         if model is not None:
-            conditions.append("model = ?")
+            # The redundant terms repeat idx_detections_model's WHERE so the
+            # planner can prove the partial index covers a bound parameter.
+            conditions.append("(model = ? AND model IS NOT NULL AND model != '')")
             params.append(model)
         return conditions, params
 

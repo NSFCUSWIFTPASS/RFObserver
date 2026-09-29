@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import math
+import re
 import struct
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
@@ -844,17 +845,33 @@ def _opt_dt(raw: str | None) -> datetime | None:
         return None
 
 
+class InvalidTimeFilterError(ValueError):
+    """A non-empty Start/Stop filter value that is not an ISO 8601 time."""
+
+
+# Fractional seconds of any length; Python 3.10's fromisoformat takes only 3 or 6.
+_FRACTION_RE = re.compile(r"(\d{2}:\d{2}:\d{2})\.(\d+)")
+
+
 def _opt_utc_dt(raw: str | None) -> datetime | None:
     """Parse a Detections-page Start/Stop (UTC) value into an aware UTC datetime.
 
     ``<input type="datetime-local">`` submits naive values such as
     ``2026-03-01T12:00`` or ``2026-03-01T12:00:30``. The page labels them UTC,
     so a naive value is taken as UTC; an explicit offset or ``Z`` is honoured
-    and converted. Empty or unparseable values mean no bound.
+    and converted. Empty means no bound; anything else that does not parse
+    raises InvalidTimeFilterError rather than silently dropping the bound.
     """
-    dt = _opt_dt(raw)
-    if dt is None:
+    if raw is None or raw.strip() == "":
         return None
+    text = raw.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    text = _FRACTION_RE.sub(lambda m: f"{m.group(1)}.{(m.group(2) + '000000')[:6]}", text, 1)
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise InvalidTimeFilterError(f"invalid time: {raw!r}") from exc
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
@@ -889,7 +906,10 @@ def _detection_filters(
     start: str | None = None,
     stop: str | None = None,
 ) -> dict[str, Any]:
-    """query_detections / duration_histogram kwargs for the Detections filters."""
+    """query_detections / duration_histogram kwargs for the Detections filters.
+
+    Raises InvalidTimeFilterError for an unparseable non-empty start/stop.
+    """
     return {
         "sdr_center_freq": _opt_float(sdr_center),
         "sample_rate": _opt_float(sample_rate),
@@ -942,19 +962,26 @@ async def detections_fragment(
         )
 
     try:
+        filters = _detection_filters(
+            sdr_center=sdr_center,
+            sample_rate=sample_rate,
+            gain=gain,
+            attributed=attributed,
+            model=model,
+            start=start,
+            stop=stop,
+        )
+    except InvalidTimeFilterError:
+        return (
+            f'<tr><td colspan="{ncols}" class="placeholder-text">Invalid start/stop time</td></tr>'
+        )
+
+    try:
         rows = await db.query_detections(
             limit=50,
             min_duration_ms=_opt_float(duration_min),
             max_duration_ms=_opt_float(duration_max),
-            **_detection_filters(
-                sdr_center=sdr_center,
-                sample_rate=sample_rate,
-                gain=gain,
-                attributed=attributed,
-                model=model,
-                start=start,
-                stop=stop,
-            ),
+            **filters,
         )
     except Exception:
         return (
@@ -971,7 +998,12 @@ async def detections_fragment(
         bw_mhz = r.get("bandwidth_hz", 0) / 1e6
         dur = r.get("duration_ms", 0)
         peak = r.get("peak_power_db", 0)
-        ts = r.get("detection_timestamp", r.get("start_time", "--"))
+        # The Detections page shows start_time, the field its Start/Stop (UTC)
+        # filters range on; the dashboard keeps its detection timestamp.
+        if full:
+            ts = r.get("start_time", "--")
+        else:
+            ts = r.get("detection_timestamp", r.get("start_time", "--"))
         extra = ""
         if full:
             # model comes from rtl_433 decoding over-the-air data: untrusted.
@@ -1004,7 +1036,10 @@ _CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 def _csv_cell(v: Any) -> Any:
     if v is None:
         return ""
-    if isinstance(v, str) and v.startswith(_CSV_FORMULA_PREFIXES):
+    # lstrip: spreadsheets also evaluate " =..." after trimming the space.
+    if isinstance(v, str) and (
+        v.startswith(_CSV_FORMULA_PREFIXES) or v.lstrip().startswith(_CSV_FORMULA_PREFIXES)
+    ):
         return "'" + v
     return v
 
@@ -1033,15 +1068,18 @@ async def detections_csv(
     if db is None:
         raise HTTPException(status_code=503, detail="Database not connected")
 
-    filters = _detection_filters(
-        sdr_center=sdr_center,
-        sample_rate=sample_rate,
-        gain=gain,
-        attributed=attributed,
-        model=model,
-        start=start,
-        stop=stop,
-    )
+    try:
+        filters = _detection_filters(
+            sdr_center=sdr_center,
+            sample_rate=sample_rate,
+            gain=gain,
+            attributed=attributed,
+            model=model,
+            start=start,
+            stop=stop,
+        )
+    except InvalidTimeFilterError as exc:
+        raise HTTPException(status_code=400, detail="Invalid start/stop time") from exc
     filters["min_duration_ms"] = _opt_float(duration_min)
     filters["max_duration_ms"] = _opt_float(duration_max)
     columns: list[str] = await db.detection_columns()
@@ -1061,17 +1099,26 @@ async def detections_csv(
         yield flush()
         cursor: tuple[str, int] | None = None
         while True:
-            rows = await db.query_detections(limit=page_size, before=cursor, **filters)
+            try:
+                rows = await db.query_detections(limit=page_size, before=cursor, **filters)
+                for r in rows:
+                    writer.writerow(
+                        [
+                            *(_csv_cell(r.get(c)) for c in columns),
+                            "true" if _is_attributed(r) else "false",
+                            _csv_cell(r.get("model") or ""),
+                        ]
+                    )
+            except Exception:
+                # Headers are already sent, so the status cannot change: mark
+                # the file itself as incomplete instead of ending it silently.
+                logger.exception("detections.csv export failed mid-stream")
+                buf.seek(0)
+                buf.truncate(0)
+                yield "# export truncated: error\n"
+                return
             if not rows:
                 return
-            for r in rows:
-                writer.writerow(
-                    [
-                        *(_csv_cell(r.get(c)) for c in columns),
-                        "true" if _is_attributed(r) else "false",
-                        _csv_cell(r.get("model") or ""),
-                    ]
-                )
             yield flush()
             if len(rows) < page_size:
                 return
@@ -1643,18 +1690,20 @@ async def detections_histogram_fragment(
         return '<div class="placeholder-text">Database not connected</div>'
 
     try:
-        hist = await db.duration_histogram(
-            bin_width=_opt_float(bin_width),
-            **_detection_filters(
-                sdr_center=sdr_center,
-                sample_rate=sample_rate,
-                gain=gain,
-                attributed=attributed,
-                model=model,
-                start=start,
-                stop=stop,
-            ),
+        filters = _detection_filters(
+            sdr_center=sdr_center,
+            sample_rate=sample_rate,
+            gain=gain,
+            attributed=attributed,
+            model=model,
+            start=start,
+            stop=stop,
         )
+    except InvalidTimeFilterError as exc:
+        raise HTTPException(status_code=400, detail="Invalid start/stop time") from exc
+
+    try:
+        hist = await db.duration_histogram(bin_width=_opt_float(bin_width), **filters)
     except Exception:
         return '<div class="placeholder-text">Error loading histogram</div>'
 

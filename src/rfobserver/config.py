@@ -205,8 +205,11 @@ class AppSettings(BaseSettings):
     ATTRIBUTION_ENABLED: bool = False
     ATTRIBUTION_RTL433_PATH: str = ""  # "" -> auto-discover via find_rtl433
     # While isolation is on, the IQ ring keeps at least this many seconds so a
-    # burst's samples are still there when detection completes.
-    ISOLATION_LOOKBACK_SEC: float = 1.5
+    # burst's samples are still there when detection completes. Live bursts
+    # reach isolation 0.5-1.3 s after they start (the rolling detector emits a
+    # burst only once it stops growing), so 1.5 s left as little as 129 ms of
+    # margin on nano-super; 2.0 s covers that plus one maximum-length burst.
+    ISOLATION_LOOKBACK_SEC: float = 2.0
     # Longer bursts are isolated only up to this length.
     ISOLATION_MAX_BURST_SEC: float = 0.5
     # Gate: dB over the noise floor at the burst's peak bin, and the most bursts

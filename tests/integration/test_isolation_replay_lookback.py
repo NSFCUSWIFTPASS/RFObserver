@@ -37,7 +37,7 @@ def _write_cf32_sigmf(base, iq):
 
 @pytest.mark.asyncio
 async def test_lossless_replay_isolates_every_picked_burst_at_the_default_lookback(tmp_path):
-    assert AppSettings(_env_file=None).ISOLATION_LOOKBACK_SEC == 1.5
+    assert AppSettings(_env_file=None).ISOLATION_LOOKBACK_SEC == 2.0
     offsets = [-600e3, -300e3, 100e3, 400e3, 700e3, -450e3, 250e3, 550e3]
     bursts = [
         Burst(start_sec=0.5 + 0.8 * i, duration_sec=0.02, freq_offset_hz=f, amplitude=0.2)

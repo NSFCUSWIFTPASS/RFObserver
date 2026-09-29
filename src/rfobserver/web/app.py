@@ -116,7 +116,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             has_loss = proc is not None and hasattr(proc, "receive_loss")
             loss = proc.receive_loss() if has_loss else None
             # Averaged-window / tone-check writes dropped at the processor's
-            # background DB writer queue (full).
+            # background DB writer queue (full). Per processor instance: it
+            # resets when the supervisor rebuilds the processor.
             db_drops = getattr(proc, "db_writes_dropped", None) if proc is not None else None
             body["pipeline"] = {
                 "active": sup.active,

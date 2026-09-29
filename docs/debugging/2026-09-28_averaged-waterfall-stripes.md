@@ -448,3 +448,48 @@ long, and writer-queue high-water 0.
   tested.
 - `handoff_dropped` should probably also count queue-full drops, or the TIMING
   line should print them separately. Not changed here.
+
+### Review follow-up 2 (2026-09-29)
+
+A review of 9bda933 found two defects and three smaller items. They are fixed in one follow-up commit.
+
+1. **CORRECTION: a cancel during the drain skipped the thread shutdown.** 9bda933
+   put the writer drain first in `run()`'s `finally`. A supervisor cancel that
+   landed while it ran (after the watchdog's 5 s or the supervisor's 15 s)
+   aborted the recording stop, `_signal_stop`, the joins, `_stop_isolation`,
+   the recctl stop and the final burst drain. The drain now runs last, in an
+   inner `finally`, so the thread shutdown always comes first. The drain also
+   still runs if that shutdown is cancelled. The blocking joins hold the loop,
+   so the writer makes no progress during them. The claim in "What changed"
+   that the drain runs "as soon as the consumer loop exits" is withdrawn.
+2. **Late rows escaped the minute rollup.** With a backlog, a window can be
+   written up to 256 writes late, far past `_rollup_lag`. A minute folded
+   before its window landed is never revisited. `_OrderedDbWriter` now tracks
+   `oldest_pending_start`: the window start of the oldest unfinished write,
+   counting the one in flight. The processor exposes it as
+   `oldest_pending_write_start`. `_rollup_loop` reads it through the
+   supervisor's processor, and `_rollup_forward` clamps its `closed` bound so
+   it never folds that window's minute or later.
+3. The queue-size comment was wrong. 256 writes is about 64 s at
+   DURATION_SEC=0.5 with the tone check on. It is about 128 s with the tone
+   check off (the default), or at 1.0 s with it on. Section 12's "about 2
+   minutes" for a stopped writer at 1.0 s with the tone check on stands.
+4. New test: an insert slower than a window (2.5 s at 1.0 s, writer queue
+   of 8). The loop's windows and result drops are unchanged, and
+   `db_writes_dropped` goes nonzero. The written rows are in window order, and
+   the closed windows minus the written rows equal the drops.
+5. The `/api/health` comment now says `db_writes_dropped` is per processor
+   instance. It resets when the supervisor rebuilds the processor.
+
+Tests: `test_cancel_during_the_drain_does_not_skip_thread_shutdown`,
+`test_oldest_pending_write_start_tracks_the_backlog`,
+`test_forward_pass_holds_back_to_the_oldest_pending_write` and
+`test_pending_write_start_reads_the_live_processor` failed on 9bda933.
+`test_insert_slower_than_a_window_fills_the_writer_not_the_loop` covers item 4.
+It already passed on 9bda933, as expected.
+
+Open: the clamp holds the whole forward pass back to the oldest pending
+window's minute. If the writer is stuck, folding stops until it recovers or
+the processor stops, and the drain then discards the rest. This is by design:
+nothing is folded early. A supervisor rebuild also loses the old processor's
+pending set, but the drain has already written or discarded it by then.

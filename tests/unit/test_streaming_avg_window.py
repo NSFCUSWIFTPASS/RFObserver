@@ -444,35 +444,55 @@ class _CappedQueue:
         return _stream_result()
 
 
-async def _run_with_insert_cost(tmp_path, monkeypatch, cost: float):
+async def _run_with_insert_cost(tmp_path, monkeypatch, cost: float, *, writer_max=None, out=None):
     """Run 60 s of results at one per chunk with DURATION_SEC=1.0 through the
     consumer loop, where each avg-window insert takes ``cost`` seconds.
 
     An insert awaited by the consumer task itself blocks the loop, so it moves
     fake time on by ``cost``. An insert on another task (the background writer)
-    runs concurrently: it finishes once fake time has passed ``cost``."""
+    runs concurrently: it finishes once fake time has passed ``cost``.
+
+    ``out`` (a dict), if given, receives ``closed`` (every window start the
+    loop published), ``written`` (window starts whose insert finished) and
+    ``proc``."""
+    from rfobserver.pipeline.streaming import _OrderedDbWriter
+
     clock = _FakeClock()
     _install_fake_clock(monkeypatch, clock)
     proc, db = _proc(tmp_path, with_sinks=False)
     proc._settings.DURATION_SEC = 1.0
+    if writer_max is not None:
+        proc._db_writer = _OrderedDbWriter(maxsize=writer_max)
     stored: list[dict] = []
+    written: list[datetime] = []
+    closed: list[datetime] = []
     consumer: asyncio.Task | None = None
 
     async def insert(**kw):
         stored.append(kw)
         if asyncio.current_task() is consumer:
             clock.t += cost
-            return
-        deadline = clock.t + cost
-        while clock.t < deadline and consumer is not None and not consumer.done():
-            await asyncio.sleep(0)
+        else:
+            deadline = clock.t + cost
+            while clock.t < deadline and consumer is not None and not consumer.done():
+                await asyncio.sleep(0)
+        written.append(kw["start_time"])
 
+    orig_publish = proc._publish_processed
+
+    async def publish(*a, **kw):
+        closed.append(kw["start_time"])
+        await orig_publish(*a, **kw)
+
+    proc._publish_processed = publish  # type: ignore[method-assign]
     db.insert_avg_window = insert
     q = _CappedQueue(clock, [_CHUNK * (i + 1) for i in range(int(60 / _CHUNK))])
     proc._result_queue = q
     proc._running = True
     consumer = asyncio.create_task(proc._result_consumer_loop())
     await consumer
+    if out is not None:
+        out.update(closed=closed, written=written, proc=proc)
     await _drain(proc)
     return stored, q
 
@@ -674,3 +694,107 @@ async def test_processor_stop_drains_pending_writes(tmp_path, monkeypatch):
     proc._result_consumer_loop = loop  # type: ignore[method-assign]
     await asyncio.wait_for(proc.run(), timeout=10)
     assert written == times
+
+
+@pytest.mark.asyncio
+async def test_insert_slower_than_a_window_fills_the_writer_not_the_loop(tmp_path, monkeypatch):
+    """2.5 s per insert at DURATION_SEC=1.0: the writer can never keep up. The
+    loop's windows and result drops are unchanged; the writer's queue fills,
+    drops are counted, and the rows that are written keep their order."""
+    base, base_q = await _run_with_insert_cost(tmp_path, monkeypatch, 0.0, writer_max=8)
+    out: dict = {}
+    slow, slow_q = await _run_with_insert_cost(tmp_path, monkeypatch, 2.5, writer_max=8, out=out)
+    assert slow_q.dropped == base_q.dropped
+    assert slow_q.taken == base_q.taken
+    assert len(out["closed"]) == len(base)
+    for d in (w["duration_sec"] for w in base[:-1]):
+        assert 1.0 - 1e-9 <= d <= 1.0 + _CHUNK + 1e-9
+    proc = out["proc"]
+    assert proc.db_writes_dropped > 0
+    written = out["written"]
+    # Every accepted write lands, in window order, and the dropped ones are
+    # exactly the difference.
+    assert written == sorted(written)
+    assert set(written) <= set(out["closed"])
+    assert len(out["closed"]) - len(written) == proc.db_writes_dropped
+
+
+@pytest.mark.asyncio
+async def test_oldest_pending_write_start_tracks_the_backlog(tmp_path):
+    proc, db = _proc(tmp_path, with_sinks=False)
+    gate = asyncio.Event()
+
+    async def blocked(**kw):
+        await gate.wait()
+
+    db.insert_avg_window = blocked
+    assert proc.oldest_pending_write_start is None
+    for i in range(3):
+        await proc._publish_processed(
+            [-80.0, -70.0, -60.0, -50.0],
+            _result(),
+            _stats(),
+            start_time=_T0 + timedelta(seconds=i),
+            duration_sec=1.0,
+        )
+    await asyncio.sleep(0)
+    # In flight counts as pending until its insert finishes.
+    assert proc.oldest_pending_write_start == _T0
+    gate.set()
+    await _drain(proc)
+    assert proc.oldest_pending_write_start is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_the_drain_does_not_skip_thread_shutdown(tmp_path, monkeypatch):
+    """The supervisor cancels run() after its stop timeout. A cancel landing
+    while the writer drains must not skip stopping and joining the threads."""
+    import threading as _real_threading
+
+    from rfobserver.pipeline import streaming
+
+    joined: list[str] = []
+    signalled: list[object] = []
+
+    class _NoThread:
+        def __init__(self, *a, name="", **kw) -> None:
+            self.name = name
+
+        def start(self) -> None:
+            pass
+
+        def join(self, timeout=None) -> None:
+            joined.append(self.name)
+
+    class _Threading:
+        Thread = _NoThread
+
+        def __getattr__(self, name):
+            return getattr(_real_threading, name)
+
+    monkeypatch.setattr(streaming, "threading", _Threading())
+    monkeypatch.setattr(streaming, "_signal_stop", lambda q: signalled.append(q))
+    proc, db = _proc(tmp_path, with_sinks=False)
+    in_insert = asyncio.Event()
+
+    async def stuck(**kw):
+        in_insert.set()
+        await asyncio.Event().wait()
+
+    db.insert_avg_window = stuck
+
+    async def loop() -> None:
+        await proc._publish_processed(
+            [-80.0, -70.0, -60.0, -50.0], _result(), _stats(), start_time=_T0, duration_sec=1.0
+        )
+
+    proc._result_consumer_loop = loop  # type: ignore[method-assign]
+    task = asyncio.create_task(proc.run())
+    await asyncio.wait_for(in_insert.wait(), timeout=5)
+    await asyncio.sleep(0.05)  # run() is now in the writer drain
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert signalled == [proc._chunk_queue, proc._burst_queue]
+    assert joined == ["recv", "dispatch", "burst", "recctl"]
+    assert proc._db_writer.idle

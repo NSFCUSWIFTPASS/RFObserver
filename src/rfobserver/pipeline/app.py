@@ -342,7 +342,7 @@ async def run(settings: AppSettings) -> None:
         )
     )
     if settings.PEAKS_ROLLUP_INTERVAL_SEC > 0:
-        workers.append(asyncio.create_task(_rollup_loop(settings, db)))
+        workers.append(asyncio.create_task(_rollup_loop(settings, db, supervisor)))
     # Serve until a stop signal. The supervisor owns the processor task
     # independently of these, so a Standby or headless run waits here too.
     stop_task = asyncio.create_task(stop.wait())
@@ -731,9 +731,22 @@ def _rollup_lag(settings: AppSettings) -> timedelta:
     return timedelta(seconds=max(10.0, 4.0 * float(settings.DURATION_SEC)))
 
 
-async def _rollup_forward(db: SensorDatabase, now: datetime, lag: timedelta = timedelta(0)) -> None:
-    """Fold every minute that has closed (by ``lag``) since the last run."""
+async def _rollup_forward(
+    db: SensorDatabase,
+    now: datetime,
+    lag: timedelta = timedelta(0),
+    pending_since: datetime | None = None,
+) -> None:
+    """Fold every minute that has closed (by ``lag``) since the last run.
+
+    ``pending_since`` is the window start of the oldest averaged-window write
+    still queued on the pipeline's background writer. The pass never folds that
+    window's minute or later, since a backlog can land rows far past ``lag``
+    and a folded minute is not revisited.
+    """
     closed = (now - lag).replace(second=0, microsecond=0)
+    if pending_since is not None:
+        closed = min(closed, pending_since.replace(second=0, microsecond=0))
     key = await db.get_config(ROLLUP_NEWEST_KEY)
     if key is None:
         # First run: anchor at the current minute and let the backfill reach
@@ -770,7 +783,14 @@ async def _rollup_backfill(db: SensorDatabase, now: datetime) -> None:
         await db.set_config(ROLLUP_OLDEST_KEY, _minute_str(until))
 
 
-async def _rollup_loop(settings: AppSettings, db: SensorDatabase) -> None:
+def _pending_write_start(supervisor: Any) -> datetime | None:
+    """The live processor's oldest unfinished averaged-window write start."""
+    proc = getattr(supervisor, "processor", None) if supervisor is not None else None
+    value = getattr(proc, "oldest_pending_write_start", None) if proc is not None else None
+    return value if isinstance(value, datetime) else None
+
+
+async def _rollup_loop(settings: AppSettings, db: SensorDatabase, supervisor: Any = None) -> None:
     """Keep avg_minutes in step with avg_windows.
 
     The forward pass folds minutes that have just closed (about 120 windows).
@@ -780,7 +800,9 @@ async def _rollup_loop(settings: AppSettings, db: SensorDatabase) -> None:
     while True:
         try:
             now = datetime.now(timezone.utc)
-            await _rollup_forward(db, now, _rollup_lag(settings))
+            await _rollup_forward(
+                db, now, _rollup_lag(settings), pending_since=_pending_write_start(supervisor)
+            )
             await _rollup_backfill(db, now)
         except Exception:
             logger.exception("avg_minutes rollup pass failed")

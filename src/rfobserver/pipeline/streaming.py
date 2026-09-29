@@ -346,9 +346,10 @@ class _LoopHandoff:
 
 
 # The consumer loop's per-window DB writes (averaged window, tone check) run on
-# one background task. The bound is in writes, about two minutes of windows at
-# DURATION_SEC=0.5 with the tone check on; past it a write is dropped rather
-# than blocking the loop. The drain bound keeps a stop inside the watchdog's
+# one background task. The bound is in writes (one per window, two with the
+# tone check on): about 64 s of windows at DURATION_SEC=0.5 with the tone check
+# on, about 128 s with it off (the default) or at 1.0 s with it on. Past it a
+# write is dropped rather than blocking the loop. The drain bound keeps a stop inside the watchdog's
 # default 5 s stop timeout (WATCHDOG_STOP_TIMEOUT_SEC).
 _DB_WRITE_QUEUE_MAX = 256
 _DB_WRITE_DRAIN_SEC = 3.0
@@ -368,10 +369,16 @@ class _OrderedDbWriter:
 
     Each job handles and logs its own errors (disk-full reporting included);
     the worker also logs anything that escapes, per item, and carries on.
+
+    ``oldest_pending_start`` is the window start of the oldest write not yet
+    finished (in flight or queued), so the minute rollup can hold back until
+    a backlog has landed.
     """
 
     def __init__(self, maxsize: int = _DB_WRITE_QUEUE_MAX) -> None:
         self._q: asyncio.Queue[Callable[[], Awaitable[None]]] = asyncio.Queue(maxsize=maxsize)
+        # Window starts of the unfinished writes, in submission (= write) order.
+        self._pending_starts: collections.deque[datetime] = collections.deque()
         self._task: asyncio.Task[None] | None = None
         self._busy = False
         self.dropped = 0
@@ -383,9 +390,15 @@ class _OrderedDbWriter:
         """No worker task is running."""
         return self._task is None or self._task.done()
 
-    def submit(self, job: Callable[[], Awaitable[None]]) -> bool:
-        """Queue ``job`` (called with no arguments on the worker). Must run on
-        the event loop. Returns False when it was dropped (queue full)."""
+    @property
+    def oldest_pending_start(self) -> datetime | None:
+        """Window start of the oldest unfinished write, None when empty."""
+        return self._pending_starts[0] if self._pending_starts else None
+
+    def submit(self, job: Callable[[], Awaitable[None]], *, window_start: datetime) -> bool:
+        """Queue ``job`` (called with no arguments on the worker) for the
+        window starting at ``window_start``. Must run on the event loop.
+        Returns False when it was dropped (queue full)."""
         try:
             self._q.put_nowait(job)
         except asyncio.QueueFull:
@@ -402,6 +415,7 @@ class _OrderedDbWriter:
                 self._warned_at = now
                 self._dropped_at_warn = self.dropped
             return False
+        self._pending_starts.append(window_start)
         if self.idle:
             self._task = asyncio.get_running_loop().create_task(self._run(), name="db-writer")
         return True
@@ -416,6 +430,7 @@ class _OrderedDbWriter:
                 logger.exception("Background DB write failed")
             finally:
                 self._busy = False
+                self._pending_starts.popleft()
                 self._q.task_done()
 
     async def drain(self, timeout: float) -> int:
@@ -442,6 +457,7 @@ class _OrderedDbWriter:
             while not self._q.empty():
                 self._q.get_nowait()
                 self._q.task_done()
+            self._pending_starts.clear()
         return discarded
 
 
@@ -915,42 +931,47 @@ class StreamingProcessor:
             await self._result_consumer_loop()
         finally:
             self._running = False
-            # The consumer loop has queued its last windows: write them now,
-            # bounded, before the steps below that can block the loop.
             try:
-                await self._db_writer.drain(_DB_WRITE_DRAIN_SEC)
-            except Exception:
-                logger.exception("DB write drain failed during shutdown")
-            # Stop any active recording, waiting for the finalize job so the
-            # capture files are properly closed before threads exit.
-            if self._recording_state == "recording":
-                self._request_end_recording(wait=True, reason="shutdown")
-            elif self._recording_state == "finalizing":
-                self._end_done.wait(timeout=15)
-            self._recording_state = "idle"
-            # Unblock threads (drain-safe: a full queue in lossless mode must not
-            # wedge shutdown now that the consumers have stopped).
-            _signal_stop(self._chunk_queue)
-            _signal_stop(self._burst_queue)
-            recv_thread.join(timeout=5)
-            dispatch_thread.join(timeout=5)
-            burst_thread.join(timeout=5)
-            # The burst thread (the stage's producer) has stopped; now the
-            # stage (its stop() joins a worker thread, so off the loop), then
-            # the attribution worker.
-            await self._stop_isolation()
-            self._recctl_queue.put(None)
-            recctl_thread.join(timeout=5)
-            self._recctl_thread = None
-            # Final drain: the burst thread may have enqueued completed bursts
-            # (via call_soon_threadsafe) after the consumer loop's last drain --
-            # i.e. a burst finishing right at shutdown. Let those scheduled
-            # enqueues run, then persist them so they aren't silently dropped.
-            try:
-                await asyncio.sleep(0)
-                await self._drain_burst_results()
-            except Exception:
-                logger.exception("Final burst-result drain failed during shutdown")
+                # Stop any active recording, waiting for the finalize job so the
+                # capture files are properly closed before threads exit.
+                if self._recording_state == "recording":
+                    self._request_end_recording(wait=True, reason="shutdown")
+                elif self._recording_state == "finalizing":
+                    self._end_done.wait(timeout=15)
+                self._recording_state = "idle"
+                # Unblock threads (drain-safe: a full queue in lossless mode must not
+                # wedge shutdown now that the consumers have stopped).
+                _signal_stop(self._chunk_queue)
+                _signal_stop(self._burst_queue)
+                recv_thread.join(timeout=5)
+                dispatch_thread.join(timeout=5)
+                burst_thread.join(timeout=5)
+                # The burst thread (the stage's producer) has stopped; now the
+                # stage (its stop() joins a worker thread, so off the loop), then
+                # the attribution worker.
+                await self._stop_isolation()
+                self._recctl_queue.put(None)
+                recctl_thread.join(timeout=5)
+                self._recctl_thread = None
+                # Final drain: the burst thread may have enqueued completed bursts
+                # (via call_soon_threadsafe) after the consumer loop's last drain --
+                # i.e. a burst finishing right at shutdown. Let those scheduled
+                # enqueues run, then persist them so they aren't silently dropped.
+                try:
+                    await asyncio.sleep(0)
+                    await self._drain_burst_results()
+                except Exception:
+                    logger.exception("Final burst-result drain failed during shutdown")
+            finally:
+                # Last, so a cancel landing during it (the supervisor's stop
+                # timeout) cannot skip the thread shutdown above, and in a
+                # finally so it still runs if that shutdown was cancelled. The
+                # blocking joins above hold the loop, so the writer makes no
+                # progress during them; it drains here, bounded.
+                try:
+                    await self._db_writer.drain(_DB_WRITE_DRAIN_SEC)
+                except Exception:
+                    logger.exception("DB write drain failed during shutdown")
 
     def stop(self) -> None:
         self._running = False
@@ -960,6 +981,12 @@ class StreamingProcessor:
         """Per-window DB writes dropped because the background writer's queue
         was full (see _OrderedDbWriter)."""
         return self._db_writer.dropped
+
+    @property
+    def oldest_pending_write_start(self) -> datetime | None:
+        """Window start of the oldest per-window DB write not yet finished,
+        None when the writer is empty. The minute rollup holds back to it."""
+        return self._db_writer.oldest_pending_start
 
     # -- Burst isolation / attribution --
 
@@ -3166,7 +3193,7 @@ class StreamingProcessor:
 
         # The evaluation above is cheap (one pass over the bins); only the
         # insert goes to the background writer.
-        self._db_writer.submit(insert)
+        self._db_writer.submit(insert, window_start=window_start)
         state = "DETECTED" if tc["detected"] else ("out-of-band" if not tc["in_band"] else "absent")
         snr = tc["snr_db"]
         logger.info(
@@ -3252,7 +3279,8 @@ class StreamingProcessor:
                 iq_stats,
                 start_time=start_time,
                 duration_sec=duration_sec,
-            )
+            ),
+            window_start=start_time,
         )
         if self._zms_monitor is None and self._nats_producer is None:
             return

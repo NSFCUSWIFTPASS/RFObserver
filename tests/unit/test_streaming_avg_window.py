@@ -294,3 +294,93 @@ async def test_detection_joins_the_window_whose_real_span_contains_it(tmp_path, 
             assert abs((got - (_BASE + timedelta(seconds=0.1 + 0.5 * k))).total_seconds()) < 1e-6
     finally:
         await real_db.close()
+
+
+# --- review follow-up: no window spans an outage or a retune ---
+
+
+class _TimeoutQueue(_ScheduledQueue):
+    """Like _ScheduledQueue, but emulates wait_for's 0.5 s timeout while the
+    next arrival is more than 0.5 s away."""
+
+    async def get(self):
+        if self._items and self._items[0][0] - self._clock.t > 0.5:
+            self._clock.t += 0.5
+            raise asyncio.TimeoutError
+        return await super().get()
+
+
+def _spans(stored: list[dict]) -> list[tuple[float, float]]:
+    return [
+        (round((s["start_time"] - _BASE).total_seconds(), 6), round(s["duration_sec"], 6))
+        for s in stored
+    ]
+
+
+async def _collect(tmp_path, monkeypatch, queue_cls, arrivals, factory=_stream_result):
+    clock = _FakeClock()
+    _install_fake_clock(monkeypatch, clock)
+    proc, db = _proc(tmp_path, with_sinks=False)
+    stored: list[dict] = []
+
+    async def insert(**kw):
+        stored.append(kw)
+
+    db.insert_avg_window = insert
+    proc._result_queue = queue_cls(clock, arrivals, factory)
+    proc._running = True
+    await proc._result_consumer_loop()
+    return stored
+
+
+@pytest.mark.asyncio
+async def test_window_after_an_outage_starts_when_results_resume(tmp_path, monkeypatch):
+    """Results at 0.1-0.6 s, then nothing until 10.0 s. The window opened by
+    the close at 0.6 s must not claim the outage (it used to store (0.6, 9.4))."""
+    arrivals = [0.1 * (i + 1) for i in range(6)] + [10.0 + 0.1 * i for i in range(8)]
+    stored = await _collect(tmp_path, monkeypatch, _TimeoutQueue, arrivals)
+    assert _spans(stored) == [(0.1, 0.5), (10.0, 0.5)]
+
+
+@pytest.mark.asyncio
+async def test_short_stall_after_a_close_does_not_stretch_the_next_window(tmp_path, monkeypatch):
+    """A 0.35 s stall right after a close is under the 0.5 s idle timeout but
+    over the gap limit (max(0.2 s, 4 chunks)): the next window starts at the
+    first result after the stall."""
+    arrivals = [0.1 * (i + 1) for i in range(6)] + [0.95 + 0.1 * i for i in range(8)]
+    stored = await _collect(tmp_path, monkeypatch, _TimeoutQueue, arrivals)
+    assert _spans(stored)[:2] == [(0.1, 0.5), (0.95, 0.5)]
+
+
+@pytest.mark.asyncio
+async def test_retune_ends_the_window_at_the_old_tunings_last_result(tmp_path, monkeypatch):
+    """A center-frequency change flushes the pending window (ending at its last
+    result) instead of mixing tunings; the new tuning starts its own window."""
+    tunings = iter([915_000_000] * 3 + [2_437_000_000] * 8)
+
+    def factory():
+        r = _stream_result()
+        r.center_freq_hz = next(tunings)
+        return r
+
+    arrivals = [0.1 * (i + 1) for i in range(11)]
+    stored = await _collect(tmp_path, monkeypatch, _ScheduledQueue, arrivals, factory)
+    assert _spans(stored) == [(0.1, 0.2), (0.4, 0.5)]
+    assert [s["sdr_center_freq_hz"] for s in stored] == [915e6, 2437e6]
+
+
+@pytest.mark.asyncio
+async def test_tone_check_is_stamped_with_the_window_start(tmp_path, monkeypatch):
+    clock = _FakeClock()
+    _install_fake_clock(monkeypatch, clock)
+    proc, db = _proc(tmp_path, with_sinks=False)
+    proc._settings.TONE_CHECK_ENABLED = True
+    db.insert_tone_check = AsyncMock()
+    stored: list[dict] = []
+
+    async def insert(**kw):
+        stored.append(kw)
+
+    db.insert_avg_window = insert
+    await _run_loop(proc, clock, [0.1 * (i + 1) for i in range(6)])
+    assert db.insert_tone_check.call_args.kwargs["timestamp"] == stored[0]["start_time"]

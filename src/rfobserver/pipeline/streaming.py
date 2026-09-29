@@ -157,23 +157,37 @@ class _AvgWindowClock:
     belong to the next window, so the nominal length under-reports it. Both
     clocks are read at every boundary: monotonic for the duration, wall for the
     start, so a wall-clock step never accumulates into later windows.
+
+    A window opened by a close claims the time up to its first result only if
+    that result follows promptly: when the consumer waited longer than
+    ``max_gap_sec`` for it (a stall, a retune, a receiver restart) the window
+    restarts at the arrival, so it never spans an outage. The wait is measured
+    from when the consumer was ready, not from the previous arrival, since
+    results queue up while the consumer does its awaited per-window work. The
+    consumer loop also resets the clock when the queue goes idle (0.5 s) with
+    nothing pending.
     """
 
-    __slots__ = ("_start_mono", "_start_wall", "_last_mono", "_last_wall")
+    __slots__ = ("_max_gap", "_start_mono", "_start_wall", "_last_mono", "_has_results")
 
-    def __init__(self) -> None:
+    def __init__(self, max_gap_sec: float) -> None:
+        self._max_gap = max_gap_sec
         self._start_mono: float | None = None
         self._start_wall: datetime | None = None
         self._last_mono = 0.0
-        self._last_wall: datetime | None = None
+        self._has_results = False
 
-    def mark_result(self) -> None:
-        """A result was accumulated: start the window if idle, note the arrival."""
-        self._last_mono = time.monotonic()
-        self._last_wall = datetime.now(timezone.utc)
+    def mark_result(self, waited_sec: float) -> None:
+        """A result was accumulated after the consumer waited ``waited_sec``
+        for it: start the window if idle, note the arrival."""
+        now = time.monotonic()
+        if self._start_mono is not None and not self._has_results and waited_sec > self._max_gap:
+            self.reset()
         if self._start_mono is None:
-            self._start_mono = self._last_mono
-            self._start_wall = self._last_wall
+            self._start_mono = now
+            self._start_wall = datetime.now(timezone.utc)
+        self._last_mono = now
+        self._has_results = True
 
     def elapsed(self) -> float:
         return 0.0 if self._start_mono is None else time.monotonic() - self._start_mono
@@ -182,13 +196,12 @@ class _AvgWindowClock:
         """End the window and return its (start, duration_sec).
 
         Default: it ends now and the next window starts here (tiling).
-        ``at_last_result``: it ends at its last result's arrival (idle flush)
-        and the next window starts when the next result arrives.
+        ``at_last_result``: it ends at its last result's arrival (idle flush,
+        retune) and the next window starts when the next result arrives.
         """
         assert self._start_mono is not None and self._start_wall is not None
         start_wall = self._start_wall
         if at_last_result:
-            assert self._last_wall is not None
             duration = self._last_mono - self._start_mono
             self.reset()
         else:
@@ -197,11 +210,13 @@ class _AvgWindowClock:
             duration = end_mono - self._start_mono
             self._start_mono = end_mono
             self._start_wall = end_wall
+            self._has_results = False
         return start_wall, max(0.0, duration)
 
     def reset(self) -> None:
         self._start_mono = None
         self._start_wall = None
+        self._has_results = False
 
 
 class _StreamResult:
@@ -2770,34 +2785,42 @@ class StreamingProcessor:
 
         accum_powers: list[list[float]] = []
         accum_moments: IQMoments | None = None
-        window_clock = _AvgWindowClock()
+        # A gap of a few chunks with no result means a stall or a restart, not
+        # the next window's data (see _AvgWindowClock).
+        window_clock = _AvgWindowClock(max(0.2, 4.0 * self._chunk_duration))
         last_result: _StreamResult | None = None
 
+        async def flush_pending() -> None:
+            """Emit the pending partial window, ending at its last result."""
+            nonlocal accum_moments, last_result
+            if not accum_powers or last_result is None:
+                window_clock.reset()
+                return
+            avg = _np.mean(accum_powers, axis=0).tolist()
+            # accum_moments is folded right after each accum_powers.append,
+            # so it is non-None whenever accum_powers is non-empty.
+            assert accum_moments is not None
+            interval_stats = finalize_moments(accum_moments)
+            win_start, win_dur = window_clock.close(at_last_result=True)
+            await self._broadcast_averaged(avg, last_result, len(accum_powers), win_start)
+            await self._publish_processed(
+                avg, last_result, interval_stats, start_time=win_start, duration_sec=win_dur
+            )
+            accum_powers.clear()
+            accum_moments = None
+            last_result = None
+
         while self._running:
+            wait_start = time.monotonic()
             try:
                 result = await asyncio.wait_for(self._result_queue.get(), timeout=0.5)
+                waited = time.monotonic() - wait_start
             except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
                 await self._drain_burst_results()
-                # Flush accumulator on timeout if data pending
-                if accum_powers and last_result is not None:
-                    avg = _np.mean(accum_powers, axis=0).tolist()
-                    # accum_moments is folded right after each accum_powers.append,
-                    # so it is non-None whenever accum_powers is non-empty.
-                    assert accum_moments is not None
-                    interval_stats = finalize_moments(accum_moments)
-                    # The queue went idle: this window ends at its last result.
-                    win_start, win_dur = window_clock.close(at_last_result=True)
-                    await self._broadcast_averaged(avg, last_result, len(accum_powers))
-                    await self._publish_processed(
-                        avg,
-                        last_result,
-                        interval_stats,
-                        start_time=win_start,
-                        duration_sec=win_dur,
-                    )
-                    accum_powers.clear()
-                    accum_moments = None
-                    last_result = None
+                # The queue went idle: flush any pending window (it ends at its
+                # last result), or with nothing pending drop the window a close
+                # opened, so the next one starts when results resume.
+                await flush_pending()
                 continue
 
             await self._drain_burst_results()
@@ -2820,7 +2843,13 @@ class StreamingProcessor:
                 accum_moments = None
                 window_clock.reset()
                 last_result = None
-            window_clock.mark_result()
+            elif last_result is not None and last_result.center_freq_hz != result.center_freq_hz:
+                # A retune (sweep dwell or reconfigure) ends the window: flush
+                # what the old tuning accumulated rather than mixing tunings.
+                # Flushed, not dropped: a sweep dwell can be shorter than
+                # DURATION_SEC, so dropping would lose every window.
+                await flush_pending()
+            window_clock.mark_result(waited)
             accum_powers.append(new_powers)
             accum_moments = (
                 result.iq_moments if accum_moments is None else accum_moments.add(result.iq_moments)
@@ -2838,11 +2867,11 @@ class StreamingProcessor:
                 win_start, win_dur = window_clock.close()
 
                 if self._settings.TONE_CHECK_ENABLED:
-                    await self._run_tone_check(avg, result)
+                    await self._run_tone_check(avg, result, win_start)
 
                 # Normal-mode UI broadcast (only if no high-res subscribers)
                 if self._broadcast is not None and not self._broadcast.has_high_res_subscribers():
-                    await self._broadcast_averaged(avg, result, len(accum_powers))
+                    await self._broadcast_averaged(avg, result, len(accum_powers), win_start)
 
                 # ZMS + NATS always get DURATION_SEC-averaged data
                 await self._publish_processed(
@@ -2897,8 +2926,10 @@ class StreamingProcessor:
         avg_powers: list[float],
         result: _StreamResult,
         chunk_count: int,
+        window_start: datetime,
     ) -> None:
-        """Broadcast a DURATION_SEC-averaged PSD to the UI.
+        """Broadcast a DURATION_SEC-averaged PSD to the UI, stamped with the
+        window's start (``chunk_time_ms``), the same time its stored row has.
 
         Burst rectangles are intentionally omitted from the averaged broadcast:
         bursts are detected at PSD-grid resolution (~0.5 ms rows) but each
@@ -2937,7 +2968,7 @@ class StreamingProcessor:
                 "cal_offset_db": self._settings.CAL_OFFSET_DB,
                 "scale_min_db": self._settings.PSD_SCALE_MIN_DB,
                 "scale_max_db": self._settings.PSD_SCALE_MAX_DB,
-                "chunk_time_ms": datetime.now(timezone.utc).timestamp() * 1000.0,
+                "chunk_time_ms": window_start.timestamp() * 1000.0,
             }
         )
 
@@ -2982,8 +3013,11 @@ class StreamingProcessor:
             psd_data=averaged_psd,
         )
 
-    async def _run_tone_check(self, avg_powers: list[float], result: _StreamResult) -> None:
-        """Evaluate the tone check on the averaged PSD and persist + log it."""
+    async def _run_tone_check(
+        self, avg_powers: list[float], result: _StreamResult, window_start: datetime
+    ) -> None:
+        """Evaluate the tone check on the averaged PSD and persist + log it,
+        stamped with the averaged window's start."""
         if self._replay_mode:
             return
         from rfobserver.processing.tone_check import evaluate_tone_check
@@ -2996,7 +3030,7 @@ class StreamingProcessor:
         )
         try:
             await self._db.insert_tone_check(
-                timestamp=datetime.now(timezone.utc),
+                timestamp=window_start,
                 tone_freq_hz=tc["tone_freq_hz"],
                 sdr_center_freq_hz=result.center_freq_hz,
                 in_band=tc["in_band"],

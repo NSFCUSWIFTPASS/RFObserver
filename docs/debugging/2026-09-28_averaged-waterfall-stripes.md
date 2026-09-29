@@ -204,3 +204,64 @@ Screenshots (scratch, not committed):
   start. It is left unchanged, since changing it changes the envelope contract.
 - The fallback cannot tell a short real outage (under 2x duration) from the old
   spacing bug, and will paint over it on rows written before the fix.
+
+### Review follow-up (2026-09-28)
+
+A review of 5693346/ffc5733 found one regression and four smaller issues, fixed in
+one follow-up commit.
+
+1. **CORRECTION: a window could span an outage (regression from 5693346).** After a
+   steady-state close the next window starts at the close instant. If results then
+   stopped (reconfigure, receiver restart, stall), the idle-flush branch did nothing
+   because nothing was pending, so the clock was never reset, and the first window
+   after the outage claimed the whole outage. Reviewer's reproduction: results at
+   0.1 to 0.6 s, then from 10.0 s, stored `(0.1, 0.5), (0.6, 9.4), (10.0, 0.5)`,
+   where main stored `(10.0, 0.5)`. The claim in "What changed" that windows tile is
+   withdrawn for this case. Fix: the idle branch resets the clock when nothing is
+   pending. Also, a window opened by a close restarts at its first result when the
+   consumer waited longer than `max(0.2 s, 4 chunks)` for it, which covers stalls
+   under the 0.5 s idle timeout. The wait is measured from when the consumer was
+   ready for the next result, not from the previous arrival: results queue up while
+   the awaited per-window work runs (0.85 s per window was inferred on the Jetson),
+   and measuring from the previous arrival would restart nearly every window there.
+   Now stored: `(0.1, 0.5), (10.0, 0.5)`.
+2. **The minute rollup could skip the last window of a minute.** Windows are
+   inserted about one window after their start, and `_rollup_forward` folded up to
+   `now.replace(second=0)`. It now folds up to `now - lag`, with
+   `lag = max(10 s, 4 * DURATION_SEC)` (`_rollup_lag`).
+3. **Exactly 600 raw rows.** The client tested `bucketCount < MAX_ROWS`, and the
+   server returns raw when the window count is `<= max_rows`. The binary header
+   has no mode flag, and the row count alone is ambiguous: aggregation also yields
+   `max_rows` or `max_rows + 1` buckets. `parseWaterfall` now sums the per-row
+   window `count`s, which equal the range's window count in both modes, and sets
+   `isRaw = sum <= MAX_ROWS`. The status line, the label and `rowEndSec` use it.
+4. **A window could span a retune.** A change of `center_freq_hz` now ends the
+   pending window at its last result (flushed and stored), and the new tuning
+   starts its own window. This deviates from the review's "reset the
+   accumulation": in sweep mode a dwell is `int(DURATION_SEC / chunk)` chunks,
+   which is shorter than `DURATION_SEC`, so dropping the partial window would drop
+   every window.
+5. **Leftovers.** `_last_wall` was removed. The tone-check row timestamp and the
+   averaged broadcast's `chunk_time_ms` are now the window's start, the same time
+   as its stored row, not the time of the awaited work.
+
+Tests added (each failed on ffc5733): `test_window_after_an_outage_starts_when_results_resume`,
+`test_short_stall_after_a_close_does_not_stretch_the_next_window`,
+`test_retune_ends_the_window_at_the_old_tunings_last_result`,
+`test_tone_check_is_stamped_with_the_window_start`,
+`test_forward_lag_keeps_a_late_inserted_window_in_its_minute` and
+`test_rollup_lag_covers_several_windows`. Item 3 has no JS unit harness and was not
+re-screenshotted.
+
+Open follow-ups (not done here):
+- Window timing is by result arrival at the consumer, not stream time. Arrival
+  jitter (worker completion order, event-loop stalls) goes into the spans. The
+  reviewer recommends carrying a `recv_time` (or stream sample position) in
+  `_StreamResult` and timing windows from it.
+- The ZMS/NATS envelope has the same bug: `MetadataRecord.timestamp` is set at
+  publish (the window's end) and `length` is always `DURATION_SEC`. Low risk to
+  fix now that the real start and duration are available at `_publish_processed`,
+  but it changes what the RFS ingest receives, so tell its owner first.
+- The gap limit is fixed from the chunk duration at the start of the consumer
+  loop; a reconfigure that changes the chunk length does not update it (the
+  0.2 s floor dominates at the default chunk of 36.6 ms).

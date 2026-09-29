@@ -224,7 +224,9 @@ async def test_replay_mode_skips_tone_check_insert(tmp_path):
     proc, db, _zms, _nats = _proc(True, tmp_path)
     db.insert_tone_check = AsyncMock()
 
-    await proc._run_tone_check([-90.0, -80.0, -70.0, -80.0, -90.0], _tone_check_result())
+    await proc._run_tone_check(
+        [-90.0, -80.0, -70.0, -80.0, -90.0], _tone_check_result(), datetime.now(timezone.utc)
+    )
 
     db.insert_tone_check.assert_not_called()
 
@@ -234,7 +236,9 @@ async def test_normal_mode_tone_check_inserts(tmp_path):
     proc, db, _zms, _nats = _proc(False, tmp_path)
     db.insert_tone_check = AsyncMock()
 
-    await proc._run_tone_check([-90.0, -80.0, -70.0, -80.0, -90.0], _tone_check_result())
+    await proc._run_tone_check(
+        [-90.0, -80.0, -70.0, -80.0, -90.0], _tone_check_result(), datetime.now(timezone.utc)
+    )
 
     db.insert_tone_check.assert_called_once()
 

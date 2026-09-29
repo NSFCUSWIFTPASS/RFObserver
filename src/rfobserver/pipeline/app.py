@@ -722,9 +722,17 @@ async def _rollup_span(db: SensorDatabase, since: datetime, until: datetime) -> 
     return written
 
 
-async def _rollup_forward(db: SensorDatabase, now: datetime) -> None:
-    """Fold every minute that has closed since the last run."""
-    closed = now.replace(second=0, microsecond=0)
+def _rollup_lag(settings: AppSettings) -> timedelta:
+    """How far the forward rollup trails now. A window is inserted about one
+    window after its start (it is persisted when it closes), so the last window
+    of a minute can land after the minute ends; waiting a few windows lets it
+    in before the minute is folded."""
+    return timedelta(seconds=max(10.0, 4.0 * float(settings.DURATION_SEC)))
+
+
+async def _rollup_forward(db: SensorDatabase, now: datetime, lag: timedelta = timedelta(0)) -> None:
+    """Fold every minute that has closed (by ``lag``) since the last run."""
+    closed = (now - lag).replace(second=0, microsecond=0)
     key = await db.get_config(ROLLUP_NEWEST_KEY)
     if key is None:
         # First run: anchor at the current minute and let the backfill reach
@@ -771,7 +779,7 @@ async def _rollup_loop(settings: AppSettings, db: SensorDatabase) -> None:
     while True:
         try:
             now = datetime.now(timezone.utc)
-            await _rollup_forward(db, now)
+            await _rollup_forward(db, now, _rollup_lag(settings))
             await _rollup_backfill(db, now)
         except Exception:
             logger.exception("avg_minutes rollup pass failed")

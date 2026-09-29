@@ -232,7 +232,16 @@
         }
         const freqs = [];
         for (let i = 0; i < numBins; i++) freqs.push(meta.freq_start_hz + i * meta.freq_step_hz);
-        return { bucketCount: rowCount, numBins: numBins, meta: meta, rows: rows, stats: stats, freqs: freqs };
+        // Raw mode, mirroring the server: it returns one row per window when
+        // the range holds max_rows windows or fewer. The row count alone cannot
+        // tell (aggregation also yields max_rows or max_rows + 1 buckets), but
+        // the per-row window counts sum to the range's window count in both modes.
+        let windowCount = 0;
+        for (let y = 0; y < rowCount; y++) windowCount += stats[y].count;
+        return {
+            bucketCount: rowCount, numBins: numBins, meta: meta, rows: rows, stats: stats,
+            freqs: freqs, isRaw: windowCount <= MAX_ROWS,
+        };
     }
 
     // --- live ("Now") mode ---
@@ -832,7 +841,7 @@
             $("avg-time").textContent =
                 new Date(state.wf.stats[state.selRow].start_epoch * 1000).toLocaleString();
             const windows = Math.round(state.wf.meta.total_windows);
-            const isRaw = state.wf.bucketCount < MAX_ROWS;
+            const isRaw = state.wf.isRaw;
             $("avg-status").textContent = (isRaw
                 ? windows + " windows (no averaging needed)"
                 : windows + " windows in " + state.wf.bucketCount + " buckets"
@@ -895,7 +904,7 @@
         const wf = state.wf;
         const s = wf.stats[idx];
         const end = s.start_epoch + s.duration_sec;
-        if (wf.bucketCount < MAX_ROWS && idx + 1 < wf.bucketCount) {
+        if (wf.isRaw && idx + 1 < wf.bucketCount) {
             const next = wf.stats[idx + 1].start_epoch;
             if (next > end && next - end < 2 * s.duration_sec) return next;
         }
@@ -1300,7 +1309,7 @@
     function updateWfLabel() {
         const wf = state.wf;
         const m = wf.meta;
-        const isRaw = wf.bucketCount < MAX_ROWS;
+        const isRaw = wf.isRaw;
         if (isRaw) {
             $("avg-wf-label").textContent =
                 Math.round(m.total_windows) + " windows, no averaging (raw rows)";

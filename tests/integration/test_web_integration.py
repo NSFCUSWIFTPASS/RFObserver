@@ -64,13 +64,17 @@ async def test_api_status_with_db(app_with_db):
 
 
 @pytest.mark.asyncio
-async def test_history_page_renders(app_with_db):
+async def test_detections_page_renders(app_with_db):
     from httpx import ASGITransport, AsyncClient
 
     app, db = app_with_db
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        r = await client.get("/history/")
+        r = await client.get("/detections/")
         assert r.status_code == 200
+        assert "<h1>Detections</h1>" in r.text
+        r = await client.get("/history/")
+        assert r.status_code == 308
+        assert r.headers["location"] == "/detections"
 
 
 @pytest.mark.asyncio

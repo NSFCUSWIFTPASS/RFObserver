@@ -276,10 +276,16 @@ def test_config_page(client):
     assert "Configuration" in response.text
 
 
-def test_history_page(client):
-    response = client.get("/history")
+def test_detections_page(client):
+    response = client.get("/detections")
     assert response.status_code == 200
-    assert "Detection History" in response.text
+    assert "<h1>Detections</h1>" in response.text
+
+
+def test_history_redirects_to_detections(client):
+    response = client.get("/history", follow_redirects=False)
+    assert response.status_code in (301, 308)
+    assert response.headers["location"] == "/detections"
 
 
 # -- Config apply tests --

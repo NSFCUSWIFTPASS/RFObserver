@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import functools
 import logging
 import math
 import os
@@ -56,7 +57,7 @@ from rfobserver.storage.governor import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Awaitable, Callable, Iterable, Sequence
     from pathlib import Path
 
     from rfobserver.capture.receiver import IReceiver
@@ -144,6 +145,79 @@ def _preroll_gaps(
     one at ``start`` precedes the file.
     """
     return [[s - start, lost] for s, lost in stream_gaps if start < s < end and s - start < written]
+
+
+class _AvgWindowClock:
+    """Real time span of the averaged window being accumulated.
+
+    A window starts when its first result arrives, or, in steady state, at the
+    instant the previous window closed, so consecutive windows tile the
+    timeline. It ends when it is closed. The stored start and duration are this
+    real span, not ``DURATION_SEC``: a window closes on the first result past
+    ``DURATION_SEC`` and the results that arrive during the awaited persist
+    belong to the next window, so the nominal length under-reports it. Both
+    clocks are read at every boundary: monotonic for the duration, wall for the
+    start, so a wall-clock step never accumulates into later windows.
+
+    A window opened by a close claims the time up to its first result only if
+    that result follows promptly: when the consumer waited longer than
+    ``max_gap_sec`` for it (a stall, a retune, a receiver restart) the window
+    restarts at the arrival, so it never spans an outage. The wait is measured
+    from when the consumer was ready, not from the previous arrival, since
+    results queue up while the consumer does its awaited per-window work. The
+    consumer loop also resets the clock when the queue goes idle (0.5 s) with
+    nothing pending.
+    """
+
+    __slots__ = ("_max_gap", "_start_mono", "_start_wall", "_last_mono", "_has_results")
+
+    def __init__(self, max_gap_sec: float) -> None:
+        self._max_gap = max_gap_sec
+        self._start_mono: float | None = None
+        self._start_wall: datetime | None = None
+        self._last_mono = 0.0
+        self._has_results = False
+
+    def mark_result(self, waited_sec: float) -> None:
+        """A result was accumulated after the consumer waited ``waited_sec``
+        for it: start the window if idle, note the arrival."""
+        now = time.monotonic()
+        if self._start_mono is not None and not self._has_results and waited_sec > self._max_gap:
+            self.reset()
+        if self._start_mono is None:
+            self._start_mono = now
+            self._start_wall = datetime.now(timezone.utc)
+        self._last_mono = now
+        self._has_results = True
+
+    def elapsed(self) -> float:
+        return 0.0 if self._start_mono is None else time.monotonic() - self._start_mono
+
+    def close(self, *, at_last_result: bool = False) -> tuple[datetime, float]:
+        """End the window and return its (start, duration_sec).
+
+        Default: it ends now and the next window starts here (tiling).
+        ``at_last_result``: it ends at its last result's arrival (idle flush,
+        retune) and the next window starts when the next result arrives.
+        """
+        assert self._start_mono is not None and self._start_wall is not None
+        start_wall = self._start_wall
+        if at_last_result:
+            duration = self._last_mono - self._start_mono
+            self.reset()
+        else:
+            end_mono = time.monotonic()
+            end_wall = datetime.now(timezone.utc)
+            duration = end_mono - self._start_mono
+            self._start_mono = end_mono
+            self._start_wall = end_wall
+            self._has_results = False
+        return start_wall, max(0.0, duration)
+
+    def reset(self) -> None:
+        self._start_mono = None
+        self._start_wall = None
+        self._has_results = False
 
 
 class _StreamResult:
@@ -269,6 +343,122 @@ class _LoopHandoff:
         with self._lock:
             self._pending -= 1
         _put_nowait_drop_full(self._q, item)
+
+
+# The consumer loop's per-window DB writes (averaged window, tone check) run on
+# one background task. The bound is in writes (one per window, two with the
+# tone check on): about 64 s of windows at DURATION_SEC=0.5 with the tone check
+# on, about 128 s with it off (the default) or at 1.0 s with it on. Past it a
+# write is dropped rather than blocking the loop. The drain bound keeps a stop inside the watchdog's
+# default 5 s stop timeout (WATCHDOG_STOP_TIMEOUT_SEC).
+_DB_WRITE_QUEUE_MAX = 256
+_DB_WRITE_DRAIN_SEC = 3.0
+_DB_WRITE_DROP_LOG_SEC = 60.0
+
+
+class _OrderedDbWriter:
+    """Runs DB writes on one background task, in submission order.
+
+    The consumer loop used to await its per-window inserts inline. aiosqlite
+    runs every statement on the writer connection through one thread, so an
+    insert that waits behind other statements (the minute rollup, a slow disk)
+    stalled the averaging loop: results were dropped at the bounded result
+    queue and windows averaged fewer chunks. ``submit`` never waits: when the
+    queue is full the write is dropped, counted in ``dropped``, and a WARNING
+    is logged at most once per ``_DB_WRITE_DROP_LOG_SEC``.
+
+    Each job handles and logs its own errors (disk-full reporting included);
+    the worker also logs anything that escapes, per item, and carries on.
+
+    ``oldest_pending_start`` is the window start of the oldest write not yet
+    finished (in flight or queued), so the minute rollup can hold back until
+    a backlog has landed.
+    """
+
+    def __init__(self, maxsize: int = _DB_WRITE_QUEUE_MAX) -> None:
+        self._q: asyncio.Queue[Callable[[], Awaitable[None]]] = asyncio.Queue(maxsize=maxsize)
+        # Window starts of the unfinished writes, in submission (= write) order.
+        self._pending_starts: collections.deque[datetime] = collections.deque()
+        self._task: asyncio.Task[None] | None = None
+        self._busy = False
+        self.dropped = 0
+        self._warned_at: float | None = None
+        self._dropped_at_warn = 0
+
+    @property
+    def idle(self) -> bool:
+        """No worker task is running."""
+        return self._task is None or self._task.done()
+
+    @property
+    def oldest_pending_start(self) -> datetime | None:
+        """Window start of the oldest unfinished write, None when empty."""
+        return self._pending_starts[0] if self._pending_starts else None
+
+    def submit(self, job: Callable[[], Awaitable[None]], *, window_start: datetime) -> bool:
+        """Queue ``job`` (called with no arguments on the worker) for the
+        window starting at ``window_start``. Must run on the event loop.
+        Returns False when it was dropped (queue full)."""
+        try:
+            self._q.put_nowait(job)
+        except asyncio.QueueFull:
+            self.dropped += 1
+            now = time.monotonic()
+            if self._warned_at is None or now - self._warned_at >= _DB_WRITE_DROP_LOG_SEC:
+                logger.warning(
+                    "DB write queue full (%d pending): dropped %d write(s) since the last"
+                    " warning, %d in total",
+                    self._q.qsize(),
+                    self.dropped - self._dropped_at_warn,
+                    self.dropped,
+                )
+                self._warned_at = now
+                self._dropped_at_warn = self.dropped
+            return False
+        self._pending_starts.append(window_start)
+        if self.idle:
+            self._task = asyncio.get_running_loop().create_task(self._run(), name="db-writer")
+        return True
+
+    async def _run(self) -> None:
+        while True:
+            job = await self._q.get()
+            self._busy = True
+            try:
+                await job()
+            except Exception:
+                logger.exception("Background DB write failed")
+            finally:
+                self._busy = False
+                self._pending_starts.popleft()
+                self._q.task_done()
+
+    async def drain(self, timeout: float) -> int:
+        """Wait up to ``timeout`` s for the queued writes, then stop the
+        worker. Returns how many writes were discarded (0 if all finished)."""
+        discarded = 0
+        try:
+            if not self.idle:
+                try:
+                    await asyncio.wait_for(self._q.join(), timeout=timeout)
+                except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
+                    discarded = self._q.qsize() + (1 if self._busy else 0)
+                    logger.warning(
+                        "DB writer did not drain within %.1f s: discarded %d write(s)",
+                        timeout,
+                        discarded,
+                    )
+        finally:
+            task, self._task = self._task, None
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            while not self._q.empty():
+                self._q.get_nowait()
+                self._q.task_done()
+            self._pending_starts.clear()
+        return discarded
 
 
 def _signal_stop(q: queue.Queue[Any]) -> None:
@@ -423,6 +613,8 @@ class StreamingProcessor:
         self._dropped_chunks = 0
         self._result_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=8)
         self._result_handoff = _LoopHandoff(self._result_queue)
+        # Per-window DB writes, off the consumer loop (see _OrderedDbWriter).
+        self._db_writer = _OrderedDbWriter()
         self._loop: asyncio.AbstractEventLoop | None = None
 
         # Recording state machine: "idle" | "armed" | "recording" | "finalizing".
@@ -739,39 +931,62 @@ class StreamingProcessor:
             await self._result_consumer_loop()
         finally:
             self._running = False
-            # Stop any active recording, waiting for the finalize job so the
-            # capture files are properly closed before threads exit.
-            if self._recording_state == "recording":
-                self._request_end_recording(wait=True, reason="shutdown")
-            elif self._recording_state == "finalizing":
-                self._end_done.wait(timeout=15)
-            self._recording_state = "idle"
-            # Unblock threads (drain-safe: a full queue in lossless mode must not
-            # wedge shutdown now that the consumers have stopped).
-            _signal_stop(self._chunk_queue)
-            _signal_stop(self._burst_queue)
-            recv_thread.join(timeout=5)
-            dispatch_thread.join(timeout=5)
-            burst_thread.join(timeout=5)
-            # The burst thread (the stage's producer) has stopped; now the
-            # stage (its stop() joins a worker thread, so off the loop), then
-            # the attribution worker.
-            await self._stop_isolation()
-            self._recctl_queue.put(None)
-            recctl_thread.join(timeout=5)
-            self._recctl_thread = None
-            # Final drain: the burst thread may have enqueued completed bursts
-            # (via call_soon_threadsafe) after the consumer loop's last drain --
-            # i.e. a burst finishing right at shutdown. Let those scheduled
-            # enqueues run, then persist them so they aren't silently dropped.
             try:
-                await asyncio.sleep(0)
-                await self._drain_burst_results()
-            except Exception:
-                logger.exception("Final burst-result drain failed during shutdown")
+                # Stop any active recording, waiting for the finalize job so the
+                # capture files are properly closed before threads exit.
+                if self._recording_state == "recording":
+                    self._request_end_recording(wait=True, reason="shutdown")
+                elif self._recording_state == "finalizing":
+                    self._end_done.wait(timeout=15)
+                self._recording_state = "idle"
+                # Unblock threads (drain-safe: a full queue in lossless mode must not
+                # wedge shutdown now that the consumers have stopped).
+                _signal_stop(self._chunk_queue)
+                _signal_stop(self._burst_queue)
+                recv_thread.join(timeout=5)
+                dispatch_thread.join(timeout=5)
+                burst_thread.join(timeout=5)
+                # The burst thread (the stage's producer) has stopped; now the
+                # stage (its stop() joins a worker thread, so off the loop), then
+                # the attribution worker.
+                await self._stop_isolation()
+                self._recctl_queue.put(None)
+                recctl_thread.join(timeout=5)
+                self._recctl_thread = None
+                # Final drain: the burst thread may have enqueued completed bursts
+                # (via call_soon_threadsafe) after the consumer loop's last drain --
+                # i.e. a burst finishing right at shutdown. Let those scheduled
+                # enqueues run, then persist them so they aren't silently dropped.
+                try:
+                    await asyncio.sleep(0)
+                    await self._drain_burst_results()
+                except Exception:
+                    logger.exception("Final burst-result drain failed during shutdown")
+            finally:
+                # Last, so a cancel landing during it (the supervisor's stop
+                # timeout) cannot skip the thread shutdown above, and in a
+                # finally so it still runs if that shutdown was cancelled. The
+                # blocking joins above hold the loop, so the writer makes no
+                # progress during them; it drains here, bounded.
+                try:
+                    await self._db_writer.drain(_DB_WRITE_DRAIN_SEC)
+                except Exception:
+                    logger.exception("DB write drain failed during shutdown")
 
     def stop(self) -> None:
         self._running = False
+
+    @property
+    def db_writes_dropped(self) -> int:
+        """Per-window DB writes dropped because the background writer's queue
+        was full (see _OrderedDbWriter)."""
+        return self._db_writer.dropped
+
+    @property
+    def oldest_pending_write_start(self) -> datetime | None:
+        """Window start of the oldest per-window DB write not yet finished,
+        None when the writer is empty. The minute rollup holds back to it."""
+        return self._db_writer.oldest_pending_start
 
     # -- Burst isolation / attribution --
 
@@ -2712,27 +2927,42 @@ class StreamingProcessor:
 
         accum_powers: list[list[float]] = []
         accum_moments: IQMoments | None = None
-        accum_start = time.monotonic()
+        # A gap of a few chunks with no result means a stall or a restart, not
+        # the next window's data (see _AvgWindowClock).
+        window_clock = _AvgWindowClock(max(0.2, 4.0 * self._chunk_duration))
         last_result: _StreamResult | None = None
 
+        async def flush_pending() -> None:
+            """Emit the pending partial window, ending at its last result."""
+            nonlocal accum_moments, last_result
+            if not accum_powers or last_result is None:
+                window_clock.reset()
+                return
+            avg = _np.mean(accum_powers, axis=0).tolist()
+            # accum_moments is folded right after each accum_powers.append,
+            # so it is non-None whenever accum_powers is non-empty.
+            assert accum_moments is not None
+            interval_stats = finalize_moments(accum_moments)
+            win_start, win_dur = window_clock.close(at_last_result=True)
+            await self._broadcast_averaged(avg, last_result, len(accum_powers), win_start)
+            await self._publish_processed(
+                avg, last_result, interval_stats, start_time=win_start, duration_sec=win_dur
+            )
+            accum_powers.clear()
+            accum_moments = None
+            last_result = None
+
         while self._running:
+            wait_start = time.monotonic()
             try:
                 result = await asyncio.wait_for(self._result_queue.get(), timeout=0.5)
+                waited = time.monotonic() - wait_start
             except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
                 await self._drain_burst_results()
-                # Flush accumulator on timeout if data pending
-                if accum_powers and last_result is not None:
-                    avg = _np.mean(accum_powers, axis=0).tolist()
-                    # accum_moments is folded right after each accum_powers.append,
-                    # so it is non-None whenever accum_powers is non-empty.
-                    assert accum_moments is not None
-                    interval_stats = finalize_moments(accum_moments)
-                    await self._broadcast_averaged(avg, last_result, len(accum_powers))
-                    await self._publish_processed(avg, last_result, interval_stats)
-                    accum_powers.clear()
-                    accum_moments = None
-                    accum_start = time.monotonic()
-                    last_result = None
+                # The queue went idle: flush any pending window (it ends at its
+                # last result), or with nothing pending drop the window a close
+                # opened, so the next one starts when results resume.
+                await flush_pending()
                 continue
 
             await self._drain_burst_results()
@@ -2753,35 +2983,48 @@ class StreamingProcessor:
             if accum_powers and len(accum_powers[0]) != len(new_powers):
                 accum_powers.clear()
                 accum_moments = None
-                accum_start = time.monotonic()
+                window_clock.reset()
                 last_result = None
+            elif last_result is not None and last_result.center_freq_hz != result.center_freq_hz:
+                # A retune (sweep dwell or reconfigure) ends the window: flush
+                # what the old tuning accumulated rather than mixing tunings.
+                # Flushed, not dropped: a sweep dwell can be shorter than
+                # DURATION_SEC, so dropping would lose every window.
+                await flush_pending()
+            window_clock.mark_result(waited)
             accum_powers.append(new_powers)
             accum_moments = (
                 result.iq_moments if accum_moments is None else accum_moments.add(result.iq_moments)
             )
             last_result = result
 
-            elapsed = time.monotonic() - accum_start
-            if elapsed >= self._settings.DURATION_SEC:
+            if window_clock.elapsed() >= self._settings.DURATION_SEC:
                 avg = _np.mean(accum_powers, axis=0).tolist()
                 # accum_moments is folded right after each accum_powers.append,
                 # so it is non-None whenever accum_powers is non-empty.
                 assert accum_moments is not None
                 interval_stats = finalize_moments(accum_moments)
+                # Close before the per-window work below: results that arrive
+                # during it belong to the next window, which starts now. That
+                # work only queues: the DB writes go to _OrderedDbWriter, ZMS
+                # and NATS to tasks, and the broadcast is a put_nowait per
+                # client, so a slow insert no longer delays the next window.
+                win_start, win_dur = window_clock.close()
 
                 if self._settings.TONE_CHECK_ENABLED:
-                    await self._run_tone_check(avg, result)
+                    await self._run_tone_check(avg, result, win_start)
 
                 # Normal-mode UI broadcast (only if no high-res subscribers)
                 if self._broadcast is not None and not self._broadcast.has_high_res_subscribers():
-                    await self._broadcast_averaged(avg, result, len(accum_powers))
+                    await self._broadcast_averaged(avg, result, len(accum_powers), win_start)
 
                 # ZMS + NATS always get DURATION_SEC-averaged data
-                await self._publish_processed(avg, result, interval_stats)
+                await self._publish_processed(
+                    avg, result, interval_stats, start_time=win_start, duration_sec=win_dur
+                )
 
                 accum_powers.clear()
                 accum_moments = None
-                accum_start = time.monotonic()
                 last_result = None
 
             # --- High-res UI broadcast (every chunk) ---
@@ -2828,8 +3071,10 @@ class StreamingProcessor:
         avg_powers: list[float],
         result: _StreamResult,
         chunk_count: int,
+        window_start: datetime,
     ) -> None:
-        """Broadcast a DURATION_SEC-averaged PSD to the UI.
+        """Broadcast a DURATION_SEC-averaged PSD to the UI, stamped with the
+        window's start (``chunk_time_ms``), the same time its stored row has.
 
         Burst rectangles are intentionally omitted from the averaged broadcast:
         bursts are detected at PSD-grid resolution (~0.5 ms rows) but each
@@ -2868,7 +3113,7 @@ class StreamingProcessor:
                 "cal_offset_db": self._settings.CAL_OFFSET_DB,
                 "scale_min_db": self._settings.PSD_SCALE_MIN_DB,
                 "scale_max_db": self._settings.PSD_SCALE_MAX_DB,
-                "chunk_time_ms": datetime.now(timezone.utc).timestamp() * 1000.0,
+                "chunk_time_ms": window_start.timestamp() * 1000.0,
             }
         )
 
@@ -2913,8 +3158,12 @@ class StreamingProcessor:
             psd_data=averaged_psd,
         )
 
-    async def _run_tone_check(self, avg_powers: list[float], result: _StreamResult) -> None:
-        """Evaluate the tone check on the averaged PSD and persist + log it."""
+    async def _run_tone_check(
+        self, avg_powers: list[float], result: _StreamResult, window_start: datetime
+    ) -> None:
+        """Evaluate the tone check on the averaged PSD and log it; its row,
+        stamped with the averaged window's start, is queued on the background
+        DB writer."""
         if self._replay_mode:
             return
         from rfobserver.processing.tone_check import evaluate_tone_check
@@ -2925,19 +3174,26 @@ class StreamingProcessor:
             tone_freq_hz=self._settings.TONE_CHECK_FREQ_HZ,
             threshold_db=self._settings.TONE_CHECK_THRESHOLD_DB,
         )
-        try:
-            await self._db.insert_tone_check(
-                timestamp=datetime.now(timezone.utc),
-                tone_freq_hz=tc["tone_freq_hz"],
-                sdr_center_freq_hz=result.center_freq_hz,
-                in_band=tc["in_band"],
-                tone_power_db=tc["tone_power_db"],
-                noise_floor_db=tc["noise_floor_db"],
-                snr_db=tc["snr_db"],
-                detected=tc["detected"],
-            )
-        except Exception:
-            logger.exception("tone-check insert failed")
+        row = dict(
+            timestamp=window_start,
+            tone_freq_hz=tc["tone_freq_hz"],
+            sdr_center_freq_hz=result.center_freq_hz,
+            in_band=tc["in_band"],
+            tone_power_db=tc["tone_power_db"],
+            noise_floor_db=tc["noise_floor_db"],
+            snr_db=tc["snr_db"],
+            detected=tc["detected"],
+        )
+
+        async def insert() -> None:
+            try:
+                await self._db.insert_tone_check(**row)
+            except Exception:
+                logger.exception("tone-check insert failed")
+
+        # The evaluation above is cheap (one pass over the bins); only the
+        # insert goes to the background writer.
+        self._db_writer.submit(insert, window_start=window_start)
         state = "DETECTED" if tc["detected"] else ("out-of-band" if not tc["in_band"] else "absent")
         snr = tc["snr_db"]
         logger.info(
@@ -2949,20 +3205,30 @@ class StreamingProcessor:
         )
 
     async def _persist_avg_window(
-        self, avg_powers: list[float], result: _StreamResult, iq_stats: IQStatistics
+        self,
+        avg_powers: list[float],
+        result: _StreamResult,
+        iq_stats: IQStatistics,
+        *,
+        start_time: datetime,
+        duration_sec: float,
     ) -> None:
         """Store the averaged window locally. Runs for every live window,
         independent of whether ZMS/NATS are attached. Flags (interference /
         violations) are not computed in the streaming path yet, so they are left
-        NULL until the PSDProcessor gap is closed."""
+        NULL until the PSDProcessor gap is closed.
+
+        ``start_time`` / ``duration_sec`` are the window's real span, measured by
+        the caller (see ``_AvgWindowClock``), not the persist time and the
+        nominal ``DURATION_SEC``."""
         s = self._settings
         freqs = result.summary_psd.frequencies
         freq_start = float(freqs[0]) if freqs else 0.0
         freq_step = float(freqs[1] - freqs[0]) if len(freqs) > 1 else 0.0
         try:
             await self._db.insert_avg_window(
-                start_time=datetime.now(timezone.utc),
-                duration_sec=s.DURATION_SEC,
+                start_time=start_time,
+                duration_sec=duration_sec,
                 sdr_center_freq_hz=float(result.center_freq_hz),
                 sample_rate_hz=float(s.BANDWIDTH),
                 gain_db=float(s.GAIN),
@@ -2986,18 +3252,36 @@ class StreamingProcessor:
             logger.exception("avg-window persist failed (chunk #%d)", result.capture_num)
 
     async def _publish_processed(
-        self, avg_powers: list[float], result: _StreamResult, iq_stats: IQStatistics
+        self,
+        avg_powers: list[float],
+        result: _StreamResult,
+        iq_stats: IQStatistics,
+        *,
+        start_time: datetime,
+        duration_sec: float,
     ) -> None:
-        """Build the per-window envelope once, fan out to ZMS + NATS.
+        """Queue the window's DB insert, build the envelope once, fan out to
+        ZMS + NATS.
 
-        Both fanouts run as background tasks so the consumer loop returns
-        immediately. ZMS POSTs and NATS publishes can take 10-25 ms each;
-        awaiting them inline previously blocked the next high-res FFT
+        Nothing here is awaited, so the consumer loop returns immediately. The
+        insert goes to the ordered background writer (_OrderedDbWriter). ZMS
+        POSTs and NATS publishes can take 10-25 ms each and run as background
+        tasks; awaiting them inline previously blocked the next high-res FFT
         broadcast every DURATION_SEC, which the user saw as a stutter.
         """
         if self._replay_mode:
             return
-        await self._persist_avg_window(avg_powers, result, iq_stats)
+        self._db_writer.submit(
+            functools.partial(
+                self._persist_avg_window,
+                avg_powers,
+                result,
+                iq_stats,
+                start_time=start_time,
+                duration_sec=duration_sec,
+            ),
+            window_start=start_time,
+        )
         if self._zms_monitor is None and self._nats_producer is None:
             return
         try:

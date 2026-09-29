@@ -57,6 +57,7 @@ def test_health_reports_pipeline_and_degrades_on_give_up(settings):
         "beacon_age_sec": None,
         "overflow_events": None,
         "overflow_lost_samples": None,
+        "db_writes_dropped": None,
     }
 
 
@@ -83,6 +84,17 @@ def test_health_reports_overflow_loss_when_processor_has_receive_loss(settings):
     data = TestClient(app).get("/api/health").json()
     assert data["pipeline"]["overflow_events"] == 2
     assert data["pipeline"]["overflow_lost_samples"] == 50
+
+
+def test_health_reports_dropped_db_writes(settings):
+    app = create_app(settings)
+    sup = MagicMock(active=True, gave_up=False, consecutive_crashes=0)
+    sup.processor.receive_loss.return_value = {"overflow_events": 0, "overflow_lost_samples": 0}
+    sup.processor.db_writes_dropped = 7
+    app.state.supervisor = sup
+    app.state.beacon = None
+    data = TestClient(app).get("/api/health").json()
+    assert data["pipeline"]["db_writes_dropped"] == 7
 
 
 def test_health_reports_null_overflow_loss_without_processor(settings):

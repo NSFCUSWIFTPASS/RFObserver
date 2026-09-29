@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
@@ -202,7 +203,9 @@ async def test_replay_mode_publish_processed_skips_egress(tmp_path, monkeypatch)
     mock_create_task = MagicMock()
     monkeypatch.setattr(asyncio, "create_task", mock_create_task)
 
-    await proc._publish_processed([], MagicMock(), MagicMock())
+    await proc._publish_processed(
+        [], MagicMock(), MagicMock(), start_time=datetime.now(timezone.utc), duration_sec=0.5
+    )
 
     mock_create_task.assert_not_called()
 
@@ -221,7 +224,9 @@ async def test_replay_mode_skips_tone_check_insert(tmp_path):
     proc, db, _zms, _nats = _proc(True, tmp_path)
     db.insert_tone_check = AsyncMock()
 
-    await proc._run_tone_check([-90.0, -80.0, -70.0, -80.0, -90.0], _tone_check_result())
+    await proc._run_tone_check(
+        [-90.0, -80.0, -70.0, -80.0, -90.0], _tone_check_result(), datetime.now(timezone.utc)
+    )
 
     db.insert_tone_check.assert_not_called()
 
@@ -231,7 +236,11 @@ async def test_normal_mode_tone_check_inserts(tmp_path):
     proc, db, _zms, _nats = _proc(False, tmp_path)
     db.insert_tone_check = AsyncMock()
 
-    await proc._run_tone_check([-90.0, -80.0, -70.0, -80.0, -90.0], _tone_check_result())
+    await proc._run_tone_check(
+        [-90.0, -80.0, -70.0, -80.0, -90.0], _tone_check_result(), datetime.now(timezone.utc)
+    )
+    # The insert runs on the processor's background DB writer.
+    await proc._db_writer.drain(5.0)
 
     db.insert_tone_check.assert_called_once()
 

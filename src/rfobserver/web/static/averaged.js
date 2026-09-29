@@ -232,7 +232,16 @@
         }
         const freqs = [];
         for (let i = 0; i < numBins; i++) freqs.push(meta.freq_start_hz + i * meta.freq_step_hz);
-        return { bucketCount: rowCount, numBins: numBins, meta: meta, rows: rows, stats: stats, freqs: freqs };
+        // Raw mode, mirroring the server: it returns one row per window when
+        // the range holds max_rows windows or fewer. The row count alone cannot
+        // tell (aggregation also yields max_rows or max_rows + 1 buckets), but
+        // the per-row window counts sum to the range's window count in both modes.
+        let windowCount = 0;
+        for (let y = 0; y < rowCount; y++) windowCount += stats[y].count;
+        return {
+            bucketCount: rowCount, numBins: numBins, meta: meta, rows: rows, stats: stats,
+            freqs: freqs, isRaw: windowCount <= MAX_ROWS,
+        };
     }
 
     // --- live ("Now") mode ---
@@ -832,7 +841,7 @@
             $("avg-time").textContent =
                 new Date(state.wf.stats[state.selRow].start_epoch * 1000).toLocaleString();
             const windows = Math.round(state.wf.meta.total_windows);
-            const isRaw = state.wf.bucketCount < MAX_ROWS;
+            const isRaw = state.wf.isRaw;
             $("avg-status").textContent = (isRaw
                 ? windows + " windows (no averaging needed)"
                 : windows + " windows in " + state.wf.bucketCount + " buckets"
@@ -886,13 +895,29 @@
     function sinceSec() { return state.sinceMs / 1000; }
     function xForSec(sec, W) { return ((sec - sinceSec()) / spanSec()) * W; }
 
-    // Pixel columns covered by row i: [x0, x1) from its own start+duration. In
+    // End (epoch s) of row i's painted span. Normally start + duration_sec. In
+    // raw mode, rows stored before 2026-09-28 carry the nominal DURATION_SEC
+    // while the windows were really spaced wider, which left a dark stripe
+    // after every row; extend such a row to the next row's start when the gap
+    // is under 2x its own duration. Longer gaps (outages, restarts) stay dark.
+    function rowEndSec(idx) {
+        const wf = state.wf;
+        const s = wf.stats[idx];
+        const end = s.start_epoch + s.duration_sec;
+        if (wf.isRaw && idx + 1 < wf.bucketCount) {
+            const next = wf.stats[idx + 1].start_epoch;
+            if (next > end && next - end < 2 * s.duration_sec) return next;
+        }
+        return end;
+    }
+
+    // Pixel columns covered by row i: [x0, x1) from its start to rowEndSec. In
     // raw mode (few windows) each window stretches to its real time span; in
     // aggregated mode buckets tile the full width.
     function colSpan(idx, W) {
         const s = state.wf.stats[idx];
         const x0 = Math.max(0, Math.min(W - 1, Math.floor(xForSec(s.start_epoch, W))));
-        const x1 = Math.max(0, Math.min(W, Math.ceil(xForSec(s.start_epoch + s.duration_sec, W))));
+        const x1 = Math.max(0, Math.min(W, Math.ceil(xForSec(rowEndSec(idx), W))));
         return { x0: x0, x1: Math.max(x0 + 1, x1) };
     }
 
@@ -1017,7 +1042,9 @@
     }
 
     // Map a pixel column back to the row whose time span contains it (or the
-    // row that started just before it when clicking a data gap).
+    // row that started just before it when clicking a data gap). The latest
+    // start at or before the click also covers a span extended by rowEndSec,
+    // so a click selects the row painted there.
     function rowForPixelX(x) {
         const wf = state.wf;
         if (!wf || !wf.bucketCount) return -1;
@@ -1282,7 +1309,7 @@
     function updateWfLabel() {
         const wf = state.wf;
         const m = wf.meta;
-        const isRaw = wf.bucketCount < MAX_ROWS;
+        const isRaw = wf.isRaw;
         if (isRaw) {
             $("avg-wf-label").textContent =
                 Math.round(m.total_windows) + " windows, no averaging (raw rows)";

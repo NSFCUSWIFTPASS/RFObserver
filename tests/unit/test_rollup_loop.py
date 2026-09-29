@@ -125,3 +125,64 @@ async def test_rollup_is_idempotent(db):
         since=NOW - timedelta(hours=2), until=NOW, metric="pwr_max"
     )
     assert len(peaks) == 1
+
+
+async def test_forward_lag_keeps_a_late_inserted_window_in_its_minute(db):
+    """Windows are inserted about one window after their start, so the last
+    window of a minute can land after the minute closed. With a lag the forward
+    pass waits for it; the minute is folded once it is present."""
+    lag = timedelta(seconds=10)
+    await db.set_config(ROLLUP_NEWEST_KEY, "2026-09-19T05:59")
+    await _insert_window(db, NOW - timedelta(seconds=30), -40.0)
+    # 5 s past the minute: inside the lag, so 05:59 is not folded yet.
+    await _rollup_forward(db, NOW + timedelta(seconds=5), lag=lag)
+    assert await db.get_config(ROLLUP_NEWEST_KEY) == "2026-09-19T05:59"
+    # The late window (it started at 05:59:59.6) arrives now.
+    await _insert_window(db, NOW - timedelta(milliseconds=400), -20.0)
+    await _rollup_forward(db, NOW + timedelta(seconds=15), lag=lag)
+    assert await db.get_config(ROLLUP_NEWEST_KEY) == "2026-09-19T06:00"
+    peaks = await db.query_avg_minute_peaks(
+        since=NOW - timedelta(minutes=1), until=NOW, metric="pwr_max"
+    )
+    assert [round(p[1], 1) for p in peaks] == [-20.0]
+
+
+async def test_forward_pass_holds_back_to_the_oldest_pending_write(db):
+    """A backlog on the pipeline's background writer can land a window far
+    past the lag. The forward pass must not fold its minute until it has."""
+    lag = timedelta(seconds=10)
+    await db.set_config(ROLLUP_NEWEST_KEY, "2026-09-19T05:55")
+    await _insert_window(db, NOW - timedelta(minutes=4, seconds=30), -40.0)
+    # The window at 05:57:10 is still queued on the writer.
+    pending = NOW - timedelta(minutes=2, seconds=50)
+    await _rollup_forward(db, NOW + timedelta(minutes=1), lag=lag, pending_since=pending)
+    # 05:55 and 05:56 are folded; 05:57 (the pending window's minute) is not.
+    assert await db.get_config(ROLLUP_NEWEST_KEY) == "2026-09-19T05:57"
+    await _insert_window(db, pending, -20.0)
+    await _rollup_forward(db, NOW + timedelta(minutes=1, seconds=5), lag=lag, pending_since=None)
+    assert await db.get_config(ROLLUP_NEWEST_KEY) == "2026-09-19T06:00"
+    peaks = await db.query_avg_minute_peaks(
+        since=NOW - timedelta(minutes=5), until=NOW, metric="pwr_max"
+    )
+    assert sorted(round(p[1], 1) for p in peaks) == [-40.0, -20.0]
+
+
+def test_pending_write_start_reads_the_live_processor():
+    from types import SimpleNamespace
+
+    from rfobserver.pipeline.app import _pending_write_start
+
+    assert _pending_write_start(None) is None
+    assert _pending_write_start(SimpleNamespace(processor=None)) is None
+    proc = SimpleNamespace(oldest_pending_write_start=NOW)
+    assert _pending_write_start(SimpleNamespace(processor=proc)) == NOW
+    proc = SimpleNamespace(oldest_pending_write_start=None)
+    assert _pending_write_start(SimpleNamespace(processor=proc)) is None
+
+
+def test_rollup_lag_covers_several_windows():
+    from rfobserver.config import AppSettings
+    from rfobserver.pipeline.app import _rollup_lag
+
+    assert _rollup_lag(AppSettings(_env_file=None, DURATION_SEC=0.5)) == timedelta(seconds=10)
+    assert _rollup_lag(AppSettings(_env_file=None, DURATION_SEC=5.0)) == timedelta(seconds=20)

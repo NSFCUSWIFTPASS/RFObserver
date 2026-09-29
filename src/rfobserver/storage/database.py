@@ -275,6 +275,18 @@ _DETECTION_ATTRIBUTION_COLUMNS: dict[str, str] = {
 }
 
 
+def _utc_iso(dt: datetime) -> str:
+    """ISO string for comparing against stored start_time (aware UTC, +00:00).
+
+    Aware datetimes are converted to UTC so an offset like +02:00 cannot skew
+    the string comparison. Naive ones pass through unchanged, as before, since
+    they only ever meet naive-stored rows (tests, pre-UTC data).
+    """
+    if dt.tzinfo is None:
+        return dt.isoformat()
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 def _nice_bin_width(span: float) -> float:
     """Pick a human-friendly bin width (1/2/5 x 10^k ms) targeting ~20 bins.
 
@@ -414,6 +426,12 @@ class SensorDatabase:
         # added by the migration above, so this can't run inside SCHEMA.
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_detections_sdr_center ON detections(sdr_center_freq_hz)"
+        )
+        # Partial: only decoded rows, so the Detections page's model dropdown
+        # (SELECT DISTINCT model) reads a small index instead of the table.
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_detections_model ON detections(model) "
+            "WHERE model IS NOT NULL AND model != ''"
         )
         await self._db.commit()
         logger.info("Database connected: %s", self._db_path)
@@ -1426,6 +1444,69 @@ class SensorDatabase:
             params.append(gain)
         return conditions, params
 
+    @classmethod
+    def _detection_conditions(
+        cls,
+        *,
+        min_freq: float | None = None,
+        max_freq: float | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        sdr_center_freq: float | None = None,
+        sample_rate: float | None = None,
+        gain: float | None = None,
+        min_duration_ms: float | None = None,
+        max_duration_ms: float | None = None,
+        attributed: bool | None = None,
+        model: str | None = None,
+    ) -> tuple[list[str], list[Any]]:
+        """WHERE fragments shared by the detections table, histogram and CSV.
+
+        since/until compare against the stored start_time ISO string. Writers
+        store timezone-aware UTC (``...+00:00``), so callers should pass aware
+        datetimes; they are normalized to UTC here so the string comparison
+        lines up. In that format ``+`` sorts before ``.``, so a whole-second
+        bound compares correctly against fractional-second rows.
+        """
+        conditions: list[str] = []
+        params: list[Any] = []
+        if min_freq is not None:
+            conditions.append("center_freq_hz >= ?")
+            params.append(min_freq)
+        if max_freq is not None:
+            conditions.append("center_freq_hz <= ?")
+            params.append(max_freq)
+        if since is not None:
+            conditions.append("start_time >= ?")
+            params.append(_utc_iso(since))
+        if until is not None:
+            conditions.append("start_time < ?")
+            params.append(_utc_iso(until))
+        # Exact-match SDR capture-context filters (categorize by tuning config).
+        sdr_conditions, sdr_params = cls._sdr_conditions(sdr_center_freq, sample_rate, gain)
+        conditions.extend(sdr_conditions)
+        params.extend(sdr_params)
+        # Half-open [min, max) duration range -- matches the histogram buckets so a
+        # bar click drills the table to exactly that bucket.
+        if min_duration_ms is not None:
+            conditions.append("duration_ms >= ?")
+            params.append(min_duration_ms)
+        if max_duration_ms is not None:
+            conditions.append("duration_ms < ?")
+            params.append(max_duration_ms)
+        # Attributed means rtl_433 decoded the burst (a non-empty model).
+        # Tried-without-decode and never-tried both count as not attributed.
+        if attributed is True:
+            conditions.append("(model IS NOT NULL AND model != '')")
+        elif attributed is False:
+            conditions.append("(model IS NULL OR model = '')")
+        if model is not None:
+            # The redundant terms repeat idx_detections_model's WHERE so the
+            # planner can prove the partial index covers a bound parameter.
+            conditions.append("(model = ? AND model IS NOT NULL AND model != '')")
+            params.append(model)
+        return conditions, params
+
     async def query_detections(
         self,
         limit: int = 100,
@@ -1439,38 +1520,41 @@ class SensorDatabase:
         gain: float | None = None,
         min_duration_ms: float | None = None,
         max_duration_ms: float | None = None,
+        attributed: bool | None = None,
+        model: str | None = None,
+        before: tuple[str, int] | None = None,
     ) -> list[dict[str, Any]]:
-        assert self._db is not None
-        conditions = []
-        params: list[Any] = []
+        """Detections newest first (start_time DESC, id DESC as the tiebreak).
 
-        if min_freq is not None:
-            conditions.append("center_freq_hz >= ?")
-            params.append(min_freq)
-        if max_freq is not None:
-            conditions.append("center_freq_hz <= ?")
-            params.append(max_freq)
-        if since is not None:
-            conditions.append("start_time >= ?")
-            params.append(since.isoformat())
-        if until is not None:
-            conditions.append("start_time < ?")
-            params.append(until.isoformat())
-        # Exact-match SDR capture-context filters (categorize by tuning config).
-        sdr_conditions, sdr_params = self._sdr_conditions(sdr_center_freq, sample_rate, gain)
-        conditions.extend(sdr_conditions)
-        params.extend(sdr_params)
-        # Half-open [min, max) duration range — matches the histogram buckets so a
-        # bar click drills the table to exactly that bucket.
-        if min_duration_ms is not None:
-            conditions.append("duration_ms >= ?")
-            params.append(min_duration_ms)
-        if max_duration_ms is not None:
-            conditions.append("duration_ms < ?")
-            params.append(max_duration_ms)
+        ``before`` is a keyset cursor: the (start_time, id) of the last row of
+        the previous page. Paging on it walks idx_detections_time instead of
+        re-scanning skipped rows the way a growing OFFSET would.
+        """
+        assert self._db is not None
+        conditions, params = self._detection_conditions(
+            min_freq=min_freq,
+            max_freq=max_freq,
+            since=since,
+            until=until,
+            sdr_center_freq=sdr_center_freq,
+            sample_rate=sample_rate,
+            gain=gain,
+            min_duration_ms=min_duration_ms,
+            max_duration_ms=max_duration_ms,
+            attributed=attributed,
+            model=model,
+        )
+        if before is not None:
+            # Row-value form: SQLite walks idx_detections_time (rowid is the
+            # implicit tiebreak) with no temp sort. The equivalent OR form
+            # makes the planner collect every older row and sort it per page.
+            conditions.append("(start_time, id) < (?, ?)")
+            params.extend([before[0], before[1]])
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        query = f"SELECT * FROM detections {where} ORDER BY start_time DESC LIMIT ? OFFSET ?"
+        query = (
+            f"SELECT * FROM detections {where} ORDER BY start_time DESC, id DESC LIMIT ? OFFSET ?"
+        )
         params.extend([limit, offset])
 
         self._db.row_factory = aiosqlite.Row
@@ -1478,22 +1562,53 @@ class SensorDatabase:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
+    async def detection_columns(self) -> list[str]:
+        """The detections table's column names, in table order (CSV header)."""
+        assert self._db is not None
+        async with self._db.execute("PRAGMA table_info(detections)") as cursor:
+            return [row[1] for row in await cursor.fetchall()]
+
+    async def detection_models(self) -> list[str]:
+        """Distinct non-empty rtl_433 model names, sorted (Detections filter).
+
+        Served by the partial index idx_detections_model, so this walks only
+        the decoded rows' index entries rather than the table.
+        """
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT DISTINCT model FROM detections "
+            "WHERE model IS NOT NULL AND model != '' ORDER BY model"
+        ) as cursor:
+            return [str(row[0]) for row in await cursor.fetchall()]
+
     async def duration_histogram(
         self,
         bin_width: float | None = None,
         sdr_center_freq: float | None = None,
         sample_rate: float | None = None,
         gain: float | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        attributed: bool | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
         """Bucket detection pulse lengths (duration_ms) into fixed-width bins.
 
-        Aggregates over the full set matching the SDR filters (not the table's
-        50-row page). bin_width None → an auto width derived from the data range.
+        Aggregates over the full set matching the filters (not the table's
+        50-row page). bin_width None -> an auto width derived from the data range.
         Returns {min, max, count, bin_width, bins:[{lo, hi, count}, ...]} with each
         bin half-open [lo, hi); the final bin includes an exact-max sample.
         """
         assert self._db is not None
-        conditions, params = self._sdr_conditions(sdr_center_freq, sample_rate, gain)
+        conditions, params = self._detection_conditions(
+            since=since,
+            until=until,
+            sdr_center_freq=sdr_center_freq,
+            sample_rate=sample_rate,
+            gain=gain,
+            attributed=attributed,
+            model=model,
+        )
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         query = f"SELECT duration_ms FROM detections {where}"
         async with self._db.execute(query, params) as cursor:

@@ -3,22 +3,29 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import html
+import io
 import json
 import logging
 import math
+import re
 import struct
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 from rfobserver.__about__ import __version__
 from rfobserver.storage.rollup import METRICS, ROLLUP_OLDEST_KEY, Candidate, select_peaks
 from rfobserver.web.routes.config import _persist_settings
 from rfobserver.web.uiprefs import THEME_VALUES, UI_PREFS_KEY
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 logger = logging.getLogger(__name__)
 
@@ -838,6 +845,87 @@ def _opt_dt(raw: str | None) -> datetime | None:
         return None
 
 
+class InvalidTimeFilterError(ValueError):
+    """A non-empty Start/Stop filter value that is not an ISO 8601 time."""
+
+
+# Fractional seconds of any length; Python 3.10's fromisoformat takes only 3 or 6.
+_FRACTION_RE = re.compile(r"(\d{2}:\d{2}:\d{2})\.(\d+)")
+
+
+def _opt_utc_dt(raw: str | None) -> datetime | None:
+    """Parse a Detections-page Start/Stop (UTC) value into an aware UTC datetime.
+
+    ``<input type="datetime-local">`` submits naive values such as
+    ``2026-03-01T12:00`` or ``2026-03-01T12:00:30``. The page labels them UTC,
+    so a naive value is taken as UTC; an explicit offset or ``Z`` is honoured
+    and converted. Empty means no bound; anything else that does not parse
+    raises InvalidTimeFilterError rather than silently dropping the bound.
+    """
+    if raw is None or raw.strip() == "":
+        return None
+    text = raw.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    text = _FRACTION_RE.sub(lambda m: f"{m.group(1)}.{(m.group(2) + '000000')[:6]}", text, 1)
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise InvalidTimeFilterError(f"invalid time: {raw!r}") from exc
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _opt_bool(raw: str | None) -> bool | None:
+    """'true'/'false' filter value -> bool; '' (All) or anything else -> None."""
+    if raw is None:
+        return None
+    v = raw.strip().lower()
+    if v == "true":
+        return True
+    if v == "false":
+        return False
+    return None
+
+
+def _opt_str(raw: str | None) -> str | None:
+    """Optional string filter; '' (the 'All' option) -> None."""
+    if raw is None or raw == "":
+        return None
+    return raw
+
+
+def _detection_filters(
+    *,
+    sdr_center: str | None = None,
+    sample_rate: str | None = None,
+    gain: str | None = None,
+    attributed: str | None = None,
+    model: str | None = None,
+    start: str | None = None,
+    stop: str | None = None,
+) -> dict[str, Any]:
+    """query_detections / duration_histogram kwargs for the Detections filters.
+
+    Raises InvalidTimeFilterError for an unparseable non-empty start/stop.
+    """
+    return {
+        "sdr_center_freq": _opt_float(sdr_center),
+        "sample_rate": _opt_float(sample_rate),
+        "gain": _opt_float(gain),
+        "attributed": _opt_bool(attributed),
+        "model": _opt_str(model),
+        "since": _opt_utc_dt(start),
+        "until": _opt_utc_dt(stop),
+    }
+
+
+def _is_attributed(r: dict[str, Any]) -> bool:
+    """rtl_433 decoded the burst: its model is set and non-empty."""
+    return bool(r.get("model"))
+
+
 @router.get("/detections", response_class=HTMLResponse)
 async def detections_fragment(
     request: Request,
@@ -846,53 +934,202 @@ async def detections_fragment(
     gain: str | None = None,
     duration_min: str | None = None,
     duration_max: str | None = None,
+    attributed: str | None = None,
+    model: str | None = None,
+    start: str | None = None,
+    stop: str | None = None,
+    view: str | None = None,
 ) -> str:
-    """Return HTML table rows for HTMX detection history.
+    """Return HTML table rows for the HTMX detections tables.
 
     Optional query params filter by SDR capture context so detections can be
     categorized by tuning config; with none supplied the table is unfiltered
     (the dashboard's Recent Detections table relies on that). Params are strings
     so the filter form's empty 'All' option round-trips cleanly. duration_min/max
-    narrow the table to a histogram bucket (half-open [min, max)).
+    narrow the table to a histogram bucket (half-open [min, max)). attributed,
+    model and start/stop (UTC; start inclusive, stop exclusive) are the
+    Detections page filters.
+
+    ``view=full`` (the Detections page) adds the Attributed and Burst
+    Attribution columns; without it the six dashboard columns are unchanged.
     """
+    full = view == "full"
+    ncols = 8 if full else 6
     db = _get_db(request)
     if db is None:
-        return '<tr><td colspan="6" class="placeholder-text">Database not connected</td></tr>'
+        return (
+            f'<tr><td colspan="{ncols}" class="placeholder-text">Database not connected</td></tr>'
+        )
+
+    try:
+        filters = _detection_filters(
+            sdr_center=sdr_center,
+            sample_rate=sample_rate,
+            gain=gain,
+            attributed=attributed,
+            model=model,
+            start=start,
+            stop=stop,
+        )
+    except InvalidTimeFilterError:
+        return (
+            f'<tr><td colspan="{ncols}" class="placeholder-text">Invalid start/stop time</td></tr>'
+        )
 
     try:
         rows = await db.query_detections(
             limit=50,
-            sdr_center_freq=_opt_float(sdr_center),
-            sample_rate=_opt_float(sample_rate),
-            gain=_opt_float(gain),
             min_duration_ms=_opt_float(duration_min),
             max_duration_ms=_opt_float(duration_max),
+            **filters,
         )
     except Exception:
-        return '<tr><td colspan="6" class="placeholder-text">Error loading detections</td></tr>'
+        return (
+            f'<tr><td colspan="{ncols}" class="placeholder-text">Error loading detections</td></tr>'
+        )
 
     if not rows:
-        return '<tr><td colspan="6" class="placeholder-text">No detections yet</td></tr>'
+        return f'<tr><td colspan="{ncols}" class="placeholder-text">No detections yet</td></tr>'
 
+    esc = html.escape
     html_rows = []
     for r in rows:
         freq_mhz = r.get("center_freq_hz", 0) / 1e6
         bw_mhz = r.get("bandwidth_hz", 0) / 1e6
         dur = r.get("duration_ms", 0)
         peak = r.get("peak_power_db", 0)
-        ts = r.get("detection_timestamp", r.get("start_time", "--"))
+        # The Detections page shows start_time, the field its Start/Stop (UTC)
+        # filters range on; the dashboard keeps its detection timestamp.
+        if full:
+            ts = r.get("start_time", "--")
+        else:
+            ts = r.get("detection_timestamp", r.get("start_time", "--"))
+        extra = ""
+        if full:
+            # model comes from rtl_433 decoding over-the-air data: untrusted.
+            attributed_cell = "true" if _is_attributed(r) else "false"
+            extra = f"<td>{attributed_cell}</td><td>{esc(str(r.get('model') or ''))}</td>"
         html_rows.append(
             f"<tr>"
-            f"<td>{ts}</td>"
+            f"<td>{esc(str(ts))}</td>"
             f"<td>{freq_mhz:.2f} MHz</td>"
             f"<td>{bw_mhz:.2f} MHz</td>"
             f"<td>{dur:.2f} ms</td>"
             f"<td>{peak:.1f} dB</td>"
-            f"<td>{_format_capture(r)}</td>"
+            f"<td>{esc(_format_capture(r))}</td>"
+            f"{extra}"
             f"</tr>"
         )
 
     return "\n".join(html_rows)
+
+
+# Rows fetched per DB round trip while streaming the CSV export.
+CSV_PAGE_SIZE = 1000
+
+# Spreadsheet apps evaluate a cell starting with one of these as a formula.
+# Text fields can carry over-the-air data (the rtl_433 model and payload), so
+# such values get a leading single quote. Numbers are never touched.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_cell(v: Any) -> Any:
+    if v is None:
+        return ""
+    # lstrip: spreadsheets also evaluate " =..." after trimming the space.
+    if isinstance(v, str) and (
+        v.startswith(_CSV_FORMULA_PREFIXES) or v.lstrip().startswith(_CSV_FORMULA_PREFIXES)
+    ):
+        return "'" + v
+    return v
+
+
+@router.get("/detections.csv", response_model=None)
+async def detections_csv(
+    request: Request,
+    sdr_center: str | None = None,
+    sample_rate: str | None = None,
+    gain: str | None = None,
+    duration_min: str | None = None,
+    duration_max: str | None = None,
+    attributed: str | None = None,
+    model: str | None = None,
+    start: str | None = None,
+    stop: str | None = None,
+) -> StreamingResponse:
+    """Every detection matching the Detections page filters, as a CSV download.
+
+    Streams newest first in CSV_PAGE_SIZE pages with a (start_time, id) keyset
+    cursor, so a long history is never held in memory. Columns are every
+    detections column plus the derived ``attributed`` (true/false) and
+    ``burst_attribution`` (the rtl_433 model, or empty).
+    """
+    db = _get_db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+
+    try:
+        filters = _detection_filters(
+            sdr_center=sdr_center,
+            sample_rate=sample_rate,
+            gain=gain,
+            attributed=attributed,
+            model=model,
+            start=start,
+            stop=stop,
+        )
+    except InvalidTimeFilterError as exc:
+        raise HTTPException(status_code=400, detail="Invalid start/stop time") from exc
+    filters["min_duration_ms"] = _opt_float(duration_min)
+    filters["max_duration_ms"] = _opt_float(duration_max)
+    columns: list[str] = await db.detection_columns()
+    page_size = CSV_PAGE_SIZE
+
+    async def body() -> AsyncIterator[str]:
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+
+        def flush() -> str:
+            out = buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+            return out
+
+        writer.writerow([*columns, "attributed", "burst_attribution"])
+        yield flush()
+        cursor: tuple[str, int] | None = None
+        while True:
+            try:
+                rows = await db.query_detections(limit=page_size, before=cursor, **filters)
+                for r in rows:
+                    writer.writerow(
+                        [
+                            *(_csv_cell(r.get(c)) for c in columns),
+                            "true" if _is_attributed(r) else "false",
+                            _csv_cell(r.get("model") or ""),
+                        ]
+                    )
+            except Exception:
+                # Headers are already sent, so the status cannot change: mark
+                # the file itself as incomplete instead of ending it silently.
+                logger.exception("detections.csv export failed mid-stream")
+                buf.seek(0)
+                buf.truncate(0)
+                yield "# export truncated: error\n"
+                return
+            if not rows:
+                return
+            yield flush()
+            if len(rows) < page_size:
+                return
+            cursor = (rows[-1]["start_time"], rows[-1]["id"])
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return StreamingResponse(
+        body(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="detections_{stamp}.csv"'},
+    )
 
 
 @router.get("/detections.json")
@@ -1436,24 +1673,37 @@ async def detections_histogram_fragment(
     sdr_center: str | None = None,
     sample_rate: str | None = None,
     gain: str | None = None,
+    attributed: str | None = None,
+    model: str | None = None,
+    start: str | None = None,
+    stop: str | None = None,
 ) -> str:
     """Return the pulse-length (duration_ms) distribution as clickable HTML bars.
 
-    Scoped by the same SDR capture-context filters as the detections table.
-    Ignores any duration_min/max params: the histogram always shows the full
-    distribution for the SDR scope while a bar click narrows only the table.
+    Scoped by the same filters as the detections table (SDR capture context,
+    attribution, model, start/stop UTC). Ignores any duration_min/max params:
+    the histogram always shows the full distribution for that scope while a
+    bar click narrows only the table.
     """
     db = _get_db(request)
     if db is None:
         return '<div class="placeholder-text">Database not connected</div>'
 
     try:
-        hist = await db.duration_histogram(
-            bin_width=_opt_float(bin_width),
-            sdr_center_freq=_opt_float(sdr_center),
-            sample_rate=_opt_float(sample_rate),
-            gain=_opt_float(gain),
+        filters = _detection_filters(
+            sdr_center=sdr_center,
+            sample_rate=sample_rate,
+            gain=gain,
+            attributed=attributed,
+            model=model,
+            start=start,
+            stop=stop,
         )
+    except InvalidTimeFilterError as exc:
+        raise HTTPException(status_code=400, detail="Invalid start/stop time") from exc
+
+    try:
+        hist = await db.duration_histogram(bin_width=_opt_float(bin_width), **filters)
     except Exception:
         return '<div class="placeholder-text">Error loading histogram</div>'
 

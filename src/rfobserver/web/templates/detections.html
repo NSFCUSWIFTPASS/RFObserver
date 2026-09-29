@@ -1,12 +1,17 @@
 {% extends "base.html" %}
-{% block title %}Detection History - RFObserver{% endblock %}
+{% block title %}Detections - RFObserver{% endblock %}
 {% block content %}
 <div class="page-header">
-    <h1>Detection History</h1>
+    <h1>Detections</h1>
 </div>
 
 <div class="card full-width">
-    <div class="card-header">Recent Bursts</div>
+    <div class="card-header">
+        <span class="card-header-label">Recent Bursts</span>
+        <span style="flex: 1;"></span>
+        <button type="button" id="export-csv" class="btn-export"
+                title="Download every detection matching the filters as CSV">Export CSV</button>
+    </div>
     <div class="card-body">
         <form id="detection-filters" class="detection-filters" onsubmit="return false;">
             <label class="filter-field">
@@ -48,6 +53,31 @@
                     <option value="50">50 ms</option>
                 </select>
             </label>
+            <label class="filter-field">
+                <span>Attributed</span>
+                <select name="attributed">
+                    <option value="">All</option>
+                    <option value="true">true</option>
+                    <option value="false">false</option>
+                </select>
+            </label>
+            <label class="filter-field">
+                <span>Burst Attribution</span>
+                <select name="model">
+                    <option value="">All</option>
+                    {% for m in models %}
+                    <option value="{{ m }}">{{ m }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label class="filter-field">
+                <span>Start (UTC)</span>
+                <input type="datetime-local" name="start" step="1">
+            </label>
+            <label class="filter-field">
+                <span>Stop (UTC)</span>
+                <input type="datetime-local" name="stop" step="1">
+            </label>
             <input type="hidden" name="duration_min" value="">
             <input type="hidden" name="duration_max" value="">
         </form>
@@ -68,23 +98,36 @@
         <table class="data-table">
             <thead>
                 <tr>
-                    <th>Time</th>
+                    <th>Start (UTC)</th>
                     <th>Frequency</th>
                     <th>Bandwidth</th>
                     <th>Duration</th>
                     <th>Peak Power</th>
                     <th>Capture</th>
+                    <th>Attributed</th>
+                    <th>Burst Attribution</th>
                 </tr>
             </thead>
-            <tbody hx-get="/api/detections" hx-include="#detection-filters"
+            <tbody hx-get="/api/detections" hx-vals='{"view": "full"}' hx-include="#detection-filters"
                    hx-trigger="load, change from:#detection-filters, refreshDetections from:body, filterByDuration from:body"
                    hx-swap="innerHTML">
-                <tr><td colspan="6" class="placeholder-text">Loading...</td></tr>
+                <tr><td colspan="8" class="placeholder-text">Loading...</td></tr>
             </tbody>
         </table>
     </div>
 </div>
 <script>
+// --- Export CSV: download every row matching the current filters (including a
+// histogram drill-down), not just the 50 shown. The server streams it.
+(function() {
+    const form = document.getElementById("detection-filters");
+    document.getElementById("export-csv").addEventListener("click", function() {
+        const params = new URLSearchParams(new FormData(form));
+        params.delete("bin_width");  // histogram-only; the export ignores it
+        window.location.href = "/api/detections.csv?" + params.toString();
+    });
+})();
+
 // --- Histogram drill-down: clicking a bar narrows ONLY the table to that
 // duration bucket (the histogram itself keeps showing the full distribution).
 (function() {

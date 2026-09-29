@@ -75,11 +75,21 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     if STATIC_DIR.exists():
         app.mount("/static", _RevalidatedStaticFiles(directory=str(STATIC_DIR)), name="static")
 
-    from rfobserver.web.routes import api, averaged, captures, config, dashboard, history, modules
+    from rfobserver.web.routes import (
+        api,
+        averaged,
+        captures,
+        config,
+        dashboard,
+        detections,
+        modules,
+    )
 
     app.include_router(dashboard.router)
     app.include_router(config.router, prefix="/config")
-    app.include_router(history.router, prefix="/history")
+    app.include_router(detections.router, prefix="/detections")
+    # The page was called History and lived at /history; keep old links working.
+    app.include_router(detections.legacy_router)
     app.include_router(captures.router, prefix="/captures")
     app.include_router(averaged.router)
     app.include_router(api.router, prefix="/api")

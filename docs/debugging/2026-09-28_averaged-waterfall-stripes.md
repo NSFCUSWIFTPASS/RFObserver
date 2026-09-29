@@ -265,3 +265,32 @@ Open follow-ups (not done here):
 - The gap limit is fixed from the chunk duration at the start of the consumer
   loop; a reconfigure that changes the chunk length does not update it (the
   0.2 s floor dominates at the default chunk of 36.6 ms).
+
+## 11. Measurement on nano-super (2026-09-28)
+
+The second review simulated the Jetson with about 0.85 s of awaited work per window
+(inferred from the screenshot's 1.85 s spacing). It found that closing the window
+before that work makes windows come more often and drop more results when the work is
+close to DURATION_SEC. The actual work was measured before deciding.
+
+Procedure: nano-super (15W), `main` 22bd52f against `fix/avg-window-times` 99c2a71,
+each run in its own clone. Mock receiver, `BANDWIDTH=26000000`, 915 MHz,
+`DURATION_SEC=1.0`, 150 s per run, `GET /api/averaged`, first 3 windows skipped.
+
+```
+main: n=141 spacing p10/p50/p90=1.017/1.046/1.090 duration p50=1.000
+fix:  n=141 spacing p10/p50/p90=1.014/1.035/1.066 duration p50=1.035
+main  TIMING recv#2150: recv=51.7ms dropped=0 (IQ=39.4ms) handoff_dropped=0/0 ovf=0 lost=0
+fix   TIMING recv#2150: recv=51.1ms dropped=0 (IQ=39.4ms) handoff_dropped=0/0 ovf=0 lost=0
+```
+
+- On this hardware the per-window work is about 46 ms (main's spacing 1.046 s against
+  1.000 s), not 0.85 s. The fix tiles (spacing equals stored duration) and nothing is
+  dropped in either build.
+- REJECTED (do not retry): "the Jetson spends about 0.85 s per window in the awaited
+  work" as an explanation for the screenshot's 1.85 s spacing. It does not hold on
+  nano-super with the mock receiver.
+- Open: what makes the deployed sensor's windows about 1.85 s apart (a different
+  DURATION_SEC, a real USRP at a higher rate, ZMS or NATS publishing, add-on modules,
+  or a slow disk). Needs the sensor's `RFOBS_DURATION_SEC` and a few minutes of its
+  `TIMING` and `PROC` log lines.

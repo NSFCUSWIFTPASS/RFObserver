@@ -882,3 +882,50 @@ and no `rfobserver`, `val_run.py`, `poll.py` or `live.sh` process is running.
 and a clean status. `~/rfobs-replay-data`, `~/rfobs-stall` and `~/rfobs-stalltest` were
 not touched, and nvpmodel is still 15W. On the workstation, the bundle was deleted. The
 server logs and poll files are kept in the session scratchpad only.
+
+## Open items as of 2026-09-28 (end of session, HEAD ff9f16b)
+
+This list replaces section 9 as the current open list. Section 9 stays as written.
+Resolved since section 9:
+- F1: replay pacing now uses a deadline clock, and a 6.0 s capture plays in 6.03 s.
+- F2: replay loop is now an option and off by default.
+- F3: the live `iq_expired` burst is root-caused and fixed, with 0 expiries in 343 live
+  bursts.
+- F5: sigmf is installed on nano-super.
+- The lookback default was raised to 2.0 s.
+
+**Findings not yet investigated**
+- **F4.** Strong bursts are detected 15 to 26 MHz wide (feb4 919.43 MHz: 902.0 to
+  927.99 MHz). They could be splatter or a detector artefact. Their stored bandwidth is
+  wrong, although isolation still cuts at the peak and feb4 decodes.
+- **F6.** Every on-air decode is from the flex `ssnmesh` decoder, none is protocol 383:
+  13 in the acceptance runs and 35 in the F3 live runs. Flex has no CRC, so these are
+  not confirmed SSN.
+- **Channelizer taper.** A 10 to 20% taper decoded 13 to 14 protocol-383 bursts on feb5
+  against 11 with the 5% taper. This was tested on one capture only, so it was not
+  adopted. It needs the full-capture set before any change.
+- **Detection delay.** Bursts reach isolation 0.5 to 1.3 s after they start, although
+  end-to-end latency is about 110 ms; the rolling detector emits a burst only once it has
+  stopped growing. With 2.0 s of lookback the margin is about 0.6 s. Not broken down
+  further. Watch `iq_expired_overwritten` in health.
+- **The 920.903 MHz flex decode comes and goes.** It varies between offline runs on the
+  workstation and between channelizer versions.
+
+**Known limitations (parked, with a follow-up noted)**
+- A finished single-pass UI replay keeps running until the operator clicks Stop; there
+  is no auto-stop.
+- A wedged stage worker (a hung filesystem during an archive write) can hang the offline
+  `run_replay` until its 3600 s ceiling.
+- A mid-run RAM-guard trip joins the isolation stage on the receiver thread for up to
+  5 s, inside an existing reconfigure gap.
+- Position-less streaming batches switch the rate gate to the monotonic clock and reset
+  its window; this is rare.
+- A looping UI replay decodes the same bursts again on every pass, when loop is turned
+  on.
+- Bursts beyond the 256 MB per-batch snapshot budget are read lazily and can still
+  expire under extreme load.
+
+**Not measured**
+- Latency and lookback at 56 Msps under load. Everything here was 26 Msps.
+- MAXN behaviour. Not possible on this board until it is reflashed with the Super device
+  tree.

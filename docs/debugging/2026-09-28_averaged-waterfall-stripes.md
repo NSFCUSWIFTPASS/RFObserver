@@ -294,3 +294,157 @@ fix   TIMING recv#2150: recv=51.1ms dropped=0 (IQ=39.4ms) handoff_dropped=0/0 ov
   DURATION_SEC, a real USRP at a higher rate, ZMS or NATS publishing, add-on modules,
   or a slow disk). Needs the sensor's `RFOBS_DURATION_SEC` and a few minutes of its
   `TIMING` and `PROC` log lines.
+
+## 12. Per-window DB writes moved off the averaging loop (2026-09-29)
+
+### The question
+
+A reviewer showed by simulation that when the consumer loop's awaited per-window
+work takes close to DURATION_SEC (0.85 s at 1.0 s), closing the window before that
+work makes windows come more often, each average fewer chunks, and the bounded
+result queue (8) drop more results than on main. Task: take the slow work off the
+loop's critical path, so the loop only accumulates and closes windows.
+
+### The answer
+
+The only awaited step that can be slow is the DB insert. It was awaited inline
+for no stated reason: there is no back-pressure to gain, since the result queue
+drops rather than blocks when the loop falls behind, and the comment at
+`pipeline/app.py:44` already described the inline await as a hazard. Both
+inserts (averaged window, tone check) now go through `_OrderedDbWriter` in
+commit 9bda933: one bounded `asyncio.Queue` (256 writes) and one worker task
+owned by the processor. With an injected 0.85 s insert on nano-super, main
+drops 14% of results and spaces windows 1.90 s apart. The fix drops none and
+spaces them 1.045 s apart, the same as with no delay.
+
+### What changed
+
+- `_publish_processed` queues `_persist_avg_window` on the writer and
+  returns. `replay_mode` still skips; `skip_psd_blobs` and disk-full
+  reporting are unchanged because they stay inside `_persist_avg_window`, now
+  evaluated when the write runs. ZMS/NATS stay fire-and-forget tasks.
+- `_run_tone_check` still evaluates and logs inline (one pass over the bins,
+  1.6 ms p50 on nano-super including the log). Only its insert is queued.
+- The writer keeps submission order. A full queue drops the write, counts it
+  (`db_writes_dropped` in `/api/health` under `pipeline`), and logs a WARNING
+  at most once a minute. Each job logs its own errors; the worker also logs
+  anything that escapes, per item.
+- `run()` drains the writer for up to 3 s (`_DB_WRITE_DRAIN_SEC`, inside the
+  watchdog's 5 s stop timeout) as soon as the consumer loop exits. If the drain
+  times out, it logs how many writes were discarded and cancels the worker.
+- The broadcast is unchanged: `LiveBroadcast.publish` is a `put_nowait` per
+  subscriber queue (drops when a client's queue of 10 is full) and never
+  awaits a socket. Each client's `send_loop` runs on its own task.
+
+### Procedure
+
+1. **Per-step cost, main, instrumented.** `timing_wrap.py` (scratch, not
+   committed) wraps `_run_tone_check`, `_broadcast_averaged`,
+   `_publish_processed`, `_persist_avg_window`,
+   `SensorDatabase.insert_avg_window` and `insert_tone_check` with timers,
+   then calls `cli.main()`. It isolates each awaited step with no product code
+   change. The tone check was enabled (`TONE_CHECK_FREQ_HZ=915.5 MHz`) so its
+   insert was exercised.
+2. **Result-queue drops.** The same wrapper counts `_put_nowait_drop_full`
+   calls on the maxsize-8 queue, split into put and dropped (see trap below).
+3. **Injected delay.** `AVGM_INSERT_DELAY=0.85` makes the wrapped
+   `insert_avg_window` sleep 0.85 s before inserting. This stands in for a slow
+   writer thread on the deployed sensor. Run on both builds.
+4. nano-super at 15 W. Mock receiver, `BANDWIDTH=26000000`, 915 MHz,
+   `DURATION_SEC=1.0`, 150 s per run. Read with `GET /api/averaged` and skip
+   the first 3 windows. Clones of `main` 22bd52f and the fix 9bda933 were
+   shipped with a git bundle. The chunk is 1,024,000 samples (39.4 ms), with
+   3 PSD workers.
+
+### Evidence
+
+Per-step cost, ms (p50 / p90 / max, about 120 windows):
+
+| Step | workstation, branch HEAD | nano-super, main |
+|---|---|---|
+| `insert_avg_window` | 12.7 / 23.5 / 26.2 | 1.3 / 2.0 / 9.6 |
+| `_run_tone_check` (eval + insert + log) | 0.6 / 4.4 / 7.1 | 2.8 / 3.7 / 7.9 |
+| `insert_tone_check` | 0.2 / 4.0 / 6.8 | 1.3 / 1.7 / 3.2 |
+| `_broadcast_averaged` | 0.3 / 0.4 / 2.5 | 1.3 / 1.7 / 2.4 |
+
+nano-super, second round, with the queue counters (the first round agreed within
+15 ms on every spacing figure):
+```
+maindelay: n=76  spacing p10/p50/p90=1.871/1.904/1.970 duration p50=1.000 gap max=1002.8ms  resultq put=1381 dropped=232
+fixdelay:  n=139 spacing p10/p50/p90=1.013/1.045/1.110 duration p50=1.045 gap max=0.0ms     resultq put=1818 dropped=0
+main:      n=139 spacing p10/p50/p90=1.023/1.063/1.117 duration p50=1.000 gap max=148.6ms   resultq put=1791 dropped=0
+fix:       n=140 spacing p10/p50/p90=1.014/1.049/1.104 duration p50=1.049 gap max=0.0ms     resultq put=1811 dropped=0
+fixdelay   _publish_processed p50=0.0 max=0.1ms, insert_avg_window p50=852.5ms, db_writes_dropped=0
+```
+The fix's windows last a little over 1.0 s because a window closes on the first
+result at or past DURATION_SEC. That adds up to one chunk (39.4 ms) plus arrival
+jitter.
+
+Unit test, `test_slow_db_insert_does_not_bend_windows_or_drop_results`
+(fake clock, results every 36.6 ms into a capped queue of 8, 60 s,
+DURATION_SEC 1.0, 0.85 s inserts). On 9bda933's parent it failed with
+`assert 861 == 0` (results dropped against a free insert). Now: 58 windows,
+1639 results taken, 0 dropped, 28.3 chunks per window, every window 1.0248 s
+long, and writer-queue high-water 0.
+
+### Findings
+
+- On nano-super with the mock receiver, the awaited work is small, about 5.5 ms
+  p50 per window in total. The rest of main's 1.06 s spacing is the one-chunk
+  close granularity.
+- Main with an injected 0.85 s insert reproduces the deployed sensor's
+  screenshot (1.85 s spacing, 1.0 s stored duration) almost exactly: 1.904 s.
+  This makes a slow insert on the sensor's writer connection the leading
+  explanation for the screenshot. It is not proven: the sensor itself was not
+  measured.
+- On main, that slow insert also lost 14% of results (232 of 1613) at the
+  result queue. Section 9's open question, "are results dropped while that
+  work runs", is answered yes for main. It is 0 with the fix.
+
+### Measured and REJECTED (do not retry)
+
+- "The tone check or the broadcast is what costs time." They cost 1.3 to
+  2.8 ms p50 on nano-super. Only the DB insert can be slow, because it waits
+  behind every other statement on the single aiosqlite writer thread.
+- "The inline await was deliberate back-pressure." Nothing in the history
+  says so (667a657 added it without comment), and back-pressure is not possible
+  here: `_put_nowait_drop_full` drops at the result queue instead of blocking.
+
+### Measurement traps hit
+
+- The `TIMING recv#` line's `handoff_dropped=` counts only `_LoopHandoff`'s
+  in-flight cap. It does NOT count results dropped by `_put_nowait_drop_full`
+  when the result queue itself is full. Main with the injected delay printed
+  `handoff_dropped=0/0` while it had dropped 232 results. That counter was
+  used in section 11 to say "nothing is dropped". It was right there only
+  because the work was small. Count queue-full drops directly.
+- `fuser -k` sends SIGKILL, so an `atexit` report never runs. The wrapper
+  prints its percentiles every 30 inserts instead.
+- The existing fake-clock tests modelled insert cost as `clock.t += cost`
+  inside the insert. With a background writer, that moves the loop's clock
+  from another task, which is wrong. The new harness advances fake time only
+  in the queue's `get()`. It lets an insert on the writer task finish once
+  fake time passes its deadline, and advances the clock directly only when the
+  insert runs on the consumer task itself (the old inline path, for the RED
+  run).
+
+### Open, not yet answered
+
+- The deployed sensor's real insert cost. Needs the sensor's
+  `RFOBS_DURATION_SEC`, and some of its `TIMING`/`PROC` lines or a
+  `db_writes_dropped` reading once this is deployed. If the writer there
+  averages longer than a window per window's writes, the queue grows. At
+  DURATION_SEC=1.0 with the tone check on (2 writes a window), a writer that
+  stops entirely fills the 256 slots in about 2 minutes. After that, writes are
+  dropped and counted rather than stalling the loop.
+- `_drain_burst_results` still awaits `insert_detections_batch` inline on the
+  consumer loop, on the same writer connection. It runs every iteration, so
+  a slow writer can still stall the loop through that path whenever bursts are
+  pending. Not moved here, since detection persistence has its own ordering and
+  error paths; it is the next candidate.
+- `skip_psd_blobs` is now read when the write runs, not when the window
+  closed. Under a backlog, a window closed before the governor tripped may be
+  stored without its blob. This is the conservative side, and it was not
+  tested.
+- `handoff_dropped` should probably also count queue-full drops, or the TIMING
+  line should print them separately. Not changed here.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
@@ -202,7 +203,9 @@ async def test_replay_mode_publish_processed_skips_egress(tmp_path, monkeypatch)
     mock_create_task = MagicMock()
     monkeypatch.setattr(asyncio, "create_task", mock_create_task)
 
-    await proc._publish_processed([], MagicMock(), MagicMock())
+    await proc._publish_processed(
+        [], MagicMock(), MagicMock(), start_time=datetime.now(timezone.utc), duration_sec=0.5
+    )
 
     mock_create_task.assert_not_called()
 

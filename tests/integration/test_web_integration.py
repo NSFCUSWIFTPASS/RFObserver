@@ -164,6 +164,7 @@ async def test_api_averaged_detail_and_detections(_seed_avg):
 
 @pytest.mark.asyncio
 async def test_publish_processed_persists_and_is_queryable(app_with_db):
+    from datetime import datetime, timezone
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
@@ -200,7 +201,13 @@ async def test_publish_processed_persists_and_is_queryable(app_with_db):
     result = SimpleNamespace(summary_psd=summary, center_freq_hz=915_000_000, capture_num=1)
     stats = IQStatistics(average=-70.0, max=-50.0, median=-72.0, std=3.0, kurtosis=1.0)
 
-    await proc._publish_processed([-80.0, -70.0], result, stats)
+    await proc._publish_processed(
+        [-80.0, -70.0],
+        result,
+        stats,
+        start_time=datetime.now(timezone.utc),
+        duration_sec=0.5,
+    )
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         windows = (await c.get("/api/averaged")).json()["windows"]

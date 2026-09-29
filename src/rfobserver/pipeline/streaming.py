@@ -146,6 +146,64 @@ def _preroll_gaps(
     return [[s - start, lost] for s, lost in stream_gaps if start < s < end and s - start < written]
 
 
+class _AvgWindowClock:
+    """Real time span of the averaged window being accumulated.
+
+    A window starts when its first result arrives, or, in steady state, at the
+    instant the previous window closed, so consecutive windows tile the
+    timeline. It ends when it is closed. The stored start and duration are this
+    real span, not ``DURATION_SEC``: a window closes on the first result past
+    ``DURATION_SEC`` and the results that arrive during the awaited persist
+    belong to the next window, so the nominal length under-reports it. Both
+    clocks are read at every boundary: monotonic for the duration, wall for the
+    start, so a wall-clock step never accumulates into later windows.
+    """
+
+    __slots__ = ("_start_mono", "_start_wall", "_last_mono", "_last_wall")
+
+    def __init__(self) -> None:
+        self._start_mono: float | None = None
+        self._start_wall: datetime | None = None
+        self._last_mono = 0.0
+        self._last_wall: datetime | None = None
+
+    def mark_result(self) -> None:
+        """A result was accumulated: start the window if idle, note the arrival."""
+        self._last_mono = time.monotonic()
+        self._last_wall = datetime.now(timezone.utc)
+        if self._start_mono is None:
+            self._start_mono = self._last_mono
+            self._start_wall = self._last_wall
+
+    def elapsed(self) -> float:
+        return 0.0 if self._start_mono is None else time.monotonic() - self._start_mono
+
+    def close(self, *, at_last_result: bool = False) -> tuple[datetime, float]:
+        """End the window and return its (start, duration_sec).
+
+        Default: it ends now and the next window starts here (tiling).
+        ``at_last_result``: it ends at its last result's arrival (idle flush)
+        and the next window starts when the next result arrives.
+        """
+        assert self._start_mono is not None and self._start_wall is not None
+        start_wall = self._start_wall
+        if at_last_result:
+            assert self._last_wall is not None
+            duration = self._last_mono - self._start_mono
+            self.reset()
+        else:
+            end_mono = time.monotonic()
+            end_wall = datetime.now(timezone.utc)
+            duration = end_mono - self._start_mono
+            self._start_mono = end_mono
+            self._start_wall = end_wall
+        return start_wall, max(0.0, duration)
+
+    def reset(self) -> None:
+        self._start_mono = None
+        self._start_wall = None
+
+
 class _StreamResult:
     """Container for results produced by the processing workers."""
 
@@ -2712,7 +2770,7 @@ class StreamingProcessor:
 
         accum_powers: list[list[float]] = []
         accum_moments: IQMoments | None = None
-        accum_start = time.monotonic()
+        window_clock = _AvgWindowClock()
         last_result: _StreamResult | None = None
 
         while self._running:
@@ -2727,11 +2785,18 @@ class StreamingProcessor:
                     # so it is non-None whenever accum_powers is non-empty.
                     assert accum_moments is not None
                     interval_stats = finalize_moments(accum_moments)
+                    # The queue went idle: this window ends at its last result.
+                    win_start, win_dur = window_clock.close(at_last_result=True)
                     await self._broadcast_averaged(avg, last_result, len(accum_powers))
-                    await self._publish_processed(avg, last_result, interval_stats)
+                    await self._publish_processed(
+                        avg,
+                        last_result,
+                        interval_stats,
+                        start_time=win_start,
+                        duration_sec=win_dur,
+                    )
                     accum_powers.clear()
                     accum_moments = None
-                    accum_start = time.monotonic()
                     last_result = None
                 continue
 
@@ -2753,21 +2818,24 @@ class StreamingProcessor:
             if accum_powers and len(accum_powers[0]) != len(new_powers):
                 accum_powers.clear()
                 accum_moments = None
-                accum_start = time.monotonic()
+                window_clock.reset()
                 last_result = None
+            window_clock.mark_result()
             accum_powers.append(new_powers)
             accum_moments = (
                 result.iq_moments if accum_moments is None else accum_moments.add(result.iq_moments)
             )
             last_result = result
 
-            elapsed = time.monotonic() - accum_start
-            if elapsed >= self._settings.DURATION_SEC:
+            if window_clock.elapsed() >= self._settings.DURATION_SEC:
                 avg = _np.mean(accum_powers, axis=0).tolist()
                 # accum_moments is folded right after each accum_powers.append,
                 # so it is non-None whenever accum_powers is non-empty.
                 assert accum_moments is not None
                 interval_stats = finalize_moments(accum_moments)
+                # Close before the awaited work below: results that arrive
+                # during it belong to the next window, which starts now.
+                win_start, win_dur = window_clock.close()
 
                 if self._settings.TONE_CHECK_ENABLED:
                     await self._run_tone_check(avg, result)
@@ -2777,11 +2845,12 @@ class StreamingProcessor:
                     await self._broadcast_averaged(avg, result, len(accum_powers))
 
                 # ZMS + NATS always get DURATION_SEC-averaged data
-                await self._publish_processed(avg, result, interval_stats)
+                await self._publish_processed(
+                    avg, result, interval_stats, start_time=win_start, duration_sec=win_dur
+                )
 
                 accum_powers.clear()
                 accum_moments = None
-                accum_start = time.monotonic()
                 last_result = None
 
             # --- High-res UI broadcast (every chunk) ---
@@ -2949,20 +3018,30 @@ class StreamingProcessor:
         )
 
     async def _persist_avg_window(
-        self, avg_powers: list[float], result: _StreamResult, iq_stats: IQStatistics
+        self,
+        avg_powers: list[float],
+        result: _StreamResult,
+        iq_stats: IQStatistics,
+        *,
+        start_time: datetime,
+        duration_sec: float,
     ) -> None:
         """Store the averaged window locally. Runs for every live window,
         independent of whether ZMS/NATS are attached. Flags (interference /
         violations) are not computed in the streaming path yet, so they are left
-        NULL until the PSDProcessor gap is closed."""
+        NULL until the PSDProcessor gap is closed.
+
+        ``start_time`` / ``duration_sec`` are the window's real span, measured by
+        the caller (see ``_AvgWindowClock``), not the persist time and the
+        nominal ``DURATION_SEC``."""
         s = self._settings
         freqs = result.summary_psd.frequencies
         freq_start = float(freqs[0]) if freqs else 0.0
         freq_step = float(freqs[1] - freqs[0]) if len(freqs) > 1 else 0.0
         try:
             await self._db.insert_avg_window(
-                start_time=datetime.now(timezone.utc),
-                duration_sec=s.DURATION_SEC,
+                start_time=start_time,
+                duration_sec=duration_sec,
                 sdr_center_freq_hz=float(result.center_freq_hz),
                 sample_rate_hz=float(s.BANDWIDTH),
                 gain_db=float(s.GAIN),
@@ -2986,7 +3065,13 @@ class StreamingProcessor:
             logger.exception("avg-window persist failed (chunk #%d)", result.capture_num)
 
     async def _publish_processed(
-        self, avg_powers: list[float], result: _StreamResult, iq_stats: IQStatistics
+        self,
+        avg_powers: list[float],
+        result: _StreamResult,
+        iq_stats: IQStatistics,
+        *,
+        start_time: datetime,
+        duration_sec: float,
     ) -> None:
         """Build the per-window envelope once, fan out to ZMS + NATS.
 
@@ -2997,7 +3082,9 @@ class StreamingProcessor:
         """
         if self._replay_mode:
             return
-        await self._persist_avg_window(avg_powers, result, iq_stats)
+        await self._persist_avg_window(
+            avg_powers, result, iq_stats, start_time=start_time, duration_sec=duration_sec
+        )
         if self._zms_monitor is None and self._nats_producer is None:
             return
         try:

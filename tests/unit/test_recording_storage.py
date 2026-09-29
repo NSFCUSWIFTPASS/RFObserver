@@ -384,7 +384,9 @@ async def test_step_4_writes_the_stats_row_without_a_blob(tmp_path):
         capture_num=1,
     )
     stats = SimpleNamespace(average=0.0, max=0.0, median=0.0, std=0.0, kurtosis=0.0)
-    await proc._persist_avg_window([1.0, 2.0], result, stats)
+    await proc._persist_avg_window(
+        [1.0, 2.0], result, stats, start_time=datetime.now(timezone.utc), duration_sec=0.5
+    )
     assert captured["powers"] is None
     assert captured["pwr_avg"] == 0.0
 
@@ -405,7 +407,9 @@ async def test_sqlite_disk_full_reports_to_the_governor(tmp_path):
         capture_num=1,
     )
     stats = SimpleNamespace(average=0.0, max=0.0, median=0.0, std=0.0, kurtosis=0.0)
-    await proc._persist_avg_window([1.0, 2.0], result, stats)
+    await proc._persist_avg_window(
+        [1.0, 2.0], result, stats, start_time=datetime.now(timezone.utc), duration_sec=0.5
+    )
     assert "disk is full" in gov.state.last_write_error["error"]
 
 

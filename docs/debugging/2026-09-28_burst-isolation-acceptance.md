@@ -690,3 +690,195 @@ running. `~/GitHub/RFObserver` is still on `feat/averaged-window-store` with
 `stash@{0}` intact and a clean status. `~/rfobs-*` was not touched. The unit suite's
 `tmp_path` directories went into the existing `/tmp/pytest-of-ocollaco`, which pytest
 rotates.
+
+## F3 live confirmation (2026-09-28, after 41d6545)
+
+This section is appended; everything above is unchanged. It answers the first item of
+"Open, not yet answered" in the F3 root-cause section (the fix had not run live).
+
+### Question
+
+Does the F3 fix (snapshot-first reads, FFT channelizer, expiry sub-counters, one expiry
+WARNING per batch, lazy bursts read first) hold on the live B200mini, with no young
+`iq_expired` under load, and if any burst expires, which sub-counter does it land in?
+Build: `feat/rtl433-burst-attribution` at `41d6545`. Hardware: nano-super, 15W (MAXN
+unavailable, nvpmodel not touched), B200mini serial 322750B, 915 MHz, 26 Msps.
+
+### Answer
+
+Yes. In 3 live runs of 10 minutes each (343 picked bursts in total), `iq_expired` was
+0, and so were all three sub-counters (`overwritten`, `unwritten`, `nopos`). There was
+no expiry WARNING and no failed read_range. Both invariants held and the sub-counters
+summed to `iq_expired` in all 33 health samples. Latency is unchanged from the
+pre-fix live runs: steady-state (minutes 2 to 10) `excess_ms` p50 was 110.5 to 110.8 ms
+and p99 was 134.2 to 141.8 ms. There were 0 overflows. Dropped chunks were 3, 4 and 3,
+all in the first 50 chunks. Peak RSS was 698 MB, below the earlier 777 MB.
+
+The stage keeps up: no batch waited in the queue for more than 2 ms, and the slowest
+batch (10 bursts, run 3) took 564 ms. Most of the lookback is now spent before the
+stage sees a burst, not in it: bursts are 0.53 to 1.28 s past their stop sample when
+their batch starts (see Open).
+
+### Procedure
+
+1. Shipped the committed branch as a git bundle (`/tmp/f3live.bundle`) and cloned it
+   to `~/rfobs-f3live/repo` (a separate clone, so `~/GitHub/RFObserver` gained no ref).
+   The server ran with `PYTHONPATH=~/rfobs-f3live/repo/src` and the existing
+   `~/GitHub/RFObserver/.venv`. Each server log starts with
+   `rfobserver from /home/ocollaco/rfobs-f3live/repo/src/rfobserver/__init__.py`.
+2. Instrumentation came from the section 3 wrapper (`val_run.py`, same `VALTRACE`,
+   `VALNONE` and latency hooks), which calls `rfobserver.cli.main` with `run`. One hook
+   was added, `VALBATCH`, wrapping `IsolationStage.submit` and `process_batch`. Per
+   batch it logs:
+   - `qwait_ms`: time from submit to the start of processing, which isolates stage
+     backlog;
+   - `age_at_start_ms`: `total_written - stop_sample` for each candidate at the start
+     of the batch, which is how far into the 1.5 s ring each burst already is when the
+     stage first touches it;
+   - `proc_ms`: the whole batch, gate plus snapshot plus DSP;
+   - burst durations and final states.
+   No product code was changed.
+3. The env was the same as section 3's `live_on`: `RFOBS_SENSOR_ACTIVE=true`,
+   `RFOBS_FREQUENCY_START=915000000`, `RFOBS_FREQUENCY_END=915000000`,
+   `RFOBS_FREQUENCY_STEP=0`, `RFOBS_BANDWIDTH=26000000`,
+   `RFOBS_ATTRIBUTION_ENABLED=true`, port 8888, with STORAGE_PATH and DB_PATH under
+   `~/rfobs-f3live/<run>/storage`. The runs were:
+   - `run1` and `run2`: the settings above;
+   - `run3`: the same plus `RFOBS_ISOLATION_SNR_DB=8` (default 13), to raise the
+     isolation load.
+4. For each run: start the server, wait for `/api/health`, wait 20 s, then poll
+   `/api/health` 11 times at 60 s. Each poll checked:
+   - `received == gated_out + queue_full + picked`;
+   - `picked - (isolated + iq_expired + too_long + error) == 0`;
+   - `iq_expired_overwritten + iq_expired_unwritten + iq_expired_nopos == iq_expired`;
+   - VmRSS and VmHWM from `/proc/<pid>/status`.
+   Then `fuser -k 8888/tcp`, wait 10 s, and confirm no `val_run.py` is left.
+5. Afterwards, grep each log for `iq_expired`, `WARNING`, `ERROR`, `Traceback`, the
+   snapshot-budget INFO line and `VALNONE`, and read decodes from each run's DB.
+
+### Evidence
+
+Per run (steady = minutes 2 to 10; startup = minute 1):
+
+| run | picked | isolated | iq_expired (ovw / unw / nopos) | gated_out, queue_full, too_long, error | attr_decoded | lat p50 steady | lat p99 steady | lat p99 / max startup | dropped | ovf | RSS range MB | HWM MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| run1 | 108 | 108 | 0 (0/0/0) | 0, 0, 0, 0 | 7 | 110.6-110.8 | 134.2-139.7 | 164.5 / 367.8 | 3 | 0 | 570-666 | 668 |
+| run2 | 99 | 99 | 0 (0/0/0) | 0, 0, 0, 0 | 8 | 110.5-110.7 | 134.6-139.8 | 207.0 / 414.2 | 4 | 0 | 614-656 | 664 |
+| run3 (SNR 8) | 136 | 136 | 0 (0/0/0) | 0, 0, 0, 0 | 20 | 110.6-110.7 | 134.4-141.8 | 190.2 / 335.4 | 3 | 0 | 582-659 | 698 |
+
+The sub-counters never appeared in `counts` (the stats object only lists counters that
+have moved), so each one is 0. `sub_sum_ok` was True in every sample.
+
+Final health sample of each run (`inv` is the received invariant, then picked minus the
+terminal states, then the sub-counter sum check):
+```
+run1 23:56:37 10 {'received': 108, 'picked': 108, 'isolated': 108, 'attr_decoded': 7, 'attr_not_decoded': 101, 'attr_dropped': 0} inv True 0 sub True ovf 0 proc {'VmHWM': 668, 'VmRSS': 666}
+run2 00:07:18 10 {'received': 99, 'picked': 99, 'isolated': 99, 'attr_decoded': 8, 'attr_not_decoded': 91, 'attr_dropped': 0} inv True 0 sub True ovf 0 proc {'VmHWM': 664, 'VmRSS': 656}
+run3 00:17:59 10 {'received': 136, 'picked': 136, 'isolated': 136, 'attr_decoded': 20, 'attr_not_decoded': 116, 'attr_dropped': 0} inv True 0 sub True ovf 0 proc {'VmHWM': 698, 'VmRSS': 659}
+```
+All 33 samples: `inv True 0 sub True ovf 0`.
+
+The `iq_expired` WARNING lines, verbatim: none. `grep 'iq_expired\|WARNING\|ERROR\|Traceback\|snapshot budget\|lagged'`
+matched nothing in any of the three server logs, and there were 0 `VALNONE` lines, so no
+read_range returned None.
+
+Drops: the counter was set by recv#50 and never moved.
+```
+run1 23:46:17,603 TIMING recv#50: recv=38.4ms dropped=3 (IQ=39.4ms) handoff_dropped=0/0 ovf=0 lost=0
+run1 23:56:41,848 TIMING recv#15900: recv=38.6ms dropped=3 (IQ=39.4ms) handoff_dropped=0/0 ovf=0 lost=0
+run2 23:56:58,306 TIMING recv#50: recv=38.5ms dropped=4 (IQ=39.4ms) handoff_dropped=0/0 ovf=0 lost=0
+run2 00:07:22,550 TIMING recv#15900: recv=38.6ms dropped=4 (IQ=39.4ms) handoff_dropped=0/0 ovf=0 lost=0
+run3 00:07:39,257 TIMING recv#50: recv=38.6ms dropped=3 (IQ=39.4ms) handoff_dropped=0/0 ovf=0 lost=0
+run3 00:18:03,505 TIMING recv#15900: recv=38.3ms dropped=3 (IQ=39.4ms) handoff_dropped=0/0 ovf=0 lost=0
+```
+
+Last VALTRACE of each run (the `all_*` fields cover the whole run):
+```
+run1 VALTRACE lat_n=1525 lat_p50=110.6 lat_p99=135.2 lat_max=150.8 wr_n=1525 wr_mean=0.77 wr_max=4.4 wr_over5=0 wr_over20=0 rr_n=12 rr_mean=0.66 rr_max=2.8 rr_max_samples=4153920 rss_mb=666 hwm_mb=668 all_wr_max=8.6 all_rr_max=3.7 all_lat_max=367.8 all_wr_over20=0
+run2 VALTRACE lat_n=1525 lat_p50=110.5 lat_p99=139.0 lat_max=160.5 wr_n=1525 wr_mean=0.76 wr_max=2.3 wr_over5=0 wr_over20=0 rr_n=8 rr_mean=0.45 rr_max=0.7 rr_max_samples=441920 rss_mb=634 hwm_mb=664 all_wr_max=12.8 all_rr_max=4.0 all_lat_max=414.2 all_wr_over20=0
+run3 VALTRACE lat_n=1525 lat_p50=110.6 lat_p99=134.7 lat_max=156.4 wr_n=1525 wr_mean=0.77 wr_max=2.2 wr_over5=0 wr_over20=0 rr_n=16 rr_mean=0.84 rr_max=4.6 rr_max_samples=4153920 rss_mb=659 hwm_mb=698 all_wr_max=16.7 all_rr_max=15.3 all_lat_max=335.4 all_wr_over20=0
+```
+In run3 minute 3, the longest read_range was 15.3 ms, for 6,719,040 samples (the
+254 ms burst). The worst ring write that minute was 9.6 ms, and there was no overflow.
+The 16.7 ms write maximum was in minute 1 (startup).
+
+Stage lag (`VALBATCH`, all batches):
+```
+run1 batches 71 picked/batch max 5  proc_ms p50 39 p99 165 max 165 | qwait_ms max 1 | age_at_start_ms p50 723 p99 1017 max 1282 | burst dur p50 9.1 max 156.0, sum 2.56 s
+run2 batches 64 picked/batch max 3  proc_ms p50 42 p99 173 max 173 | qwait_ms max 1 | age_at_start_ms p50 728 p99 1266 max 1266 | burst dur p50 9.1 max 155.8, sum 2.23 s
+run3 batches 78 picked/batch max 10 proc_ms p50 42 p99 564 max 564 | qwait_ms max 2 | age_at_start_ms p50 722 p99 1206 max 1271 | burst dur p50 9.1 max 254.4, sum 3.49 s
+```
+The heaviest batches, verbatim:
+```
+run3 VALBATCH n=10 picked=10 qwait_ms=0 proc_ms=564 age_at_start_ms=[782, 767, 752, 737, 722, 707, 692, 677, 661, 646] dur_ms=[209.1, 12.8, 12.8, 13.0, 12.8, 12.8, 13.0, 12.8, 12.8, 13.0] states={'isolated': 10}
+run3 VALBATCH n=2 picked=2 qwait_ms=0 proc_ms=424 age_at_start_ms=[1077, 819] dur_ms=[118.5, 254.4] states={'isolated': 2}
+run3 VALBATCH n=1 picked=1 qwait_ms=0 proc_ms=268 age_at_start_ms=[1129] dur_ms=[239.5] states={'isolated': 1}
+run1 VALBATCH n=2 picked=2 qwait_ms=0 proc_ms=78 age_at_start_ms=[1282, 529] dur_ms=[36.6, 9.1] states={'isolated': 2}
+run2 VALBATCH n=1 picked=1 qwait_ms=0 proc_ms=71 age_at_start_ms=[1266] dur_ms=[52.8] states={'isolated': 1}
+```
+The 10-burst batch is a sweep at 908.0 to 911.2 MHz in 0.4 MHz steps, 12.8 ms bursts
+15 ms apart, plus one 209 ms burst. It is larger than F3's 3-burst batch, and every
+burst was isolated. The read start (the stop age plus the duration plus the 2 ms guard)
+was at most 1321 ms old at batch start (run1: 1282 + 36.6 + 2). In run3,
+1129 + 239.5 + 2 = 1371 ms, which is 129 ms short of the 1.5 s ring. Snapshot-first
+means that margin only has to cover the gate and the copy, not the DSP.
+
+On-air decodes (DB rows with a model). All of them are `ssnmesh` flex decodes (no CRC),
+and none is protocol 383, as in F6:
+```
+run1 (7): 916.803 -67.6 dB 6.7 ms; 927.594 -67.1 dB 27.8 ms; 923.595 -67.8 dB 16.3 ms; 904.006 -71.2 dB 6.7 ms;
+          907.599 -71.7 dB 27.6 ms; 911.204 -73.3 dB 6.7 ms; 926.400 -64.2 dB 23.0 ms
+run2 (8): 911.598 27.4 ms; 914.797 27.4 ms; 917.603 6.7 ms; 911.204 46.5 ms; 920.396 12.8 ms; 913.604 6.7 ms;
+          904.806 46.3 ms; 913.997 12.6 ms (-67.1 to -72.5 dB)
+run3 (20): 908.005 to 911.204 (9 of the 12.8 ms sweep bursts, -72.8 to -75.4 dB); 917.196 254.4 ms 6.74 MHz wide -67.1 dB;
+          916.396; 903.600; 907.599; 912.804 (67.0 ms); 913.604; 913.197 (x2); 907.205; 916.803; 904.806
+```
+Detections: 111 / 99 / 137, each with attribution. SigMF metas under `bursts/`: 111 /
+99 / 137.
+
+### Measured and REJECTED (do not retry)
+
+- **"The F3 young expiry recurs under live load after the fix."** Rejected: 0 of 343
+  picked bursts expired, including a 10-burst batch (564 ms of DSP) and 118 to 254 ms
+  bursts in run3.
+- **"The FFT channelizer or the snapshot copy costs latency or RSS live."** Rejected:
+  steady p50 was 110.5 to 110.8 ms (110.4 to 110.8 before) and p99 134.2 to 141.8 ms
+  (130.5 to 139.9 before). Peak HWM was 698 MB against 769 to 777 MB before.
+
+### Measurement traps
+
+- **SNR 8 in run3 is not shown to be the cause of its higher load.** gated_out was 0 in
+  all three runs, so the gate did not reject anything at 13 dB either. run3's extra
+  bursts (136 against 99 and 108) and its 10-burst sweep may be on-air variation. The
+  setting was applied (it is in the run3 env dump), but its effect was not isolated.
+- **An absent counter means 0.** `iq_expired_*` do not appear in `counts` until they
+  move, so a script that requires the key would report a false failure. poll.py
+  treats a missing key as 0.
+- **The run timestamps cross midnight.** run2 and run3 ended on 2026-09-29 (bursts under
+  `bursts/20260929/`), although the section is dated by the build day.
+- **The first minute still carries startup costs** (p99 164 to 207 ms, max 335 to
+  414 ms), as in section 6. The steady-state figures exclude it.
+
+### Open, not yet answered
+
+- **Detection lag uses most of the lookback.** A burst is 0.53 to 1.28 s past its stop
+  sample before its batch starts, although `excess_ms` is about 110 ms. The rest is
+  upstream of the stage, presumably burst tracking and closure over later chunks, and
+  it was not broken down here. The tightest read was 129 ms from being overwritten
+  (run3). A longer burst, up to ISOLATION_MAX_BURST_SEC = 0.5 s, detected that late
+  would not fit in the 1.5 s ring whatever the stage does. It would land in
+  `iq_expired_overwritten`, and that counter is now visible if it happens.
+- The lazy path (a batch over the 256 MB snapshot budget) was not hit live: no
+  snapshot-budget INFO line. It is still untested live.
+- F6 stands: 35 on-air decodes, all flex `ssnmesh`, none protocol 383.
+- 56 Msps and MAXN: still not measured.
+
+### Cleanup (this confirmation)
+
+On nano-super, `~/rfobs-f3live` (the clone, scripts, run dirs, DBs and bursts) and
+`/tmp/f3live.bundle` were removed. After `fuser -k`, `fuser 8888/tcp` finds nothing,
+and no `rfobserver`, `val_run.py`, `poll.py` or `live.sh` process is running.
+`~/GitHub/RFObserver` is still on `feat/averaged-window-store` with `stash@{0}` intact
+and a clean status. `~/rfobs-replay-data`, `~/rfobs-stall` and `~/rfobs-stalltest` were
+not touched, and nvpmodel is still 15W. On the workstation, the bundle was deleted. The
+server logs and poll files are kept in the session scratchpad only.

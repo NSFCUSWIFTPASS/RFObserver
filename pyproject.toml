@@ -53,6 +53,7 @@ dependencies = [
     "pytest-asyncio>=0.24,<1",
     "pytest-mock>=3.14,<4",
     "respx>=0.22,<1",
+    "sigmf>=1.2,<2",
 ]
 
 [tool.hatch.envs.test.scripts]
@@ -121,10 +122,12 @@ module = [
     "rfobserver.processing.spectral",
     "rfobserver.processing.iq_utils",
     "rfobserver.processing.burst",
+    "rfobserver.processing.channelize",
     "rfobserver.capture.trigger",
     "rfobserver.capture.receiver",
     "rfobserver.capture.buffer",
     "rfobserver.modules.*",
+    "rfobserver.pipeline.attribution",
 ]
 disallow_any_generics = false
 

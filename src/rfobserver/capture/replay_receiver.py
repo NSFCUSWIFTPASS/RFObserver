@@ -25,6 +25,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# If paced playback falls this far behind wall clock (a slow host), re-anchor
+# the pacing clock instead of sleeping 0s on every subsequent chunk until the
+# backlog drains -- that would burst chunks through with no pacing at all.
+_PACE_REANCHOR_LAG_SEC = 1.0
+
 
 class FileReplayReceiver(MockReceiver):
     """Replays a ``SigmfCapture`` as an SC16 stream.
@@ -60,6 +65,17 @@ class FileReplayReceiver(MockReceiver):
         self._speed_lock = threading.Lock()
         self._speed = max(0.01, float(speed))
         self._exhausted = threading.Event()
+        # Deadline-based pacing: t0 anchors wall-clock 0 to the first paced
+        # chunk, and _pace_samples is the running total emitted since that
+        # anchor. Each call sleeps to t0 + _pace_samples / (fs * speed)
+        # instead of a fixed per-chunk sleep, so conversion/processing time
+        # inside recv_chunk doesn't add to the period. Re-anchored (t0 reset,
+        # _pace_samples zeroed) on the first paced call, on a speed change,
+        # on a loop wrap, and if playback falls behind by more than
+        # _PACE_REANCHOR_LAG_SEC (a slow host) -- re-anchoring avoids bursting
+        # a backlog of chunks through with no sleep to "catch up".
+        self._pace_t0: float | None = None
+        self._pace_samples = 0
         self._drain_rng = np.random.default_rng(0)
         # Estimate the capture's NOISE FLOOR (not RMS) so trailing drain noise
         # matches the quiet parts. Using RMS would track a strong continuous
@@ -89,6 +105,9 @@ class FileReplayReceiver(MockReceiver):
     def set_speed(self, speed: float) -> None:
         with self._speed_lock:
             self._speed = max(0.01, float(speed))
+            # Re-anchor pacing: the old t0 was scheduled for the old rate, so
+            # keeping it would jump the very next sleep by the whole backlog.
+            self._pace_t0 = None
 
     def _fill_drain(self, out_buf: np.ndarray[Any, np.dtype[Any]], start: int = 0) -> None:
         n = len(out_buf) - start
@@ -112,12 +131,14 @@ class FileReplayReceiver(MockReceiver):
             self._fill_drain(out_buf)
             return n
         filled = 0
+        wrapped = False
         while filled < n:
             remaining = self._n - self._pos
             if remaining <= 0:
                 if self.loop:
                     self._pos = 0
                     remaining = self._n
+                    wrapped = True
                     if remaining <= 0:
                         break
                 else:
@@ -131,8 +152,40 @@ class FileReplayReceiver(MockReceiver):
             self._pos += take
             filled += take
         if self._paced:
-            # Pace to wall-clock: n samples at sample_rate * speed.
-            delay = n / (self._cap.sample_rate_hz * self.speed)
-            if delay > 0:
-                time.sleep(delay)
+            self._pace(n, wrapped)
         return n
+
+    def _pace(self, n: int, wrapped: bool) -> None:
+        """Sleep until this chunk's deadline on a wall clock anchored at t0.
+
+        Called after the chunk is already produced, so the deadline for chunk
+        k is ``t0 + total_samples_emitted / (fs * speed)``: conversion time
+        inside `recv_chunk` is absorbed into the sleep instead of adding to
+        every period the way a fixed per-chunk ``sleep(n / (fs * speed))``
+        does.
+        """
+        now = time.monotonic()
+        with self._speed_lock:
+            if self._pace_t0 is None or wrapped:
+                self._pace_t0 = now
+                self._pace_samples = 0
+            speed = self._speed
+            self._pace_samples += n
+            t0 = self._pace_t0
+            samples = self._pace_samples
+        target = t0 + samples / (self._cap.sample_rate_hz * speed)
+        delay = target - now
+        if delay > 0:
+            time.sleep(delay)
+        elif delay < -_PACE_REANCHOR_LAG_SEC:
+            # Log once per lag event: re-anchoring below resets the deadline
+            # to "now", so the condition clears immediately and won't
+            # re-trigger next chunk unless the host falls behind again.
+            logger.warning(
+                "Replay pacing fell behind wall clock by %.2fs; re-anchoring "
+                "instead of bursting to catch up",
+                -delay,
+            )
+            with self._speed_lock:
+                self._pace_t0 = time.monotonic()
+                self._pace_samples = 0

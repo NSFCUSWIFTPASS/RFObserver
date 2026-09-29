@@ -184,3 +184,83 @@ def test_dashboard_handles_evicting_young():
 def test_config_page_legend_handles_evicting_young():
     html = _client(None).get("/config").text
     assert "evicting_young" in html
+
+
+def test_health_reports_bursts_gb():
+    gov = StorageGovernor()
+    gov.tick(
+        StorageSample(
+            data=VolumeSample(500 * GB, 1000 * GB),
+            db_volume=None,
+            db_file_bytes=GB,
+            db_reusable_bytes=0,
+            auto_bytes=0,
+            manual_bytes=0,
+            evictable_auto=True,
+            bursts_bytes=3 * GB,
+        ),
+        min_free_gb=0,
+        now=T0,
+    )
+    assert _client(gov).get("/api/health").json()["storage"]["bursts_gb"] == 3.0
+
+
+def test_health_reports_isolation_status():
+    from types import SimpleNamespace
+
+    app = create_app(AppSettings(_env_file=None))
+    status = {
+        "enabled": True,
+        "attribution": False,
+        "rtl433": None,
+        "ring_sec": 1.5,
+        "disabled_reason": None,
+        "counts": {"isolated": 3},
+    }
+    proc = SimpleNamespace(isolation_status=lambda: status)
+    app.state.supervisor = SimpleNamespace(
+        processor=proc, active=True, gave_up=False, consecutive_crashes=0
+    )
+    body = TestClient(app).get("/api/health").json()
+    assert body["isolation"] == status
+
+
+def test_health_without_isolation_status_has_no_isolation_block():
+    from types import SimpleNamespace
+
+    app = create_app(AppSettings(_env_file=None))
+    app.state.supervisor = SimpleNamespace(
+        processor=SimpleNamespace(), active=True, gave_up=False, consecutive_crashes=0
+    )
+    assert "isolation" not in TestClient(app).get("/api/health").json()
+
+
+def test_config_page_has_the_isolation_fields():
+    html = _client(None).get("/config").text
+    for name in (
+        "isolation_enabled",
+        "attribution_enabled",
+        "isolation_snr_db",
+        "isolation_max_per_sec",
+        "isolation_lookback_sec",
+        "isolation_max_burst_sec",
+        "burst_archive_max_gb",
+    ):
+        assert f'name="{name}"' in html
+
+
+def test_dashboard_draws_attribution_labels():
+    html = _client(None).get("/live/").text
+    # Fed from the psd payload, cleared with the waterfall, drawn by model.
+    assert "updateBurstOverlay(data.bursts, data.attributions)" in html
+    assert "attrLabels.set(a.id, a)" in html
+    assert "attrLabels.clear()" in html
+    assert "fillText(text, tx, ty)" in html
+    assert "String(a.model)" in html
+    assert "rgba(255, 214, 10, 0.95)" in html
+
+
+def test_config_page_marks_the_isolation_switches_as_next_start():
+    html = _client(None).get("/config").text
+    assert html.count("Applies at next start") == 2
+    assert 'class="sb-seg sb-bursts"' in html

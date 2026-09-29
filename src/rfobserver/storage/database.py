@@ -265,6 +265,15 @@ _DETECTION_SDR_COLUMNS: dict[str, str] = {
     "peak_freq_hz": "REAL",
 }
 
+# rtl_433 burst-attribution columns: which device model / protocol (if any)
+# rtl_433 decoded from a burst's IQ, plus the raw decode payload. Nullable,
+# since most detections are never attempted or never decode.
+_DETECTION_ATTRIBUTION_COLUMNS: dict[str, str] = {
+    "model": "TEXT",
+    "protocol_id": "INTEGER",
+    "attribution": "TEXT",
+}
+
 
 def _nice_bin_width(span: float) -> float:
     """Pick a human-friendly bin width (1/2/5 x 10^k ms) targeting ~20 bins.
@@ -410,7 +419,8 @@ class SensorDatabase:
         logger.info("Database connected: %s", self._db_path)
 
     async def _migrate_detection_columns(self) -> None:
-        """Add SDR capture-context columns to an existing detections table.
+        """Add SDR capture-context and attribution columns to an existing
+        detections table.
 
         Fresh databases get these from SCHEMA; older ones are upgraded in place
         so their pre-existing rows keep working (the new columns read as NULL).
@@ -418,7 +428,10 @@ class SensorDatabase:
         assert self._db is not None
         async with self._db.execute("PRAGMA table_info(detections)") as cursor:
             existing = {row[1] for row in await cursor.fetchall()}
-        for column, col_type in _DETECTION_SDR_COLUMNS.items():
+        for column, col_type in {
+            **_DETECTION_SDR_COLUMNS,
+            **_DETECTION_ATTRIBUTION_COLUMNS,
+        }.items():
             if column not in existing:
                 await self._db.execute(f"ALTER TABLE detections ADD COLUMN {column} {col_type}")
                 logger.info("Migrated detections: added column %s", column)
@@ -536,6 +549,26 @@ class SensorDatabase:
             ),
         )
         await self._db.commit()
+
+    @_guarded_write
+    async def update_detection_attribution(
+        self,
+        *,
+        burst_id: str,
+        model: str | None,
+        protocol_id: int | None,
+        attribution: str,
+    ) -> int:
+        """Merge an rtl_433 result onto an existing detection. No-op if the
+        burst_id is absent (e.g. pruned). Returns the number of rows updated
+        (0 or 1), so a caller can retry when the detection row is not there yet."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "UPDATE detections SET model = ?, protocol_id = ?, attribution = ? WHERE burst_id = ?",
+            (model, protocol_id, attribution, burst_id),
+        )
+        await self._db.commit()
+        return int(cursor.rowcount)
 
     @_guarded_write
     async def insert_detections(self, detections: Sequence[Mapping[str, Any]]) -> int:

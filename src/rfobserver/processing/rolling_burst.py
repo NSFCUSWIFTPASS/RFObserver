@@ -75,6 +75,12 @@ class RollingBurstDetector:
         self._rows_filled = 0  # total rows written (capped at window_rows)
         self._rows_since_eval = 0
         self._total_rows_written = 0  # absolute row counter (for cross-eval identity)
+        # Stream sample position of each absolute row (abs % len), -1 when
+        # unknown. Twice the window, so a burst emitted as it scrolls out of the
+        # window still has its first row's position. Recorded per row, never
+        # derived from the row count, so a dropped chunk cannot shift it.
+        self._row_pos = np.full(2 * window_rows, -1, dtype=np.int64)
+        self._slice_samples: int | None = None
         self._eval_count = 0
         self._tracked: list[_TrackedBurst] = []
         self._last_detection: BurstDetectionResult | None = None
@@ -97,8 +103,18 @@ class RollingBurstDetector:
     def last_detection(self) -> BurstDetectionResult | None:
         return self._last_detection
 
-    def feed(self, psd_grid: PSDGridResult) -> list[BurstFingerprint]:
-        """Append rows from *psd_grid* and return any completed bursts."""
+    def feed(
+        self,
+        psd_grid: PSDGridResult,
+        chunk_start: int | None = None,
+        slice_samples: int | None = None,
+    ) -> list[BurstFingerprint]:
+        """Append rows from *psd_grid* and return any completed bursts.
+
+        ``chunk_start`` is the stream sample of the grid's first row and
+        ``slice_samples`` the samples per row; with both, completed bursts carry
+        ``start_sample`` / ``stop_sample``.
+        """
         new_rows = psd_grid.grid
         n_new = new_rows.shape[0]
 
@@ -112,6 +128,15 @@ class RollingBurstDetector:
             self._window[: n_new - first] = new_rows[first:]
         self._write_pos = end % self._window_rows
         self._rows_filled = min(self._rows_filled + n_new, self._window_rows)
+
+        L = self._row_pos.shape[0]
+        idx = (self._total_rows_written + np.arange(n_new)) % L
+        if chunk_start is not None and slice_samples:
+            self._row_pos[idx] = chunk_start + np.arange(n_new, dtype=np.int64) * slice_samples
+            self._slice_samples = int(slice_samples)
+        else:
+            self._row_pos[idx] = -1
+
         self._total_rows_written += n_new
 
         self._rows_since_eval += n_new
@@ -310,6 +335,20 @@ class RollingBurstDetector:
         tres = self._time_resolution_s
         start_time = now - timedelta(seconds=(self._total_rows_written - t.abs_start) * tres)
         stop_time = now - timedelta(seconds=(self._total_rows_written - t.abs_end) * tres)
+
+        start_sample = stop_sample = None
+        L = self._row_pos.shape[0]
+        last_row = t.abs_end - 1
+        if (
+            self._slice_samples is not None
+            and t.abs_start >= self._total_rows_written - L
+            and last_row >= t.abs_start
+        ):
+            p0 = int(self._row_pos[t.abs_start % L])
+            p1 = int(self._row_pos[last_row % L])
+            if p0 >= 0 and p1 >= p0:
+                start_sample, stop_sample = p0, p1 + self._slice_samples
+
         return BurstFingerprint(
             start_time=start_time,
             stop_time=stop_time,
@@ -319,6 +358,8 @@ class RollingBurstDetector:
             peak_power_db=t.peak_power_db,
             duration_ms=duration_sec * 1000.0,
             detection_timestamp=now,
+            start_sample=start_sample,
+            stop_sample=stop_sample,
         )
 
     def reset(self) -> None:
@@ -328,6 +369,8 @@ class RollingBurstDetector:
         self._rows_filled = 0
         self._rows_since_eval = 0
         self._total_rows_written = 0
+        self._row_pos[:] = -1
+        self._slice_samples = None
         self._eval_count = 0
         self._tracked.clear()
         self._rebuild_index()

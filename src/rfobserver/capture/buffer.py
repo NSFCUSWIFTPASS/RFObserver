@@ -219,6 +219,11 @@ class CircularBuffer:
         return self._max_samples
 
     @property
+    def itemsize(self) -> int:
+        """Bytes per sample."""
+        return int(self._buffer.itemsize)
+
+    @property
     def filled(self) -> int:
         return min(self._total_written, self._max_samples)
 
@@ -281,3 +286,48 @@ class CircularBuffer:
             self._buffer[:] = 0
             self._write_pos = 0
             self._total_written = 0
+
+    @property
+    def oldest_position(self) -> int:
+        """Stream position of the oldest sample still held."""
+        with self._lock:
+            return self._total_written - min(self._total_written, self._max_samples)
+
+    def bounds(self) -> tuple[int, int]:
+        """(oldest held position, total_written) at one instant: the stream
+        samples ``[oldest, total_written)`` are readable."""
+        with self._lock:
+            return self._total_written - min(self._total_written, self._max_samples), (
+                self._total_written
+            )
+
+    def _copy_range_locked(self, start: int, end: int) -> np.ndarray:
+        # The newest sample (position total-1) sits at index write_pos-1. This
+        # holds after an oversized write too (write_pos resets to 0 while
+        # total_written is not a multiple of capacity), so never use p % cap.
+        cap = self._max_samples
+        i0 = (self._write_pos - (self._total_written - start)) % cap
+        n = end - start
+        if i0 + n <= cap:
+            return self._buffer[i0 : i0 + n].copy()
+        first = cap - i0
+        return np.concatenate([self._buffer[i0:], self._buffer[: n - first]])
+
+    def read_range(self, start: int, end: int) -> np.ndarray | None:
+        """A copy of stream samples ``[start, end)``, or None if any of them has
+        already been overwritten or not yet written (or the range is empty)."""
+        with self._lock:
+            oldest = self._total_written - min(self._total_written, self._max_samples)
+            if start >= end or start < oldest or end > self._total_written:
+                return None
+            return self._copy_range_locked(start, end)
+
+    def read_tail_with_position(self, n: int) -> tuple[np.ndarray, int]:
+        """The newest ``n`` samples (fewer if not held) and ``total_written``."""
+        with self._lock:
+            n = min(n, self._total_written, self._max_samples)
+            if n <= 0:
+                return self._buffer[:0].copy(), self._total_written
+            return self._copy_range_locked(self._total_written - n, self._total_written), (
+                self._total_written
+            )

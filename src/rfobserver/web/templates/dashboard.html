@@ -50,7 +50,7 @@
                 <canvas id="burst-tuning-canvas" width="920" height="140" style="width: 100%; height: 140px;"></canvas>
             </div>
             <div id="replay-banner" style="display: none;">
-                <span class="replay-banner-label">Replaying</span>
+                <span id="replay-banner-label" class="replay-banner-label">Replaying</span>
                 <span id="replay-banner-source" class="replay-banner-source">--</span>
                 <span id="replay-banner-looping" class="replay-banner-loop" style="display: none;">Looping</span>
                 <span style="flex: 1;"></span>
@@ -773,6 +773,9 @@
     // so re-detection of the same physical burst in subsequent rolling
     // evaluations keeps refining its anchor instead of stacking.
     const seenBursts = new Map();
+    // rtl_433 labels for decoded bursts, keyed by burst id, from the psd
+    // payload's "attributions" (the newest decoded bursts).
+    const attrLabels = new Map();
     // Last broadcast's frequency span — used to map burst freq to x.
     let lastFreqLowHz = null;
     let lastFreqHighHz = null;
@@ -788,6 +791,7 @@
         wfMessageCount = 0;
         wfRowTimes = [];
         seenBursts.clear();
+        attrLabels.clear();
         burstCtx.clearRect(0, 0, wfWidth, wfHeight);
         // Trigger level is synced from server on every PSD message, so no reset needed.
     }
@@ -830,7 +834,7 @@
         return wfRowTimes.length;
     }
 
-    function updateBurstOverlay(newBursts) {
+    function updateBurstOverlay(newBursts, newAttributions) {
         // Add / refresh each reported burst by id; the backend re-emits
         // pending bursts across detector evaluations, so the latest payload
         // for an id is the most accurate (the burst may have grown).
@@ -839,12 +843,26 @@
                 if (b.id != null) seenBursts.set(b.id, b);
             }
         }
+        if (Array.isArray(newAttributions)) {
+            for (const a of newAttributions) {
+                if (a.id != null && typeof a.start_time_ms === "number"
+                        && typeof a.stop_time_ms === "number"
+                        && typeof a.freq_low_hz === "number"
+                        && typeof a.freq_high_hz === "number") {
+                    attrLabels.set(a.id, a);
+                }
+            }
+        }
 
-        // Drop bursts whose stop time is older than the oldest visible row.
+        // Drop bursts and labels whose stop time is older than the oldest
+        // visible row.
         if (wfRowTimes.length > 0) {
             const oldest = wfRowTimes[wfRowTimes.length - 1];
             for (const [id, b] of seenBursts) {
                 if (b.stop_time_ms < oldest) seenBursts.delete(id);
+            }
+            for (const [id, a] of attrLabels) {
+                if (a.stop_time_ms < oldest) attrLabels.delete(id);
             }
         }
 
@@ -886,6 +904,38 @@
             burstCtx.fillStyle = "rgba(255, 60, 60, 0.08)";
             burstCtx.fillRect(x, y, w, h);
             lastDrawnRects.push({x, y, w, h, meta: b});
+        }
+
+        // rtl_433 labels, placed like the rectangles, at each box's top-left.
+        // A label that would overlap one already drawn is skipped, so a dense
+        // run of decodes stays readable.
+        const drawnLabels = [];
+        burstCtx.font = "11px -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif";
+        burstCtx.textBaseline = "bottom";
+        burstCtx.fillStyle = "rgba(255, 214, 10, 0.95)";
+        for (const a of attrLabels.values()) {
+            if (!a.model) continue;
+            const yTopRow = rowForTime(a.stop_time_ms);
+            const yBotRow = rowForTime(a.start_time_ms);
+            const yTop = yTopRow < 0 ? 0 : yTopRow;
+            const yBot = yBotRow >= wfHeight ? wfHeight : yBotRow;
+            if (yBot <= 0 || yTop >= wfHeight) continue;
+            const h = Math.max(3, yBot - yTop);
+            const y = Math.max(0, Math.round((yTop + yBot) / 2 - h / 2));
+            const xLoF = (a.freq_low_hz - lastFreqLowHz) / fSpan;
+            const xHiF = (a.freq_high_hz - lastFreqLowHz) / fSpan;
+            const w = Math.max(3, (xHiF - xLoF) * wfWidth);
+            const x = Math.round(((xLoF + xHiF) / 2) * wfWidth - w / 2);
+            // Above the box when there is room, else just inside its top.
+            const ty = y >= 12 ? y - 1 : y + 12;
+            const tx = Math.max(0, x);
+            const text = String(a.model);
+            const tw = burstCtx.measureText(text).width;
+            const hit = drawnLabels.some(r =>
+                tx < r.x + r.w && r.x < tx + tw && ty - 11 < r.y && r.y - 11 < ty);
+            if (hit) continue;
+            drawnLabels.push({x: tx, y: ty, w: tw});
+            burstCtx.fillText(text, tx, ty);
         }
     }
 
@@ -1034,7 +1084,7 @@
                 const chunkTimeMs = typeof data.chunk_time_ms === "number"
                     ? data.chunk_time_ms : Date.now();
                 addWaterfallLine(data.powers, chunkTimeMs);
-                updateBurstOverlay(data.bursts);
+                updateBurstOverlay(data.bursts, data.attributions);
                 drawLegendBar();
 
                 // When new bursts arrive, ask the detections table to refetch
@@ -1070,6 +1120,7 @@
     // Shown only while the pipeline is being driven by a capture/raw-file
     // replay in place of the live SDR (data.replay on the heartbeat).
     const replayBanner = document.getElementById("replay-banner");
+    const replayBannerLabel = document.getElementById("replay-banner-label");
     const replayBannerSource = document.getElementById("replay-banner-source");
     const replayBannerLooping = document.getElementById("replay-banner-looping");
     const replayBannerSpeed = document.getElementById("replay-banner-speed");
@@ -1088,6 +1139,8 @@
         }
         document.body.classList.add("replaying");
         replayBanner.style.display = "";
+        replayBanner.classList.toggle("replay-banner-done", !!replay.finished);
+        replayBannerLabel.textContent = replay.finished ? "Replay finished" : "Replaying";
         replayBannerSource.textContent = replay.source || "replay";
         replayBannerLooping.style.display = replay.looping ? "" : "none";
         if (document.activeElement !== replayBannerSpeed && typeof replay.speed === "number") {

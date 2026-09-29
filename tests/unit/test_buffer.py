@@ -60,3 +60,50 @@ def test_buffer_empty_read():
     buf = CircularBuffer(10)
     result = buf.read()
     assert len(result) == 0
+
+
+def test_read_range_returns_exact_stream_samples():
+    buf = CircularBuffer(10, dtype=np.int32)
+    buf.write(np.arange(7, dtype=np.int32))
+    assert list(buf.read_range(2, 5)) == [2, 3, 4]
+    buf.write(np.arange(7, 15, dtype=np.int32))  # holds stream 5..14
+    assert buf.oldest_position == 5
+    assert list(buf.read_range(8, 13)) == [8, 9, 10, 11, 12]
+    assert list(buf.read_range(5, 15)) == list(range(5, 15))
+
+
+def test_read_range_outside_the_ring_is_none():
+    buf = CircularBuffer(10, dtype=np.int32)
+    buf.write(np.arange(15, dtype=np.int32))  # holds 5..14
+    assert buf.read_range(4, 8) is None  # start already overwritten
+    assert buf.read_range(10, 16) is None  # end not written yet
+    assert buf.read_range(8, 8) is None  # empty
+
+
+def test_read_range_after_an_oversized_write():
+    buf = CircularBuffer(10, dtype=np.int32)
+    buf.write(np.arange(3, dtype=np.int32))
+    buf.write(np.arange(3, 26, dtype=np.int32))  # larger than capacity: holds 16..25
+    assert buf.oldest_position == 16
+    assert list(buf.read_range(16, 26)) == list(range(16, 26))
+    buf.write(np.arange(26, 30, dtype=np.int32))  # holds 20..29
+    assert list(buf.read_range(24, 30)) == list(range(24, 30))
+
+
+def test_read_tail_with_position():
+    buf = CircularBuffer(10, dtype=np.int32)
+    buf.write(np.arange(14, dtype=np.int32))
+    data, end = buf.read_tail_with_position(3)
+    assert end == 14 and list(data) == [11, 12, 13]
+    data, end = buf.read_tail_with_position(100)  # clamps to what is held
+    assert list(data) == list(range(4, 14))
+
+
+def test_bounds_is_oldest_and_total_written():
+    buf = CircularBuffer(10, dtype=np.int32)
+    assert buf.bounds() == (0, 0)
+    buf.write(np.arange(4, dtype=np.int32))
+    assert buf.bounds() == (0, 4)
+    buf.write(np.arange(22, dtype=np.int32))
+    assert buf.bounds() == (16, 26)
+    assert buf.bounds()[0] == buf.oldest_position

@@ -10,12 +10,13 @@ Double-buffer pipeline:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from rfobserver.processing.burst import BurstDetectionConfig, detect_bursts
 from rfobserver.processing.iq_utils import calculate_iq_statistics, convert_bytes_to_complex
@@ -25,7 +26,9 @@ if TYPE_CHECKING:
     from rfobserver.capture.receiver import CaptureResult, IReceiver
     from rfobserver.config import AppSettings
     from rfobserver.models import BurstFingerprint, IQStatistics, ProcessedDataEnvelope, PSDData
+    from rfobserver.pipeline.attribution import AttributionWorker
     from rfobserver.pipeline.beacon import ProgressBeacon
+    from rfobserver.pipeline.isolation import IsolationStage
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.storage.local import LocalStorage
     from rfobserver.transport.nats_producer import NatsProducer
@@ -75,6 +78,17 @@ class ContinuousProcessor:
         self._running = False
         self._excess_ms: float = 0.0
 
+        # Burst isolation + rtl_433 attribution (built in run() when enabled).
+        self._isolation: IsolationStage | None = None
+        self._attrib_worker: AttributionWorker | None = None
+        self._attrib_task: asyncio.Task[None] | None = None
+        self._rtl_status: str | None = None
+        # Why isolation is off although switched on (a build failure).
+        self._isolation_disabled_reason: str | None = None
+        # Module manager, attached externally (optional); the stage feeds it
+        # isolated bursts.
+        self._module_manager: Any = None
+
         logger.info(
             "Pipeline: 1 capture thread, %d PSD worker threads (%d cores, 2 reserved)",
             self._process_workers,
@@ -93,6 +107,38 @@ class ContinuousProcessor:
             s.BANDWIDTH,
         )
 
+        if s.ISOLATION_ENABLED or s.ATTRIBUTION_ENABLED:
+            from rfobserver.pipeline.isolation import build_isolation
+
+            mm = self._module_manager
+            try:
+                self._isolation, self._attrib_worker, self._rtl_status = build_isolation(
+                    s,
+                    database=self._db,
+                    storage_path=str(self._storage.storage_path),
+                    loop=asyncio.get_running_loop(),
+                    module_feed=mm.feed_bursts if mm is not None else None,
+                    refuse_saving=lambda: False,
+                    replay_source=None,
+                    on_label=None,
+                )
+            except Exception as exc:
+                # Isolation is an add-on (e.g. an unwritable STORAGE_PATH): the
+                # sweep runs without it rather than crash-looping.
+                logger.exception("Burst isolation could not start; continuing without it")
+                self._isolation = self._attrib_worker = None
+                self._isolation_disabled_reason = f"isolation could not start: {exc}"
+            if self._isolation is not None:
+                self._isolation.start()
+            if self._attrib_worker is not None:
+                self._attrib_task = asyncio.create_task(self._attrib_worker.run())
+
+        try:
+            await self._sweep_loop(freqs)
+        finally:
+            await self._stop_isolation()
+
+    async def _sweep_loop(self, freqs: list[int]) -> None:
         process_future: asyncio.Future[_ProcessResult] | None = None
         broadcast_task: asyncio.Task[None] | None = None
 
@@ -161,8 +207,42 @@ class ContinuousProcessor:
         if broadcast_task is not None:
             await broadcast_task
 
+    async def _stop_isolation(self) -> None:
+        """Run on every exit from run(), including an exception or a cancel.
+        The producer (_store_and_broadcast) is done: stop the stage (its
+        stop() joins a worker thread, so off the loop), then the attribution
+        worker (its queue.get() only unblocks on cancel, so stop() alone is
+        not enough)."""
+        if self._isolation is not None:
+            try:
+                await asyncio.to_thread(self._isolation.stop)
+            except Exception:
+                logger.exception("Isolation stage stop failed")
+        if self._attrib_worker is not None:
+            self._attrib_worker.stop()
+        if self._attrib_task is not None:
+            self._attrib_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._attrib_task
+            self._attrib_task = None
+
     def stop(self) -> None:
         self._running = False
+
+    def isolation_status(self) -> dict[str, Any]:
+        counts: dict[str, int] = {}
+        if self._isolation is not None:
+            counts = self._isolation.stats.snapshot()
+            if self._attrib_worker is not None:
+                counts["attr_dropped"] = self._attrib_worker.queue.dropped
+        return {
+            "enabled": self._isolation is not None,
+            "attribution": self._attrib_worker is not None,
+            "rtl433": self._rtl_status,
+            "ring_sec": 0.0,
+            "disabled_reason": self._isolation_disabled_reason,
+            "counts": counts,
+        }
 
     async def _store_and_broadcast(self, pr: _ProcessResult, excess_ms: float) -> None:
         """Save raw file, store detections in SQLite, broadcast to WebSocket."""
@@ -191,6 +271,25 @@ class ContinuousProcessor:
                 len(pr.bursts),
                 pr.center_freq_hz,
                 pr.capture_num,
+            )
+
+        # Burst isolation: the stage gates, isolates and fans out on its own
+        # worker thread (the IQ conversion happens there too); submit never
+        # blocks.
+        if self._isolation is not None and pr.bursts:
+            from rfobserver.pipeline.isolation import (
+                BurstCandidate,
+                IsolationBatch,
+                WholeCaptureSource,
+            )
+
+            self._isolation.submit(
+                IsolationBatch(
+                    [BurstCandidate(b, b.peak_power_db - pr.noise_floor_db) for b in pr.bursts],
+                    float(pr.center_freq_hz),
+                    float(self._settings.BANDWIDTH),
+                    WholeCaptureSource(pr.iq_bytes),
+                )
             )
 
         # Build the processed envelope once; fan out to ZMS + NATS.
@@ -292,6 +391,7 @@ class _ProcessResult:
         "process_ms",
         "filename",
         "iq_bytes",
+        "noise_floor_db",
     )
 
     def __init__(
@@ -304,6 +404,7 @@ class _ProcessResult:
         process_ms: float,
         filename: str,
         iq_bytes: bytes,
+        noise_floor_db: float = 0.0,
     ) -> None:
         self.iq_stats = iq_stats
         self.summary_psd = summary_psd
@@ -313,6 +414,7 @@ class _ProcessResult:
         self.process_ms = process_ms
         self.filename = filename
         self.iq_bytes = iq_bytes
+        self.noise_floor_db = noise_floor_db
 
 
 def _process_capture_blocking(
@@ -376,4 +478,5 @@ def _process_capture_blocking(
         process_ms=process_ms,
         filename=filename,
         iq_bytes=iq_bytes,
+        noise_floor_db=detection_result.noise_floor_db,
     )

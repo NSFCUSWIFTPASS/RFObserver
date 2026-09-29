@@ -1225,6 +1225,46 @@ async def test_iq_capture_cap_keeps_newest(db):
     assert [r["filename"] for r in rows] == ["c4.sc16", "c3.sc16", "c2.sc16"]
 
 
+async def test_update_detection_attribution_three_state(db):
+    """A detection starts unattributed (null), can be marked attempted-not-decoded,
+    or attributed with a model/protocol. Merge keys on burst_id."""
+    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    await db.insert_detection(
+        burst_id="b-attr-1",
+        start_time=now,
+        stop_time=now,
+        center_freq_hz=915e6,
+        bandwidth_hz=250e3,
+        peak_power_db=-40.0,
+        duration_ms=20.0,
+        detection_timestamp=now,
+    )
+    # until is exclusive (start_time < until), so widen it past `now` to catch
+    # a detection whose start_time is exactly `now`.
+    rows = await db.query_detections(since=now, until=now + timedelta(seconds=1))
+    row = next(r for r in rows if r["burst_id"] == "b-attr-1")
+    assert row["model"] is None and row["protocol_id"] is None and row["attribution"] is None
+
+    await db.update_detection_attribution(
+        burst_id="b-attr-1",
+        model="SilverSpring-Mesh",
+        protocol_id=383,
+        attribution='[{"channel": 57}]',
+    )
+    rows = await db.query_detections(since=now, until=now + timedelta(seconds=1))
+    row = next(r for r in rows if r["burst_id"] == "b-attr-1")
+    assert row["model"] == "SilverSpring-Mesh"
+    assert row["protocol_id"] == 383
+    assert row["attribution"] == '[{"channel": 57}]'
+
+
+async def test_update_detection_attribution_missing_burst_is_noop(db):
+    # Updating a burst_id that is not present affects zero rows and does not raise.
+    await db.update_detection_attribution(
+        burst_id="does-not-exist", model=None, protocol_id=None, attribution="{}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_read_only_connection_reads_but_rejects_writes(tmp_path):
     path = str(tmp_path / "ro.sqlite")

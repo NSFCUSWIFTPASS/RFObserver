@@ -97,14 +97,14 @@ async def _record(
     )
     ring = proc._pre_trigger_buf
     reads: list[tuple[int, int]] = []
-    orig_read = ring.read_with_position
+    orig_read = ring.read_tail_with_position
 
-    def spy_read() -> tuple[np.ndarray, int]:
-        data, end = orig_read()
+    def spy_read(n: int) -> tuple[np.ndarray, int]:
+        data, end = orig_read(n)
         reads.append((len(data), end))
         return data, end
 
-    ring.read_with_position = spy_read  # type: ignore[method-assign]
+    ring.read_tail_with_position = spy_read  # type: ignore[method-assign]
 
     async def driver() -> None:
         for _ in range(2000):  # wait for streaming to start

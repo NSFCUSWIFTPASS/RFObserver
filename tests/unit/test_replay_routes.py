@@ -35,7 +35,12 @@ class _FakeSupervisor:
         if self._replay is None:
             return None
         rx = self._replay
-        return {"source": rx.source_name, "speed": rx.speed, "looping": rx.loop}
+        return {
+            "source": rx.source_name,
+            "speed": rx.speed,
+            "looping": rx.loop,
+            "finished": bool(getattr(rx, "exhausted", False)),
+        }
 
     async def set_active(self, v):
         self.active = v
@@ -84,7 +89,8 @@ def test_start_raw_replay_then_status_and_stop(app_ctx):
     )
     assert r.status_code == 200
     s = c.get("/api/sensor").json()
-    assert s["replay"]["speed"] == 2.0 and s["replay"]["looping"] is True
+    # loop was not in the request body, so it defaults to False.
+    assert s["replay"]["speed"] == 2.0 and s["replay"]["looping"] is False
     assert c.post("/api/replay/stop").status_code == 200
     assert c.get("/api/sensor").json()["replay"] is None
 
@@ -226,6 +232,57 @@ def test_replay_record_requires_active_replay(app_ctx):
     c = _client(app)
     r = c.post("/api/replay/record", json={"on": True})
     assert r.status_code == 409
+
+
+def test_replay_loop_defaults_false_and_passes_through(app_ctx):
+    app, src = app_ctx
+    c = _client(app)
+    path = str(src / "iq_capture_x_915MHz_1.0Msps_0.1s_30dB_test.dat")
+
+    r = c.post(
+        "/api/replay/start",
+        json={"path": path, "sample_rate_hz": 1e6, "center_freq_hz": 915e6},
+    )
+    assert r.status_code == 200
+    assert c.get("/api/sensor").json()["replay"]["looping"] is False
+    assert c.post("/api/replay/stop").status_code == 200
+
+    r = c.post(
+        "/api/replay/start",
+        json={"path": path, "sample_rate_hz": 1e6, "center_freq_hz": 915e6, "loop": True},
+    )
+    assert r.status_code == 200
+    assert c.get("/api/sensor").json()["replay"]["looping"] is True
+
+
+def test_nonlooping_replay_reaches_finished_state(app_ctx):
+    """A replay started with loop=False (the default) must reach a visible
+    finished state once the capture is fully drained, instead of silently
+    serving noise forever with no way to tell it ended."""
+    app, src = app_ctx
+    c = _client(app)
+    path = str(src / "iq_capture_x_915MHz_1.0Msps_0.1s_30dB_test.dat")
+
+    r = c.post(
+        "/api/replay/start",
+        json={"path": path, "sample_rate_hz": 1e6, "center_freq_hz": 915e6, "gain_db": 30},
+    )
+    assert r.status_code == 200
+    s = c.get("/api/sensor").json()
+    assert s["replay"]["looping"] is False
+    assert s["replay"]["finished"] is False
+
+    # Drain the (100-sample) capture in one over-sized recv_chunk call.
+    rx = app.state.supervisor.receiver
+    buf = np.empty(1000, dtype=np.int32)
+    rx.recv_chunk(buf)
+    assert rx.exhausted is True
+
+    s = c.get("/api/sensor").json()
+    assert s["replay"]["finished"] is True
+    # Stopping a finished replay still works like any other stop.
+    assert c.post("/api/replay/stop").status_code == 200
+    assert c.get("/api/sensor").json()["replay"] is None
 
 
 def test_replay_speed_missing_body_field_returns_400(app_ctx):

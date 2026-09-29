@@ -63,6 +63,12 @@
                         <option value="4">4x</option>
                     </select>
                 </div>
+                <div class="form-group" style="flex: 0 0 auto; justify-content: flex-end;">
+                    <label class="toggle-label" title="Loop the capture instead of stopping at the end of the file">
+                        <input type="checkbox" id="replay-loop">
+                        <span class="toggle-text">Loop</span>
+                    </label>
+                </div>
                 <div class="form-group" style="justify-content: flex-end;">
                     <label>&nbsp;</label>
                     <button type="button" id="replay-raw-start-btn" class="btn-apply" style="width: 100%;">Start replay</button>
@@ -957,6 +963,7 @@
         const gainInput = document.getElementById("replay-gain-db");
         const datatypeSelect = document.getElementById("replay-datatype");
         const speedSelect = document.getElementById("replay-speed");
+        const loopCheckbox = document.getElementById("replay-loop");
         const startBtn = document.getElementById("replay-raw-start-btn");
         const errEl = document.getElementById("replay-raw-error");
 
@@ -1001,6 +1008,7 @@
                 gain_db: isNaN(gainDb) ? 0 : gainDb,
                 datatype: datatypeSelect.value,
                 speed: parseFloat(speedSelect.value),
+                loop: loopCheckbox.checked,
             };
             try {
                 const r = await fetch("/api/replay/start", {

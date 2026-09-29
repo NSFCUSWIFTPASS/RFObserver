@@ -90,6 +90,13 @@ class StorageSample:
     manual_bytes: int
     # Any auto/ capture other than the one being recorded.
     evictable_auto: bool
+    # Isolated burst files under bursts/, and those last written before the
+    # tick began. Old bursts are evicted before automatic captures, but count
+    # as something to evict only when deleting them all would reach the floor
+    # (see _evictable): isolation keeps saving small bursts until step 3, and
+    # they must not pin the ladder at step 1.
+    bursts_bytes: int = 0
+    old_bursts_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -163,6 +170,7 @@ class StorageState:
             "db_reusable_gb": _gb(s.db_reusable_bytes) if s else None,
             "auto_gb": _gb(s.auto_bytes) if s else None,
             "manual_gb": _gb(s.manual_bytes) if s else None,
+            "bursts_gb": _gb(s.bursts_bytes) if s else None,
             "step": self.step,
             "step_text": step_text,
             "step_since": self.step_since.isoformat(),
@@ -175,6 +183,15 @@ class StorageState:
             if self.last_young_eviction
             else None,
         }
+
+
+def _evictable(sample: StorageSample, floor: int) -> bool:
+    """Step 1 is possible: an automatic capture can go, or deleting the old
+    burst files alone would lift free space to the floor."""
+    if sample.evictable_auto:
+        return True
+    old = sample.old_bursts_bytes
+    return old > 0 and sample.data.free_bytes + old >= floor
 
 
 def _volume_step(free: int, floor: int, evictable: bool, current: int) -> int:
@@ -235,7 +252,8 @@ class StorageGovernor:
             st = self._state
             floor = resolve_floor(min_free_gb, sample.data.total_bytes)
             data = sample.data
-            raw = _volume_step(data.free_bytes, floor, sample.evictable_auto, st.step)
+            evictable = _evictable(sample, floor)
+            raw = _volume_step(data.free_bytes, floor, evictable, st.step)
             recovered = data.free_bytes >= floor * RECOVERY_MARGIN
             db_floor = None
             if sample.db_volume is not None:
@@ -279,7 +297,10 @@ class StorageGovernor:
             )
 
             target = int(floor * RECOVERY_MARGIN)
-            evict = step >= 1 and sample.evictable_auto and data.free_bytes < target
+            # Old bursts are deleted whenever short, even when they alone cannot
+            # reach the floor (they then do not hold the step at 1).
+            has_victims = evictable or sample.old_bursts_bytes > 0
+            evict = step >= 1 and has_victims and data.free_bytes < target
             actions = StorageActions(
                 evict_to_free_bytes=target if evict else None,
                 start_pressure_prune=st.step < 2 <= step,

@@ -74,3 +74,9 @@ class UpstreamModule(ABC):
     def output_queue(self) -> asyncio.Queue[bytes]:
         """Queue of output data (e.g. PCM audio) for WebSocket streaming."""
         return self._output_queue
+
+    def feed_burst(self, iq: np.ndarray, sample_rate: int, meta: dict[str, Any]) -> None:
+        """Receive one isolated burst (complex64 at ``sample_rate``, its peak at
+        DC). Called on the isolation worker thread; keep it quick. Optional:
+        modules that only use the wideband stream ignore it."""
+        return None

@@ -91,6 +91,14 @@ class ModuleManager:
             except Exception:
                 logger.exception("Module %s feed error", module.module_id)
 
+    def feed_bursts(self, iq: np.ndarray, sample_rate: int, meta: dict[str, Any]) -> None:
+        """Offer an isolated burst to every module. Non-blocking."""
+        for module in list(self._modules.values()):
+            try:
+                module.feed_burst(iq, sample_rate, meta)
+            except Exception:
+                logger.exception("Module %s feed_burst error", module.module_id)
+
     def stop_all(self) -> None:
         """Stop all modules."""
         for module_id in list(self._modules):

@@ -1,0 +1,822 @@
+"""The isolation stage: gate, states, fan-out, and the attribution switch."""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+import time
+from datetime import datetime, timezone
+
+import numpy as np
+
+from rfobserver.capture.buffer import CircularBuffer
+from rfobserver.config import AppSettings
+from rfobserver.models import BurstFingerprint
+from rfobserver.pipeline.isolation import (
+    BurstCandidate,
+    IsolationBatch,
+    IsolationStage,
+    RingSource,
+    WholeCaptureSource,
+    build_isolation,
+)
+from rfobserver.storage.burst_archive import BurstArchive
+
+FS = 2_000_000.0
+
+
+def _settings(**kw):
+    base = dict(
+        ISOLATION_ENABLED=True,
+        ISOLATION_SNR_DB=13.0,
+        ISOLATION_MAX_PER_SEC=3,
+        ISOLATION_MAX_BURST_SEC=0.5,
+        ISOLATION_QUEUE_MAX=2,
+        _env_file=None,
+    )
+    base.update(kw)
+    return AppSettings(**base)
+
+
+def _ring(n=400_000):
+    r = CircularBuffer(n, dtype=np.int32)
+    r.write(np.random.default_rng(0).integers(-2000, 2000, n, dtype=np.int32))
+    return r
+
+
+def _cand(i, snr, start=10_000, stop=20_000):
+    now = datetime.now(timezone.utc)
+    b = BurstFingerprint(
+        burst_id=f"b{i}",
+        start_time=now,
+        stop_time=now,
+        center_freq_hz=915e6,
+        peak_freq_hz=915.1e6,
+        bandwidth_hz=250e3,
+        peak_power_db=-40 + snr,
+        start_sample=start,
+        stop_sample=stop,
+    )
+    return BurstCandidate(b, snr)
+
+
+class _Clock:
+    t = 100.0
+
+    def __call__(self):
+        return self.t
+
+
+def _stage(tmp_path, clock=None, **kw):
+    saved, fed, handed = [], [], []
+    archive = BurstArchive(tmp_path)
+    orig = archive.save
+
+    def save(iso, meta, subdir=None):
+        saved.append(iso.burst_id)
+        return orig(iso, meta, subdir)
+
+    archive.save = save
+    st = IsolationStage(
+        _settings(**kw),
+        archive=archive,
+        module_feed=lambda iq, rate, meta: fed.append(meta["burst_id"]),
+        attribution_handoff=lambda item: handed.append(item.burst_id),
+        clock=clock or _Clock(),
+    )
+    return st, saved, fed, handed
+
+
+def test_gate_takes_strongest_first_and_respects_the_per_second_limit(tmp_path):
+    st, saved, fed, handed = _stage(tmp_path)
+    cands = [_cand(i, snr) for i, snr in enumerate([20, 5, 40, 30, 25])]
+    out = st.process_batch(IsolationBatch(cands, 915e6, FS, RingSource(_ring())))
+    # 40, 30, 25 dB; b0 over the limit, b1 below SNR
+    assert [bid for bid, _ in out] == ["b2", "b3", "b4"]
+    assert all(s == "isolated" for _, s in out)
+    assert saved == fed == handed == ["b2", "b3", "b4"]
+    assert st.stats.snapshot()["gated_out"] == 2
+
+
+def _no_pos(c):
+    # Sweep-style candidate: no stream sample positions.
+    c.burst.start_sample = c.burst.stop_sample = None
+    return c
+
+
+def test_rate_limit_window_resets_after_a_second(tmp_path):
+    # Without stop_sample (sweep pipeline) the gate falls back to the monotonic clock.
+    clock = _Clock()
+    st, *_ = _stage(tmp_path, clock=clock, ISOLATION_MAX_PER_SEC=1)
+    src = WholeCaptureSource(np.zeros(1000, dtype=np.int32).tobytes())
+    assert len(st.process_batch(IsolationBatch([_no_pos(_cand(0, 30))], 915e6, FS, src))) == 1
+    assert st.process_batch(IsolationBatch([_no_pos(_cand(1, 30))], 915e6, FS, src)) == []
+    clock.t += 1.01
+    assert len(st.process_batch(IsolationBatch([_no_pos(_cand(2, 30))], 915e6, FS, src))) == 1
+
+
+def test_rate_limit_runs_on_stream_time_when_bursts_carry_positions(tmp_path):
+    # The wall clock never moves (replay faster than real time): the window
+    # follows the bursts' stop_sample / sample rate instead.
+    st, *_ = _stage(tmp_path, clock=_Clock(), ISOLATION_MAX_PER_SEC=1)
+    src = RingSource(_ring(4_000_000))
+
+    def at(i, sec):
+        stop = int(sec * FS)
+        return IsolationBatch([_cand(i, 30, stop - 1000, stop)], 915e6, FS, src)
+
+    assert len(st.process_batch(at(0, 0.10))) == 1
+    assert st.process_batch(at(1, 0.60)) == []  # same stream second
+    assert len(st.process_batch(at(2, 1.11))) == 1  # 1.01 s of stream later
+
+
+def test_rate_limit_window_resets_when_stream_time_goes_backwards(tmp_path):
+    # A ring rebuild (or a replay loop) restarts stream positions at 0.
+    st, *_ = _stage(tmp_path, clock=_Clock(), ISOLATION_MAX_PER_SEC=1)
+    src = RingSource(_ring(4_000_000))
+    b0 = IsolationBatch([_cand(0, 30, 1_599_000, 1_600_000)], 915e6, FS, src)  # 0.8 s
+    b1 = IsolationBatch([_cand(1, 30, 99_000, 100_000)], 915e6, FS, src)  # 0.05 s
+    assert len(st.process_batch(b0)) == 1
+    assert len(st.process_batch(b1)) == 1
+
+
+def test_every_picked_burst_gets_exactly_one_state(tmp_path):
+    st, *_ = _stage(tmp_path, ISOLATION_MAX_BURST_SEC=0.001)
+    ring = CircularBuffer(100_000, dtype=np.int32)
+    ring.write(np.zeros(300_000, dtype=np.int32))  # holds 200k..300k
+    cands = [_cand(0, 30, 250_000, 260_000), _cand(1, 30, 10_000, 20_000)]
+    out = dict(st.process_batch(IsolationBatch(cands, 915e6, FS, RingSource(ring))))
+    assert out == {"b0": "too_long", "b1": "iq_expired"}
+    snap = st.stats.snapshot()
+    assert snap["too_long"] == 1 and snap["iq_expired"] == 1
+
+
+def test_a_weak_burst_is_not_evicted_by_the_dsp_of_stronger_ones(tmp_path, monkeypatch):
+    """F3: bursts are handled strongest first, and the receiver keeps writing
+    the ring while each one is channelized. If every burst were read only
+    just before its own DSP, the stronger bursts' DSP time would push the
+    weakest one's samples out of the ring. Its IQ is copied before any DSP.
+
+    A mere reorder of which state gets which burst would also pass the
+    end-state assertions below, so this also records the order of ring
+    reads vs. DSP calls directly and proves every read precedes the first
+    DSP call (under budget: all three are snapshotted up front)."""
+    import rfobserver.processing.isolate as isolate_mod
+
+    ring = CircularBuffer(400_000, dtype=np.int32)
+    ring.write(np.random.default_rng(0).integers(-2000, 2000, 400_000, dtype=np.int32))
+    real = isolate_mod.channelize_to_cs16
+    real_read_range = ring.read_range
+    events: list[str] = []  # "read" / "dsp" in call order
+
+    def tracking_read_range(start, end):
+        events.append("read")
+        return real_read_range(start, end)
+
+    monkeypatch.setattr(ring, "read_range", tracking_read_range)
+
+    dsp_calls = []
+
+    def slow_dsp(*a, **k):
+        # Stands in for the receiver writing 50k samples (25 ms at 2 Msps)
+        # while one burst is channelized: after one call the ring no longer
+        # holds position 16k, where b2's read starts.
+        events.append("dsp")
+        dsp_calls.append(ring.oldest_position)
+        ring.write(np.zeros(50_000, dtype=np.int32))
+        return real(*a, **k)
+
+    monkeypatch.setattr(isolate_mod, "channelize_to_cs16", slow_dsp)
+    st, *_ = _stage(tmp_path)
+    cands = [
+        _cand(0, 40, 350_000, 360_000),
+        _cand(1, 30, 300_000, 310_000),
+        _cand(2, 20, 20_000, 30_000),  # weakest, oldest: handled last
+    ]
+    out = st.process_batch(IsolationBatch(cands, 915e6, FS, RingSource(ring)))
+    assert out == [("b0", "isolated"), ("b1", "isolated"), ("b2", "isolated")]
+    assert len(dsp_calls) == 3
+    assert ring.oldest_position > 20_000  # b2's samples really are gone from the ring now
+    # All three snapshot reads (the fix under test) happen before the first
+    # DSP call, not just before their own.
+    assert events.count("read") == 3
+    first_dsp = events.index("dsp")
+    assert events[:first_dsp] == ["read", "read", "read"]
+
+
+def test_over_budget_lazy_bursts_are_read_before_any_dsp(tmp_path, monkeypatch):
+    """Item 2: the snapshot budget is filled strongest first, so whatever is
+    left for a lazy read is always the weakest of the batch -- the exact
+    bursts F3 hit. Prove the fix directly, tagging both the ring reads and
+    the DSP calls (by burst id) with their call order: both lazy bursts'
+    reads happen before b0's DSP -- even though b0 is strongest, was
+    snapshotted first, and used to be processed (and DSP'd) first."""
+    import rfobserver.pipeline.isolation as iso_mod
+
+    ring = CircularBuffer(400_000, dtype=np.int32)
+    ring.write(np.zeros(400_000, dtype=np.int32))
+    real_isolate = iso_mod.isolate_samples
+    real_read_range = ring.read_range
+    events: list[tuple] = []  # ("read", start, end) / ("dsp", burst_id)
+
+    def tracking_read_range(start, end):
+        events.append(("read", start, end))
+        return real_read_range(start, end)
+
+    monkeypatch.setattr(ring, "read_range", tracking_read_range)
+
+    def tracking_isolate(burst, data, **kw):
+        events.append(("dsp", burst.burst_id))
+        # Stands in for the receiver writing while this burst is channelized.
+        ring.write(np.zeros(50_000, dtype=np.int32))
+        return real_isolate(burst, data, **kw)
+
+    monkeypatch.setattr(iso_mod, "isolate_samples", tracking_isolate)
+    # Room for exactly one 18k-sample read; the other two must go lazy.
+    monkeypatch.setattr(iso_mod, "SNAPSHOT_MAX_BYTES", 18_000 * 4)
+    st, *_ = _stage(tmp_path)
+    cands = [
+        _cand(0, 40, 20_000, 30_000),  # strongest: snapshotted, fills the budget
+        _cand(1, 30, 350_000, 360_000),  # lazy
+        _cand(2, 20, 60_000, 70_000),  # lazy, weakest
+    ]
+    out = st.process_batch(IsolationBatch(cands, 915e6, FS, RingSource(ring)))
+    assert dict(out) == {"b0": "isolated", "b1": "isolated", "b2": "isolated"}
+    reads = [e for e in events if e[0] == "read"]
+    dsps = [e for e in events if e[0] == "dsp"]
+    assert len(reads) == 3 and len(dsps) == 3  # b0's snapshot read + 2 lazy reads
+    b1_read_idx = events.index(("read", 350_000 - 4_000, 360_000 + 4_000))
+    b2_read_idx = events.index(("read", 60_000 - 4_000, 70_000 + 4_000))
+    b0_dsp_idx = events.index(("dsp", "b0"))
+    # The bug: with the budget filled strongest-first, b0 (snapshotted) used
+    # to be processed -- and DSP'd -- before either lazy read ran. The fix:
+    # both lazy reads now happen strictly before b0's DSP.
+    assert b1_read_idx < b0_dsp_idx
+    assert b2_read_idx < b0_dsp_idx
+
+
+def test_bursts_past_the_snapshot_budget_are_read_just_before_their_dsp(
+    tmp_path, monkeypatch, caplog
+):
+    import rfobserver.pipeline.isolation as iso_mod
+    import rfobserver.processing.isolate as isolate_mod
+
+    ring = CircularBuffer(400_000, dtype=np.int32)
+    ring.write(np.zeros(400_000, dtype=np.int32))
+    real = isolate_mod.channelize_to_cs16
+
+    def slow_dsp(*a, **k):
+        ring.write(np.zeros(50_000, dtype=np.int32))
+        return real(*a, **k)
+
+    monkeypatch.setattr(isolate_mod, "channelize_to_cs16", slow_dsp)
+    # Room for one 18k-sample read (10k burst + 2 x 4k guard) of int32.
+    monkeypatch.setattr(iso_mod, "SNAPSHOT_MAX_BYTES", 18_000 * 4)
+    st, *_ = _stage(tmp_path)
+    cands = [
+        _cand(0, 40, 20_000, 30_000),  # snapshotted
+        _cand(1, 30, 350_000, 360_000),  # lazy, read before b0's DSP
+        _cand(2, 20, 60_000, 70_000),  # lazy, also read before b0's DSP
+    ]
+    with caplog.at_level("INFO", logger="rfobserver.pipeline.isolation"):
+        out = st.process_batch(IsolationBatch(cands, 915e6, FS, RingSource(ring)))
+    # Both lazy bursts are now read before b0's (snapshotted) DSP runs, not
+    # after it, so neither is pushed out of the ring: all three survive.
+    assert out == [("b1", "isolated"), ("b2", "isolated"), ("b0", "isolated")]
+    budget_logs = [r for r in caplog.records if "snapshot budget" in r.getMessage()]
+    assert len(budget_logs) == 1 and "2 read just before" in budget_logs[0].getMessage()
+
+
+def test_a_snapshot_read_that_raises_is_the_error_state(tmp_path):
+    class Boom(RingSource):
+        def read_range(self, start, end):
+            if start < 100_000:
+                raise OSError("read failed")
+            return super().read_range(start, end)
+
+    st, *_ = _stage(tmp_path)
+    cands = [_cand(0, 40, 10_000, 20_000), _cand(1, 30, 200_000, 210_000)]
+    out = st.process_batch(IsolationBatch(cands, 915e6, FS, Boom(_ring())))
+    assert out == [("b0", "error"), ("b1", "isolated")]
+
+
+def _expiry_warnings(caplog):
+    """The one per-batch WARNING summary (count, reasons, worst age)."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "WARNING" and "iq_expired" in r.getMessage()
+    ]
+
+
+def _expiry_debug_logs(caplog):
+    """The per-burst DEBUG detail (reason, read/ring range, age)."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "DEBUG" and "iq_expired" in r.getMessage()
+    ]
+
+
+def test_an_overwritten_burst_is_logged_and_counted_as_overwritten(tmp_path, caplog):
+    st, *_ = _stage(tmp_path)
+    ring = CircularBuffer(100_000, dtype=np.int32)
+    ring.write(np.zeros(300_000, dtype=np.int32))  # holds 200k..300k
+    guard = int(0.002 * FS)
+    with caplog.at_level("DEBUG", logger="rfobserver.pipeline.isolation"):
+        out = st.process_batch(
+            IsolationBatch([_cand(0, 30, 190_000, 210_000)], 915e6, FS, RingSource(ring))
+        )
+    assert out == [("b0", "iq_expired")]
+    snap = st.stats.snapshot()
+    assert snap["iq_expired"] == 1 and snap["iq_expired_overwritten"] == 1
+    assert "iq_expired_unwritten" not in snap and "iq_expired_nopos" not in snap
+    # One batch-level WARNING: count, reasons, worst age.
+    (warn,) = _expiry_warnings(caplog)
+    assert "1 burst(s) iq_expired (overwritten=1)" in warn
+    assert "age 45 ms" in warn  # (300k - 210k) / 2 Msps
+    # The per-burst detail is at DEBUG, not WARNING.
+    (debug,) = _expiry_debug_logs(caplog)
+    assert "b0 iq_expired (overwritten)" in debug
+    assert f"read [{190_000 - guard}, {210_000 + guard})" in debug
+    assert "ring holds [200000, 300000)" in debug
+
+
+def test_a_burst_past_the_newest_sample_is_counted_as_unwritten(tmp_path, caplog):
+    st, *_ = _stage(tmp_path)
+    ring = CircularBuffer(100_000, dtype=np.int32)
+    ring.write(np.zeros(300_000, dtype=np.int32))
+    with caplog.at_level("DEBUG", logger="rfobserver.pipeline.isolation"):
+        out = st.process_batch(
+            IsolationBatch([_cand(0, 30, 290_000, 299_000)], 915e6, FS, RingSource(ring))
+        )
+    assert out == [("b0", "iq_expired")]  # the end guard is not written yet
+    snap = st.stats.snapshot()
+    assert snap["iq_expired"] == 1 and snap["iq_expired_unwritten"] == 1
+    (warn,) = _expiry_warnings(caplog)
+    assert "unwritten=1" in warn and "age 0 ms" in warn
+    (debug,) = _expiry_debug_logs(caplog)
+    assert "(unwritten)" in debug and "ring holds [200000, 300000)" in debug
+
+
+def test_a_ring_burst_without_positions_is_counted_as_nopos(tmp_path, caplog):
+    st, *_ = _stage(tmp_path)
+    with caplog.at_level("DEBUG", logger="rfobserver.pipeline.isolation"):
+        out = st.process_batch(
+            IsolationBatch([_cand(0, 30, None, None)], 915e6, FS, RingSource(_ring()))
+        )
+    assert out == [("b0", "iq_expired")]
+    snap = st.stats.snapshot()
+    assert snap["iq_expired"] == 1 and snap["iq_expired_nopos"] == 1
+    (warn,) = _expiry_warnings(caplog)
+    assert "nopos=1" in warn and "worst age n/a" in warn  # no age: no rng at all
+    (debug,) = _expiry_debug_logs(caplog)
+    assert "b0 iq_expired (nopos)" in debug
+
+
+def test_expiry_warnings_are_batched_not_one_per_burst(tmp_path, caplog):
+    """Under overload a batch can carry many iq_expired bursts; only one
+    WARNING is logged for the whole batch, not one per burst."""
+    st, *_ = _stage(tmp_path, ISOLATION_MAX_PER_SEC=10)
+    ring = CircularBuffer(100_000, dtype=np.int32)
+    ring.write(np.zeros(300_000, dtype=np.int32))  # holds 200k..300k
+    cands = [_cand(i, 30, 100_000 + i, 100_100 + i) for i in range(5)]  # all overwritten
+    with caplog.at_level("DEBUG", logger="rfobserver.pipeline.isolation"):
+        out = st.process_batch(IsolationBatch(cands, 915e6, FS, RingSource(ring)))
+    assert all(state == "iq_expired" for _, state in out)
+    assert st.stats.snapshot()["iq_expired"] == 5
+    warnings = _expiry_warnings(caplog)
+    assert len(warnings) == 1
+    assert "5 burst(s) iq_expired (overwritten=5)" in warnings[0]
+    # Every burst still gets its own DEBUG line.
+    assert len(_expiry_debug_logs(caplog)) == 5
+
+
+def test_a_lazy_read_is_classified_by_the_ring_just_after_it(tmp_path, monkeypatch, caplog):
+    # Past the snapshot budget, a burst is read just before its DSP (lazy
+    # bursts run first, but a lazy burst's own DSP can still evict another,
+    # weaker lazy burst processed right after it); the reason and numbers
+    # come from the ring at that read, not at batch start.
+    import rfobserver.pipeline.isolation as iso_mod
+    import rfobserver.processing.isolate as isolate_mod
+
+    ring = CircularBuffer(400_000, dtype=np.int32)
+    ring.write(np.zeros(400_000, dtype=np.int32))
+    real = isolate_mod.channelize_to_cs16
+
+    def slow_dsp(*a, **k):
+        ring.write(np.zeros(50_000, dtype=np.int32))
+        return real(*a, **k)
+
+    monkeypatch.setattr(isolate_mod, "channelize_to_cs16", slow_dsp)
+    monkeypatch.setattr(iso_mod, "SNAPSHOT_MAX_BYTES", 18_000 * 4)
+    st, *_ = _stage(tmp_path)
+    cands = [
+        _cand(0, 50, 200_000, 210_000),  # strongest: snapshotted, fills the budget
+        _cand(1, 30, 350_000, 360_000),  # lazy, read (and survives) before b0's DSP
+        _cand(2, 20, 20_000, 30_000),  # weakest lazy: evicted by b1's own DSP write
+    ]
+    with caplog.at_level("DEBUG", logger="rfobserver.pipeline.isolation"):
+        out = st.process_batch(IsolationBatch(cands, 915e6, FS, RingSource(ring)))
+    assert out == [("b1", "isolated"), ("b2", "iq_expired"), ("b0", "isolated")]
+    assert st.stats.snapshot()["iq_expired_overwritten"] == 1
+    (debug,) = _expiry_debug_logs(caplog)
+    assert "ring holds [50000, 450000)" in debug and "age 210 ms" in debug
+
+
+def test_a_sweep_capture_has_no_expiry_sub_counter(tmp_path):
+    st, *_ = _stage(tmp_path)
+    src = WholeCaptureSource(b"")
+    out = st.process_batch(IsolationBatch([_cand(0, 30, None, None)], 915e6, FS, src))
+    assert out == [("b0", "iq_expired")]
+    assert not [k for k in st.stats.snapshot() if k.startswith("iq_expired_")]
+
+
+def test_an_exception_is_the_error_state_and_does_not_stop_the_batch(tmp_path, monkeypatch):
+    st, *_ = _stage(tmp_path)
+    calls = {"n": 0}
+    import rfobserver.pipeline.isolation as iso_mod
+
+    real = iso_mod.isolate_samples
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("bad burst")
+        return real(*a, **k)
+
+    monkeypatch.setattr(iso_mod, "isolate_samples", flaky)
+    batch = IsolationBatch([_cand(0, 40), _cand(1, 30)], 915e6, FS, RingSource(_ring()))
+    out = dict(st.process_batch(batch))
+    assert out == {"b0": "error", "b1": "isolated"}
+
+
+def test_full_queue_counts_queue_full(tmp_path):
+    st, *_ = _stage(tmp_path)  # queue max 2 batches, not started: nothing drains
+
+    def b(i):
+        return IsolationBatch([_cand(i, 30)], 915e6, FS, RingSource(_ring(1000)))
+
+    assert st.submit(b(0)) and st.submit(b(1))
+    assert not st.submit(b(2))
+    assert st.stats.snapshot()["queue_full"] == 1
+
+
+def test_received_and_picked_counters_satisfy_the_accounting_invariants(tmp_path, monkeypatch):
+    import rfobserver.pipeline.isolation as iso_mod
+
+    real = iso_mod.isolate_samples
+
+    def flaky(burst, data, **kw):
+        if burst.burst_id == "b6":
+            raise ValueError("bad burst")
+        return real(burst, data, **kw)
+
+    monkeypatch.setattr(iso_mod, "isolate_samples", flaky)
+
+    st, *_ = _stage(
+        tmp_path, ISOLATION_MAX_PER_SEC=3, ISOLATION_MAX_BURST_SEC=0.001, ISOLATION_QUEUE_MAX=1
+    )
+    ring = CircularBuffer(100_000, dtype=np.int32)
+    ring.write(np.zeros(300_000, dtype=np.int32))  # holds 200k..300k
+    cands = [
+        _cand(0, 5),  # below SNR
+        _cand(1, 6),  # below SNR
+        _cand(2, 20),  # passes SNR, but weaker than the top 3: over the rate limit
+        _cand(3, 21),  # passes SNR, but weaker than the top 3: over the rate limit
+        _cand(4, 40, 10_000, 20_000),  # picked, outside the ring's held range: iq_expired
+        _cand(5, 35, 250_000, 260_000),  # picked, longer than max_burst_sec: too_long
+        _cand(6, 30, 270_000, 280_000),  # picked, monkeypatched to raise: error
+    ]
+    mixed = IsolationBatch(cands, 915e6, FS, RingSource(ring))
+    assert st.submit(mixed)  # fills the one queue slot; received += 7
+
+    overflow = IsolationBatch([_cand(7, 30)], 915e6, FS, RingSource(ring))
+    assert not st.submit(overflow)  # queue full; received += 1, queue_full += 1
+
+    out = dict(st.process_batch(mixed))
+    assert out == {"b4": "iq_expired", "b5": "too_long", "b6": "error"}
+
+    snap = st.stats.snapshot()
+    assert snap["received"] == 8
+    assert snap["queue_full"] == 1
+    assert snap["gated_out"] == 4  # 2 below SNR + 2 over the rate limit
+    assert snap["picked"] == 3
+    assert snap["iq_expired"] == 1
+    assert snap["too_long"] == 1
+    assert snap["error"] == 1
+    assert snap.get("isolated", 0) == 0
+    assert snap["received"] == snap["gated_out"] + snap["queue_full"] + snap["picked"]
+    assert snap["picked"] == (
+        snap.get("isolated", 0) + snap["iq_expired"] + snap["too_long"] + snap["error"]
+    )
+
+
+def test_saving_stops_when_storage_refuses_but_fanout_continues(tmp_path):
+    st, saved, fed, handed = _stage(tmp_path)
+    st._refuse_saving = lambda: True
+    st.process_batch(IsolationBatch([_cand(0, 30)], 915e6, FS, RingSource(_ring())))
+    assert saved == [] and fed == ["b0"] and handed == ["b0"]
+
+
+def test_module_feed_failure_does_not_block_the_attribution_handoff(tmp_path):
+    archive = BurstArchive(tmp_path)
+    handed = []
+
+    def raising_module_feed(iq, rate, meta):
+        raise RuntimeError("module boom")
+
+    st = IsolationStage(
+        _settings(),
+        archive=archive,
+        module_feed=raising_module_feed,
+        attribution_handoff=lambda item: handed.append(item.burst_id),
+    )
+    out = st.process_batch(IsolationBatch([_cand(0, 30)], 915e6, FS, RingSource(_ring())))
+    assert out == [("b0", "isolated")]
+    assert handed == ["b0"]
+    assert st.stats.snapshot()["module_error"] == 1
+
+
+def test_whole_capture_source_for_the_sweep_pipeline(tmp_path):
+    st, saved, *_ = _stage(tmp_path)
+    iq = np.zeros(20_000, dtype=np.int16).tobytes()
+    c = _cand(0, 30, None, None)
+    out = st.process_batch(IsolationBatch([c], 915e6, FS, WholeCaptureSource(iq)))
+    assert out == [("b0", "isolated")] and saved == ["b0"]
+
+
+def test_thread_drains_submitted_batches(tmp_path):
+    st, saved, *_ = _stage(tmp_path, ISOLATION_QUEUE_MAX=8)
+    st.start()
+    try:
+        st.submit(IsolationBatch([_cand(0, 30)], 915e6, FS, RingSource(_ring())))
+        for _ in range(200):
+            if saved:
+                break
+            time.sleep(0.01)
+        assert saved == ["b0"]
+    finally:
+        st.stop()
+
+
+def test_stop_on_a_full_queue_returns_promptly_and_counts_consistently(tmp_path, monkeypatch):
+    import rfobserver.pipeline.isolation as iso_mod
+
+    real = iso_mod.isolate_samples
+
+    def slow(*a, **k):
+        time.sleep(0.3)
+        return real(*a, **k)
+
+    monkeypatch.setattr(iso_mod, "isolate_samples", slow)
+
+    st, *_ = _stage(tmp_path, ISOLATION_QUEUE_MAX=1)
+    st.start()
+    try:
+        ring = _ring()
+        st.submit(IsolationBatch([_cand(0, 30)], 915e6, FS, RingSource(ring)))
+        time.sleep(0.05)  # the worker has dequeued batch 0 and is inside the slow call
+        st.submit(IsolationBatch([_cand(1, 30)], 915e6, FS, RingSource(ring)))  # fills the slot
+
+        start = time.monotonic()
+        st.stop()
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 5.0
+        snap = st.stats.snapshot()
+        assert snap["received"] == 2
+        assert snap["queue_full"] == 1  # batch 1, drained unprocessed by stop()
+        assert snap["picked"] == 1  # batch 0, finished by the worker before it exited
+        assert snap["isolated"] == 1
+        assert snap["received"] == snap.get("gated_out", 0) + snap["queue_full"] + snap["picked"]
+    finally:
+        if st._thread is not None:
+            st.stop()
+
+
+def test_a_batch_submitted_during_stop_while_the_worker_is_busy_is_not_lost(tmp_path, monkeypatch):
+    """Reproduces the race: stop() drains an empty queue while the worker is
+    still inside process_batch(); a batch submitted in that window must not
+    vanish uncounted once the worker exits its loop without ever draining."""
+    import rfobserver.pipeline.isolation as iso_mod
+
+    real = iso_mod.isolate_samples
+    worker_inside = threading.Event()
+    release_worker = threading.Event()
+
+    def blocking(*a, **k):
+        worker_inside.set()
+        release_worker.wait(timeout=5.0)
+        return real(*a, **k)
+
+    monkeypatch.setattr(iso_mod, "isolate_samples", blocking)
+
+    st, *_ = _stage(tmp_path, ISOLATION_QUEUE_MAX=2)
+    st.start()
+    try:
+        st.submit(IsolationBatch([_cand(0, 30)], 915e6, FS, RingSource(_ring())))
+        assert worker_inside.wait(timeout=5.0)  # worker is now stuck inside process_batch(batch 0)
+
+        stop_thread = threading.Thread(target=st.stop)
+        stop_thread.start()
+        time.sleep(0.05)  # let stop() set the event and run its drain loop
+
+        # Races stop()'s drain: with the fix this is either rejected
+        # outright (stop event already set) or, if it slips into the queue,
+        # drained and counted by _loop()'s exit-time drain rather than lost.
+        st.submit(IsolationBatch([_cand(1, 30)], 915e6, FS, RingSource(_ring())))
+
+        release_worker.set()  # let batch 0 finish so the worker (and stop()) can exit
+        stop_thread.join(timeout=5.0)
+        assert not stop_thread.is_alive()
+
+        snap = st.stats.snapshot()
+        assert snap["received"] == 2
+        assert snap["received"] == (
+            snap.get("gated_out", 0) + snap.get("queue_full", 0) + snap.get("picked", 0)
+        )
+    finally:
+        release_worker.set()
+        if st._thread is not None:
+            st.stop()
+
+
+def test_stop_waits_for_an_in_flight_submit_before_setting_the_stop_event(tmp_path):
+    """Closes the last race: submit() reads stop_event (False), is
+    preempted before put_nowait, and stop() finishes its whole teardown
+    while the worker is idle -- then the late put lands in a queue nobody
+    reads. _submit_lock forces stop() to wait for a submit that is already
+    mid-flight before it can even flip the stop event.
+
+    Proven by monkeypatching the queue's put_nowait to block on an Event for
+    its first call only (the submitted batch -- stop()'s own later push of
+    the _STOP sentinel must not be blocked by this, or the test would be
+    proving something else): while a submit is stuck inside it (so
+    _submit_lock is held), a concurrent stop() must still be waiting on the
+    lock -- it cannot have returned. Releasing the block lets both finish,
+    and the received invariant must hold no matter which of {the worker,
+    stop()'s drain} ends up handling the now-enqueued batch.
+    """
+    st, *_ = _stage(tmp_path, ISOLATION_QUEUE_MAX=4)
+    st.start()
+    try:
+        real_put_nowait = st._queue.put_nowait
+        put_called = threading.Event()
+        release_put = threading.Event()
+
+        def blocking_put_nowait(item):
+            if not put_called.is_set():
+                put_called.set()
+                release_put.wait(timeout=5.0)
+            return real_put_nowait(item)
+
+        st._queue.put_nowait = blocking_put_nowait
+
+        submitted = {}
+
+        def do_submit():
+            submitted["ok"] = st.submit(
+                IsolationBatch([_cand(0, 30)], 915e6, FS, RingSource(_ring()))
+            )
+
+        submit_thread = threading.Thread(target=do_submit)
+        submit_thread.start()
+        # submit() is now blocked inside put_nowait, still holding _submit_lock.
+        assert put_called.wait(timeout=5.0)
+
+        stopped = threading.Event()
+
+        def do_stop():
+            st.stop()
+            stopped.set()
+
+        stop_thread = threading.Thread(target=do_stop)
+        stop_thread.start()
+        time.sleep(0.1)
+        # stop() needs _submit_lock to set the stop event; the in-flight
+        # submit still holds it, so stop() must still be blocked on it.
+        assert not stopped.is_set()
+
+        release_put.set()  # let the blocked submit finish, then stop() can proceed
+        submit_thread.join(timeout=5.0)
+        stop_thread.join(timeout=5.0)
+        assert not submit_thread.is_alive()
+        assert not stop_thread.is_alive()
+        assert submitted["ok"] is True
+
+        snap = st.stats.snapshot()
+        assert snap["received"] == 1
+        assert snap["received"] == (
+            snap.get("gated_out", 0) + snap.get("queue_full", 0) + snap.get("picked", 0)
+        )
+    finally:
+        if st._thread is not None:
+            st.stop()
+
+
+async def test_attribution_without_rtl433_keeps_isolation(tmp_path, monkeypatch):
+    monkeypatch.setattr("rfobserver.pipeline.isolation.find_rtl433", lambda override=None: None)
+    s = _settings(ISOLATION_ENABLED=False, ATTRIBUTION_ENABLED=True, STORAGE_PATH=str(tmp_path))
+    stage, worker, rtl = build_isolation(
+        s,
+        database=None,
+        storage_path=str(tmp_path),
+        loop=asyncio.get_running_loop(),
+        module_feed=None,
+        refuse_saving=lambda: False,
+        replay_source=None,
+        on_label=None,
+    )
+    assert stage is not None and worker is None
+    assert "not found" in rtl
+
+
+async def test_nothing_is_built_when_both_switches_are_off(tmp_path):
+    s = _settings(ISOLATION_ENABLED=False, ATTRIBUTION_ENABLED=False)
+    assert build_isolation(
+        s,
+        database=None,
+        storage_path=str(tmp_path),
+        loop=asyncio.get_running_loop(),
+        module_feed=None,
+        refuse_saving=lambda: False,
+        replay_source=None,
+        on_label=None,
+    ) == (None, None, None)
+
+
+async def test_replay_routes_results_to_a_file_not_the_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "rfobserver.pipeline.isolation.find_rtl433", lambda override=None: "/bin/true"
+    )
+    s = _settings(ATTRIBUTION_ENABLED=True)
+    stage, worker, rtl = build_isolation(
+        s,
+        database=object(),
+        storage_path=str(tmp_path),
+        loop=asyncio.get_running_loop(),
+        module_feed=None,
+        refuse_saving=lambda: False,
+        replay_source="feb4_19-39-48.dat",
+        on_label=None,
+    )
+    from rfobserver.pipeline.attribution import ReplayFileSink
+
+    assert stage._archive_subdir == "replay-feb4_19-39-48"
+    assert any(isinstance(k, ReplayFileSink) for k in worker._sinks)
+    # Ruling A: the brief's assertion checked for the absence of a db_sink by
+    # its inner closure's __name__, which is not a stable way to identify it.
+    # Assert the same intent directly: replay's only sink is the ReplayFileSink
+    # (db_sink is never added when replay_source is set).
+    assert worker._sinks == [k for k in worker._sinks if isinstance(k, ReplayFileSink)]
+
+
+def _whole(i):
+    # Each sweep batch pins its whole capture's IQ bytes.
+    cands = [_no_pos(_cand(10 * i + k, 30)) for k in range(2)]
+    return IsolationBatch(cands, 915e6, FS, WholeCaptureSource(np.zeros(4000, np.int32).tobytes()))
+
+
+def test_sweep_batches_are_capped_at_two_queued_or_in_flight(tmp_path):
+    st, *_ = _stage(tmp_path, ISOLATION_QUEUE_MAX=64)
+    assert st.submit(_whole(0)) and st.submit(_whole(1))
+    assert not st.submit(_whole(2))  # a third capture would pin a third buffer
+    snap = st.stats.snapshot()
+    assert snap["received"] == 6 and snap["queue_full"] == 2
+    # Ring batches carry no capture buffer and are not limited by it.
+    assert st.submit(IsolationBatch([_cand(99, 30)], 915e6, FS, RingSource(_ring())))
+    st.start()
+    try:
+        assert st.wait_idle(5.0)
+        assert st.submit(_whole(3))  # the earlier captures are released
+        assert st.wait_idle(5.0)
+    finally:
+        st.stop()
+    snap = st.stats.snapshot()
+    assert snap["queue_full"] == 2
+    assert snap["received"] == snap["gated_out"] + snap["queue_full"] + snap["picked"]
+
+
+def test_a_sweep_batch_in_flight_counts_toward_the_cap(tmp_path, monkeypatch):
+    st, *_ = _stage(tmp_path, ISOLATION_QUEUE_MAX=64)
+    busy, release = threading.Event(), threading.Event()
+    orig = st.process_batch
+
+    def slow(batch):
+        busy.set()
+        release.wait(5)
+        return orig(batch)
+
+    monkeypatch.setattr(st, "process_batch", slow)
+    st.start()
+    try:
+        assert st.submit(_whole(0))
+        assert busy.wait(2)  # taken off the queue, now being processed
+        assert st.submit(_whole(1))
+        assert not st.submit(_whole(2))
+        release.set()
+        assert st.wait_idle(5.0)
+    finally:
+        release.set()
+        st.stop()

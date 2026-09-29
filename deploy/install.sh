@@ -36,6 +36,16 @@ chown -R rfobserver:rfobserver /var/lib/rfobserver
 # pip 22.x.
 pip3 install .
 
+# rtl_433 for burst attribution (optional: isolation works without it). Built
+# from a pinned master commit because protocol 383 is in no release yet. A
+# failed build only warns; set RFOBS_SKIP_RTL433=1 to skip it entirely.
+if [ "${RFOBS_SKIP_RTL433:-0}" != "1" ]; then
+    if ! ./deploy/install_rtl433.sh; then
+        echo "WARNING: rtl_433 build failed; attribution will be unavailable." >&2
+        echo "Retry later with: sudo ./deploy/install_rtl433.sh" >&2
+    fi
+fi
+
 # Install config if not present. It lives as a writable .env in the state dir
 # (the service's WorkingDirectory) so that UI toggles / config-apply persist
 # across restarts. May contain tokens, so lock it down to the service user.

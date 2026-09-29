@@ -179,6 +179,14 @@ protocol 383, not in a release yet). The sensor looks for
 `~/rtl_433_build/build/src/rtl_433`, then `rtl_433` on `PATH`. If none is
 found, attribution stays off with a warning and isolation still runs.
 
+To install it, run `sudo ./deploy/install_rtl433.sh` from the repo root
+(`deploy/install.sh` runs it too; set `RFOBS_SKIP_RTL433=1` to skip). It builds
+a pinned, tested master commit with file input only (no SDR drivers, about
+20 s on a Jetson) and installs `/usr/local/bin/rtl_433`, which the systemd
+service finds on its `PATH`. Restart RFObserver afterwards. Set `RTL433_REF`
+to build another commit, `PREFIX` for another install location, and `FORCE=1`
+to rebuild over an existing install.
+
 Files go under `STORAGE_PATH/bursts/`:
 
 - live: `bursts/YYYYMMDD/<burst_id>.sigmf-data` and `.sigmf-meta`, linked to

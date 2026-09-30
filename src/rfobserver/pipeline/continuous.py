@@ -31,7 +31,6 @@ if TYPE_CHECKING:
     from rfobserver.pipeline.isolation import IsolationStage
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.storage.local import LocalStorage
-    from rfobserver.transport.nats_producer import NatsProducer
     from rfobserver.web.websocket import LiveBroadcast
     from rfobserver.zms.monitor import ZmsMonitor
 
@@ -57,7 +56,6 @@ class ContinuousProcessor:
         settings: AppSettings,
         broadcast: LiveBroadcast | None = None,
         zms_monitor: ZmsMonitor | None = None,
-        nats_producer: NatsProducer | None = None,
         beacon: ProgressBeacon | None = None,
     ) -> None:
         self._receiver = receiver
@@ -66,7 +64,6 @@ class ContinuousProcessor:
         self._settings = settings
         self._broadcast = broadcast
         self._zms_monitor = zms_monitor
-        self._nats_producer = nats_producer
         self._beacon = beacon
 
         # 1 thread for capture, N-3 cores for processing, 2 cores left free for OS/web
@@ -292,8 +289,8 @@ class ContinuousProcessor:
                 )
             )
 
-        # Build the processed envelope once; fan out to ZMS + NATS.
-        if self._zms_monitor is not None or self._nats_producer is not None:
+        # Build the processed envelope once and submit it to ZMS.
+        if self._zms_monitor is not None:
             try:
                 envelope = self._build_envelope(pr)
                 await self._fanout_envelope(envelope, pr.capture_num)
@@ -352,7 +349,7 @@ class ContinuousProcessor:
         )
 
     async def _fanout_envelope(self, envelope: ProcessedDataEnvelope, capture_num: int) -> None:
-        """Submit the processed envelope to ZMS (HTTP) and NATS (rfobs.stats)."""
+        """Submit the processed envelope to ZMS (HTTP)."""
         if self._zms_monitor is not None:
             try:
                 ok = await self._zms_monitor.submit_observation(envelope)
@@ -360,12 +357,6 @@ class ContinuousProcessor:
                     logger.debug("ZMS observation submitted (capture #%d)", capture_num)
             except Exception:
                 logger.exception("ZMS observation submission failed")
-
-        if self._nats_producer is not None:
-            try:
-                await self._nats_producer.publish_stats(envelope, self._settings.HOSTNAME)
-            except Exception:
-                logger.exception("NATS stats publish failed")
 
     def _build_frequency_list(self) -> list[int]:
         s = self._settings

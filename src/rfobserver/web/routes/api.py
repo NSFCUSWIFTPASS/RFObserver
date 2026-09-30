@@ -170,7 +170,7 @@ def build_status_bar_html(settings: Any, active: bool = True) -> str:
     "Standby" badge.
     """
     # SENSOR_NAME is a user-facing display label; HOSTNAME is the machine
-    # identifier used elsewhere (NATS subjects, capture filenames, ZMS
+    # identifier used elsewhere (capture filenames, ZMS
     # metadata). The dashboard only ever shows the friendly label.
     display_name = settings.SENSOR_NAME or settings.HOSTNAME
     freq = settings.FREQUENCY_START / 1e6

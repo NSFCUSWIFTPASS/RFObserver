@@ -63,7 +63,7 @@ def _persist_settings(settings: Any) -> None:
 
     lines: list[str] = []
     for field_name in type(settings).model_fields:
-        if field_name in ("NATS_URL", "zms"):
+        if field_name == "zms":
             continue  # computed properties, not settable
         val = getattr(settings, field_name)
         default_val = getattr(defaults, field_name)

@@ -16,15 +16,6 @@ def test_default_settings():
     assert settings.PSD_TIME_RESOLUTION_MS == 0.2
 
 
-def test_nats_url():
-    settings = AppSettings(
-        NATS_HOST="nats.example.com",
-        NATS_PORT=4223,
-        _env_file=None,
-    )
-    assert settings.NATS_URL == "nats://nats.example.com:4223"
-
-
 def test_env_prefix(monkeypatch):
     monkeypatch.setenv("RFOBS_GAIN", "50")
     monkeypatch.setenv("RFOBS_LOG_LEVEL", "DEBUG")
@@ -56,7 +47,6 @@ def test_toggle_persists_to_env_and_reloads(monkeypatch, tmp_path):
     # Enable non-default toggles, as a UI toggle would, then persist.
     settings = AppSettings(_env_file=None)
     settings.SENSOR_ACTIVE = True
-    settings.NATS_ENABLED = True
     settings.ZMS_ENABLED = True
     _persist_settings(settings)
 
@@ -65,7 +55,6 @@ def test_toggle_persists_to_env_and_reloads(monkeypatch, tmp_path):
     # A fresh process reads the same .env from cwd and sees the enabled state.
     reloaded = AppSettings()
     assert reloaded.SENSOR_ACTIVE is True
-    assert reloaded.NATS_ENABLED is True
     assert reloaded.ZMS_ENABLED is True
 
     # Toggling back to the default is likewise durable.

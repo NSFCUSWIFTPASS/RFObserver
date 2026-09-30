@@ -84,7 +84,6 @@ def _settings(tmp_path: Any, web_port: int) -> AppSettings:
     s.DB_RETENTION_DAYS = 0
     s.SENSOR_ACTIVE = False
     s.WATCHDOG_ENABLED = False
-    s.NATS_ENABLED = False
     s.ZMS_ENABLED = False
     return s
 

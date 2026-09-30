@@ -197,21 +197,6 @@ async def run(settings: AppSettings) -> None:
         await zms_monitor.start()
         logger.info("ZMS monitor enabled (id=%s)", settings.zms.monitor_id)
 
-    # NATS producer (optional). Pipeline tolerates connection failure: on
-    # error we log and proceed without NATS rather than aborting startup.
-    nats_producer = None
-    if settings.NATS_ENABLED:
-        from rfobserver.transport.nats_producer import NatsProducer
-
-        token = settings.NATS_TOKEN.get_secret_value() if settings.NATS_TOKEN else None
-        nats_producer = NatsProducer(url=settings.NATS_URL, token=token)
-        try:
-            await nats_producer.connect()
-            logger.info("NATS producer connected (%s)", settings.NATS_URL)
-        except Exception:
-            logger.exception("NATS connect failed; continuing without NATS")
-            nats_producer = None
-
     # The receiver and processor are built lazily by the supervisor when the
     # sensor is activated, so a Standby start never claims the SDR.
     def build_receiver() -> IReceiver:
@@ -237,7 +222,6 @@ async def run(settings: AppSettings) -> None:
                 settings=settings,
                 broadcast=broadcast,
                 zms_monitor=zms_monitor,
-                nats_producer=nats_producer,
                 replay_mode=replay_mode,
                 beacon=beacon,
                 storage_governor=storage_governor,
@@ -260,7 +244,6 @@ async def run(settings: AppSettings) -> None:
             settings=settings,
             broadcast=broadcast,
             zms_monitor=zms_monitor,
-            nats_producer=nats_producer,
             beacon=beacon,
         )
 
@@ -378,11 +361,6 @@ async def run(settings: AppSettings) -> None:
                     await zms_monitor.stop()
                 except Exception:
                     logger.exception("Shutdown: stopping the ZMS monitor failed; continuing")
-            if nats_producer is not None:
-                try:
-                    await nats_producer.close()
-                except Exception:
-                    logger.exception("Shutdown: closing NATS failed; continuing")
         finally:
             try:
                 try:

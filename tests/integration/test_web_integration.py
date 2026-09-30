@@ -188,7 +188,6 @@ async def test_publish_processed_persists_and_is_queryable(app_with_db):
         settings=settings,
         broadcast=None,
         zms_monitor=None,
-        nats_producer=None,
         replay_mode=False,
     )
     summary = SimpleNamespace(

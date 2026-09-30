@@ -25,7 +25,7 @@ import math
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import aiosqlite
 import numpy as np
@@ -307,6 +307,22 @@ def _nice_bin_width(span: float) -> float:
     else:
         nice = 10.0
     return max(0.5, nice * base)
+
+
+class WindowStatsRow(NamedTuple):
+    """One averaged window's stats, as the rf-db writer reads them."""
+
+    id: int
+    start_time: datetime
+    duration_sec: float
+    sdr_center_freq_hz: float
+    sample_rate_hz: float
+    gain_db: float | None
+    pwr_avg: float | None
+    pwr_max: float | None
+    pwr_median: float | None
+    pwr_std: float | None
+    kurtosis: float | None
 
 
 class SensorDatabase:
@@ -1396,6 +1412,31 @@ class SensorDatabase:
         if row is None or row[0] is None:
             return None
         return datetime.fromisoformat(row[0])
+
+    async def avg_windows_after(self, after_id: int, limit: int) -> list[WindowStatsRow]:
+        """Averaged windows with id > ``after_id``, oldest first."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT id, start_time, duration_sec, sdr_center_freq_hz, sample_rate_hz, gain_db,"
+            " pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis"
+            " FROM avg_windows WHERE id > ? ORDER BY id LIMIT ?",
+            (after_id, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        out = []
+        for r in rows:
+            start = datetime.fromisoformat(r[1])
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=timezone.utc)
+            out.append(WindowStatsRow(r[0], start, *r[2:]))
+        return out
+
+    async def newest_avg_window_id(self) -> int:
+        """Highest averaged-window id, or 0 when there are none."""
+        assert self._db is not None
+        async with self._db.execute("SELECT MAX(id) FROM avg_windows") as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
 
     async def avg_window_configs(self) -> dict[str, Any]:
         """Distinct SDR tuning configs present in avg_windows + the most recent.

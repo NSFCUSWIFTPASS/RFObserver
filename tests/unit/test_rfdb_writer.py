@@ -86,7 +86,7 @@ def _writer(db: FakeDb, client: FakeClient, flush_sec: float = 5.0) -> RfdbWrite
         reader=db,  # type: ignore[arg-type]
         store=db,  # type: ignore[arg-type]
         hostname="rf-nano-aa",
-        window_sec=0.5,
+        window_sec=lambda: 0.5,
         flush_sec=flush_sec,
     )
 
@@ -206,3 +206,24 @@ async def test_run_backs_off_after_a_failure_then_resumes(monkeypatch):
     assert _sent_ids(client) == [1, 2, 3]
     assert writer.status()["last_error"] is None
     assert client.closes == 2  # once to reset after the failure, once on the way out
+
+
+async def test_a_changed_window_length_applies_to_the_next_flush():
+    db = FakeDb([_window(1)], bookmark=0)
+    client = FakeClient()
+    window_sec = 0.5
+    writer = RfdbWriter(
+        client=client,  # type: ignore[arg-type]
+        reader=db,  # type: ignore[arg-type]
+        store=db,  # type: ignore[arg-type]
+        hostname="rf-nano-aa",
+        window_sec=lambda: window_sec,
+        flush_sec=5.0,
+    )
+
+    await writer.flush_once()
+    window_sec = 1.0
+    db.windows.append(_window(2))
+    await writer.flush_once()
+
+    assert [r.metadata.length for r in client.inserted] == [0.5, 1.0]

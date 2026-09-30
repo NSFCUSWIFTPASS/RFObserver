@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from rfobserver.pipeline.beacon import ProgressBeacon
     from rfobserver.pipeline.supervisor import PipelineSupervisor
     from rfobserver.storage.database import SensorDatabase
+    from rfobserver.transport.rfdb import RfdbWriter
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +174,38 @@ async def run(settings: AppSettings) -> None:
             await db.close()
             raise
 
+    # rf-db writer (optional). Its own read-only connection keeps its reads out
+    # of the way of pipeline writes and Dashboard queries.
+    rfdb_reader: SensorDatabase | None = None
+    rfdb_writer: RfdbWriter | None = None
+    if settings.RFDB_ENABLED and settings.rfdb is None:
+        logger.warning("RFDB_ENABLED is set without RFDB_HOST/USER/PASSWORD; not writing to rf-db")
+    elif settings.rfdb is not None and settings.RFDB_ENABLED:
+        from rfobserver.transport.rfdb import RfdbClient, RfdbWriter
+
+        rfdb_reader = SensorDatabase(settings.DB_PATH, read_only=True)
+        try:
+            await rfdb_reader.connect()
+        except Exception:
+            logger.exception("Opening the rf-db writer's reader failed; not writing to rf-db")
+            with contextlib.suppress(Exception):
+                await rfdb_reader.close()
+            rfdb_reader = None
+        except BaseException:
+            if read_db is not None:
+                await read_db.close()
+            await db.close()
+            raise
+        else:
+            rfdb_writer = RfdbWriter(
+                client=RfdbClient(settings.rfdb),
+                reader=rfdb_reader,
+                store=db,
+                hostname=settings.HOSTNAME,
+                window_sec=lambda: settings.DURATION_SEC,
+                flush_sec=settings.rfdb.flush_sec,
+            )
+
     local_storage = LocalStorage(settings.STORAGE_PATH, max_gb=settings.ARCHIVE_MAX_GB)
 
     from rfobserver.storage.governor import StorageGovernor
@@ -299,6 +332,7 @@ async def run(settings: AppSettings) -> None:
                 beacon,
                 stop,
                 storage_governor=storage_governor,
+                rfdb_writer=rfdb_writer,
             )
         )
         workers.append(web_task)
@@ -326,6 +360,8 @@ async def run(settings: AppSettings) -> None:
     )
     if settings.PEAKS_ROLLUP_INTERVAL_SEC > 0:
         workers.append(asyncio.create_task(_rollup_loop(settings, db, supervisor)))
+    if rfdb_writer is not None:
+        workers.append(asyncio.create_task(rfdb_writer.run()))
     # Serve until a stop signal. The supervisor owns the processor task
     # independently of these, so a Standby or headless run waits here too.
     stop_task = asyncio.create_task(stop.wait())
@@ -364,8 +400,12 @@ async def run(settings: AppSettings) -> None:
         finally:
             try:
                 try:
-                    if read_db is not None:
-                        await read_db.close()
+                    try:
+                        if rfdb_reader is not None:
+                            await rfdb_reader.close()
+                    finally:
+                        if read_db is not None:
+                            await read_db.close()
                 finally:
                     await db.close()
                 logger.info("Shutdown complete")
@@ -794,6 +834,7 @@ async def _run_web_server(
     beacon: ProgressBeacon,
     stop: asyncio.Event,
     storage_governor: Any = None,
+    rfdb_writer: Any = None,
 ) -> None:
     """Run the FastAPI web server as an async task."""
     import uvicorn
@@ -806,6 +847,7 @@ async def _run_web_server(
     app.state.database = database
     app.state.write_database = write_database
     app.state.storage_governor = storage_governor
+    app.state.rfdb_writer = rfdb_writer
     app.state.broadcast = broadcast
     app.state.processor = supervisor.processor
 

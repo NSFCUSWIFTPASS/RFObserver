@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 import asyncpg
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from rfobserver.config import RfdbSettingsGroup
     from rfobserver.storage.database import SensorDatabase, WindowStatsRow
@@ -204,7 +204,7 @@ class RfdbWriter:
         reader: SensorDatabase,
         store: SensorDatabase,
         hostname: str,
-        window_sec: float,
+        window_sec: Callable[[], float],
         flush_sec: float,
     ) -> None:
         self._client = client
@@ -271,9 +271,10 @@ class RfdbWriter:
             return False
 
         windows = await self._reader.avg_windows_after(self._bookmark, BATCH_SIZE)
+        window_sec = self._window_sec()
         rows = []
         for window in windows:
-            row = to_output_row(window, self._window_sec)
+            row = to_output_row(window, window_sec)
             if row is None:
                 self._skip_unstorable(window)
             else:

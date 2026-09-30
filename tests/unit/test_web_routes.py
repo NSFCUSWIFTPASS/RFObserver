@@ -43,6 +43,21 @@ def test_health_without_supervisor_has_no_pipeline_block(client):
     assert "pipeline" not in data
 
 
+def test_health_has_no_rfdb_block_when_the_writer_is_off(client):
+    assert "rfdb" not in client.get("/api/health").json()
+
+
+def test_health_reports_the_rfdb_writer_status(settings):
+    app = create_app(settings)
+    status = {"registered": True, "backlog": 0, "last_error": "boom"}
+    app.state.rfdb_writer = MagicMock(status=MagicMock(return_value=status))
+
+    data = TestClient(app).get("/api/health").json()
+
+    assert data["rfdb"] == status
+    assert data["status"] == "ok"  # rf-db trouble is reported, not a sensor fault
+
+
 def test_health_reports_pipeline_and_degrades_on_give_up(settings):
     app = create_app(settings)
     sup = MagicMock(active=False, gave_up=True, consecutive_crashes=6, processor=None)

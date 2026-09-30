@@ -120,6 +120,34 @@ def test_zms_with_dst_http():
     assert settings.zms.dst_or_zmc == "http://dst.test"
 
 
+def test_rfdb_none_when_incomplete():
+    settings = AppSettings(RFDB_HOST="10.1.42.12", RFDB_USER="rfobs_writer", _env_file=None)
+    assert settings.rfdb is None
+
+
+def test_rfdb_constructed_when_complete():
+    settings = AppSettings(
+        RFDB_HOST="10.1.42.12",
+        RFDB_USER="rfobs_writer",
+        RFDB_PASSWORD="pw",
+        _env_file=None,
+    )
+    assert settings.rfdb is not None
+    assert (settings.rfdb.port, settings.rfdb.name) == (5433, "nrdz")
+    assert settings.rfdb.password.get_secret_value() == "pw"
+    assert settings.RFDB_ENABLED is False
+
+
+def test_rfdb_password_masked_in_settings_dump():
+    settings = AppSettings(
+        RFDB_HOST="10.1.42.12",
+        RFDB_USER="rfobs_writer",
+        RFDB_PASSWORD="hunter2",
+        _env_file=None,
+    )
+    assert "hunter2" not in str(settings.model_dump())
+
+
 def test_burst_window_covers_long_bursts() -> None:
     """Field default window must hold ~400 ms bursts with room to spare.
 

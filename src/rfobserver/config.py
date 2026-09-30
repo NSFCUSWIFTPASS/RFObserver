@@ -25,6 +25,18 @@ class ZmsSettingsGroup:
         return self.dst_http or self.zmc_http
 
 
+@dataclass
+class RfdbSettingsGroup:
+    """Resolved rf-db configuration (only constructed when all required fields are set)."""
+
+    host: str
+    port: int
+    name: str
+    user: str
+    password: SecretStr
+    flush_sec: float
+
+
 class AppSettings(BaseSettings):
     """Application settings loaded from environment variables with RFOBS_ prefix."""
 
@@ -256,6 +268,16 @@ class AppSettings(BaseSettings):
     ZMS_MONITOR_SCHEMA_PATH: str | None = None
     ZMS_METRIC_ID: str | None = None
 
+    # rf-db (optional): every averaged window's stats go to the Grafana
+    # Postgres on node1.
+    RFDB_ENABLED: bool = False
+    RFDB_HOST: str | None = None
+    RFDB_PORT: int = 5433
+    RFDB_NAME: str = "nrdz"
+    RFDB_USER: str | None = None
+    RFDB_PASSWORD: SecretStr | None = None
+    RFDB_FLUSH_SEC: float = 5.0
+
     @model_validator(mode="after")
     def _carry_legacy_history_days(self) -> AppSettings:
         """Let a stored HISTORY_DAYS drive PSD retention.
@@ -285,5 +307,20 @@ class AppSettings(BaseSettings):
                 monitor_name=self.ZMS_MONITOR_NAME or f"RFObs - {self.HOSTNAME}",
                 monitor_schema_path=self.ZMS_MONITOR_SCHEMA_PATH,
                 metric_id=self.ZMS_METRIC_ID,
+            )
+        return None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def rfdb(self) -> RfdbSettingsGroup | None:
+        """Constructs rf-db settings if host, user and password are set."""
+        if self.RFDB_HOST and self.RFDB_USER and self.RFDB_PASSWORD:
+            return RfdbSettingsGroup(
+                host=self.RFDB_HOST,
+                port=self.RFDB_PORT,
+                name=self.RFDB_NAME,
+                user=self.RFDB_USER,
+                password=self.RFDB_PASSWORD,
+                flush_sec=self.RFDB_FLUSH_SEC,
             )
         return None

@@ -50,11 +50,6 @@ jobs:
   test-integration:
     needs: [lint, test-unit]
     runs-on: ubuntu-latest
-    services:
-      nats:
-        image: nats:latest
-        ports:
-          - 4222:4222
     steps:
       - uses: actions/checkout@v4
 
@@ -65,16 +60,5 @@ jobs:
       - name: Install hatch
         run: pip install hatch
 
-      - name: Wait for NATS
-        run: |
-          for i in $(seq 1 30); do
-            if nc -z localhost 4222 2>/dev/null; then echo "NATS ready"; break; fi
-            echo "Waiting for NATS... ($i)"
-            sleep 1
-          done
-
       - name: Run integration tests
         run: hatch run test:integration
-        env:
-          RFOBS_NATS_HOST: localhost
-          RFOBS_NATS_PORT: 4222

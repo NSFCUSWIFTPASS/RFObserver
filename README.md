@@ -17,7 +17,7 @@ RFObserver supports configurable add-ons to the post processing pipeline for dem
 - Configurable via API
 - Local WebUI (FastAPI + HTMX): live spectrogram, detection history, capture browser, runtime reconfiguration of every pipeline knob.
 - Local SQLite store of detections + capture metadata; long-running with WAL.
-- Outbound integrations: OpenZMS DST (SigMF observations) and NATS JetStream (`rfobs.stats.<hostname>` per-window envelopes).
+- Outbound integration: OpenZMS DST (SigMF observations).
 - Mock receiver for development without hardware; integration tests cover the most of the pipeline against synthetic IQ.
 
 ## Quick Start
@@ -227,8 +227,7 @@ pip install hatch
 # Run unit tests
 hatch run test:unit
 
-# Run integration tests (requires NATS)
-docker compose -f docker/docker-compose.yml up -d nats
+# Run integration tests
 hatch run test:integration
 
 # Lint

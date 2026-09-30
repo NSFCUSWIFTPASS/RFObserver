@@ -8,10 +8,6 @@ set -euo pipefail
 echo "=== RFObserver Jetson Setup ==="
 
 # System deps
-# Note: nats-server is intentionally NOT installed here. The sensor is a NATS
-# *client* (via the nats-py library, pulled in by pip below); it publishes to a
-# remote RFS NATS broker running on the server. Set RFOBS_NATS_HOST/PORT/TOKEN
-# in the env file to point at it. A local broker is only needed on the server.
 apt-get update
 apt-get install -y --no-install-recommends \
     python3-pip \

@@ -3,20 +3,30 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import math
-from typing import TYPE_CHECKING, NamedTuple, cast
+import time
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import asyncpg
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from datetime import datetime
 
     from rfobserver.config import RfdbSettingsGroup
-    from rfobserver.storage.database import WindowStatsRow
+    from rfobserver.storage.database import SensorDatabase, WindowStatsRow
 
 logger = logging.getLogger(__name__)
+
+BOOKMARK_KEY = "rfdb_last_id"
+BATCH_SIZE = 1000
+_BOOKMARK_SAVE_TIMEOUT_SEC = 10.0
+_BACKOFF_MIN_SEC = 5.0
+_BACKOFF_MAX_SEC = 60.0
+_SKIP_WARN_INTERVAL_SEC = 60.0
 
 _INSERT_METADATA = """
     INSERT INTO metadata (frequency, sample_rate, bandwidth, gain, length, "interval", bit_depth)
@@ -177,3 +187,161 @@ class RfdbClient:
             found = await self._pool.fetchval(_SELECT_METADATA, *key)
         self._metadata_ids[key] = int(found)
         return int(found)
+
+
+class RfdbWriter:
+    """Sends averaged windows from the local ``avg_windows`` table to rf-db.
+
+    ``avg_windows`` is the queue. The bookmark (config key ``rfdb_last_id``) is
+    the id of the last window confirmed in rf-db and only moves after a commit,
+    so an outage delays windows but never loses them.
+    """
+
+    def __init__(
+        self,
+        *,
+        client: RfdbClient,
+        reader: SensorDatabase,
+        store: SensorDatabase,
+        hostname: str,
+        window_sec: float,
+        flush_sec: float,
+    ) -> None:
+        self._client = client
+        self._reader = reader
+        self._store = store
+        self._hostname = hostname
+        self._window_sec = window_sec
+        self._flush_sec = flush_sec
+        self._connected = False
+        self._bookmark: int | None = None
+        self._registered: bool | None = None
+        self._backlog = 0
+        self._sent = 0
+        self._skipped = 0
+        self._last_ok: datetime | None = None
+        self._last_error: str | None = None
+        self._last_skip_warn = -math.inf
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "registered": self._registered,
+            "bookmark": self._bookmark,
+            "backlog": self._backlog,
+            "sent": self._sent,
+            "skipped": self._skipped,
+            "last_ok": self._last_ok.isoformat() if self._last_ok else None,
+            "last_error": self._last_error,
+        }
+
+    async def run(self) -> None:
+        """Flush until cancelled, backing off while rf-db is unreachable."""
+        backoff = _BACKOFF_MIN_SEC
+        try:
+            while True:
+                try:
+                    more = await self.flush_once()
+                except Exception as exc:
+                    self._last_error = f"{type(exc).__name__}: {exc}"
+                    logger.warning(
+                        "rf-db flush failed (%s); retrying in %.0f s", self._last_error, backoff
+                    )
+                    await self._reset_connection()
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, _BACKOFF_MAX_SEC)
+                    continue
+                backoff = _BACKOFF_MIN_SEC
+                if not more:
+                    await asyncio.sleep(self._flush_sec)
+        finally:
+            await self._client.close()
+
+    async def flush_once(self) -> bool:
+        """Send the next batch. True if a full batch went out and more may be waiting."""
+        if not self._connected:
+            await self._client.connect()
+            self._connected = True
+        if self._bookmark is None:
+            self._bookmark = await self._load_bookmark()
+
+        hardware_id = await self._client.hardware_id(self._hostname)
+        self._registered = hardware_id is not None
+        if hardware_id is None:
+            await self._update_backlog()
+            return False
+
+        windows = await self._reader.avg_windows_after(self._bookmark, BATCH_SIZE)
+        rows = []
+        for window in windows:
+            row = to_output_row(window, self._window_sec)
+            if row is None:
+                self._skip_unstorable(window)
+            else:
+                rows.append(row)
+        if rows:
+            await self._insert(hardware_id, rows)
+        if windows:
+            self._bookmark = windows[-1].id
+            await self._save_bookmark(self._bookmark)
+
+        self._last_ok = datetime.now(timezone.utc)
+        self._last_error = None
+        await self._update_backlog()
+        return len(windows) == BATCH_SIZE
+
+    async def _insert(self, hardware_id: int, rows: list[OutputRow]) -> None:
+        try:
+            await self._client.insert_outputs(hardware_id, rows)
+            self._sent += len(rows)
+        except asyncpg.DataError:
+            # One value rf-db rejects fails the whole batch: retry row by row so
+            # only that row is dropped.
+            for row in rows:
+                try:
+                    await self._client.insert_outputs(hardware_id, [row])
+                    self._sent += 1
+                except asyncpg.DataError as exc:
+                    self._skipped += 1
+                    logger.warning("rf-db rejected the window starting %s: %s", row.created_at, exc)
+
+    def _skip_unstorable(self, window: WindowStatsRow) -> None:
+        self._skipped += 1
+        now = time.monotonic()
+        if now - self._last_skip_warn >= _SKIP_WARN_INTERVAL_SEC:
+            self._last_skip_warn = now
+            logger.warning(
+                "Skipping window %d: a missing or non-finite value rf-db can't store "
+                "(%d skipped so far)",
+                window.id,
+                self._skipped,
+            )
+
+    async def _load_bookmark(self) -> int:
+        stored = await self._store.get_config(BOOKMARK_KEY)
+        if stored is not None:
+            return int(stored)
+        newest = await self._reader.newest_avg_window_id()
+        logger.info("rf-db writer first start: sending windows after id %d", newest)
+        await self._save_bookmark(newest)
+        return newest
+
+    async def _save_bookmark(self, value: int) -> None:
+        """Persist the bookmark. On a stalled disk it stays in memory only: a
+        restart then resends a few windows, which rf-db drops as duplicates."""
+        try:
+            await asyncio.wait_for(
+                self._store.set_config(BOOKMARK_KEY, str(value)),
+                timeout=_BOOKMARK_SAVE_TIMEOUT_SEC,
+            )
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
+            logger.warning("Saving the rf-db bookmark timed out; keeping it in memory")
+
+    async def _update_backlog(self) -> None:
+        assert self._bookmark is not None
+        newest = await self._reader.newest_avg_window_id()
+        self._backlog = max(0, newest - self._bookmark)
+
+    async def _reset_connection(self) -> None:
+        self._connected = False
+        with contextlib.suppress(Exception):
+            await self._client.close()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socket
 from dataclasses import dataclass
+from typing import Literal
 
 from pydantic import Field, SecretStr, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -165,6 +166,11 @@ class AppSettings(BaseSettings):
     # in a 28-56 MHz span) -- at the cost of a larger per-eval FFT/CCL grid.
     NUM_FFT_BINS: int = 2048
     PSD_TIME_RESOLUTION_MS: float = 0.2  # internal PSD grid time resolution
+    # Where the PSD grid is computed: "cpu", or "cuda" for the Jetson GPU (needs
+    # the library from deploy/build_psd_cuda.sh; on an Orin Nano a 26 Msps chunk
+    # took 3 ms instead of 46 ms of worker time). Falls back to the CPU, logged
+    # once, when the library or a CUDA device is missing.
+    PSD_BACKEND: Literal["cpu", "cuda"] = "cpu"
 
     # Streaming pipeline
     STREAMING_CHUNK_SLICES: int = 200  # PSD time slices per recv chunk

@@ -332,6 +332,29 @@ class TestConfigApply:
         assert resp.status_code == 400
         assert original == settings.NUM_FFT_BINS  # unchanged
 
+    def test_apply_psd_backend_reconfigures(self, client_with_processor, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)  # apply persists to ./.env; keep it out of the repo
+        client, settings, processor = client_with_processor
+        resp = client.post("/config/apply", json={"psd_backend": "cuda"})
+        assert resp.status_code == 200
+        assert settings.PSD_BACKEND == "cuda"
+        processor.reconfigure.assert_called_once()
+        assert "RFOBS_PSD_BACKEND=cuda" in (tmp_path / ".env").read_text()
+
+    def test_apply_psd_backend_invalid(self, client_with_processor, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        client, settings, processor = client_with_processor
+        resp = client.post("/config/apply", json={"psd_backend": "opencl"})
+        assert resp.status_code == 400
+        assert settings.PSD_BACKEND == "cpu"  # unchanged
+        processor.reconfigure.assert_not_called()
+
+    def test_config_page_has_the_psd_compute_select(self, client_with_processor):
+        client, _, _ = client_with_processor
+        html = client.get("/config").text
+        assert 'name="psd_backend"' in html
+        assert 'value="cuda"' in html
+
     def test_apply_bandwidth_triggers_reconfigure(self, client_with_processor):
         client, settings, processor = client_with_processor
         resp = client.post("/config/apply", json={"bandwidth": "28000000"})

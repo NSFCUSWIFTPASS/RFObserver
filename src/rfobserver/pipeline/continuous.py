@@ -448,6 +448,7 @@ def _process_capture_blocking(
         num_bins=s.NUM_FFT_BINS,
         time_resolution_ms=s.PSD_TIME_RESOLUTION_MS,
         num_workers=num_workers,
+        backend=s.PSD_BACKEND,
     )
     psd_grid = compute_psd_grid(data, s.BANDWIDTH, config=grid_config)
     summary_psd = compute_summary_psd(psd_grid, center_freq_hz, s.BANDWIDTH)

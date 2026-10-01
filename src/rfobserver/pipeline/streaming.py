@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from rfobserver.capture.buffer import CircularBuffer, GridPreBuffer, trim_grid_rows
+from rfobserver.processing import psd_cuda
 from rfobserver.processing.burst import BurstDetectionConfig
 from rfobserver.processing.iq_utils import (
     IQMoments,
@@ -2589,6 +2590,7 @@ class StreamingProcessor:
             num_bins=s.NUM_FFT_BINS,
             time_resolution_ms=s.PSD_TIME_RESOLUTION_MS,
             num_workers=self._fft_workers,
+            backend=s.PSD_BACKEND,
         )
 
     def _process_one_chunk(
@@ -2602,15 +2604,24 @@ class StreamingProcessor:
     ) -> _ChunkResult:
         """Pure processing function run on a worker thread."""
         t0 = time.monotonic()
-        complex_chunk = convert_sc16_to_complex(sc16_buf)
-        t_convert = time.monotonic()
+        # With the GPU PSD backend, convert straight into mapped pinned memory
+        # so the GPU reads the chunk in place instead of copying it. The buffer
+        # is reused after the with block, so complex_chunk must not escape it.
+        pinned: contextlib.AbstractContextManager[np.ndarray[Any, np.dtype[Any]] | None] = (
+            psd_cuda.pinned_complex64(len(sc16_buf))
+            if grid_config.backend == "cuda"
+            else contextlib.nullcontext(None)
+        )
+        with pinned as out:
+            complex_chunk = convert_sc16_to_complex(sc16_buf, out=out)
+            t_convert = time.monotonic()
 
-        psd_grid = compute_psd_grid(complex_chunk, self._settings.BANDWIDTH, config=grid_config)
-        t_psd = time.monotonic()
+            psd_grid = compute_psd_grid(complex_chunk, self._settings.BANDWIDTH, config=grid_config)
+            t_psd = time.monotonic()
 
-        iq_moments = moments_from_iq(complex_chunk)
-        iq_stats = finalize_moments(iq_moments)
-        t_stats = time.monotonic()
+            iq_moments = moments_from_iq(complex_chunk)
+            iq_stats = finalize_moments(iq_moments)
+            t_stats = time.monotonic()
 
         summary_psd = compute_summary_psd(psd_grid, center_freq, self._settings.BANDWIDTH)
 

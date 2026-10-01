@@ -61,3 +61,10 @@ tests/ui/*.png
 # and the Claude Code scheduler lock
 /Screenshot *.png
 .claude/scheduled_tasks.lock
+# Local analysis output at the repo root: data exports (e.g. the Detections page
+# CSV) and charts made from them. Root-only, so CSV evidence under
+# docs/debugging/ can still be committed.
+/*.csv
+/*.png
+# Papers and abstracts (drafts, PDFs, LaTeX) are kept out of the repo
+/docs/papers/

@@ -10,6 +10,8 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import SecretStr
 
+from rfobserver.processing import psd_cuda
+from rfobserver.processing.spectral import PSD_BACKENDS
 from rfobserver.web.uiprefs import ui_theme
 
 if TYPE_CHECKING:
@@ -46,6 +48,9 @@ async def config_page(request: Request) -> Any:
             "settings": settings,
             "sensor_available": sensor_available,
             "sensor_active": sensor_active,
+            # Only whether the library is built: loading it would start CUDA
+            # in the web process.
+            "psd_cuda_built": psd_cuda.library_path().exists(),
         },
     )
 
@@ -121,6 +126,7 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "burst_threshold_low_ratio": ("BURST_THRESHOLD_LOW_RATIO", float),
         "psd_time_resolution_ms": ("PSD_TIME_RESOLUTION_MS", float),
         "num_fft_bins": ("NUM_FFT_BINS", int),
+        "psd_backend": ("PSD_BACKEND", str),
         "archive_max_gb": ("ARCHIVE_MAX_GB", float),
         "history_days": ("DB_RETENTION_DAYS", int),
         "disk_min_free_gb": ("DISK_MIN_FREE_GB", float),
@@ -223,6 +229,14 @@ async def apply_config(request: Request) -> dict[str, Any]:
                     detail=f"num_fft_bins must be one of {sorted(valid_bins)}",
                 )
 
+        # Settings are set with object.__setattr__ below, which skips pydantic's
+        # Literal check, so validate the backend here.
+        if attr == "PSD_BACKEND" and new_val not in PSD_BACKENDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"psd_backend must be one of {list(PSD_BACKENDS)}",
+            )
+
         old_val = getattr(settings, attr)
         if old_val != new_val:
             object.__setattr__(settings, attr, new_val)
@@ -250,6 +264,8 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "DURATION_SEC",
         "NUM_FFT_BINS",
         "PSD_TIME_RESOLUTION_MS",
+        # The dispatch loop picks the backend up when it rebuilds the grid config.
+        "PSD_BACKEND",
         "FREQUENCY_START",
         "FREQUENCY_END",
         "FREQUENCY_STEP",

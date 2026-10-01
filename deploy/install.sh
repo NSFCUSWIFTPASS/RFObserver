@@ -28,6 +28,17 @@ fi
 mkdir -p /var/lib/rfobserver
 chown -R rfobserver:rfobserver /var/lib/rfobserver
 
+# GPU PSD library for RFOBS_PSD_BACKEND=cuda (optional: the CPU backend works
+# without it). Built before the pip install below so the wheel ships it. Needs
+# the CUDA toolkit; without it this only warns. Set RFOBS_SKIP_PSD_CUDA=1 to
+# skip it entirely.
+if [ "${RFOBS_SKIP_PSD_CUDA:-0}" != "1" ]; then
+    if ! ./deploy/build_psd_cuda.sh; then
+        echo "WARNING: GPU PSD library not built; RFOBS_PSD_BACKEND=cuda will use the CPU." >&2
+        echo "Retry later with: ./deploy/build_psd_cuda.sh, then sudo pip3 install ." >&2
+    fi
+fi
+
 # Install the package system-wide. A plain system install (not a virtualenv) is
 # required so the app can import the system UHD Python bindings (/usr/lib/
 # python3/dist-packages/uhd), which are not on PyPI. Scripts land in

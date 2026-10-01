@@ -1,5 +1,8 @@
 """Tests for rfobserver.config."""
 
+import pydantic
+import pytest
+
 from rfobserver.config import AppSettings
 from rfobserver.web.routes.config import _persist_settings
 
@@ -14,6 +17,18 @@ def test_default_settings():
     assert settings.MOCK_RECEIVER is False
     assert settings.NUM_FFT_BINS == 2048
     assert settings.PSD_TIME_RESOLUTION_MS == 0.2
+
+
+def test_psd_backend_defaults_to_cpu_and_accepts_cuda(monkeypatch):
+    assert AppSettings(_env_file=None).PSD_BACKEND == "cpu"
+    monkeypatch.setenv("RFOBS_PSD_BACKEND", "cuda")
+    assert AppSettings(_env_file=None).PSD_BACKEND == "cuda"
+
+
+def test_psd_backend_rejects_unknown_values(monkeypatch):
+    monkeypatch.setenv("RFOBS_PSD_BACKEND", "opencl")
+    with pytest.raises(pydantic.ValidationError):
+        AppSettings(_env_file=None)
 
 
 def test_nats_url():

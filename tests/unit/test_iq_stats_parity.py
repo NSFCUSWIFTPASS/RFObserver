@@ -4,11 +4,11 @@ import numpy as np
 import pytest
 
 from rfobserver.processing.iq_utils import (
-    HIST_EDGES,
     IQMoments,
     calculate_iq_statistics,
     finalize_moments,
     moments_from_iq,
+    power_histogram,
 )
 
 
@@ -47,14 +47,13 @@ def _signals():
 def _full_moments(data):
     mag = np.abs(data).astype(np.float64)
     p = mag * mag
-    hist, _ = np.histogram(p, bins=HIST_EDGES)
     return IQMoments(
         n=int(mag.size),
         s_abs=float(mag.sum()),
         s_pow=float(p.sum()),
         s_pow2=float(np.dot(p, p)),
         max_pow=float(p.max()),
-        hist=hist.astype("int64"),
+        hist=power_histogram(p),
     )
 
 
@@ -120,3 +119,16 @@ def test_moments_from_iq_is_cheap():
     for _ in range(5):
         moments_from_iq(iq)
     assert time.perf_counter() - t < 1.0  # 5 chunks < 1s (guards against full-array histogram)
+
+
+def test_median_counts_zero_power_samples():
+    # Real captures carry isolated I=Q=0 samples (0.1-0.3% at low signal levels).
+    # Power 0 is below HIST_EDGES[0]; np.histogram drops out-of-range values, so
+    # they must be clipped into the edge bins or the median shifts upward.
+    rng = np.random.default_rng(4)
+    n = 1_000_000
+    iq = (rng.standard_normal(n) + 1j * rng.standard_normal(n)).astype(np.complex64) * 0.01
+    iq[rng.random(n) < 0.3] = 0
+    ref = _refproc(iq)
+    assert abs(finalize_moments(_full_moments(iq)).median - ref["median"]) < 0.05
+    assert abs(finalize_moments(moments_from_iq(iq)).median - ref["median"]) < 0.1

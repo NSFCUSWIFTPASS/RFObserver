@@ -73,6 +73,18 @@ class IQMoments:
         )
 
 
+def power_histogram(p: np.ndarray) -> np.ndarray:
+    """Counts of power values over HIST_EDGES, out-of-range values included.
+
+    np.histogram drops values outside the edges. Real captures carry isolated
+    I=Q=0 samples (power 0, below the first edge), and dropping them shifts the
+    median up (0.25 dB measured on a real 26 Msps capture), so clip into the
+    end bins instead.
+    """
+    hist, _ = np.histogram(np.clip(p, HIST_EDGES[0], HIST_EDGES[-1]), bins=HIST_EDGES)
+    return hist.astype(np.int64)
+
+
 def moments_from_iq(data: np.ndarray) -> IQMoments:
     """Additive power moments. max is full-resolution (exact peak); the sums and
     median histogram use a ~64K strided subsample so per-chunk cost stays realtime on
@@ -93,14 +105,14 @@ def moments_from_iq(data: np.ndarray) -> IQMoments:
     sub = data[::step]
     mag = np.abs(sub).astype(np.float64)
     p = mag * mag
-    hist, _ = np.histogram(p, bins=HIST_EDGES)
+    hist = power_histogram(p)
     return IQMoments(
         n=int(mag.size),
         s_abs=float(mag.sum()),
         s_pow=float(p.sum()),
         s_pow2=float(np.dot(p, p)),
         max_pow=max_pow,
-        hist=hist.astype(np.int64),
+        hist=hist,
     )
 
 

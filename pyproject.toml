@@ -43,6 +43,9 @@ path = "src/rfobserver/__about__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rfobserver"]
+# The GPU PSD library is gitignored (built per machine by
+# deploy/build_psd_cuda.sh) but must ship in the wheel when it has been built.
+artifacts = ["src/rfobserver/processing/cuda/libpsdcuda.so"]
 
 [tool.hatch.envs.default]
 python = "3.11"
@@ -120,6 +123,7 @@ disallow_untyped_decorators = false
 [[tool.mypy.overrides]]
 module = [
     "rfobserver.processing.spectral",
+    "rfobserver.processing.psd_cuda",
     "rfobserver.processing.iq_utils",
     "rfobserver.processing.burst",
     "rfobserver.processing.channelize",

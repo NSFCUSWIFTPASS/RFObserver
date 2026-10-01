@@ -1,4 +1,4 @@
-"""Fast tests for the synthetic-waveform helpers (no NATS, no pipeline)."""
+"""Fast tests for the synthetic-waveform helpers (no pipeline)."""
 
 from __future__ import annotations
 

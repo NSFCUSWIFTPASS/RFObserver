@@ -15,7 +15,7 @@ dependencies = [
     "pydantic>=2.10,<3",
     "pydantic-settings>=2.6,<3",
     "aiosqlite>=0.20,<1",
-    "nats-py>=2.9,<3",
+    "asyncpg>=0.29,<1",
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.34,<1",
     "jinja2>=3.1,<4",
@@ -100,11 +100,11 @@ plugins = ["pydantic.mypy"]
 [[tool.mypy.overrides]]
 module = [
     "uhd.*",
-    "nats.*",
     "scipy.*",
     "numpy.*",
     "cupy.*",
     "aiosqlite.*",
+    "asyncpg.*",
     "fastapi.*",
     "uvicorn.*",
     "httpx.*",

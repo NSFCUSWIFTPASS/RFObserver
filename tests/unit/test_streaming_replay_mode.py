@@ -29,8 +29,6 @@ def _proc(replay_mode: bool, tmp_path):
     storage.auto_dir.mkdir(exist_ok=True)
     storage.manual_dir.mkdir(exist_ok=True)
     zms = MagicMock()
-    nats = MagicMock()
-    nats.publish_stats = AsyncMock()
     receiver = MagicMock()
     receiver.serial = "sim0"
     proc = StreamingProcessor(
@@ -40,15 +38,14 @@ def _proc(replay_mode: bool, tmp_path):
         settings=settings,
         broadcast=None,
         zms_monitor=zms,
-        nats_producer=nats,
         replay_mode=replay_mode,
     )
-    return proc, db, zms, nats
+    return proc, db, zms
 
 
 @pytest.mark.asyncio
 async def test_replay_mode_skips_insert(tmp_path):
-    proc, db, _zms, _nats = _proc(True, tmp_path)
+    proc, db, _zms = _proc(True, tmp_path)
     # queue one burst result and drain
     proc._burst_result_queue.put_nowait(([_fake_burst()], 915e6))
     proc._burst_result_queue.put_nowait(None)
@@ -58,7 +55,7 @@ async def test_replay_mode_skips_insert(tmp_path):
 
 @pytest.mark.asyncio
 async def test_normal_mode_inserts(tmp_path):
-    proc, db, _zms, _nats = _proc(False, tmp_path)
+    proc, db, _zms = _proc(False, tmp_path)
     proc._burst_result_queue.put_nowait(([_fake_burst()], 915e6))
     proc._burst_result_queue.put_nowait(None)
     await proc._drain_burst_results()
@@ -66,7 +63,7 @@ async def test_normal_mode_inserts(tmp_path):
 
 
 def test_replay_mode_begin_recording_is_noop(tmp_path):
-    proc, _db, _zms, _nats = _proc(True, tmp_path)
+    proc, _db, _zms = _proc(True, tmp_path)
     proc.start_recording()
     assert proc._recording_state == "idle"
 
@@ -74,7 +71,7 @@ def test_replay_mode_begin_recording_is_noop(tmp_path):
 def test_replay_mode_start_recording_requires_opt_in(tmp_path):
     """start_recording() stays inert under replay_mode until the user opts in
     via set_replay_recording(True); after opting in it actually records."""
-    proc, _db, _zms, _nats = _proc(True, tmp_path)
+    proc, _db, _zms = _proc(True, tmp_path)
 
     proc.start_recording()
     assert proc._recording_state == "idle"
@@ -90,7 +87,7 @@ def test_replay_mode_start_recording_requires_opt_in(tmp_path):
 def test_replay_mode_arm_trigger_inert_even_after_record_opt_in(tmp_path):
     """arm_trigger() must stay inert during replay regardless of the opt-in --
     only explicit manual record is allowed during replay."""
-    proc, _db, _zms, _nats = _proc(True, tmp_path)
+    proc, _db, _zms = _proc(True, tmp_path)
     proc.set_replay_recording(True)
 
     proc.arm_trigger()
@@ -103,7 +100,7 @@ async def test_replay_mode_deferred_sidecar_uses_grid_path(tmp_path, monkeypatch
     sidecar from the recorded PSD grid, not query the DB."""
     import rfobserver.storage.detections_sidecar as sidecar_mod
 
-    proc, db, _zms, _nats = _proc(True, tmp_path)
+    proc, db, _zms = _proc(True, tmp_path)
 
     grid_mock = MagicMock(return_value={})
     db_mock = MagicMock()
@@ -128,7 +125,7 @@ def _above_threshold_buf(n: int = 64) -> np.ndarray:
 
 
 def test_replay_mode_arm_trigger_never_arms(tmp_path):
-    proc, _db, _zms, _nats = _proc(True, tmp_path)
+    proc, _db, _zms = _proc(True, tmp_path)
 
     proc.arm_trigger()
     assert proc._recording_state == "idle"
@@ -148,7 +145,7 @@ def test_replay_mode_check_trigger_and_record_writes_full_iq_when_recording(tmp_
     .sc16 while the .psd grid was written in full. Opting in via
     set_replay_recording(True) and actually starting a recording must let
     every subsequent chunk reach the writer."""
-    proc, _db, _zms, _nats = _proc(True, tmp_path)
+    proc, _db, _zms = _proc(True, tmp_path)
     proc.set_replay_recording(True)
     proc.start_recording()
     assert proc._recording_state == "recording"
@@ -169,7 +166,7 @@ def test_replay_mode_check_trigger_still_inert_without_opt_in(tmp_path):
     """Without set_replay_recording(True), _check_trigger_and_record must keep
     early-returning under replay_mode (no write, no state change) even if
     _recording_state were somehow 'recording'."""
-    proc, _db, _zms, _nats = _proc(True, tmp_path)
+    proc, _db, _zms = _proc(True, tmp_path)
     assert proc._replay_record is False
     proc._recording_state = "recording"
 
@@ -185,7 +182,7 @@ def test_replay_mode_check_trigger_still_inert_without_opt_in(tmp_path):
 def test_replay_mode_check_trigger_inert_even_if_armed(tmp_path):
     """Defense-in-depth: even if state were somehow 'armed', the trigger/record
     path must stay fully inert under replay_mode (the reviewer-found leak)."""
-    proc, _db, _zms, _nats = _proc(True, tmp_path)
+    proc, _db, _zms = _proc(True, tmp_path)
     proc._recording_state = "armed"
 
     buf = _above_threshold_buf()
@@ -199,7 +196,7 @@ def test_replay_mode_check_trigger_inert_even_if_armed(tmp_path):
 
 @pytest.mark.asyncio
 async def test_replay_mode_publish_processed_skips_egress(tmp_path, monkeypatch):
-    proc, _db, _zms, _nats = _proc(True, tmp_path)
+    proc, _db, _zms = _proc(True, tmp_path)
     mock_create_task = MagicMock()
     monkeypatch.setattr(asyncio, "create_task", mock_create_task)
 
@@ -221,7 +218,7 @@ def _tone_check_result():
 async def test_replay_mode_skips_tone_check_insert(tmp_path):
     """_run_tone_check is a second DB-write path (independent of _drain_burst_results)
     and must also be gated under replay_mode."""
-    proc, db, _zms, _nats = _proc(True, tmp_path)
+    proc, db, _zms = _proc(True, tmp_path)
     db.insert_tone_check = AsyncMock()
 
     await proc._run_tone_check(
@@ -233,7 +230,7 @@ async def test_replay_mode_skips_tone_check_insert(tmp_path):
 
 @pytest.mark.asyncio
 async def test_normal_mode_tone_check_inserts(tmp_path):
-    proc, db, _zms, _nats = _proc(False, tmp_path)
+    proc, db, _zms = _proc(False, tmp_path)
     db.insert_tone_check = AsyncMock()
 
     await proc._run_tone_check(

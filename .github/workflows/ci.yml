@@ -51,10 +51,14 @@ jobs:
     needs: [lint, test-unit]
     runs-on: ubuntu-latest
     services:
-      nats:
-        image: nats:latest
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
         ports:
-          - 4222:4222
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -65,16 +69,7 @@ jobs:
       - name: Install hatch
         run: pip install hatch
 
-      - name: Wait for NATS
-        run: |
-          for i in $(seq 1 30); do
-            if nc -z localhost 4222 2>/dev/null; then echo "NATS ready"; break; fi
-            echo "Waiting for NATS... ($i)"
-            sleep 1
-          done
-
       - name: Run integration tests
         run: hatch run test:integration
         env:
-          RFOBS_NATS_HOST: localhost
-          RFOBS_NATS_PORT: 4222
+          RFDB_TEST_DSN: postgresql://postgres:postgres@localhost:5432/postgres

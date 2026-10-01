@@ -170,7 +170,7 @@ def build_status_bar_html(settings: Any, active: bool = True) -> str:
     "Standby" badge.
     """
     # SENSOR_NAME is a user-facing display label; HOSTNAME is the machine
-    # identifier used elsewhere (NATS subjects, capture filenames, ZMS
+    # identifier used elsewhere (capture filenames, ZMS
     # metadata). The dashboard only ever shows the friendly label.
     display_name = settings.SENSOR_NAME or settings.HOSTNAME
     freq = settings.FREQUENCY_START / 1e6
@@ -700,87 +700,6 @@ async def zms_disable(request: Request) -> dict[str, Any]:
     object.__setattr__(settings, "ZMS_ENABLED", False)
     _persist_settings(settings)
     logger.info("ZMS monitor disabled via API (persisted)")
-    return {"status": "disabled"}
-
-
-# -- NATS status --
-
-
-def build_nats_status_payload(settings: Any, proc: Any) -> dict[str, Any]:
-    """Same shape as ``GET /api/nats/status`` — reused by the WS heartbeat."""
-    producer = getattr(proc, "_nats_producer", None) if proc else None
-    base = {
-        "host": settings.NATS_HOST,
-        "port": settings.NATS_PORT,
-        "url": settings.NATS_URL,
-        "enabled": bool(settings.NATS_ENABLED),
-    }
-    if producer is None:
-        return {**base, "connected": False, "stats_count": 0, "dropped": 0}
-    return {
-        **base,
-        "connected": producer.connected,
-        "stats_count": producer.stats_count,
-        "dropped": producer.dropped,
-    }
-
-
-@router.get("/nats/status")
-async def nats_status(request: Request) -> dict[str, Any]:
-    """Get NATS connection status (reads live producer attached to processor)."""
-    return build_nats_status_payload(request.app.state.settings, _get_processor(request))
-
-
-@router.post("/nats/enable")
-async def nats_enable(request: Request) -> dict[str, Any]:
-    """Enable NATS producer at runtime + persist the intent to .env."""
-    from rfobserver.web.routes.config import _persist_settings
-
-    settings = request.app.state.settings
-    proc = _get_processor(request)
-
-    if proc is None:
-        return {"status": "error", "detail": "Pipeline not running"}
-
-    if getattr(proc, "_nats_producer", None) is None:
-        from rfobserver.transport.nats_producer import NatsProducer
-
-        token = settings.NATS_TOKEN.get_secret_value() if settings.NATS_TOKEN else None
-        producer = NatsProducer(url=settings.NATS_URL, token=token)
-        try:
-            await producer.connect()
-        except Exception as e:
-            logger.exception("NATS enable failed")
-            return {"status": "error", "detail": f"connect failed: {e}"}
-        proc._nats_producer = producer
-
-    settings.NATS_ENABLED = True
-    _persist_settings(settings)
-    logger.info("NATS producer enabled via API (%s, persisted)", settings.NATS_URL)
-    return {"status": "enabled"}
-
-
-@router.post("/nats/disable")
-async def nats_disable(request: Request) -> dict[str, Any]:
-    """Disable NATS producer (close + detach) + persist the intent to .env."""
-    from rfobserver.web.routes.config import _persist_settings
-
-    settings = request.app.state.settings
-    proc = _get_processor(request)
-    if proc is None:
-        return {"status": "error", "detail": "Pipeline not running"}
-
-    producer = getattr(proc, "_nats_producer", None)
-    if producer is not None:
-        try:
-            await producer.close()
-        except Exception:
-            logger.exception("NATS close raised; detaching anyway")
-        proc._nats_producer = None
-
-    settings.NATS_ENABLED = False
-    _persist_settings(settings)
-    logger.info("NATS producer disabled via API (persisted)")
     return {"status": "disabled"}
 
 

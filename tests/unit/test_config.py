@@ -31,15 +31,6 @@ def test_psd_backend_rejects_unknown_values(monkeypatch):
         AppSettings(_env_file=None)
 
 
-def test_nats_url():
-    settings = AppSettings(
-        NATS_HOST="nats.example.com",
-        NATS_PORT=4223,
-        _env_file=None,
-    )
-    assert settings.NATS_URL == "nats://nats.example.com:4223"
-
-
 def test_env_prefix(monkeypatch):
     monkeypatch.setenv("RFOBS_GAIN", "50")
     monkeypatch.setenv("RFOBS_LOG_LEVEL", "DEBUG")
@@ -71,7 +62,6 @@ def test_toggle_persists_to_env_and_reloads(monkeypatch, tmp_path):
     # Enable non-default toggles, as a UI toggle would, then persist.
     settings = AppSettings(_env_file=None)
     settings.SENSOR_ACTIVE = True
-    settings.NATS_ENABLED = True
     settings.ZMS_ENABLED = True
     _persist_settings(settings)
 
@@ -80,7 +70,6 @@ def test_toggle_persists_to_env_and_reloads(monkeypatch, tmp_path):
     # A fresh process reads the same .env from cwd and sees the enabled state.
     reloaded = AppSettings()
     assert reloaded.SENSOR_ACTIVE is True
-    assert reloaded.NATS_ENABLED is True
     assert reloaded.ZMS_ENABLED is True
 
     # Toggling back to the default is likewise durable.
@@ -144,6 +133,34 @@ def test_zms_with_dst_http():
         _env_file=None,
     )
     assert settings.zms.dst_or_zmc == "http://dst.test"
+
+
+def test_rfdb_none_when_incomplete():
+    settings = AppSettings(RFDB_HOST="10.1.42.12", RFDB_USER="rfobs_writer", _env_file=None)
+    assert settings.rfdb is None
+
+
+def test_rfdb_constructed_when_complete():
+    settings = AppSettings(
+        RFDB_HOST="10.1.42.12",
+        RFDB_USER="rfobs_writer",
+        RFDB_PASSWORD="pw",
+        _env_file=None,
+    )
+    assert settings.rfdb is not None
+    assert (settings.rfdb.port, settings.rfdb.name) == (5433, "nrdz")
+    assert settings.rfdb.password.get_secret_value() == "pw"
+    assert settings.RFDB_ENABLED is False
+
+
+def test_rfdb_password_masked_in_settings_dump():
+    settings = AppSettings(
+        RFDB_HOST="10.1.42.12",
+        RFDB_USER="rfobs_writer",
+        RFDB_PASSWORD="hunter2",
+        _env_file=None,
+    )
+    assert "hunter2" not in str(settings.model_dump())
 
 
 def test_burst_window_covers_long_bursts() -> None:

@@ -71,7 +71,6 @@ if TYPE_CHECKING:
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.storage.governor import StorageGovernor
     from rfobserver.storage.local import LocalStorage
-    from rfobserver.transport.nats_producer import NatsProducer
     from rfobserver.web.websocket import LiveBroadcast
     from rfobserver.zms.monitor import ZmsMonitor
 
@@ -550,7 +549,6 @@ class StreamingProcessor:
         settings: AppSettings,
         broadcast: LiveBroadcast | None = None,
         zms_monitor: ZmsMonitor | None = None,
-        nats_producer: NatsProducer | None = None,
         drop_on_overflow: bool = True,
         replay_mode: bool = False,
         beacon: ProgressBeacon | None = None,
@@ -563,7 +561,6 @@ class StreamingProcessor:
         self._settings = settings
         self._broadcast = broadcast
         self._zms_monitor = zms_monitor
-        self._nats_producer = nats_producer
         self._beacon = beacon
         self._governor = storage_governor
         self._running = False
@@ -575,7 +572,7 @@ class StreamingProcessor:
         self._drop_on_overflow = drop_on_overflow
         # When True, this processor drives only the live WS overlay from a
         # replayed capture: every persistence/egress side effect (DB insert,
-        # ZMS submit, NATS publish, IQ recording) is suppressed so replay
+        # ZMS submit, IQ recording) is suppressed so replay
         # never pollutes the DB or emits upstream. The live _broadcast path
         # is untouched by this flag.
         self._replay_mode = replay_mode
@@ -3018,7 +3015,7 @@ class StreamingProcessor:
                 # Close before the per-window work below: results that arrive
                 # during it belong to the next window, which starts now. That
                 # work only queues: the DB writes go to _OrderedDbWriter, ZMS
-                # and NATS to tasks, and the broadcast is a put_nowait per
+                # to a task, and the broadcast is a put_nowait per
                 # client, so a slow insert no longer delays the next window.
                 win_start, win_dur = window_clock.close()
 
@@ -3029,7 +3026,7 @@ class StreamingProcessor:
                 if self._broadcast is not None and not self._broadcast.has_high_res_subscribers():
                     await self._broadcast_averaged(avg, result, len(accum_powers), win_start)
 
-                # ZMS + NATS always get DURATION_SEC-averaged data
+                # ZMS always gets DURATION_SEC-averaged data
                 await self._publish_processed(
                     avg, result, interval_stats, start_time=win_start, duration_sec=win_dur
                 )
@@ -3225,7 +3222,7 @@ class StreamingProcessor:
         duration_sec: float,
     ) -> None:
         """Store the averaged window locally. Runs for every live window,
-        independent of whether ZMS/NATS are attached. Flags (interference /
+        independent of whether ZMS is attached. Flags (interference /
         violations) are not computed in the streaming path yet, so they are left
         NULL until the PSDProcessor gap is closed.
 
@@ -3271,13 +3268,13 @@ class StreamingProcessor:
         start_time: datetime,
         duration_sec: float,
     ) -> None:
-        """Queue the window's DB insert, build the envelope once, fan out to
-        ZMS + NATS.
+        """Queue the window's DB insert, build the envelope, submit it to
+        ZMS.
 
         Nothing here is awaited, so the consumer loop returns immediately. The
         insert goes to the ordered background writer (_OrderedDbWriter). ZMS
-        POSTs and NATS publishes can take 10-25 ms each and run as background
-        tasks; awaiting them inline previously blocked the next high-res FFT
+        POSTs can take 10-25 ms and run as a background
+        task; awaiting them inline previously blocked the next high-res FFT
         broadcast every DURATION_SEC, which the user saw as a stutter.
         """
         if self._replay_mode:
@@ -3293,7 +3290,7 @@ class StreamingProcessor:
             ),
             window_start=start_time,
         )
-        if self._zms_monitor is None and self._nats_producer is None:
+        if self._zms_monitor is None:
             return
         try:
             envelope = self._build_envelope(avg_powers, result, iq_stats)
@@ -3303,9 +3300,6 @@ class StreamingProcessor:
 
         if self._zms_monitor is not None:
             asyncio.create_task(self._zms_submit_async(envelope, result.capture_num))
-
-        if self._nats_producer is not None:
-            asyncio.create_task(self._nats_publish_async(envelope))
 
     async def _zms_submit_async(self, envelope: ProcessedDataEnvelope, chunk_num: int) -> None:
         timeout = max(15.0, 5.0 * self._settings.DURATION_SEC)
@@ -3320,12 +3314,6 @@ class StreamingProcessor:
             logger.warning("ZMS submit timed out (chunk #%d) after %.1fs", chunk_num, timeout)
         except Exception:
             logger.exception("ZMS observation submission failed")
-
-    async def _nats_publish_async(self, envelope: ProcessedDataEnvelope) -> None:
-        try:
-            await self._nats_producer.publish_stats(envelope, self._settings.HOSTNAME)  # type: ignore[union-attr]
-        except Exception:
-            logger.exception("NATS stats publish failed")
 
     async def _drain_burst_results(self) -> None:
         """Process all pending burst results from the burst detection thread."""

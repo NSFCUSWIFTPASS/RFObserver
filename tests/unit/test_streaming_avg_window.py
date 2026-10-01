@@ -38,7 +38,6 @@ def _proc(tmp_path, *, replay_mode=False, with_sinks=True):
         settings=settings,
         broadcast=None,
         zms_monitor=(MagicMock() if with_sinks else None),
-        nats_producer=(MagicMock() if with_sinks else None),
         replay_mode=replay_mode,
     )
     return proc, db

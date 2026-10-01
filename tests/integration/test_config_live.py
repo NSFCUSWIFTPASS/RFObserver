@@ -134,8 +134,6 @@ _CONFIG_FIELDS: list[tuple[str, Any, str]] = [
     ("num_fft_bins", 512, "NUM_FFT_BINS"),
     ("archive_max_gb", 0.05, "ARCHIVE_MAX_GB"),
     ("history_days", 14, "DB_RETENTION_DAYS"),
-    ("nats_host", "127.0.0.1", "NATS_HOST"),
-    ("nats_port", 4223, "NATS_PORT"),
     ("zms_zmc_http", "http://localhost:9210/v1", "ZMS_ZMC_HTTP"),
     ("zms_dst_http", "http://localhost:9220/v1", "ZMS_DST_HTTP"),
     ("zms_identity_http", "http://localhost:9200/v1", "ZMS_IDENTITY_HTTP"),
@@ -162,7 +160,7 @@ async def test_config_apply_every_field_keeps_pipeline_running(
         assert r.status_code == 200, f"{form_key}={value!r} got {r.status_code}: {r.text}"
         assert getattr(settings, attr) == value, f"{attr} not applied"
 
-    for form_key, attr in (("zms_token", "ZMS_TOKEN"), ("nats_token", "NATS_TOKEN")):
+    for form_key, attr in (("zms_token", "ZMS_TOKEN"),):
         r = await client.post("/config/apply", json={form_key: "new-secret"})
         assert r.status_code == 200, f"{form_key} secret update failed: {r.text}"
         actual = getattr(settings, attr)
@@ -235,7 +233,7 @@ async def test_storage_set_path_changes_directory(
 
 
 @pytest.mark.asyncio
-async def test_zms_nats_enable_disable_status_round_trip(
+async def test_zms_enable_disable_status_round_trip(
     live_app: tuple[AsyncClient, StreamingProcessor, AppSettings],
 ) -> None:
     client, processor, settings = live_app
@@ -252,8 +250,6 @@ async def test_zms_nats_enable_disable_status_round_trip(
     with (
         patch("rfobserver.zms.monitor.ZmsMonitor.start", noop_async),
         patch("rfobserver.zms.monitor.ZmsMonitor.stop", noop_async),
-        patch("rfobserver.transport.nats_producer.NatsProducer.connect", noop_async),
-        patch("rfobserver.transport.nats_producer.NatsProducer.close", noop_async),
     ):
         # ZMS round-trip
         r = await client.post("/api/zms/enable")
@@ -266,21 +262,6 @@ async def test_zms_nats_enable_disable_status_round_trip(
         assert r.json()["enabled"] is True
 
         r = await client.post("/api/zms/disable")
-        assert r.status_code == 200
-        assert r.json()["status"] == "disabled"
-        await _wait_for_chunks(processor, 1, timeout=10.0)
-
-        # NATS round-trip
-        r = await client.post("/api/nats/enable")
-        assert r.status_code == 200
-        assert r.json()["status"] in ("enabled", "already_enabled")
-        await _wait_for_chunks(processor, 1, timeout=10.0)
-
-        r = await client.get("/api/nats/status")
-        assert r.status_code == 200
-        assert "connected" in r.json()
-
-        r = await client.post("/api/nats/disable")
         assert r.status_code == 200
         assert r.json()["status"] == "disabled"
         await _wait_for_chunks(processor, 1, timeout=10.0)

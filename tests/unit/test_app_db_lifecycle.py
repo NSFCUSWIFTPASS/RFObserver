@@ -9,6 +9,7 @@ import signal
 from typing import Any
 
 import pytest
+from pydantic import SecretStr
 
 from rfobserver.config import AppSettings
 from rfobserver.pipeline import app as app_mod
@@ -84,7 +85,6 @@ def _settings(tmp_path: Any, web_port: int) -> AppSettings:
     s.DB_RETENTION_DAYS = 0
     s.SENSOR_ACTIVE = False
     s.WATCHDOG_ENABLED = False
-    s.NATS_ENABLED = False
     s.ZMS_ENABLED = False
     return s
 
@@ -224,3 +224,57 @@ async def test_worker_failure_propagates_after_cleanup(
     assert reg.set_active_calls == [False]
     assert all(db.closed for db in reg.instances)
     _assert_handlers_restored()
+
+
+def _rfdb_settings(tmp_path: Any, *, credentials: bool = True) -> AppSettings:
+    s = _settings(tmp_path, web_port=0)
+    s.RFDB_ENABLED = True
+    if credentials:
+        s.RFDB_HOST = "10.1.42.12"
+        s.RFDB_USER = "rfobs_writer"
+        s.RFDB_PASSWORD = SecretStr("pw")
+    return s
+
+
+@pytest.fixture
+def rfdb_runs(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    started: list[Any] = []
+
+    async def fake_run(self: Any) -> None:
+        started.append(self)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("rfobserver.transport.rfdb.RfdbWriter.run", fake_run)
+    return started
+
+
+async def test_rfdb_writer_gets_its_own_reader_and_closes_it(
+    reg: _Registry, rfdb_runs: list[Any], tmp_path: Any
+) -> None:
+    exc = await _start_then_cancel(_rfdb_settings(tmp_path))
+    assert isinstance(exc, asyncio.CancelledError)
+    writer, rfdb_reader = reg.instances
+    assert not writer.read_only and rfdb_reader.read_only
+    assert len(rfdb_runs) == 1
+    assert writer.closed and rfdb_reader.closed
+
+
+async def test_rfdb_enabled_without_credentials_opens_no_reader(
+    reg: _Registry, rfdb_runs: list[Any], tmp_path: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="rfobserver.pipeline.app"):
+        exc = await _start_then_cancel(_rfdb_settings(tmp_path, credentials=False))
+    assert isinstance(exc, asyncio.CancelledError)
+    assert [db.read_only for db in reg.instances] == [False]
+    assert rfdb_runs == []
+    assert "RFDB_ENABLED is set without" in caplog.text
+
+
+async def test_rfdb_reader_failure_runs_on_without_rfdb(
+    reg: _Registry, rfdb_runs: list[Any], tmp_path: Any
+) -> None:
+    reg.fail_reader_connect = True
+    exc = await _start_then_cancel(_rfdb_settings(tmp_path))
+    assert isinstance(exc, asyncio.CancelledError), "a broken rf-db reader must not stop the sensor"
+    assert rfdb_runs == []
+    assert reg.instances[0].closed

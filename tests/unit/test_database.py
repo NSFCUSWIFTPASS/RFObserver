@@ -1467,3 +1467,62 @@ async def test_writer_disables_secure_delete_on_connect_and_reconnect(db):
         assert await _secure_delete(db._db) == 0
     finally:
         await corpse.close()
+
+
+_WINDOW = dict(
+    duration_sec=0.5,
+    sdr_center_freq_hz=915e6,
+    sample_rate_hz=26e6,
+    gain_db=35.0,
+    num_bins=2,
+    freq_start_hz=0.0,
+    freq_step_hz=1.0,
+    pwr_avg=-70.0,
+    pwr_max=-50.0,
+    pwr_median=-72.0,
+    pwr_std=3.0,
+    kurtosis=1.0,
+    powers=[-70.0, -60.0],
+)
+
+
+async def test_newest_avg_window_id_is_zero_when_empty(db):
+    assert await db.newest_avg_window_id() == 0
+    assert await db.avg_windows_after(0, 10) == []
+
+
+async def test_avg_windows_after_returns_rows_past_the_id_in_order(db):
+    t0 = datetime(2026, 9, 30, 12, 0, 0, tzinfo=timezone.utc)
+    for i in range(5):
+        await db.insert_avg_window(start_time=t0 + timedelta(seconds=i), **_WINDOW)
+    await db._db.commit()
+
+    newest = await db.newest_avg_window_id()
+    rows = await db.avg_windows_after(newest - 3, 2)
+
+    assert [r.id for r in rows] == [newest - 2, newest - 1]
+    assert rows[0].start_time == t0 + timedelta(seconds=2)
+    assert rows[0].start_time.tzinfo is not None
+    assert (rows[0].pwr_avg, rows[0].kurtosis, rows[0].gain_db) == (-70.0, 1.0, 35.0)
+
+
+async def test_avg_windows_after_reads_naive_start_time_as_utc(db):
+    await db.insert_avg_window(start_time=datetime(2026, 9, 30, 12, 0, 0), **_WINDOW)
+    await db._db.commit()
+
+    (row,) = await db.avg_windows_after(0, 10)
+
+    assert row.start_time == datetime(2026, 9, 30, 12, 0, 0, tzinfo=timezone.utc)
+
+
+async def test_avg_windows_after_works_on_a_read_only_connection(db, tmp_path):
+    await db.insert_avg_window(start_time=datetime(2026, 9, 30, tzinfo=timezone.utc), **_WINDOW)
+    await db._db.commit()
+
+    reader = SensorDatabase(str(tmp_path / "test.db"), read_only=True)
+    await reader.connect()
+    try:
+        assert await reader.newest_avg_window_id() == 1
+        assert [r.id for r in await reader.avg_windows_after(0, 10)] == [1]
+    finally:
+        await reader.close()

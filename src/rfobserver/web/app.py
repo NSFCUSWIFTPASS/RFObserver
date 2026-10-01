@@ -59,6 +59,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.database = None
     app.state.write_database = None
     app.state.storage_governor = None
+    app.state.rfdb_writer = None
     app.state.broadcast = None
 
     # One heavy Dashboard aggregation of each kind at a time. On a field-size DB a
@@ -143,6 +144,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             # degraded. Step >= 3 or the sticky flag is degraded.
             if st.degraded:
                 body["status"] = "degraded"
+        rfdb = getattr(app.state, "rfdb_writer", None)
+        if rfdb is not None:
+            body["rfdb"] = rfdb.status()
         return body
 
     @app.websocket("/ws/live")

@@ -263,3 +263,19 @@ Benchmark on nano-super with 20,000 burst pairs; per 10 s tick, `scan_usage` plu
 The stand-in receiver has fewer competitors than the real one, which also contends with
 three PSD workers for the GIL. To confirm after deploying: the overflow rate and the
 `stalls=` count on HCRO.
+
+### Result after deploying b4bf974 on HCRO (2026-10-01)
+
+`/api/health`, polled read-only from the workstation, isolation and attribution on:
+
+```
+uptime_sec  overflow_events  overflow_lost_samples  storage  bursts isolated
+     194.8                0                      0  healthy               17
+     379.0                0                      0  healthy               70
+     559.5                0                      0  healthy               91
+     740.0                0                      0  healthy               98
+```
+
+Before this change, the same sensor overflowed 3 to 4 times a minute (37 to 50 expected in
+740 s). Not yet measured: a longer window (hours), and the overflow count while the
+storage governor is evicting (the step stayed "healthy" throughout).

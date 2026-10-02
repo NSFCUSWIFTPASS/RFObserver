@@ -71,6 +71,15 @@ range 23h50m   tiered (10 s rows, 150 s buckets)   183 ms   572 rows
 stats timeline tiered                               16 ms
 ```
 
+nano-super (Orin Nano, Python 3.10), 6 h of 1 s windows x 2048 bins, 540 rows:
+
+```
+tiered (10 s rows, 40 s buckets)   187 ms
+raw (vectorized)                   805 ms      (HCRO before: 4.24 s to first byte)
+insert, plain                      755-772 us/window
+insert, with tiers                1324-1373 us/window  (accumulator alone ~125 us/window)
+```
+
 Browser cache, mock pipeline on localhost: the cached copy painted 78 ms after
 navigation; the first request after it was a tail (6 KB, against 15 KB for a full load).
 

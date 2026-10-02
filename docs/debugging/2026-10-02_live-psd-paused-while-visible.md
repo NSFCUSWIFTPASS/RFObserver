@@ -135,3 +135,33 @@ streaming.py both use `timestamp() * 1000`). Attributions are a deque of 50, and
 **Open:** what freezes the page on the reporting browser. The next freeze report answers
 whether it is the page's own code (`longest task` about equal to the freeze) or the
 browser pausing the tab (a large freeze with no long task).
+
+## 10. Stall at 08:09 with the freeze report deployed (8dcde72)
+
+```
+08:09:05 Live client :53288 connected: reason=watchdog silent_ms=6000
+08:09:05   set wants_psd=False (hidden=True in_view=True why=open)
+08:09:12 Client :53202 set wants_psd=True (hidden=False in_view=True why=no-psd)
+08:09:12 Client :53202 set wants_psd=False (hidden=True in_view=True why=visibility)
+08:09:12 Live client :53202 closed after 67 s: sent=1009 dropped=0
+(no "page frozen" line)
+```
+
+What it shows:
+- **Not a page freeze.** The page's 1 s timer ran on time, or it would have sent a freeze
+  report.
+- **Not the server.** It handed the old socket every frame (`dropped=0`).
+- **The old TCP connection stalled in both directions.** The page saw 6 s with no
+  message, and messages the page sent on that socket earlier reached the server 7 s
+  later, after the replacement socket (opened at once) had already logged in. That is a
+  single connection stalled on the network path, typically TCP retransmission backoff
+  after packet loss, not the sensor.
+- **The watchdog recovered it** in 6 s with a new connection.
+
+Control: 300 pings from the workstation to the sensor over the same VPN in 60 s gave 0%
+loss, rtt 82/125/299 ms. The reporting browser's own path (10.1.0.130) was not measured
+and may differ.
+
+**Superseded:** section 9's reading that freezes are the page not running holds for the
+06:47 event (`silent_ms=16777`, timer late). The 08:09 event is a different failure: the
+network connection, with the page running.

@@ -68,6 +68,10 @@ RETENTION_CHUNK_ROWS = 250
 # stopped.
 BLOB_PRUNE_MARK_CONFIG_KEY = "blob_prune_mark"
 _BLOB_MARK_SAVE_EVERY_CHUNKS = 40
+# The tuning configs present in avg_windows, kept by the pipeline's writer as
+# a JSON list so the Dashboard's tuning filter does not need a DISTINCT scan of
+# every window (3.4 s on the HCRO sensor).
+AVG_CONFIGS_KEY = "avg_window_configs"
 # Tables row retention may delete from, and their time column.
 _RETENTION_TABLES = {
     "avg_windows": "start_time",
@@ -75,6 +79,11 @@ _RETENTION_TABLES = {
     "avg_minutes": "minute_start",
     "avg_tiers": "bucket_start",
 }
+
+
+def _cfg_order(c: tuple[float, float, float | None]) -> tuple[float, float, float]:
+    """Sort key for tuning configs: center, rate, gain (None first)."""
+    return (c[0], c[1], -math.inf if c[2] is None else c[2])
 
 
 def _retention_cutoff(days: int) -> str:
@@ -375,6 +384,11 @@ class SensorDatabase:
         # as it stores windows. Other connections (readers, tools) do not.
         self._tiers = TierAccumulator() if psd_tiers and not read_only else None
         self._tier_coverage_set: set[int] = set()
+        # Tuning configs seen by this writer (with psd_tiers), saved under
+        # AVG_CONFIGS_KEY once seeded from the table.
+        self._configs: set[tuple[float, float, float | None]] = set()
+        self._configs_seeded = False
+        self._configs_task: asyncio.Task[None] | None = None
         self._db: aiosqlite.Connection | None = None
         self._write_timeout = _DB_WRITE_TIMEOUT_SEC
         self._reconnect_lock = asyncio.Lock()
@@ -494,6 +508,8 @@ class SensorDatabase:
             "WHERE model IS NOT NULL AND model != ''"
         )
         await self._db.commit()
+        if self._tiers is not None:
+            self._configs_task = asyncio.create_task(self._seed_configs())
         logger.info("Database connected: %s", self._db_path)
 
     async def _migrate_detection_columns(self) -> None:
@@ -581,6 +597,10 @@ class SensorDatabase:
             raise
 
     async def close(self) -> None:
+        if self._configs_task is not None:
+            self._configs_task.cancel()
+            with contextlib.suppress(BaseException):
+                await self._configs_task
         if self._db and self._tiers is not None:
             # The open periods, partial: the next run merges the rest of each
             # period into its row.
@@ -723,9 +743,54 @@ class SensorDatabase:
         if self._tiers is None:
             return
         try:
+            await self._note_config(window)
+        except Exception:
+            logger.exception("Saving the avg_window tuning configs failed")
+        try:
             await self._add_to_tiers(window)
         except Exception:
             logger.exception("avg_tiers update failed; the Dashboard falls back to raw windows")
+
+    async def _note_config(self, w: Mapping[str, Any]) -> None:
+        cfg = (
+            float(w["sdr_center_freq_hz"]),
+            float(w["sample_rate_hz"]),
+            None if w.get("gain_db") is None else float(w["gain_db"]),
+        )
+        if cfg in self._configs:
+            return
+        self._configs.add(cfg)
+        if self._configs_seeded:
+            await self._save_configs()
+
+    async def _save_configs(self) -> None:
+        await self.set_config(AVG_CONFIGS_KEY, json.dumps(sorted(self._configs, key=_cfg_order)))
+
+    async def _seed_configs(self) -> None:
+        """Seed the tuning-config list once from the table, on a separate
+        connection so the scan never holds up the pipeline's writes."""
+        try:
+            raw = await self.get_config(AVG_CONFIGS_KEY)
+            if raw is None:
+                conn = await aiosqlite.connect(self._db_path)
+                try:
+                    await conn.execute("PRAGMA query_only=ON")
+                    rows = await conn.execute_fetchall(
+                        "SELECT DISTINCT sdr_center_freq_hz, sample_rate_hz, gain_db "
+                        "FROM avg_windows WHERE sdr_center_freq_hz IS NOT NULL"
+                    )
+                finally:
+                    await conn.close()
+            else:
+                rows = json.loads(raw)
+            for r in rows:
+                self._configs.add((float(r[0]), float(r[1]), None if r[2] is None else float(r[2])))
+            self._configs_seeded = True
+            await self._save_configs()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Seeding the avg_window tuning configs failed")
 
     async def _add_to_tiers(self, w: Mapping[str, Any]) -> None:
         assert self._tiers is not None
@@ -1593,14 +1658,24 @@ class SensorDatabase:
         Feeds the averaged-history page's tuning filter (default = latest).
         """
         assert self._db is not None
+        raw = await self.get_config(AVG_CONFIGS_KEY)
+        configs: list[dict[str, Any]]
+        if raw is not None:
+            # Kept by the pipeline's writer (_note_config): no table scan.
+            configs = [
+                {"sdr_center_freq_hz": c[0], "sample_rate_hz": c[1], "gain_db": c[2]}
+                for c in json.loads(raw)
+            ]
+        else:
+            self._db.row_factory = aiosqlite.Row
+            async with self._db.execute(
+                """SELECT DISTINCT sdr_center_freq_hz, sample_rate_hz, gain_db
+                   FROM avg_windows
+                   WHERE sdr_center_freq_hz IS NOT NULL
+                   ORDER BY sdr_center_freq_hz, sample_rate_hz, gain_db"""
+            ) as cursor:
+                configs = [dict(row) for row in await cursor.fetchall()]
         self._db.row_factory = aiosqlite.Row
-        async with self._db.execute(
-            """SELECT DISTINCT sdr_center_freq_hz, sample_rate_hz, gain_db
-               FROM avg_windows
-               WHERE sdr_center_freq_hz IS NOT NULL
-               ORDER BY sdr_center_freq_hz, sample_rate_hz, gain_db"""
-        ) as cursor:
-            configs = [dict(row) for row in await cursor.fetchall()]
         async with self._db.execute(
             """SELECT sdr_center_freq_hz, sample_rate_hz, gain_db
                FROM avg_windows

@@ -114,6 +114,8 @@
         stale: true, // displayed data lags the selected range (spinner on)
         pollTimer: null,
         scaleSaveTimer: null,  // debounced save of edited scale bounds
+        cacheKeySaved: null,   // browser-cache key last saved, and when (ms)
+        cacheSavedAt: 0,
         pickerOpen: false,
         followLatest: true, // selection tracks the newest row across refreshes
         activePreset: DEFAULT_PRESET,
@@ -791,13 +793,15 @@
         return { lo: outLo, hi: outHi };
     }
 
-    function setLive(on) {
+    // fromCache: the range was just restored from the browser cache, so the
+    // first poll may fetch only the tail (or reload in the background).
+    function setLive(on, fromCache) {
         state.live = on;
         $("avg-now").classList.toggle("on", on);
         updateRangeLabel();
         if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
         if (on) {
-            pollTick(true);
+            pollTick(!fromCache);
         } else {
             $("avg-updated").textContent = "";
             const st = $("avg-status");
@@ -1035,6 +1039,7 @@
             $("avg-updated").textContent = "Updated " + new Date().toLocaleTimeString();
             renderAll();
             ok = true;
+            saveToCache(!plan);
         } finally {
             // Only the latest load owns the shared flags; a superseded load must
             // not clear loading/stale out from under the newer one still running.
@@ -1045,6 +1050,132 @@
                 // mode the flag stays on while the poll loop retries.
                 if (ok || !state.live) setStale(false);
             }
+        }
+    }
+
+    // --- browser cache ---
+    //
+    // The last load of each live preset and tuning is kept in IndexedDB, so
+    // reopening the Dashboard paints at once from it and then fetches only the
+    // rows since (the live tail), or reloads in the background when it is
+    // older than FULL_RESYNC_MS. Per browser; best effort: any storage error
+    // just means a normal load.
+    const CACHE_DB = "rfobs-dashboard";
+    const CACHE_STORE = "ranges";
+    const CACHE_MAX_AGE_MS = 60 * 60000;  // older is not worth painting
+    const CACHE_KEEP = 6;                 // presets/tunings kept
+    const CACHE_SAVE_MS = 30000;          // live polls re-save at most this often
+
+    let cacheDbPromise = null;
+    function cacheDb() {
+        if (!cacheDbPromise) {
+            cacheDbPromise = new Promise(function (resolve) {
+                try {
+                    const req = indexedDB.open(CACHE_DB, 1);
+                    req.onupgradeneeded = function () {
+                        req.result.createObjectStore(CACHE_STORE, { keyPath: "key" });
+                    };
+                    req.onsuccess = function () { resolve(req.result); };
+                    req.onerror = function () { resolve(null); };
+                    req.onblocked = function () { resolve(null); };
+                } catch (_) {
+                    resolve(null);
+                }
+            });
+        }
+        return cacheDbPromise;
+    }
+
+    // Live presets only: an absolute range has nothing to fetch a tail of.
+    function cacheKey() {
+        if (!state.activePreset) return null;
+        return [state.activePreset, $("avg-center").value, $("avg-samplerate").value,
+            $("avg-gain").value].join("|");
+    }
+
+    function idbRequest(req) {
+        return new Promise(function (resolve) {
+            req.onsuccess = function () { resolve(req.result); };
+            req.onerror = function () { resolve(undefined); };
+        });
+    }
+
+    async function saveToCache(force) {
+        const key = state.live ? cacheKey() : null;
+        if (!key || !state.wf || !state.stats || !state.inc) return;
+        const now = Date.now();
+        if (!force && state.cacheKeySaved === key && now - state.cacheSavedAt < CACHE_SAVE_MS) return;
+        state.cacheKeySaved = key;
+        state.cacheSavedAt = now;
+        try {
+            const db = await cacheDb();
+            if (!db) return;
+            const wf = state.wf;
+            // Rows as one Float32Array: structured clone copies it as bytes.
+            const flat = new Float32Array(wf.bucketCount * wf.numBins);
+            for (let y = 0; y < wf.bucketCount; y++) flat.set(wf.rows[y], y * wf.numBins);
+            const entry = {
+                key: key,
+                savedAt: now,
+                fullAtMs: state.inc.fullAtMs,
+                spanMs: state.spanMs,
+                wf: { bucketCount: wf.bucketCount, numBins: wf.numBins, meta: wf.meta,
+                    stats: wf.stats, freqs: wf.freqs, isRaw: wf.isRaw, rows: flat },
+                stats: state.stats,
+                detections: state.detections,
+                iqCaptures: state.iqCaptures,
+            };
+            const tx = db.transaction(CACHE_STORE, "readwrite");
+            const store = tx.objectStore(CACHE_STORE);
+            store.put(entry);
+            const all = await idbRequest(store.getAll());
+            if (Array.isArray(all) && all.length > CACHE_KEEP) {
+                all.sort(function (a, b) { return b.savedAt - a.savedAt; });
+                for (const old of all.slice(CACHE_KEEP)) store.delete(old.key);
+            }
+        } catch (_) { /* not cached; the next load is a normal one */ }
+    }
+
+    // Paint the cached copy of the current preset and tuning, if any. Returns
+    // true when it did (the caller then lets the first poll fetch the tail).
+    async function restoreFromCache() {
+        const key = cacheKey();
+        if (!key) return false;
+        try {
+            const db = await cacheDb();
+            if (!db) return false;
+            const tx = db.transaction(CACHE_STORE, "readonly");
+            const e = await idbRequest(tx.objectStore(CACHE_STORE).get(key));
+            if (!e || Date.now() - e.savedAt > CACHE_MAX_AGE_MS || e.spanMs !== state.spanMs) return false;
+            if (state.wf) return false;  // a load already landed
+            const rows = [];
+            for (let y = 0; y < e.wf.bucketCount; y++) {
+                rows.push(Array.from(e.wf.rows.subarray(y * e.wf.numBins, (y + 1) * e.wf.numBins)));
+            }
+            state.wf = Object.assign({}, e.wf, { rows: rows });
+            state.stats = e.stats;
+            state.detections = e.detections || [];
+            state.iqCaptures = e.iqCaptures || [];
+            state.inc = { key: incKey(), fullAtMs: e.fullAtMs };
+            state.untilMs = Date.now();
+            state.sinceMs = state.untilMs - state.spanMs;
+            const slider = $("avg-slider");
+            slider.min = "0";
+            slider.max = String(Math.max(0, state.wf.bucketCount - 1));
+            let last = Math.max(0, state.wf.bucketCount - 1);
+            while (last > 0 && state.wf.stats[last].count === 0) last--;
+            state.selRow = last;
+            slider.value = String(last);
+            if (state.wf.bucketCount) {
+                $("avg-time").textContent =
+                    new Date(state.wf.stats[last].start_epoch * 1000).toLocaleString();
+            }
+            $("avg-updated").textContent = "Cached " + new Date(e.savedAt).toLocaleTimeString();
+            renderAll();
+            setStale(true);  // the spinner runs until the fresh data lands
+            return true;
+        } catch (_) {
+            return false;
         }
     }
 
@@ -1835,9 +1966,12 @@
                 if (state.wf) renderAll();
             }, 150);
         });
+        // The page embeds the configs and prefs (no round trips before the
+        // first data request); fetch whatever it did not carry.
+        let bootData = {};
+        try { bootData = JSON.parse($("avg-boot").textContent) || {}; } catch (_) { /* fetch below */ }
         try {
-            const r = await fetch("/api/averaged/configs");
-            const data = await r.json();
+            const data = bootData.configs || await (await fetch("/api/averaged/configs")).json();
             const configs = data.configs || [];
             const centers = [...new Set(configs.map(function (c) { return c.sdr_center_freq_hz; }))].sort(function (a, b) { return a - b; });
             const rates = [...new Set(configs.map(function (c) { return c.sample_rate_hz; }))].sort(function (a, b) { return a - b; });
@@ -1853,9 +1987,12 @@
             }
         } catch (_) { /* configs are optional; defaults stay All */ }
         try {
-            const pr = await fetch("/api/ui-prefs");
-            if (pr.ok) {
-                const doc = await pr.json();
+            let doc = bootData.prefs || null;
+            if (!doc) {
+                const pr = await fetch("/api/ui-prefs");
+                if (pr.ok) doc = await pr.json();
+            }
+            if (doc) {
                 const s = doc && doc.scale ? doc.scale : {};
                 for (const key in SCALE_FIELDS) {
                     if (typeof s[key] === "number" && isFinite(s[key])) state.scale[key] = s[key];
@@ -1865,7 +2002,8 @@
         syncScaleInputs();
         markPresetButtons();
         updateNavButtons();
-        setLive(true); // default: sliding "Now" window, polled every POLL_MS
+        const restored = await restoreFromCache();
+        setLive(true, restored); // default: sliding "Now" window, polled every POLL_MS
     }
 
     if (document.readyState === "loading") {

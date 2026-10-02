@@ -176,3 +176,43 @@ async def test_range_before_coverage_uses_raw_windows(tmp_path):
     )
     assert out["bucket_sec"] == pytest.approx(1150 / 60)  # the raw grid, not the tier's
     await db.close()
+
+
+async def test_tuning_configs_are_kept_without_a_table_scan(tmp_path):
+    """The writer seeds the config list once, adds new tunings as they appear,
+    and avg_window_configs reads the stored list."""
+    path = str(tmp_path / "cfg.db")
+    plain = SensorDatabase(path)
+    await plain.connect()
+    rng = np.random.default_rng(2)
+    await _insert(plain, 1_800_000_000.0, rng)  # history from before the list existed
+    await plain.close()
+
+    db = SensorDatabase(path, psd_tiers=True)
+    await db.connect()
+    assert db._configs_task is not None
+    await db._configs_task
+    await db.insert_avg_window(
+        start_time=datetime.fromtimestamp(1_800_000_100, tz=timezone.utc),
+        duration_sec=1.0,
+        sdr_center_freq_hz=2.437e9,
+        sample_rate_hz=56e6,
+        gain_db=None,
+        num_bins=4,
+        freq_start_hz=0.0,
+        freq_step_hz=1.0,
+        pwr_avg=-70.0,
+        pwr_max=-50.0,
+        pwr_median=-72.0,
+        pwr_std=3.0,
+        kurtosis=3.0,
+        powers=[-90.0] * 4,
+    )
+    out = await db.avg_window_configs()
+    assert [(c["sdr_center_freq_hz"], c["gain_db"]) for c in out["configs"]] == [
+        (915e6, 30.0),
+        (2.437e9, None),
+    ]
+    assert out["latest"]["sdr_center_freq_hz"] == 2.437e9
+    assert await db.get_config("avg_window_configs") is not None
+    await db.close()

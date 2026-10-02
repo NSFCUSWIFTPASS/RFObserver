@@ -1364,3 +1364,31 @@ def test_captures_list_rejects_bad_paging(settings, tmp_path):
     c = TestClient(create_app(settings))
     assert c.get("/captures/list?limit=abc").status_code == 400
     assert c.get("/captures/list?offset=-1").status_code == 400
+
+
+def test_dashboard_embeds_configs_and_prefs(settings):
+    """The page carries what averaged.js needs before its first data request,
+    so it does not wait two round trips (and a table scan) for them."""
+    import json as _json
+    import re
+
+    class FakeDB:
+        async def avg_window_configs(self):
+            cfg = {"sdr_center_freq_hz": 915e6, "sample_rate_hz": 26e6, "gain_db": 30.0}
+            return {"configs": [cfg], "latest": cfg}
+
+        async def get_config(self, key):
+            return _json.dumps({"scale": {"wf_lo": -110}, "theme": "dark"})
+
+    app = create_app(settings)
+    app.state.database = FakeDB()
+    html = TestClient(app).get("/").text
+    m = re.search(r'<script type="application/json" id="avg-boot">(.*?)</script>', html)
+    assert m is not None
+    boot = _json.loads(m.group(1))
+    assert boot["configs"]["latest"]["sdr_center_freq_hz"] == 915e6
+    assert boot["prefs"]["scale"]["wf_lo"] == -110
+
+
+def test_dashboard_without_a_database_embeds_an_empty_boot(client):
+    assert '<script type="application/json" id="avg-boot">{}</script>' in client.get("/").text

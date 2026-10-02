@@ -20,6 +20,10 @@
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
     --divider: rgba(0, 0, 0, 0.04);
     --dashed-border: rgba(0, 0, 0, 0.2);
+    /* Edge around stacked chart canvases. Light mode separates them by the
+       white gap alone; dark charts sit on a near-identical card, so they get
+       a hairline. */
+    --chart-ring: none;
 }
 
 :root[data-theme="dark"] {
@@ -34,6 +38,7 @@
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
     --divider: rgba(255, 255, 255, 0.06);
     --dashed-border: rgba(255, 255, 255, 0.3);
+    --chart-ring: 0 0 0 1px rgba(255, 255, 255, 0.14);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -49,6 +54,7 @@
         --shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
         --divider: rgba(255, 255, 255, 0.06);
         --dashed-border: rgba(255, 255, 255, 0.3);
+    --chart-ring: 0 0 0 1px rgba(255, 255, 255, 0.14);
     }
 }
 
@@ -544,12 +550,14 @@ body {
 .graph-group {
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    padding: 6px;
+    gap: 8px;
+    padding: 8px;
 }
 
 .graph-group canvas {
     display: block;
+    border-radius: 8px;
+    box-shadow: var(--chart-ring);
 }
 
 /* Status bar in card header */

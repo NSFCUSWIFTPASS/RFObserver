@@ -122,7 +122,13 @@ async def websocket_endpoint(websocket: WebSocket, broadcast: LiveBroadcast) -> 
     async def send_loop() -> None:
         while True:
             data = await sub.queue.get()
-            await websocket.send_json(shape_for_client(sub, data, time.monotonic()))
+            try:
+                await websocket.send_json(shape_for_client(sub, data, time.monotonic()))
+            except RuntimeError:
+                # The client closed the socket (the Live watchdog abandons a
+                # silent one) and the server already answered the close: the
+                # send races the disconnect. That is an ordinary disconnect.
+                return
 
     async def recv_loop() -> None:
         while True:

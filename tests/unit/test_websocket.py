@@ -150,3 +150,32 @@ async def test_psd_query_param_opts_out_of_psd_frames():
     await b.publish({"type": "heartbeat"})
     await task
     assert [m["type"] for m in sent] == ["heartbeat"]
+
+
+@pytest.mark.asyncio
+async def test_send_after_client_close_is_a_quiet_disconnect(caplog):
+    """A send racing the client's close raises RuntimeError in uvicorn
+    ("after sending 'websocket.close'"); it ends the handler without an
+    error log."""
+    b = LiveBroadcast()
+
+    class FakeWS:
+        query_params: dict[str, str] = {}
+
+        async def accept(self):
+            pass
+
+        async def send_json(self, data):
+            raise RuntimeError(
+                "Unexpected ASGI message 'websocket.send', after sending 'websocket.close'."
+            )
+
+        async def receive_text(self):
+            await asyncio.sleep(3600)
+
+    task = asyncio.create_task(websocket_endpoint(FakeWS(), b))
+    await asyncio.sleep(0)
+    await b.publish({"type": "heartbeat"})
+    await asyncio.wait_for(task, timeout=1)
+    assert b._subscribers == set()
+    assert "WebSocket handler error" not in caplog.text

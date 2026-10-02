@@ -83,6 +83,13 @@ _STOP = object()
 # A recording's .json lists at most this many gaps; lost_samples and
 # overflow_events keep counting past it (gaps_truncated says so).
 _MAX_RECORDED_GAPS = 1000
+
+# Receiver-iteration thresholds for a "RECV STALL" log line: the thread's own
+# work after recv(), and recv() running longer than one chunk of IQ by this
+# much (GIL or CPU wait). Both well inside UHD's ~160 ms receive buffer, so a
+# logged stall is an early warning, not necessarily an overflow.
+RECV_STALL_WORK_MS = 25.0
+RECV_STALL_EXTRA_MS = 60.0
 # Receive gaps remembered at stream positions, for mapping into a pre-roll.
 # More than this many overflow gaps inside one pre-roll would undercount
 # lost_samples (the oldest fall out of the log); that is not realistic, and
@@ -609,6 +616,10 @@ class StreamingProcessor:
         self._burst_grids_in = 0
         self._burst_grids_done = 0
         self._dropped_chunks = 0
+        # Receiver-thread stalls (see _note_recv_timing): counted always,
+        # logged at most once a second.
+        self._recv_stalls = 0
+        self._last_stall_log = 0.0
         self._result_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=8)
         self._result_handoff = _LoopHandoff(self._result_queue)
         # Per-window DB writes, off the consumer loop (see _OrderedDbWriter).
@@ -1331,6 +1342,47 @@ class StreamingProcessor:
             "refused": self._recording_refusal(),
         }
 
+    def _note_recv_timing(
+        self,
+        t_start: float,
+        t_recv: float,
+        t_ring: float,
+        t_modules: float,
+        t_trigger: float,
+        t_end: float,
+    ) -> None:
+        """Flag a receiver iteration that risks a UHD overflow.
+
+        UHD buffers ~160 ms at 26 Msps (num_recv_frames=1024), so the thread
+        must be back in recv() quickly. Two ways it is not: its own work after
+        recv() (ring write, modules, trigger/recording, queue) takes long, or
+        recv() itself returns far later than a chunk's worth of IQ, which
+        means the thread was waiting for the GIL or the CPU. Either is logged
+        with the breakdown so an overflow can be tied to its cause.
+        """
+        chunk_ms = self._chunk_duration * 1000.0
+        recv_ms = (t_recv - t_start) * 1000.0
+        work_ms = (t_end - t_recv) * 1000.0
+        if work_ms <= RECV_STALL_WORK_MS and recv_ms <= chunk_ms + RECV_STALL_EXTRA_MS:
+            return
+        self._recv_stalls += 1
+        if t_end - self._last_stall_log < 1.0:
+            return
+        self._last_stall_log = t_end
+        logger.warning(
+            "RECV STALL: recv=%.1fms (chunk %.1fms) work=%.1fms "
+            "[ring=%.1f modules=%.1f trigger/record=%.1f queue=%.1f] recording=%s stalls=%d",
+            recv_ms,
+            chunk_ms,
+            work_ms,
+            (t_ring - t_recv) * 1000.0,
+            (t_modules - t_ring) * 1000.0,
+            (t_trigger - t_modules) * 1000.0,
+            (t_end - t_trigger) * 1000.0,
+            self._recording_state,
+            self._recv_stalls,
+        )
+
     def receive_loss(self) -> dict[str, int]:
         """Cumulative UHD overflow loss since this receiver was built."""
         return {
@@ -1447,13 +1499,16 @@ class StreamingProcessor:
 
                         # Store raw SC16 in pre-trigger buffer
                         self._pre_trigger_buf.write(buf[:n])
+                        t_ring = time.monotonic()
 
                         # Feed upstream modules (GPU processing, non-blocking)
                         if self._module_manager is not None:
                             self._module_manager.feed_all(buf[:n], center_freq, s.BANDWIDTH)
+                        t_modules = time.monotonic()
 
                         # Handle recording / trigger
                         self._check_trigger_and_record(buf[:n], chunk_gaps, chunk_start)
+                        t_trigger = time.monotonic()
 
                         # Enqueue for processing — best-effort, drop if behind.
                         # In lossless mode block until the dispatch loop drains a
@@ -1480,13 +1535,16 @@ class StreamingProcessor:
                                 with contextlib.suppress(queue.Full):
                                     self._buf_pool.put_nowait(buf)
 
+                        self._note_recv_timing(
+                            recv_time, t_recv_done, t_ring, t_modules, t_trigger, time.monotonic()
+                        )
                         recv_count += 1
                         if recv_count % 50 == 0:
                             recv_ms = (t_recv_done - recv_time) * 1000
                             loss = self.receive_loss()
                             logger.info(
                                 "TIMING recv#%d: recv=%.1fms dropped=%d (IQ=%.1fms) "
-                                "handoff_dropped=%d/%d ovf=%d lost=%d",
+                                "handoff_dropped=%d/%d ovf=%d lost=%d stalls=%d",
                                 recv_count,
                                 recv_ms,
                                 self._dropped_chunks,
@@ -1495,6 +1553,7 @@ class StreamingProcessor:
                                 self._burst_handoff.dropped,
                                 loss["overflow_events"],
                                 loss["overflow_lost_samples"],
+                                self._recv_stalls,
                             )
 
         except Exception:

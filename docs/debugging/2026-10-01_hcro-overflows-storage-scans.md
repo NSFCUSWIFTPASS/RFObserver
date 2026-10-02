@@ -165,3 +165,47 @@ so its single gap over 160 ms understates the effect on the real receiver.
 
 To confirm after deploying: the overflow and `handoff_dropped` rates on HCRO, measured
 over 2 minutes as in section 3.
+
+## 9. After deploying e06740c to HCRO (2026-10-01)
+
+The startup index reports 22,238 captures (`X-Total-Count` on `/captures/list`).
+
+```
+isolation OFF: over 120s 4 overflows (2.0/min), 0.15 s IQ lost (0.12%)
+isolation ON:  over 120s 8 overflows (4.0/min), 0.40 s IQ lost (0.33%)
+isolation ON:  over 120s 6 overflows (3.0/min), 0.23 s IQ lost (0.19%)
+journal: handoff_dropped=0/0 throughout; dropped (worker queue) 6 in ~3.5 min;
+         per overflow lost ~0.73M samples (28 ms) vs ~2.7M (107 ms) before
+```
+
+- `handoff_dropped` is fixed: 0, against about 12 a second before.
+- Overflows are down 3x to 5x, and each one is about 4x smaller: the receiver now misses
+  UHD's ~160 ms buffer only narrowly.
+- The remaining overflows do not coincide with recordings or evictions (22:00:10.075 had
+  none nearby; the recording and rotation at 22:00:18.9 caused none).
+
+Open: what still delays the receiver. Candidates: steady contention from the three PSD
+workers, isolation, rtl_433 and the recording writer. Next steps under consideration: a
+larger UHD receive buffer (num_recv_frames is hard-coded at 1024), and a second py-spy
+profile (GIL and all threads).
+
+## 10. Follow-ups measured (2026-10-01)
+
+- **A larger UHD buffer:** on nano-super's B200mini at 26 Msps, `num_recv_frames=1024`
+  streamed 15 s with 0 overflows. 2048 and 4096 crashed UHD's receive task loop
+  ("mutex lock failed in pthread_mutex_lock") and hung the stream. Suspected cause: the
+  usbfs limit. `usbfs_memory_mb` = 16; packets hold 2040 samples (~8 KB), so 1024 frames is
+  ~8 MB and 2048 is at the limit. **Not confirmed:** raising the limit is a kernel setting,
+  not changed without approval. A larger buffer needs that limit raised on the sensor.
+- **Recording-start pre-roll copy:** HCRO runs `trigger_pre_sec` = 0.1, so the copy on the
+  receiver thread is ~10 MB, about 1 to 2 ms. Not a stall cause; left as is.
+- **Live high-res "hang":** a high-res client on HCRO over the VPN for 90 s received
+  2,276 frames (25.3 a second). Inter-frame gap p50 39 ms, p99 90 ms, max 172 ms. A
+  recording started and finalized in that window with no gap over 300 ms. In a local
+  browser, high-res Live ran 20 s with 0 long tasks and a worst frame of 33 ms. The server
+  feed is not where it hangs; the client side (machine, browser, VPN path) is unconfirmed.
+- **Receiver stall logging added:** a `RECV STALL` warning (at most once a second, plus a
+  `stalls=` count on the TIMING line) when the receiver's own work after `recv()` exceeds
+  25 ms, or `recv()` takes more than a chunk plus 60 ms. It includes the breakdown (ring,
+  modules, trigger/record, queue) and the recording state, to tie each remaining overflow
+  to its cause.

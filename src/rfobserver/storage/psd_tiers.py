@@ -134,6 +134,7 @@ class TierAccumulator:
         ended before this window, ready to store."""
         done = self._close_before(epoch)
         crange = color_range(powers) if powers is not None else None
+        p64 = None if powers is None else np.asarray(powers, dtype=np.float64)
         for level in self.tiers:
             key = (level, tuning)
             row = self._open.get(key)
@@ -152,13 +153,12 @@ class TierAccumulator:
             if pwr_max is not None:
                 row.max_max = pwr_max if row.max_max is None else max(row.max_max, pwr_max)
                 row.min_avg = pwr_avg if row.min_avg is None else min(row.min_avg, pwr_avg)
-            if powers is not None:
-                p = np.asarray(powers, dtype=np.float64)
+            if p64 is not None:
                 if row.psd_sum is None:
-                    row.psd_sum = p.copy()
+                    row.psd_sum = p64.copy()
                     row.n_psd = 1
-                elif row.psd_sum.size == p.size:
-                    row.psd_sum += p
+                elif row.psd_sum.size == p64.size:
+                    row.psd_sum += p64
                     row.n_psd += 1
                 if crange is not None:
                     row.psd_min = _opt(min, row.psd_min, crange[0])

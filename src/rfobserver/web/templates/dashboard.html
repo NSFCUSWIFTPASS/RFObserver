@@ -483,6 +483,10 @@
     let lastPowers = [];
     let lastMaxPowers = [];        // per-bin max across the chunk's PSD rows
     let lastNoiseFloorPerBin = []; // per-bin 10th percentile from rolling window
+    // The server sends the noise floor at most once a second and the
+    // frequency axis only when it changes; keep the last copies. rawNoiseFloor
+    // is the uncalibrated array, so the cal offset is never applied twice.
+    let rawNoiseFloor = [];
     let lastFrequencies = [];
     let psdCrosshairBin = -1;  // persists across redraws
 
@@ -1045,24 +1049,25 @@
                     if (Array.isArray(data.max_powers)) {
                         for (let i = 0; i < data.max_powers.length; i++) data.max_powers[i] += off;
                     }
-                    if (Array.isArray(data.noise_floor_per_bin)) {
-                        for (let i = 0; i < data.noise_floor_per_bin.length; i++) {
-                            data.noise_floor_per_bin[i] += off;
-                        }
-                    }
                     if (typeof data.noise_floor_db === "number") data.noise_floor_db += off;
                 }
 
                 // PSD + waterfall
                 lastPowers = data.powers;
                 lastMaxPowers = Array.isArray(data.max_powers) ? data.max_powers : [];
-                lastNoiseFloorPerBin = Array.isArray(data.noise_floor_per_bin)
-                    ? data.noise_floor_per_bin
-                    : [];
-                lastFrequencies = data.frequencies;
-                if (data.frequencies && data.frequencies.length >= 2) {
-                    lastFreqLowHz = data.frequencies[0];
-                    lastFreqHighHz = data.frequencies[data.frequencies.length - 1];
+                if (Array.isArray(data.noise_floor_per_bin)) {
+                    rawNoiseFloor = data.noise_floor_per_bin;
+                }
+                const nfOff = calSet ? data.cal_offset_db : 0;
+                lastNoiseFloorPerBin = nfOff !== 0
+                    ? rawNoiseFloor.map(function (v) { return v + nfOff; })
+                    : rawNoiseFloor;
+                if (Array.isArray(data.frequencies)) {
+                    lastFrequencies = data.frequencies;
+                    if (data.frequencies.length >= 2) {
+                        lastFreqLowHz = data.frequencies[0];
+                        lastFreqHighHz = data.frequencies[data.frequencies.length - 1];
+                    }
                 }
                 updateDynamicRange(data.powers);
                 // Sync threshold-line state from server (skip the field

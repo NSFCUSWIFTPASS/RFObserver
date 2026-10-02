@@ -1037,7 +1037,7 @@
         let lastCount = -1;
         let ws = null;
         function connect() {
-            ws = new WebSocket("ws://" + location.host + "/ws/live");
+            ws = new WebSocket("ws://" + location.host + "/ws/live?psd=0");
             ws.onmessage = function(evt) {
                 try {
                     const d = JSON.parse(evt.data);

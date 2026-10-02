@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from rfobserver.storage import psd_grid
 from rfobserver.storage.sigmf_export import iq_sigmf_meta
@@ -135,27 +135,74 @@ async def captures_page(request: Request) -> Any:
     )
 
 
-@router.get("/list")
-async def captures_list(request: Request) -> list[dict[str, Any]]:
-    """List all .sc16 capture files with metadata."""
-    storage = _get_storage(request)
-    if not storage.exists():
-        return []
+def _page_param(raw: str | None, default: int | None, name: str) -> int | None:
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{name} must be an integer") from exc
+    if value < 0:
+        raise HTTPException(status_code=400, detail=f"{name} must be >= 0")
+    return value
 
-    # Scan auto/ and manual/ (and the legacy root for any not-yet-migrated
-    # captures), newest first across all of them.
+
+def _scan_captures(storage: Path) -> list[tuple[Path, str]]:
+    """Newest-first (path, origin) by listing the capture directories. Only
+    for a web-only process, which has no capture index (and no receiver)."""
     found: list[tuple[Path, str]] = []
     for d in _capture_dirs(storage):
         if d.exists():
             origin = d.name if d != storage else "manual"
             found.extend((sc16, origin) for sc16 in d.glob("*.sc16"))
+    return sorted(found, key=lambda t: t[0].stat().st_mtime, reverse=True)
 
+
+@router.get("/list")
+async def captures_list(
+    request: Request,
+    response: Response,
+    offset: str | None = None,
+    limit: str | None = None,
+) -> list[dict[str, Any]]:
+    """List .sc16 captures with metadata, newest first.
+
+    ``offset``/``limit`` page the list (the page asks for 200 at a time;
+    without ``limit`` every capture is returned, as before). The total is in
+    the ``X-Total-Count`` header. With the pipeline running, the capture
+    index supplies the order, so only the requested page touches the disk.
+    """
+    storage = _get_storage(request)
+    off = _page_param(offset, 0, "offset") or 0
+    lim = _page_param(limit, None, "limit")
+    if not storage.exists():
+        response.headers["X-Total-Count"] = "0"
+        return []
+
+    local = getattr(request.app.state, "local_storage", None)
+    if local is not None:
+        total = local.capture_count()
+        page = [(e.path, e.origin) for e in local.captures_newest_first(off, lim)]
+    else:
+        found = await asyncio.to_thread(_scan_captures, storage)
+        total = len(found)
+        page = found[off : None if lim is None else off + lim]
+    response.headers["X-Total-Count"] = str(total)
+    return await asyncio.to_thread(_describe_captures, page)
+
+
+def _describe_captures(page: list[tuple[Path, str]]) -> list[dict[str, Any]]:
+    """The list entries for one page of captures (blocking file reads)."""
     captures: list[dict[str, Any]] = []
-    for sc16, origin in sorted(found, key=lambda t: t[0].stat().st_mtime, reverse=True):
+    for sc16, origin in page:
+        try:
+            size = sc16.stat().st_size
+        except OSError:
+            continue  # evicted since the page was chosen
         entry: dict[str, Any] = {
             "filename": sc16.name,
             "origin": origin,
-            "size_bytes": sc16.stat().st_size,
+            "size_bytes": size,
             "has_psd": _has_psd(sc16),
             "files": _capture_files(sc16),
             "sigmf": _sigmf_names(sc16),
@@ -491,6 +538,9 @@ async def capture_redetect(request: Request, filename: str) -> dict[str, Any]:
     # detect_bursts on a full grid is multi-second CPU work; run it off the event
     # loop so the live WS/heartbeat stay responsive during a re-detect.
     payload: dict[str, Any] = await asyncio.to_thread(ds.write_sidecar_from_grid, sc16, cfg)
+    local = getattr(request.app.state, "local_storage", None)
+    if local is not None:
+        await asyncio.to_thread(local.track, sc16)  # the sidecar's new size
     return payload
 
 

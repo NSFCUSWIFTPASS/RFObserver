@@ -91,8 +91,10 @@ def _settings(tmp_path: Any, web_port: int) -> AppSettings:
 
 async def _start_then_cancel(settings: AppSettings) -> BaseException | None:
     task = asyncio.create_task(app_mod.run(settings))
+    # Real time, not just loop turns: start-up builds the capture index on a
+    # worker thread (milliseconds for an empty storage dir).
     for _ in range(50):
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
     assert not task.done(), "run() should still be serving"
     task.cancel()
     try:
@@ -152,8 +154,10 @@ def _assert_handlers_restored() -> None:
 
 async def _start(settings: AppSettings) -> asyncio.Task[None]:
     task = asyncio.create_task(app_mod.run(settings))
+    # Real time, not just loop turns: start-up builds the capture index on a
+    # worker thread (milliseconds for an empty storage dir).
     for _ in range(50):
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
     assert not task.done(), "run() should still be serving"
     _assert_handlers_installed()
     return task

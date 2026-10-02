@@ -11,13 +11,15 @@ import pytest
 from rfobserver.storage.local import LocalStorage, is_active_capture
 
 
-def _cap(d: Path, name: str, size: int, mtime: float) -> Path:
+def _cap(ls: LocalStorage, d: Path, name: str, size: int, mtime: float) -> Path:
+    """Write a capture and register it, as the recording finalize does."""
     sc16 = d / f"{name}.sc16"
     sc16.write_bytes(b"\0" * size)
     (d / f"{name}.json").write_text("{}")
     (d / f"{name}.psd").write_bytes(b"\0" * 8)
     for p in (sc16, d / f"{name}.json", d / f"{name}.psd"):
         os.utime(p, (mtime, mtime))
+    ls.track(sc16)
     return sc16
 
 
@@ -37,9 +39,9 @@ class _Disk:
 
 def test_evicts_oldest_first_until_the_target(tmp_path):
     ls = LocalStorage(str(tmp_path), max_gb=100)
-    a = _cap(ls.auto_dir, "A", 1000, 1)
-    b = _cap(ls.auto_dir, "B", 1000, 2)
-    c = _cap(ls.auto_dir, "C", 1000, 3)
+    a = _cap(ls, ls.auto_dir, "A", 1000, 1)
+    b = _cap(ls, ls.auto_dir, "B", 1000, 2)
+    c = _cap(ls, ls.auto_dir, "C", 1000, 3)
     disk = _Disk(ls, free=100)
     freed = ls.evict_until_free(1500, free_bytes=disk)
     assert not a.exists() and not b.exists() and c.exists()
@@ -49,23 +51,23 @@ def test_evicts_oldest_first_until_the_target(tmp_path):
 
 def test_stops_when_nothing_is_left_to_evict(tmp_path):
     ls = LocalStorage(str(tmp_path), max_gb=100)
-    _cap(ls.auto_dir, "A", 1000, 1)
+    _cap(ls, ls.auto_dir, "A", 1000, 1)
     freed = ls.evict_until_free(10**12, free_bytes=lambda: 0)
     assert freed > 0 and list(ls.auto_dir.glob("*.sc16")) == []
 
 
 def test_manual_captures_are_never_evicted(tmp_path):
     ls = LocalStorage(str(tmp_path), max_gb=100)
-    m = _cap(ls.manual_dir, "M", 1000, 0)
+    m = _cap(ls, ls.manual_dir, "M", 1000, 0)
     ls.evict_until_free(10**12, free_bytes=lambda: 0)
     assert m.exists()
 
 
 def test_evict_never_takes_the_active_capture_or_its_drop_renamed_name(tmp_path):
     ls = LocalStorage(str(tmp_path), max_gb=100)
-    active = _cap(ls.auto_dir, "S-host-20260923T100000", 1000, 1)
-    renamed = _cap(ls.auto_dir, "S-host-20260923T090000_drop3", 1000, 0)
-    other = _cap(ls.auto_dir, "S-host-20260923T080000", 1000, 0)
+    active = _cap(ls, ls.auto_dir, "S-host-20260923T100000", 1000, 1)
+    renamed = _cap(ls, ls.auto_dir, "S-host-20260923T090000_drop3", 1000, 0)
+    other = _cap(ls, ls.auto_dir, "S-host-20260923T080000", 1000, 0)
     ls.evict_until_free(
         10**12,
         exclude={"S-host-20260923T100000.sc16", "S-host-20260923T090000.sc16"},
@@ -84,8 +86,8 @@ def test_is_active_capture():
 
 def test_sample_counts_auto_and_manual_and_evictability(tmp_path):
     ls = LocalStorage(str(tmp_path / "s"), max_gb=100)
-    _cap(ls.auto_dir, "A", 1000, 1)
-    _cap(ls.manual_dir, "M", 500, 1)
+    _cap(ls, ls.auto_dir, "A", 1000, 1)
+    _cap(ls, ls.manual_dir, "M", 500, 1)
     s = ls.sample(
         db_path=tmp_path / "s" / "db.sqlite",
         active_names=set(),
@@ -129,26 +131,29 @@ def test_sample_reports_a_db_on_another_device(tmp_path, monkeypatch):
     assert s.db_volume is not None and s.db_volume.total_bytes > 0
 
 
-def test_sample_tolerates_a_capture_deleted_mid_walk(tmp_path, monkeypatch):
+def test_a_capture_deleted_outside_rfobserver_is_corrected_by_eviction_or_restart(tmp_path):
+    """sample() reads the index and never walks the disk, so a capture deleted
+    behind RFObserver's back (over SFTP, say) stays counted. Evicting it is a
+    no-op on disk that drops it from the index, and a restart rebuilds the
+    index from the disk. Disk safety never depends on the count: the
+    governor's floor uses the volume's real free space."""
     ls = LocalStorage(str(tmp_path), max_gb=100)
-    gone = _cap(ls.auto_dir, "GONE", 1000, 1)
-    _cap(ls.auto_dir, "KEEP", 1000, 2)
-    real = LocalStorage._capture_size
-
-    def racing(self, p):
-        if p.name == "GONE.sc16":
-            gone.unlink()
-            p.stat()  # raises FileNotFoundError, as a real race would
-        return real(self, p)
-
-    monkeypatch.setattr(LocalStorage, "_capture_size", racing)
+    gone = _cap(ls, ls.auto_dir, "GONE", 1000, 1)
+    _cap(ls, ls.auto_dir, "KEEP", 1000, 2)
+    for p in ls.auto_dir.glob("GONE*"):
+        p.unlink()
     s = ls.sample(db_path=tmp_path / "db", active_names=(), db_file_bytes=0, db_reusable_bytes=0)
-    assert s.auto_bytes == 1000 + 2 + 8
+    assert s.auto_bytes == 2 * (1000 + 2 + 8)  # still counted: no walk
+    assert LocalStorage(str(tmp_path), max_gb=100).get_usage_bytes() == 1000 + 2 + 8  # restart
+    ls.max_bytes = 1000 + 2 + 8
+    ls.enforce_cap()  # the oldest (GONE) is "evicted": nothing to delete, index corrected
+    assert not gone.exists() and ls.get_usage_bytes() == 1000 + 2 + 8
+    assert (ls.auto_dir / "KEEP.sc16").exists()
 
 
 def test_manual_usage(tmp_path):
     ls = LocalStorage(str(tmp_path), max_gb=100)
-    _cap(ls.manual_dir, "M", 500, 1)
+    _cap(ls, ls.manual_dir, "M", 500, 1)
     assert ls.get_manual_usage_bytes() == 500 + 2 + 8
 
 
@@ -160,8 +165,8 @@ def test_exclude_fn_is_rechecked_before_each_delete(tmp_path):
     file_stats and the sample in between) survives: exclude_fn is asked again
     right before every delete."""
     ls = LocalStorage(str(tmp_path), max_gb=100)
-    old = _cap(ls.auto_dir, "OLD", 1000, 1)
-    new = _cap(ls.auto_dir, "NEW", 1000, 2)
+    old = _cap(ls, ls.auto_dir, "OLD", 1000, 1)
+    new = _cap(ls, ls.auto_dir, "NEW", 1000, 2)
     active: set[str] = set()
 
     def free() -> int:
@@ -176,8 +181,8 @@ def test_exclude_fn_is_rechecked_before_each_delete(tmp_path):
 
 def test_a_file_written_after_not_after_is_neither_evicted_nor_evictable(tmp_path):
     ls = LocalStorage(str(tmp_path), max_gb=100)
-    old = _cap(ls.auto_dir, "OLD", 1000, 1000)
-    fresh = _cap(ls.auto_dir, "FRESH", 1000, 3000)  # still being written at 3000
+    old = _cap(ls, ls.auto_dir, "OLD", 1000, 1000)
+    fresh = _cap(ls, ls.auto_dir, "FRESH", 1000, 3000)  # still being written at 3000
     ls.evict_until_free(10**12, not_after=2000.0, free_bytes=lambda: 0)
     assert not old.exists() and fresh.exists()
     s = ls.sample(
@@ -196,8 +201,8 @@ def test_a_file_written_after_not_after_is_neither_evicted_nor_evictable(tmp_pat
 
 def test_delete_capture_tolerates_a_racing_unlink(tmp_path, monkeypatch):
     ls = LocalStorage(str(tmp_path), max_gb=100)
-    gone = _cap(ls.auto_dir, "GONE", 1000, 1)
-    keep_going = _cap(ls.auto_dir, "NEXT", 1000, 2)
+    gone = _cap(ls, ls.auto_dir, "GONE", 1000, 1)
+    keep_going = _cap(ls, ls.auto_dir, "NEXT", 1000, 2)
     real = LocalStorage._capture_size
 
     def racing(self, p):
@@ -218,9 +223,9 @@ def test_delete_capture_tolerates_a_racing_unlink(tmp_path, monkeypatch):
 def test_on_evict_called_with_path_and_plausible_age_in_eviction_order(tmp_path):
     ls = LocalStorage(str(tmp_path), max_gb=100)
     now = time.time()
-    old = _cap(ls.auto_dir, "OLD", 1000, now - 5000)
-    young = _cap(ls.auto_dir, "YOUNG", 1000, now - 30)
-    active = _cap(ls.auto_dir, "ACTIVE", 1000, now)
+    old = _cap(ls, ls.auto_dir, "OLD", 1000, now - 5000)
+    young = _cap(ls, ls.auto_dir, "YOUNG", 1000, now - 30)
+    active = _cap(ls, ls.auto_dir, "ACTIVE", 1000, now)
     calls: list[tuple[str, float]] = []
     ls.evict_until_free(
         10**12,
@@ -237,8 +242,8 @@ def test_on_evict_called_with_path_and_plausible_age_in_eviction_order(tmp_path)
 def test_on_evict_not_called_for_protected_captures(tmp_path):
     ls = LocalStorage(str(tmp_path), max_gb=100)
     now = time.time()
-    active = _cap(ls.auto_dir, "ACTIVE", 1000, now)
-    m = _cap(ls.manual_dir, "M", 1000, now - 5000)
+    active = _cap(ls, ls.auto_dir, "ACTIVE", 1000, now)
+    m = _cap(ls, ls.manual_dir, "M", 1000, now - 5000)
     calls: list[tuple[str, float]] = []
     ls.evict_until_free(
         10**12,

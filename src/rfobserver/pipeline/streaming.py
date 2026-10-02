@@ -2167,6 +2167,9 @@ class StreamingProcessor:
         # cap from settings first -- ARCHIVE_MAX_GB may have been changed at
         # runtime via /config/apply after LocalStorage snapshotted it at startup.
         self._storage.max_bytes = int(self._settings.ARCHIVE_MAX_GB * 1024**3)
+        # Track the new capture (stats just its files), then trim the index's
+        # oldest: no directory walk per recording.
+        self._storage.track(self._recording_dir / base_name)
         self._storage.enforce_cap()
 
     def _report_write_error(self, message: str) -> None:
@@ -2263,6 +2266,9 @@ class StreamingProcessor:
                     "Capture %s was evicted during its sidecar write; removed the sidecar",
                     sc16_path.name,
                 )
+            else:
+                # The sidecar is part of the capture's footprint.
+                self._storage.track(sc16_path)
         except Exception:
             logger.exception("Detections sidecar write failed for %s", sc16_path.name)
 

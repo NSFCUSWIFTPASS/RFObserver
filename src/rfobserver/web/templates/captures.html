@@ -106,42 +106,77 @@
         return hz + " Hz";
     }
 
-    async function loadList() {
+    // The list is paged: an archive can hold tens of thousands of captures,
+    // and the server reads each listed capture's metadata. "Load more" appends
+    // the next page; a refresh reloads as many as are already shown.
+    const LIST_PAGE = 200;
+    let listShown = 0;
+    let listTotal = 0;
+    let listSelected = null;
+
+    function itemHtml(c) {
+        const m = c.meta || {};
+        const freq = m.center_freq_hz ? formatFreq(m.center_freq_hz) : "";
+        const dur = m.duration_sec ? formatDuration(m.duration_sec) : "";
+        const dropped = m.dropped_chunks || 0;
+        const time = m.start_time ? new Date(m.start_time).toLocaleString() : "";
+        const psdBadge = c.has_psd ? '<span class="psd-badge">PSD</span>' : '';
+
+        let html = '<div class="capture-item" data-file="' + c.filename + '"'
+            + ' data-has-psd="' + (c.has_psd ? '1' : '0') + '">';
+        html += '<div class="capture-name">' + c.filename + ' ' + psdBadge + '</div>';
+        html += '<div class="capture-info">';
+        html += formatBytes(c.size_bytes);
+        if (dur) html += ' &middot; ' + dur;
+        if (freq) html += ' &middot; ' + freq;
+        if (dropped > 0) html += ' &middot; <span style="color:#ff3b30;">' + dropped + ' dropped</span>';
+        html += '</div>';
+        if (time) html += '<div class="capture-time">' + time + '</div>';
+        html += '</div>';
+        return html;
+    }
+
+    function moreHtml() {
+        const left = listTotal - listShown;
+        return left > 0
+            ? '<button type="button" class="btn-preset capture-load-more">Load '
+                + Math.min(left, LIST_PAGE) + ' more (' + left + ' older)</button>'
+            : "";
+    }
+
+    async function loadList(more) {
+        const offset = more ? listShown : 0;
+        const limit = more ? LIST_PAGE : Math.max(LIST_PAGE, listShown);
         try {
-            const r = await fetch("/captures/list");
+            const r = await fetch("/captures/list?offset=" + offset + "&limit=" + limit);
             if (!r.ok) return;
             const captures = await r.json();
+            listTotal = Number(r.headers.get("X-Total-Count")) || captures.length;
 
-            if (captures.length === 0) {
+            if (!more && captures.length === 0) {
+                listShown = 0;
                 listEl.innerHTML = '<div class="placeholder-text">No captures yet</div>';
                 return;
             }
 
-            let html = "";
-            for (const c of captures) {
-                const m = c.meta || {};
-                const freq = m.center_freq_hz ? formatFreq(m.center_freq_hz) : "";
-                const dur = m.duration_sec ? formatDuration(m.duration_sec) : "";
-                const dropped = m.dropped_chunks || 0;
-                const time = m.start_time ? new Date(m.start_time).toLocaleString() : "";
-                const psdBadge = c.has_psd ? '<span class="psd-badge">PSD</span>' : '';
-
-                html += '<div class="capture-item" data-file="' + c.filename + '"'
-                    + ' data-has-psd="' + (c.has_psd ? '1' : '0') + '">';
-                html += '<div class="capture-name">' + c.filename + ' ' + psdBadge + '</div>';
-                html += '<div class="capture-info">';
-                html += formatBytes(c.size_bytes);
-                if (dur) html += ' &middot; ' + dur;
-                if (freq) html += ' &middot; ' + freq;
-                if (dropped > 0) html += ' &middot; <span style="color:#ff3b30;">' + dropped + ' dropped</span>';
-                html += '</div>';
-                if (time) html += '<div class="capture-time">' + time + '</div>';
-                html += '</div>';
+            const html = captures.map(itemHtml).join("");
+            if (more) {
+                const btn = listEl.querySelector(".capture-load-more");
+                if (btn) btn.remove();
+                listShown += captures.length;
+                listEl.insertAdjacentHTML("beforeend", html + moreHtml());
+            } else {
+                listShown = captures.length;
+                listEl.innerHTML = html;
+                listEl.insertAdjacentHTML("beforeend", moreHtml());
             }
-            listEl.innerHTML = html;
-
+            if (listSelected) {
+                listEl.querySelectorAll(".capture-item").forEach(function(el) {
+                    el.classList.toggle("selected", el.dataset.file === listSelected);
+                });
+            }
         } catch (_) {
-            listEl.innerHTML = '<div class="placeholder-text">Failed to load</div>';
+            if (!more) listEl.innerHTML = '<div class="placeholder-text">Failed to load</div>';
         }
     }
 
@@ -235,6 +270,7 @@
     }
 
     async function showDetail(filename, hasPsd) {
+        listSelected = filename;
         document.querySelectorAll(".capture-item").forEach(function(el) {
             el.classList.toggle("selected", el.dataset.file === filename);
         });
@@ -929,6 +965,7 @@
     }
 
     listEl.addEventListener("click", function(e) {
+        if (e.target.closest(".capture-load-more")) { loadList(true); return; }
         const item = e.target.closest(".capture-item");
         if (item) showDetail(item.dataset.file, item.dataset.hasPsd === "1");
     });
@@ -946,13 +983,23 @@
         if (item) {
             item.scrollIntoView({ block: "nearest" });
             showDetail(item.dataset.file, item.dataset.hasPsd === "1");
+        } else if (listShown < listTotal) {
+            // Older than the pages shown: ask the server for it directly.
+            fetch("/captures/detail/" + encodeURIComponent(file)).then(function(r) {
+                if (r.ok) return r.json().then(function(d) { showDetail(file, !!d.has_psd); });
+                showGone(file);
+            }).catch(function() { showGone(file); });
         } else {
-            const notice = document.createElement("div");
-            notice.className = "placeholder-text";
-            notice.style.color = "#ff9f0a";
-            notice.textContent = "Capture " + file + " is no longer available.";
-            listEl.insertBefore(notice, listEl.firstChild);
+            showGone(file);
         }
+    }
+
+    function showGone(file) {
+        const notice = document.createElement("div");
+        notice.className = "placeholder-text";
+        notice.style.color = "#ff9f0a";
+        notice.textContent = "Capture " + file + " is no longer available.";
+        listEl.insertBefore(notice, listEl.firstChild);
     }
 
     // --- Replay a raw file (arbitrary path outside the managed capture store) ---

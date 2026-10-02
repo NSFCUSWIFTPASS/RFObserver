@@ -760,7 +760,22 @@ class TestStoragePath:
         new_path = str(tmp_path / "new_storage")
         resp = client.post("/api/storage/set-path", json={"path": new_path})
         assert resp.status_code == 200
-        assert mock_storage.storage_path == Path(new_path)
+        # Re-points auto/ and manual/ too and re-indexes, not just the root.
+        mock_storage.set_storage_path.assert_called_once_with(Path(new_path))
+
+    def test_set_path_reindexes_the_real_storage(self, client_with_processor, tmp_path):
+        from rfobserver.storage.local import LocalStorage
+
+        client, _, processor = client_with_processor
+        old = LocalStorage(str(tmp_path / "old"), max_gb=1.0)
+        new_root = tmp_path / "new_storage"
+        (new_root / "auto").mkdir(parents=True)
+        (new_root / "auto" / "x.sc16").write_bytes(b"\0" * 100)
+        processor._storage = old
+        resp = client.post("/api/storage/set-path", json={"path": str(new_root)})
+        assert resp.status_code == 200
+        assert old.auto_dir == new_root / "auto"
+        assert old.capture_count() == 1 and old.get_usage_bytes() == 100
 
     def test_config_page_shows_storage_path(self, client):
         resp = client.get("/config")
@@ -1311,3 +1326,41 @@ def test_pages_load_no_external_scripts_or_styles(client):
         assert external == [], f"{path} loads {external}"
     r = client.get("/static/vendor/htmx-2.0.4.min.js")
     assert r.status_code == 200 and r.text.startswith("var htmx=")
+
+
+def _indexed_storage(settings, tmp_path, n):
+    import os
+
+    from rfobserver.storage.local import LocalStorage
+
+    settings.STORAGE_PATH = str(tmp_path / "store")
+    ls = LocalStorage(settings.STORAGE_PATH, max_gb=1.0)
+    for i in range(n):
+        p = ls.auto_dir / f"c{i:03d}.sc16"
+        p.write_bytes(b"\0" * 8)
+        os.utime(p, (1000 + i, 1000 + i))
+        ls.track(p)
+    return ls
+
+
+@pytest.mark.parametrize("indexed", [True, False])
+def test_captures_list_pages_newest_first(settings, tmp_path, indexed):
+    # With the pipeline running the index supplies the order; a web-only
+    # process lists the directories. Same answer either way.
+    ls = _indexed_storage(settings, tmp_path, 5)
+    app = create_app(settings)
+    if indexed:
+        app.state.local_storage = ls
+    c = TestClient(app)
+    r = c.get("/captures/list?offset=1&limit=2")
+    assert r.status_code == 200
+    assert r.headers["X-Total-Count"] == "5"
+    assert [e["filename"] for e in r.json()] == ["c003.sc16", "c002.sc16"]
+    assert len(c.get("/captures/list").json()) == 5  # no limit: everything, as before
+
+
+def test_captures_list_rejects_bad_paging(settings, tmp_path):
+    _indexed_storage(settings, tmp_path, 1)
+    c = TestClient(create_app(settings))
+    assert c.get("/captures/list?limit=abc").status_code == 400
+    assert c.get("/captures/list?offset=-1").status_code == 400

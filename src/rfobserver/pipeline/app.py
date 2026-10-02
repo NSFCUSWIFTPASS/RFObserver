@@ -206,7 +206,20 @@ async def run(settings: AppSettings) -> None:
                 flush_sec=settings.rfdb.flush_sec,
             )
 
-    local_storage = LocalStorage(settings.STORAGE_PATH, max_gb=settings.ARCHIVE_MAX_GB)
+    # Builds the capture index with one scan, before any streaming starts and
+    # off the event loop (seconds on a sensor with tens of thousands of captures).
+    try:
+        local_storage = await asyncio.to_thread(
+            LocalStorage, settings.STORAGE_PATH, max_gb=settings.ARCHIVE_MAX_GB
+        )
+    except BaseException:
+        # An await point before the main try/finally: close what is open.
+        if rfdb_reader is not None:
+            await rfdb_reader.close()
+        if read_db is not None:
+            await read_db.close()
+        await db.close()
+        raise
 
     from rfobserver.storage.governor import StorageGovernor
 
@@ -333,6 +346,7 @@ async def run(settings: AppSettings) -> None:
                 stop,
                 storage_governor=storage_governor,
                 rfdb_writer=rfdb_writer,
+                local_storage=local_storage,
             )
         )
         workers.append(web_task)
@@ -454,15 +468,11 @@ async def _heartbeat_loop(
     automations that aren't on a websocket. Reads the supervisor's current
     processor each tick so the state reflects Standby (no processor) live.
     """
-    from pathlib import Path
-
     from rfobserver.web.routes.api import (
         build_status_bar_html,
         build_zms_status_payload,
     )
     from rfobserver.web.routes.modules import build_modules_payload
-
-    storage_path = Path(getattr(local_storage, "storage_path", "."))
 
     while True:
         try:
@@ -480,11 +490,10 @@ async def _heartbeat_loop(
             except Exception:
                 detection_count = 0
 
+            # From the capture index: a directory walk here ran on the event
+            # loop every second and starved the receiver on a large archive.
             try:
-                # rglob: captures live under auto/ and manual/ subdirs now.
-                capture_count = (
-                    sum(1 for _ in storage_path.rglob("*.sc16")) if storage_path.exists() else 0
-                )
+                capture_count = int(local_storage.capture_count())  # type: ignore[attr-defined]
             except Exception:
                 capture_count = 0
 
@@ -835,6 +844,7 @@ async def _run_web_server(
     stop: asyncio.Event,
     storage_governor: Any = None,
     rfdb_writer: Any = None,
+    local_storage: Any = None,
 ) -> None:
     """Run the FastAPI web server as an async task."""
     import uvicorn
@@ -848,6 +858,7 @@ async def _run_web_server(
     app.state.write_database = write_database
     app.state.storage_governor = storage_governor
     app.state.rfdb_writer = rfdb_writer
+    app.state.local_storage = local_storage
     app.state.broadcast = broadcast
     app.state.processor = supervisor.processor
 

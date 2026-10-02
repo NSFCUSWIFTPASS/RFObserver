@@ -774,6 +774,12 @@ body {
     border-left: 3px solid var(--accent);
 }
 
+.capture-load-more {
+    display: block;
+    width: calc(100% - 28px);
+    margin: 10px 14px;
+}
+
 .capture-name {
     font-size: 12px;
     font-weight: 600;

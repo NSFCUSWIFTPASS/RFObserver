@@ -16,6 +16,7 @@ def test_get_usage(tmp_path):
     storage = LocalStorage(str(tmp_path), max_gb=1.0)
     assert storage.get_usage_bytes() == 0
     (storage.auto_dir / "test.sc16").write_bytes(b"\x00" * 500)
+    storage.track(storage.auto_dir / "test.sc16")  # as the recording finalize does
     assert storage.get_usage_bytes() == 500
 
 
@@ -53,6 +54,8 @@ def _write_capture(storage, base, sc16_bytes, sub="auto"):
     (d / f"{base}.psd.json").write_text("{}")
     (d / f"{base}.json").write_text("{}")
     (d / f"{base}.detections.json").write_text("[]")
+    # Registered as the recording finalize registers a new capture.
+    storage.track(d / f"{base}.sc16")
 
 
 def test_creates_auto_and_manual_subdirs(tmp_path):

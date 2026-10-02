@@ -582,10 +582,13 @@ async def set_storage_path(request: Request) -> dict[str, Any]:
 
     # Update LocalStorage instance on the processor if available
     proc = _get_processor(request)
-    if proc is not None:
+    storage = getattr(request.app.state, "local_storage", None)
+    if storage is None and proc is not None:
         storage = getattr(proc, "_storage", None)
-        if storage is not None:
-            storage.storage_path = target
+    if storage is not None:
+        # Re-points auto/ and manual/ too, and indexes the new location (one
+        # scan, off the event loop).
+        await asyncio.to_thread(storage.set_storage_path, target)
 
     # Persist to .env
     from rfobserver.web.routes.config import _persist_settings

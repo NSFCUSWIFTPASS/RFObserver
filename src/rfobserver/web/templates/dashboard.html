@@ -1049,8 +1049,37 @@
         connectWS();
     }
 
+    // Page freezes: this 1 s timer arriving FREEZE_MS late means the page ran
+    // no code meanwhile (a long task, or the browser pausing the tab), so the
+    // socket's silence is ours, not the server's. Report it with the longest
+    // task the browser recorded, and give the socket a fresh grace period to
+    // deliver what queued up instead of reconnecting.
+    const FREEZE_MS = 2000;
+    let lastTick = performance.now();
+    let longTaskMs = 0;
+    try {
+        new PerformanceObserver(function(list) {
+            for (const e of list.getEntries()) longTaskMs = Math.max(longTaskMs, e.duration);
+        }).observe({entryTypes: ["longtask"]});
+    } catch (_) { /* no longtask support: reports carry 0 */ }
+
     setInterval(function() {
         const now = performance.now();
+        const late = now - lastTick - 1000;
+        lastTick = now;
+        if (late > FREEZE_MS) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: "freeze",
+                    late_ms: Math.round(late),
+                    hidden: document.visibilityState !== "visible",
+                    longest_task_ms: Math.round(longTaskMs),
+                }));
+            }
+            longTaskMs = 0;
+            wsLastMessage = now;
+            return;
+        }
         if (ws && wsLastMessage && now - wsLastMessage > WS_SILENT_MS) {
             abandonAndReconnect();
             return;

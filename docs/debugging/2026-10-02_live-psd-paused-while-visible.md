@@ -92,3 +92,46 @@ server: wants_psd=False (hidden=True in_view=True why=visibility)
 - Why the 05:31:56 socket was opened (the watchdog or a close), and the 117 ms GIL stall
   at the same instant. The next occurrence's `Live client ... connected: reason=` and
   `closed after` lines answer the first.
+
+## 9. Freeze at 06:46 to 06:48 with the new logging (2026-10-02)
+
+Journal (pid 580085, 9897c77), the Live lines:
+
+```
+06:47:00 Live client :50563 closed after 60 s: sent=60 dropped=0     (heartbeats only)
+06:47:01 Live client :50614 connected: reason=watchdog silent_ms=16777
+06:47:01   set wants_psd=True (hidden=False in_view=True why=open)
+06:47:02   set wants_psd=False (hidden=True ...)  closed after 2 s        (the user reloads)
+06:47:02 GET /live/
+06:47:03 Live client :50625 connected: reason=load
+06:48:00 Live client :50668 connected: reason=watchdog silent_ms=5998
+06:48:00   set wants_psd=False (hidden=True in_view=True why=open)
+06:48:01 Client :50625 set wants_psd=True (why=no-psd); closed after 58 s: sent=1530 dropped=0
+```
+
+What it shows:
+- **The server never stopped.** :50625 was fed 1530 frames in 58 s (26/s) with nothing
+  dropped, and its replacement was opened while it still worked.
+- **The page stopped running.** The watchdog checks every 1 s and fires after 5 s of
+  silence, so `silent_ms=16777` means its own timer also did not run for about 11 s.
+  Neither messages nor timers were processed: a long task in the page, or the browser
+  pausing the tab. The tab was visible at the reconnect (hidden=False).
+- **The queued work replayed out of order.** At 06:48:01 the old socket's `no-psd` resend
+  arrived after the new socket's hello. Both timer ticks ran back to back once the page
+  resumed.
+
+**Rejected (do not retry):** unbounded client state. The burst and label maps are pruned
+against the oldest waterfall row on the same epoch-ms clock (isolation.py and
+streaming.py both use `timestamp() * 1000`). Attributions are a deque of 50, and
+`_active_bursts` is replaced on each detection pass.
+
+**Changes:**
+- The page's 1 s timer measures its own lateness. Over 2 s late, it sends
+  `freeze {late_ms, hidden, longest_task_ms}`, which the server logs as a warning, and
+  resets the watchdog instead of reconnecting.
+- Verified on the mock: a forced 7 s busy loop gave
+  `page frozen 6260 ms (hidden=False, longest task 7000 ms)` with no reconnect.
+
+**Open:** what freezes the page on the reporting browser. The next freeze report answers
+whether it is the page's own code (`longest task` about equal to the freeze) or the
+browser pausing the tab (a large freeze with no long task).

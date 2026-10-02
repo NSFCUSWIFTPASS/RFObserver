@@ -192,6 +192,7 @@ async def test_connection_logs_reason_view_and_close_counts(caplog):
     gate = asyncio.Event()
     msgs = [
         '{"type": "hello", "reason": "watchdog", "silent_ms": 5123}',
+        '{"type": "freeze", "late_ms": 16000, "hidden": false, "longest_task_ms": 15800}',
         '{"type": "set_view", "psd_visible": false, "hidden": true, "in_view": true,'
         ' "why": "visibility"}',
     ]
@@ -225,5 +226,6 @@ async def test_connection_logs_reason_view_and_close_counts(caplog):
     await asyncio.wait_for(task, timeout=1)
     assert "Live client 10.0.0.9:4242 connected: reason=watchdog silent_ms=5123" in caplog.text
     assert "set wants_psd=False (hidden=True in_view=True why=visibility)" in caplog.text
+    assert "page frozen 16000 ms (hidden=False, longest task 15800 ms)" in caplog.text
     assert "5 frames dropped since the last warning" in caplog.text
     assert "Live client 10.0.0.9:4242 closed after 0 s: sent=10 dropped=5" in caplog.text

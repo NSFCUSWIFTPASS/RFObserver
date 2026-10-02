@@ -188,6 +188,16 @@ async def websocket_endpoint(websocket: WebSocket, broadcast: LiveBroadcast) -> 
                     msg.get("reason"),
                     msg.get("silent_ms"),
                 )
+            elif msg.get("type") == "freeze":
+                # The page ran no code for late_ms (its own timer measured it):
+                # a long task in the page, or the browser pausing the tab.
+                logger.warning(
+                    "Live client %s: page frozen %s ms (hidden=%s, longest task %s ms)",
+                    peer,
+                    msg.get("late_ms"),
+                    msg.get("hidden"),
+                    msg.get("longest_task_ms"),
+                )
             elif msg.get("type") == "set_mode":
                 sub.high_res = bool(msg.get("high_res", False))
                 logger.info("Client %s set high_res=%s", peer, sub.high_res)

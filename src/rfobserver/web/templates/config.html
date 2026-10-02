@@ -423,12 +423,11 @@
 </div>
 </form>
 
-<!-- Map picker modal. Lazy-loads Leaflet from CDN on first open so the
-     rest of the page doesn't carry the asset cost when the user never
-     touches the map. Geocoding uses OpenStreetMap Nominatim; no API
-     key, light-touch rate limit (1 req/s, enforced by debounce). -->
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<!-- Map picker modal. Lazy-loads Leaflet (script and stylesheet) from CDN
+     on first open so the rest of the page doesn't carry the asset cost, or
+     wait on the CDN, when the user never touches the map. Geocoding uses
+     OpenStreetMap Nominatim; no API key, light-touch rate limit (1 req/s,
+     enforced by debounce). -->
 <div id="map-modal" class="map-modal" style="display: none;">
     <div class="map-modal-overlay"></div>
     <div class="map-modal-panel">
@@ -653,7 +652,7 @@
     // Open a websocket purely to receive heartbeat state. Reconnect on close.
     let statusWs = null;
     function connectStatusWs() {
-        statusWs = new WebSocket("ws://" + location.host + "/ws/live");
+        statusWs = new WebSocket("ws://" + location.host + "/ws/live?psd=0");
         statusWs.onmessage = function(evt) {
             try {
                 const data = JSON.parse(evt.data);
@@ -759,12 +758,25 @@
         if (window.L) return Promise.resolve(window.L);
         if (leafletPromise) return leafletPromise;
         leafletPromise = new Promise((resolve, reject) => {
+            const css = document.createElement('link');
+            css.rel = 'stylesheet';
+            css.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+            css.integrity = 'sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=';
+            css.crossOrigin = '';
+            document.head.appendChild(css);
             const s = document.createElement('script');
             s.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
             s.integrity = 'sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=';
             s.crossOrigin = '';
             s.onload = () => resolve(window.L);
-            s.onerror = () => reject(new Error('Failed to load Leaflet'));
+            s.onerror = () => {
+                // Offline sensors have no CDN: forget the failure so a later
+                // open retries once a connection is back.
+                leafletPromise = null;
+                s.remove();
+                css.remove();
+                reject(new Error('Failed to load Leaflet (no internet connection?)'));
+            };
             document.head.appendChild(s);
         });
         return leafletPromise;

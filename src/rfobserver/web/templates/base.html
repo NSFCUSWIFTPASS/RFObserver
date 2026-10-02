@@ -5,7 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}RFObserver{% endblock %}</title>
     <link rel="stylesheet" href="/static/style.css">
-    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <!-- Served locally: sensors can be reached with no internet connection.
+         htmx 2.0.4, byte-identical to the npm package's dist/htmx.min.js. -->
+    <script src="/static/vendor/htmx-2.0.4.min.js" defer></script>
     <script src="/static/theme.js" defer></script>
 </head>
 <body>
@@ -14,8 +16,8 @@
         <div class="nav-links">
             <a href="/" class="nav-link">Dashboard</a>
             <a href="/live/" class="nav-link">Live</a>
-            <a href="/captures" class="nav-link">Captures</a>
-            <a href="/config" class="nav-link">Config</a>
+            <a href="/captures/" class="nav-link">Captures</a>
+            <a href="/config/" class="nav-link">Config</a>
             <a href="/detections" class="nav-link">Detections</a>
         </div>
         {% set theme = ui_theme or 'auto' %}

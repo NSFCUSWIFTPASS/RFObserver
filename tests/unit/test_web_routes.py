@@ -1285,3 +1285,29 @@ def test_ui_prefs_put_merges_into_the_writers_current_document(settings):
 def test_ui_prefs_put_503_without_a_database(settings):
     r = TestClient(create_app(settings)).put("/api/ui-prefs", json={"theme": "dark"})
     assert r.status_code == 503
+
+
+def test_nav_links_are_served_without_a_redirect(client):
+    # A redirect costs a full round trip per click, which is most of a page
+    # change over a VPN to a field sensor.
+    import re
+
+    html = client.get("/").text
+    nav = re.findall(r'<a href="(/[^"]*)" class="nav-link">', html)
+    assert len(nav) == 5
+    for href in nav:
+        r = client.get(href, follow_redirects=False)
+        assert r.status_code == 200, f"{href} answered {r.status_code}"
+
+
+def test_pages_load_no_external_scripts_or_styles(client):
+    # Sensors can be served with no internet connection; a page that pulls a
+    # script or stylesheet from a CDN breaks (or stalls) there.
+    import re
+
+    for path in ("/", "/live/", "/captures/", "/config/", "/detections"):
+        html = client.get(path).text
+        external = re.findall(r'<(?:script|link)[^>]+(?:src|href)="(https?://[^"]+)"', html)
+        assert external == [], f"{path} loads {external}"
+    r = client.get("/static/vendor/htmx-2.0.4.min.js")
+    assert r.status_code == 200 and r.text.startswith("var htmx=")

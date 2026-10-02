@@ -17,6 +17,11 @@ Group=rfobserver
 StateDirectory=rfobserver
 WorkingDirectory=/var/lib/rfobserver
 ExecStart=/usr/local/bin/rfobserver run
+# The web UI serves on port 80 (RFOBS_WEB_PORT in the .env): this one
+# capability lets the unprivileged service user bind ports below 1024, and
+# nothing else.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 # Memory backstop: if a bug blows past this, OOM-kill just this service (then
 # Restart=on-failure brings it back) instead of freezing the whole board. Tune

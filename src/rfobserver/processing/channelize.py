@@ -25,7 +25,9 @@ from scipy import fft as sfft
 # spec's fixed two-tier policy.
 TIER_BANDWIDTH_HZ: float = 200_000.0
 
-_SSN_FLEX = "n=ssnmesh,m=FSK_PCM,s=16,l=16,r=8000"
+# rtl_433 reports the flex decoder's n= as the model. "-like": a flex match
+# with no CRC resembles SSN mesh framing; only -R 383 confirms the protocol.
+_SSN_FLEX = "n=ssnmesh-like,m=FSK_PCM,s=16,l=16,r=8000"
 
 # Fraction of the kept band, on each side, over which the taper rolls off.
 TAPER_FRACTION = 0.05

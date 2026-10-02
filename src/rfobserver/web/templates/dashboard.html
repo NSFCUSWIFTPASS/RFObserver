@@ -1031,6 +1031,9 @@
         wsLastMessage = performance.now();
 
         ws.onopen = function() {
+            // Clear "reconnecting" now; the rate shows again with the next frame.
+            const el = document.getElementById("ups-counter");
+            if (el && el.textContent === "reconnecting") el.textContent = "-- ups";
             if (highRes) {
                 ws.send(JSON.stringify({type: "set_mode", high_res: true}));
             }

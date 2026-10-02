@@ -174,3 +174,45 @@ aggregated: heldRows 601, fullRows 601, grid identical, maxPsdDiff 0 on all equa
 - The connect time at HCRO (200 to 300 ms against a 115 ms ping) was measured while
   someone's browser tabs on the old code may have been loading the link. It should be
   re-measured after deploying.
+
+## 9. Live High Res still hangs occasionally (2026-10-01, after the watchdog)
+
+Reported: "it still hangs occasionally", with a screenshot showing the Live header stuck on
+"reconnecting", and the sensor journal:
+
+```
+23:36:37,564 rfobserver.web.websocket ERROR WebSocket handler error
+  ... send_loop -> websocket.send_json ...
+RuntimeError: Unexpected ASGI message 'websocket.send', after sending 'websocket.close'.
+```
+
+That traceback is a consequence, not a cause: the browser closed the socket (the watchdog
+abandoning a silent one), uvicorn answered the close, and the next queued send raced it.
+It is now treated as an ordinary disconnect (7904cd3).
+
+Probes, both from the workstation over the same VPN, read-only:
+
+1. Two raw WebSocket clients for 8 min (`/ws/live?psd=0`, and `/ws/live` in high res).
+   This isolates the sensor's sending from any browser.
+   ```
+   hires 60s: msgs=1585 1009 kB/s worst_gap=0.10-0.44s  (8 consecutive minutes)
+   hb    60s: msgs=60   2 kB/s    worst_gap=1.03-1.07s
+   ```
+   No silence, while the sensor was recording every few seconds.
+2. The deployed Live page in headless Chrome for 256 s, with JSON.parse wrapped to time
+   every message, WebSocket construction counted, and a longtask observer. This adds the
+   page's own work.
+   ```
+   msgs 6749 (26.4/s), worst gap 200 ms, new sockets 0, long tasks 0
+   ```
+
+**Rejected (do not retry):** the sensor stops sending at recording start or rotation (no gap
+above 0.44 s across many recordings); the Live page's per-frame work blocks the main thread
+(no long tasks).
+
+**Open, not answered:** the stall did not reproduce from the workstation. The remaining
+suspect is the reporting browser's own path to the sensor (its VPN client) or that
+browser's state. The header now drops "reconnecting" as soon as a reconnect opens, so the
+next screenshot shows whether reconnects succeed. Next time it happens, note the time and
+check the sensor journal for `Client set high_res=True` lines: one appears per reconnect
+that reached the server.

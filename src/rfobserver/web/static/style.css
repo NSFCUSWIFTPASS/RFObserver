@@ -1501,14 +1501,24 @@ body {
 
 .avg-time {
     display: flex;
+    flex-wrap: wrap; /* narrow windows wrap the group instead of clipping it */
+    justify-content: flex-end;
     align-items: center;
     gap: 6px;
     margin-left: auto;
+    min-width: 0;
+}
+
+/* An arrow set and its button wrap as one unit. */
+.avg-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
 }
 
 /* Separates the peaks group from the time-range group. */
-#avg-back {
-    margin-left: 18px;
+.avg-group + .avg-group {
+    margin-left: 12px;
 }
 
 .avg-picker-btn {

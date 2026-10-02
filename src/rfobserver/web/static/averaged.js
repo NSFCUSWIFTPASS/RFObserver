@@ -44,8 +44,10 @@
  *
  * Manual display scale: each chart header carries its own Scale low/high
  * inputs (waterfall, PSD: dBFS; power: dB; kurtosis: unitless); empty
- * bounds auto-scale from the data. The scale is persisted server-side in
- * the DB config table (/api/ui-prefs), so it applies to every browser.
+ * bounds auto-scale from the data. Focusing an empty input fills in the
+ * bound currently in use, so the arrow keys step from it; the charts redraw
+ * on every edit. The scale is persisted server-side in the DB config table
+ * (/api/ui-prefs), so it applies to every browser.
  */
 (function () {
     "use strict";
@@ -111,6 +113,7 @@
         inc: null,       // {key, fullAtMs} of the last full load, for tail polls
         stale: true, // displayed data lags the selected range (spinner on)
         pollTimer: null,
+        scaleSaveTimer: null,  // debounced save of edited scale bounds
         pickerOpen: false,
         followLatest: true, // selection tracks the newest row across refreshes
         activePreset: DEFAULT_PRESET,
@@ -131,8 +134,10 @@
         detections: [],
         iqCaptures: [],  // IQ capture spans overlapping the range (availability highlights)
         iqBands: [],     // pixel rects of the drawn highlights, for click/hover hit-testing
+        showIq: true,    // the IQ highlights switch on the power chart (remembered per browser)
         selRow: 0,
         crosshairBin: -1,
+        autoScale: {},   // the auto bound each chart last drew with, per scale key
         scale: {
             wf_lo: null, wf_hi: null,
             psd_lo: null, psd_hi: null,
@@ -695,34 +700,67 @@
         }
     }
 
-    // A scale input changed (Enter/blur): validate the whole set and save.
-    // Empty means auto for that bound.
-    function applyScaleInputs() {
+    // Read and validate the whole set of scale inputs. Empty means auto for
+    // that bound. Returns {scale} or {bad: keys, msg}.
+    function readScaleInputs() {
         const scale = {};
         for (const key in SCALE_FIELDS) {
             const raw = $(SCALE_FIELDS[key]).value.trim();
             if (raw === "") { scale[key] = null; continue; }
             const v = Number(raw);
-            if (!isFinite(v)) {
-                markScaleInvalid([key], "Bounds must be numbers (or empty for auto).");
-                return;
-            }
+            if (!isFinite(v)) return { bad: [key], msg: "Bounds must be numbers (or empty for auto)." };
             scale[key] = v;
         }
         for (const pair of SCALE_PAIRS) {
             const lo = scale[pair[0]], hi = scale[pair[1]];
-            if (lo != null && hi != null && lo >= hi) {
-                markScaleInvalid(pair, "Low must be less than high.");
-                return;
-            }
+            if (lo != null && hi != null && lo >= hi) return { bad: pair, msg: "Low must be less than high." };
         }
-        saveScale(scale);
+        return { scale: scale };
+    }
+
+    // A scale input changed (Enter/blur): validate and save now.
+    function applyScaleInputs() {
+        clearTimeout(state.scaleSaveTimer);
+        const r = readScaleInputs();
+        if (r.bad) { markScaleInvalid(r.bad, r.msg); return; }
+        saveScale(r.scale);
+    }
+
+    // Each edit (typing, arrow keys, spinner): redraw with the new bounds at
+    // once and save shortly after the edits stop. A half-typed value ("-")
+    // just waits; it is flagged only when the edit is committed.
+    const SCALE_SAVE_DELAY_MS = 600;
+
+    function previewScaleInputs() {
+        const r = readScaleInputs();
+        if (r.bad) return;
+        state.scale = r.scale;
+        markScaleInvalid([], "");
+        if (state.wf) renderAll();
+        clearTimeout(state.scaleSaveTimer);
+        state.scaleSaveTimer = setTimeout(function () { saveScale(r.scale); }, SCALE_SAVE_DELAY_MS);
+    }
+
+    // Fill an empty bound with the value the chart is drawing with, rounded
+    // outward (1 dB, or 0.1 for kurtosis), so the arrow keys step from it.
+    // Left untouched, it reverts to empty (auto) on blur.
+    function fillScaleFromAuto(el, key) {
+        if (el.value.trim() !== "") return;
+        const a = state.autoScale[key];
+        if (a == null || !isFinite(a)) return;
+        const step = key.indexOf("kurt") === 0 ? 0.1 : 1;
+        const lo = key.slice(-3) === "_lo";
+        const v = (lo ? Math.floor(a / step) : Math.ceil(a / step)) * step;
+        el.value = String(Number(v.toFixed(step < 1 ? 1 : 0)));
+        el.dataset.autofilled = "1";
     }
 
     // Effective waterfall color range: manual bounds override the
     // data-driven meta range, per side.
     function wfRange() {
         const m = state.wf.meta;
+        state.autoScale.wf_lo = m.min_db;
+        state.autoScale.wf_hi = m.max_db;
         return {
             min: state.scale.wf_lo != null ? state.scale.wf_lo : m.min_db,
             max: state.scale.wf_hi != null ? state.scale.wf_hi : m.max_db,
@@ -733,6 +771,8 @@
     // with its own independent manual bounds.
     function psdRange() {
         const m = state.wf.meta;
+        state.autoScale.psd_lo = m.min_db;
+        state.autoScale.psd_hi = m.max_db;
         return {
             min: state.scale.psd_lo != null ? state.scale.psd_lo : m.min_db,
             max: state.scale.psd_hi != null ? state.scale.psd_hi : m.max_db,
@@ -742,6 +782,8 @@
     // Manual bound override for the line charts: an unset side keeps the
     // auto (data + padding) bound.
     function chartRange(lo, hi, pad, loKey, hiKey) {
+        state.autoScale[loKey] = lo - pad;
+        state.autoScale[hiKey] = hi + pad;
         let outLo = state.scale[loKey] != null ? state.scale[loKey] : lo - pad;
         let outHi = state.scale[hiKey] != null ? state.scale[hiKey] : hi + pad;
         if (outHi <= outLo) outHi = outLo + 1; // never invert, even vs. data
@@ -1248,6 +1290,7 @@
 
     function drawIqBands(ctx, W, H) {
         state.iqBands = [];
+        if (!state.showIq) return;
         const spanMs = state.untilMs - state.sinceMs;
         if (spanMs <= 0 || !state.iqCaptures || !state.iqCaptures.length) return;
         for (const cap of state.iqCaptures) {
@@ -1567,6 +1610,28 @@
         renderBucketStats();
     }
 
+    // The IQ switch on the power chart. Off hides the bands, which also makes
+    // them unclickable (no rects to hit-test).
+    const IQ_PREF_KEY = "rfobs.dashboard.showIq";
+
+    function setupIqToggle() {
+        const box = $("avg-iq-toggle");
+        if (!box) return;
+        try {
+            if (localStorage.getItem(IQ_PREF_KEY) === "0") state.showIq = false;
+        } catch (_) { /* storage unavailable: default on */ }
+        box.checked = state.showIq;
+        $("avg-iq-legend").style.display = state.showIq ? "" : "none";
+        box.addEventListener("change", function () {
+            state.showIq = box.checked;
+            try { localStorage.setItem(IQ_PREF_KEY, box.checked ? "1" : "0"); } catch (_) { /* not saved */ }
+            $("avg-iq-legend").style.display = state.showIq ? "" : "none";
+            const tip = $("avg-iq-tooltip");
+            if (tip) tip.style.display = "none";
+            renderStatsChart();
+        });
+    }
+
     function setupSlider() {
         const slider = $("avg-slider");
         slider.addEventListener("input", function () { selectRow(parseInt(slider.value, 10)); });
@@ -1705,7 +1770,16 @@
             stepPeak(1);
         });
         for (const key in SCALE_FIELDS) {
-            $(SCALE_FIELDS[key]).addEventListener("change", applyScaleInputs);
+            const el = $(SCALE_FIELDS[key]);
+            el.addEventListener("focus", function () { fillScaleFromAuto(el, key); });
+            el.addEventListener("input", function () {
+                delete el.dataset.autofilled;
+                previewScaleInputs();
+            });
+            el.addEventListener("change", applyScaleInputs);
+            el.addEventListener("blur", function () {
+                if (el.dataset.autofilled) { delete el.dataset.autofilled; el.value = ""; }
+            });
         }
         document.addEventListener("click", function () {
             if (state.pickerOpen) closePicker();
@@ -1749,6 +1823,7 @@
     async function boot() {
         setupControls();
         setupSlider();
+        setupIqToggle();
         fitCanvases();
         let resizeTimer = null;
         window.addEventListener("resize", function () {

@@ -544,14 +544,19 @@ async def capture_redetect(request: Request, filename: str) -> dict[str, Any]:
     return payload
 
 
+# Rows per binary frame on the PSD WebSocket.
+WS_FRAME_ROWS = 16
+
+
 @router.websocket("/ws/psd/{filename}")
 async def capture_psd_ws(websocket: WebSocket, filename: str) -> None:
     """Stream PSD windows as binary frames, pushing scroll-ahead neighbours.
 
     Client sends JSON range requests ``{start, count, max_bins, have?}``; the
-    server replies with a binary frame for the requested window, then proactively
-    for the next window, the window two ahead, and the previous window (bounded
-    to the grid, skipping any starts the client lists in ``have``). Reached at
+    server replies with the requested window, as binary frames of at most
+    ``WS_FRAME_ROWS`` rows in row order, then proactively for the next window,
+    the window two ahead, and the previous window (bounded to the grid,
+    skipping any starts the client lists in ``have``). Reached at
     ``/captures/ws/psd/{filename}``.
     """
     storage = Path(websocket.app.state.settings.STORAGE_PATH)
@@ -598,9 +603,10 @@ async def capture_psd_ws(websocket: WebSocket, filename: str) -> None:
         if skip_have and s in have:
             return
         sliced, _fa, _nb = _slice_psd(grid, info["freq_axis"], info["num_bins"], s, count, max_bins)
-        if sliced.shape[0] == 0:
-            return
-        await websocket.send_bytes(_psd_frame_bytes(s, sliced))
+        # Small frames, so the viewer can paint rows as they arrive instead of
+        # waiting for a whole window (about 1 MB at 500 x 512) over a slow link.
+        for off in range(0, sliced.shape[0], WS_FRAME_ROWS):
+            await websocket.send_bytes(_psd_frame_bytes(s + off, sliced[off : off + WS_FRAME_ROWS]))
 
     try:
         while True:

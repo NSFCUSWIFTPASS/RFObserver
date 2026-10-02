@@ -188,7 +188,7 @@ async function main() {
   console.log("opening", BASE + "/");
   await page.goto(BASE + "/", { waitUntil: "networkidle2", timeout: 30000 });
   assert(await page.$("#avg-wf"), "landing page / is the averaged Dashboard");
-  assert((await page.title()) === "Dashboard - RFObserver", "Dashboard page title");
+  assert((await page.title()) === "Dashboard - RFObs", "Dashboard page title");
 
   // Navbar: Dashboard first (href /), Live second (href /live/), then the
   // rest; the theme picker sits at the right end, defaulting to Auto.
@@ -216,7 +216,7 @@ async function main() {
   // The live spectrogram page moved to /live/.
   await page.goto(BASE + "/live/", { waitUntil: "networkidle2", timeout: 30000 });
   assert(await page.$("#timeseries-canvas"), "Live page renders at /live/");
-  assert((await page.title()) === "Live - RFObserver", "Live page title");
+  assert((await page.title()) === "Live - RFObs", "Live page title");
 
   // The remaining checks run against the Dashboard via the legacy URL.
   console.log("opening", BASE + "/averaged/");

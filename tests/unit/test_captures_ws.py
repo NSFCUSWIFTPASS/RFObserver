@@ -129,3 +129,21 @@ def test_ws_missing_capture_closes(client):
         client.websocket_connect("/captures/ws/psd/nope.sc16") as ws,
     ):
         ws.receive_json()
+
+
+def test_ws_splits_a_window_into_row_ordered_frames(client, seeded_filename, monkeypatch):
+    """A window arrives as frames of at most WS_FRAME_ROWS rows, in row order,
+    so the viewer can paint rows as they land."""
+    monkeypatch.setattr("rfobserver.web.routes.captures.WS_FRAME_ROWS", 2)
+    with client.websocket_connect(f"/captures/ws/psd/{seeded_filename}") as ws:
+        ws.receive_json()  # meta
+        # Rows 0-4 as frames of 2, 2 and 1, then the next window (row 5 only).
+        ws.send_json({"start": 0, "count": 5, "max_bins": 512})
+        got = []
+        for _ in range(4):
+            raw = ws.receive_bytes()
+            s, count, nb = struct.unpack("<iii", raw[:12])
+            got.append((s, np.frombuffer(raw[12:], dtype="<f4").reshape(count, nb)))
+    assert [(s, r.shape[0]) for s, r in got] == [(0, 2), (2, 2), (4, 1), (5, 1)]
+    full = np.arange(6 * 8, dtype=np.float32).reshape(6, 8)
+    assert np.array_equal(np.concatenate([r for _s, r in got]), full)

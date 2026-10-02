@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Captures - RFObserver{% endblock %}
+{% block title %}Captures - RFObs{% endblock %}
 {% block content %}
 <script src="/static/shared-charts.js"></script>
 <div class="page-header">
@@ -206,8 +206,10 @@
 
     const VIEW_ROWS = 400;     // waterfall viewport height in rows (1px/row)
     const PAGE = 500;          // rows fetched per request
+    const FIRST_ROWS = 16;     // rows in the first HTTP fetch, painted before the rest stream in
     const MAX_PAGES = 48;      // LRU cap (~24k rows cached)
-    let pageCache = new Map(); // pageIdx -> rows[][] (Map order = LRU)
+    let pageCache = new Map(); // pageIdx -> rows[][] (Map order = LRU); may be partly filled
+    let pageFill = new Map();  // pageIdx -> rows present, so a partial page counts as missing
     let pageLoading = new Set();
     let psdWs = null;          // binary PSD stream for the open capture (null = HTTP only)
 
@@ -336,10 +338,10 @@
         }
     }
 
-    async function fetchPageRaw(start) {
+    async function fetchPageRaw(start, count) {
         try {
             const r = await fetch("/captures/psd/" + encodeURIComponent(viewerFilename)
-                + "?start=" + start + "&count=" + PAGE + "&max_bins=512");
+                + "?start=" + start + "&count=" + (count || PAGE) + "&max_bins=512");
             if (!r.ok) return null;
             return await r.json();
         } catch (_) {
@@ -347,21 +349,58 @@
         }
     }
 
+    // Rows in page p, and whether all of them are cached.
+    function pageLen(p) { return Math.max(0, Math.min(PAGE, viewerTotalRows - p * PAGE)); }
+    function pageComplete(p) { return pageCache.has(p) && (pageFill.get(p) || 0) >= pageLen(p); }
+
+    // Store rows (already calibration-shifted) starting at absolute row `start`,
+    // into however many pages they span. Rows already present are kept.
+    function storeRows(start, rows) {
+        for (let i = 0; i < rows.length; i++) {
+            const abs = start + i;
+            const p = Math.floor(abs / PAGE);
+            let page = pageCache.get(p);
+            if (!page) { page = new Array(pageLen(p)); pageCache.set(p, page); pageFill.set(p, 0); }
+            const k = abs - p * PAGE;
+            if (!page[k]) { page[k] = rows[i]; pageFill.set(p, pageFill.get(p) + 1); }
+        }
+    }
+
+    function dropPage(p) { pageCache.delete(p); pageFill.delete(p); }
+
     async function loadPsdViewer(filename, durationSec) {
         viewerFilename = filename;
         closePsdWs();
         pageCache = new Map();
+        pageFill = new Map();
         pageLoading = new Set();
         viewerCrosshairBin = -1;
         viewerDetections = [];
         viewerDetPending = false;
         selectedDetection = null;
 
+        // Open the binary PSD stream now, so its handshake overlaps the first
+        // fetch below. Frames only arrive once a window is requested, which
+        // happens after the viewer is built.
+        let ws = null;
         try {
-            // The first page doubles as the metadata probe (total rows, time
-            // resolution, freq axis, global colour range).
-            const first = await fetchPageRaw(0);
-            if (!first) { viewerEl.innerHTML = '<div class="placeholder-text">PSD data unavailable</div>'; return; }
+            ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://")
+                + location.host + "/captures/ws/psd/" + encodeURIComponent(filename));
+            ws.binaryType = "arraybuffer";
+            psdWs = ws;
+        } catch (_) { ws = null; }
+
+        try {
+            // The first few rows double as the metadata probe (total rows, time
+            // resolution, freq axis, global colour range) and paint at once;
+            // the rest of the page streams in over the socket.
+            const first = await fetchPageRaw(0, FIRST_ROWS);
+            if (viewerFilename !== filename) return;  // another capture was opened meanwhile
+            if (!first) {
+                closePsdWs();
+                viewerEl.innerHTML = '<div class="placeholder-text">PSD data unavailable</div>';
+                return;
+            }
 
             viewerFreqs = first.freq_axis;
             viewerCenterFreq = first.center_freq_hz || 0;
@@ -392,7 +431,7 @@
             viewerMin = (first.grid_min + viewerOffset) - 3;
             viewerMax = (first.grid_max + viewerOffset) + 3;
             shiftRows(first.grid);
-            pageCache.set(0, first.grid);
+            storeRows(0, first.grid);
 
             const totalRows = viewerTotalRows;
             const viewH = Math.max(1, Math.min(VIEW_ROWS, totalRows));  // viewport rows (1px each)
@@ -509,7 +548,7 @@
                 while (pageCache.size > MAX_PAGES) {
                     let removed = false;
                     for (const key of pageCache.keys()) {
-                        if (!neededSet.has(key)) { pageCache.delete(key); removed = true; break; }
+                        if (!neededSet.has(key)) { dropPage(key); removed = true; break; }
                     }
                     if (!removed) break;
                 }
@@ -523,7 +562,7 @@
                 const toFetch = [];
                 for (let p = firstPage; p <= lastPage; p++) {
                     needed.add(p);
-                    if (!pageCache.has(p) && !pageLoading.has(p)) toFetch.push(p);
+                    if (!pageComplete(p) && !pageLoading.has(p)) toFetch.push(p);
                 }
                 currentNeeded = needed;
                 if (toFetch.length === 0) return false;
@@ -533,7 +572,8 @@
                 // also pushes the neighbouring pages; all frames arrive async and
                 // fill the cache, so the binary handler owns the repaint.
                 if (psdWs && psdWs.readyState === WebSocket.OPEN) {
-                    const have = Array.from(pageCache.keys()).map(function(idx) { return idx * PAGE; });
+                    const have = Array.from(pageCache.keys()).filter(pageComplete)
+                        .map(function(idx) { return idx * PAGE; });
                     for (const p of toFetch) {
                         pageLoading.add(p);
                         psdWs.send(JSON.stringify({start: p * PAGE, count: PAGE, max_bins: 512, have: have}));
@@ -546,7 +586,7 @@
                     pageLoading.add(p);
                     const resp = await fetchPageRaw(p * PAGE);
                     pageLoading.delete(p);
-                    if (resp) { shiftRows(resp.grid); pageCache.set(p, resp.grid); }
+                    if (resp) { shiftRows(resp.grid); storeRows(p * PAGE, resp.grid); }
                 }));
                 evict(needed);
                 return true;
@@ -559,12 +599,13 @@
             function prefetchPages(pages) {
                 const lastPage = pageIndexFor(totalRows - 1);
                 const toFetch = pages.filter(function(p) {
-                    return p >= 0 && p <= lastPage && !pageCache.has(p) && !pageLoading.has(p);
+                    return p >= 0 && p <= lastPage && !pageComplete(p) && !pageLoading.has(p);
                 });
                 if (toFetch.length === 0) return;
 
                 if (psdWs && psdWs.readyState === WebSocket.OPEN) {
-                    const have = Array.from(pageCache.keys()).map(function(idx) { return idx * PAGE; });
+                    const have = Array.from(pageCache.keys()).filter(pageComplete)
+                        .map(function(idx) { return idx * PAGE; });
                     for (const p of toFetch) {
                         pageLoading.add(p);
                         psdWs.send(JSON.stringify({start: p * PAGE, count: PAGE, max_bins: 512, have: have}));
@@ -579,7 +620,7 @@
                     pageLoading.delete(p);
                     if (resp) {
                         shiftRows(resp.grid);
-                        pageCache.set(p, resp.grid);
+                        storeRows(p * PAGE, resp.grid);
                         evict(currentNeeded);
                     }
                 });
@@ -828,33 +869,63 @@
                     rows[i] = r;
                 }
                 shiftRows(rows);
-                const pageIdx = Math.round(start / PAGE);
-                pageCache.set(pageIdx, rows);
-                pageLoading.delete(pageIdx);
+                storeRows(start, rows);
+                // A window streams in row order, so the frame that reaches the
+                // end of a page is its last: stop counting the page as in
+                // flight even if it is still partial (part of it was evicted),
+                // so it can be asked for again.
+                const pageIdx = pageIndexFor(start);
+                if (start + count >= pageIdx * PAGE + pageLen(pageIdx)) pageLoading.delete(pageIdx);
                 evict(currentNeeded);
                 const fp = pageIndexFor(firstVisibleRow);
                 const lp = pageIndexFor(Math.min(totalRows - 1, firstVisibleRow + viewH - 1));
-                if (pageIdx >= fp && pageIdx <= lp) {
-                    renderWaterfall();
-                    drawViewerPSD(parseInt(slider.value));
-                }
+                if (pageIdx >= fp && pageIdx <= lp) schedulePaint();
             }
 
-            // Open the binary PSD stream. Meta + the first page were bootstrapped
-            // over HTTP above; the socket serves subsequent page fetches with
-            // server push-ahead. If it never connects, ensureVisible falls back to
-            // HTTP transparently. The meta frame is ignored (already bootstrapped).
-            try {
-                psdWs = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://")
-                    + location.host + "/captures/ws/psd/" + encodeURIComponent(filename));
-                psdWs.binaryType = "arraybuffer";
-                psdWs.onmessage = function(ev) {
+            // Frames land up to dozens per second; repaint once per animation frame.
+            let paintPending = false;
+            function schedulePaint() {
+                if (paintPending) return;
+                paintPending = true;
+                requestAnimationFrame(function() {
+                    paintPending = false;
+                    if (viewerFilename !== filename) return;
+                    renderWaterfall();
+                    drawViewerPSD(parseInt(slider.value));
+                });
+            }
+
+            // Load what the viewport is missing: over the socket (rows paint as
+            // their frames arrive) or, once it has failed, over HTTP.
+            function fillViewport() {
+                ensureVisible(firstVisibleRow).then(function(fetched) {
+                    if (fetched && viewerFilename === filename) schedulePaint();
+                });
+            }
+
+            // The socket opened above (its meta frame is ignored, as the first
+            // fetch already carried the metadata) serves the rest of the page
+            // with server push-ahead. If it fails, ensureVisible falls back to HTTP.
+            if (ws) {
+                ws.onmessage = function(ev) {
                     if (typeof ev.data === "string") return;
                     handlePsdBinary(ev.data);
                 };
-                psdWs.onerror = function() { try { psdWs.close(); } catch (_) {} };
-                psdWs.onclose = function() { pageLoading.clear(); };
-            } catch (_) { psdWs = null; }
+                ws.onerror = function() { try { ws.close(); } catch (_) {} };
+                ws.onclose = function() {
+                    if (psdWs === ws) psdWs = null;
+                    pageLoading.clear();
+                    fillViewport();
+                };
+                if (ws.readyState === WebSocket.OPEN) {
+                    fillViewport();
+                } else if (ws.readyState === WebSocket.CONNECTING) {
+                    ws.onopen = fillViewport;
+                } else {
+                    psdWs = null;  // closed during the first fetch
+                }
+            }
+            if (!psdWs) fillViewport();
 
             // Initial paint
             rescopeSlider();
@@ -956,6 +1027,7 @@
             }
 
         } catch (_) {
+            if (psdWs === ws) closePsdWs();
             viewerEl.innerHTML = '<div class="placeholder-text">Failed to load PSD data</div>';
         }
     }

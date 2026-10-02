@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Live - RFObserver{% endblock %}
+{% block title %}Live - RFObs{% endblock %}
 {% block content %}
 <script src="/static/shared-charts.js"></script>
 <div id="storage-banner" class="storage-banner" role="status" style="display: none;">
@@ -17,10 +17,10 @@
             <span id="timing-info" class="card-header-label" style="opacity: 0.5;"></span>
             <span style="flex: 1;"></span>
             <label class="toggle-label" title="Per-chunk updates (off = duration-averaged)">
-                <input type="checkbox" id="highres-toggle">
+                <input type="checkbox" id="highres-toggle" checked>
                 <span class="toggle-text">High Res</span>
             </label>
-            <label class="toggle-label" title="Show detected bursts on waterfall" id="burst-toggle-label" style="display:none;">
+            <label class="toggle-label" title="Show detected bursts on waterfall" id="burst-toggle-label">
                 <input type="checkbox" id="burst-toggle" checked>
                 <span style="display:inline-block;width:15px;height:13px;border:1.5px solid #ff3b30;border-radius:2px;vertical-align:middle;"></span>
             </label>
@@ -135,8 +135,9 @@
     const WS_URL = "ws://" + location.host + "/ws/live";
     const TS_MAX_POINTS = 120;
 
-    // High-res mode state
-    let highRes = false;
+    // High-res mode state. On by default: per-chunk rows are what Live is for;
+    // the Dashboard covers averaged viewing.
+    let highRes = true;
     let showBursts = true;
     let ws = null;
     // Live-PSD visibility gating: only stream "psd" frames while the PSD

@@ -34,7 +34,7 @@ async def test_dashboard_renders(app_with_db):
         # The landing page / is the averaged-history Dashboard.
         r = await client.get("/")
         assert r.status_code == 200
-        assert "RFObserver" in r.text
+        assert "RFObs" in r.text
         assert "Averaged PSD Waterfall" in r.text
         # Navbar order: Dashboard first, Live second.
         assert r.text.index('href="/"') < r.text.index('href="/live/"')
@@ -48,7 +48,7 @@ async def test_live_page_renders(app_with_db):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         r = await client.get("/live/")
         assert r.status_code == 200
-        assert "Live - RFObserver" in r.text
+        assert "Live - RFObs" in r.text
 
 
 @pytest.mark.asyncio

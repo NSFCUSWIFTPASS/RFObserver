@@ -91,7 +91,7 @@ def test_detections_page_renders(settings):
     for path in ("/detections", "/detections/"):
         r = client.get(path, follow_redirects=False)
         assert r.status_code == 200, path
-        assert "<title>Detections - RFObserver</title>" in r.text
+        assert "<title>Detections - RFObs</title>" in r.text
         assert "<h1>Detections</h1>" in r.text
 
 

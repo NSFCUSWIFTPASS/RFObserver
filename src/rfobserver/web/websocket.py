@@ -24,11 +24,28 @@ _DB_ARRAYS = ("powers", "max_powers", "noise_floor_per_bin")
 # client gets it at most this often (and at once when the bin count changes).
 NOISE_FLOOR_RESEND_SEC = 1.0
 
+# A single send blocking this long means the client's link has stalled (the
+# socket's buffers are full). Logged at most once per LOG_EVERY_SEC per client,
+# as are dropped frames (a full per-client queue).
+SLOW_SEND_SEC = 1.0
+LOG_EVERY_SEC = 10.0
+
 
 class _Subscriber:
     """Per-client subscriber state."""
 
-    __slots__ = ("queue", "high_res", "wants_psd", "freq_sig", "nf_bins", "nf_sent_at")
+    __slots__ = (
+        "queue",
+        "high_res",
+        "wants_psd",
+        "freq_sig",
+        "nf_bins",
+        "nf_sent_at",
+        "sent",
+        "dropped",
+        "dropped_logged",
+        "last_drop_log",
+    )
 
     def __init__(self) -> None:
         self.queue: _QueueType = asyncio.Queue(maxsize=10)
@@ -38,6 +55,11 @@ class _Subscriber:
         self.freq_sig: tuple[int, float, float] | None = None
         self.nf_bins: int = -1
         self.nf_sent_at: float = 0.0
+        # Diagnostics for the close log and the slow-client warnings.
+        self.sent = 0
+        self.dropped = 0
+        self.dropped_logged = 0
+        self.last_drop_log = 0.0
 
 
 def shape_for_client(sub: _Subscriber, data: dict[str, Any], now: float) -> dict[str, Any]:
@@ -106,14 +128,19 @@ class LiveBroadcast:
             msg = data
             if sub.high_res and grid_rows is not None:
                 msg = {**data, "grid_rows": grid_rows}
-            with contextlib.suppress(asyncio.QueueFull):
+            try:
                 sub.queue.put_nowait(msg)
+            except asyncio.QueueFull:
+                sub.dropped += 1
 
 
 async def websocket_endpoint(websocket: WebSocket, broadcast: LiveBroadcast) -> None:
     """Handle a WebSocket connection for live data streaming."""
     await websocket.accept()
     sub = broadcast.subscribe()
+    client = getattr(websocket, "client", None)
+    peer = f"{client.host}:{client.port}" if client else "?"
+    opened = time.monotonic()
     # Pages that only want the heartbeat connect with ?psd=0, so they never
     # receive spectrum frames (not even before a set_view message arrives).
     if websocket.query_params.get("psd") == "0":
@@ -122,13 +149,28 @@ async def websocket_endpoint(websocket: WebSocket, broadcast: LiveBroadcast) -> 
     async def send_loop() -> None:
         while True:
             data = await sub.queue.get()
+            t0 = time.monotonic()
             try:
-                await websocket.send_json(shape_for_client(sub, data, time.monotonic()))
+                await websocket.send_json(shape_for_client(sub, data, t0))
             except RuntimeError:
                 # The client closed the socket (the Live watchdog abandons a
                 # silent one) and the server already answered the close: the
                 # send races the disconnect. That is an ordinary disconnect.
                 return
+            sub.sent += 1
+            now = time.monotonic()
+            slow = now - t0 >= SLOW_SEND_SEC
+            new_drops = sub.dropped - sub.dropped_logged
+            if (slow or new_drops) and now - sub.last_drop_log >= LOG_EVERY_SEC:
+                sub.last_drop_log = now
+                sub.dropped_logged = sub.dropped
+                logger.warning(
+                    "Live client %s is behind: last send took %.1f s, %d frames dropped "
+                    "since the last warning (link stalled or too slow?)",
+                    peer,
+                    now - t0,
+                    new_drops,
+                )
 
     async def recv_loop() -> None:
         while True:
@@ -137,12 +179,28 @@ async def websocket_endpoint(websocket: WebSocket, broadcast: LiveBroadcast) -> 
                 msg = json.loads(text)
             except json.JSONDecodeError:
                 continue
-            if msg.get("type") == "set_mode":
+            if msg.get("type") == "hello":
+                # Why the page opened this socket: first load, the watchdog
+                # after a silence, or the previous socket closing.
+                logger.info(
+                    "Live client %s connected: reason=%s silent_ms=%s",
+                    peer,
+                    msg.get("reason"),
+                    msg.get("silent_ms"),
+                )
+            elif msg.get("type") == "set_mode":
                 sub.high_res = bool(msg.get("high_res", False))
-                logger.info("Client set high_res=%s", sub.high_res)
+                logger.info("Client %s set high_res=%s", peer, sub.high_res)
             elif msg.get("type") == "set_view":
                 sub.wants_psd = bool(msg.get("psd_visible", True))
-                logger.info("Client set wants_psd=%s", sub.wants_psd)
+                logger.info(
+                    "Client %s set wants_psd=%s (hidden=%s in_view=%s why=%s)",
+                    peer,
+                    sub.wants_psd,
+                    msg.get("hidden"),
+                    msg.get("in_view"),
+                    msg.get("why"),
+                )
 
     tasks = [asyncio.create_task(send_loop()), asyncio.create_task(recv_loop())]
     try:
@@ -163,4 +221,11 @@ async def websocket_endpoint(websocket: WebSocket, broadcast: LiveBroadcast) -> 
             t.cancel()
         with contextlib.suppress(BaseException):
             await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info(
+            "Live client %s closed after %.0f s: sent=%d dropped=%d",
+            peer,
+            time.monotonic() - opened,
+            sub.sent,
+            sub.dropped,
+        )
         broadcast.unsubscribe(sub)

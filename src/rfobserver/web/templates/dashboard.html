@@ -453,15 +453,23 @@
     const psdTooltip = document.getElementById("psd-tooltip");
 
     // --- Gate live-PSD streaming on visibility ---
-    function sendView() {
+    // The view state goes with the inputs it came from (and why it was sent),
+    // so the server log shows why a client stopped or resumed PSD frames.
+    function sendView(why) {
         if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({type: "set_view", psd_visible: psdVisible}));
+            ws.send(JSON.stringify({
+                type: "set_view",
+                psd_visible: psdVisible,
+                hidden: document.visibilityState !== "visible",
+                in_view: psdInView,
+                why: why || "",
+            }));
         }
     }
-    function setPsdVisible(v) {
+    function setPsdVisible(v, why) {
         if (v === psdVisible) return;
         psdVisible = v;
-        sendView();
+        sendView(why);
     }
     // Observe the whole live-charts group, not just the PSD canvas: the "psd"
     // message also drives the time-series and waterfall charts in this group, so
@@ -474,11 +482,21 @@
     if (liveCharts && "IntersectionObserver" in window) {
         new IntersectionObserver(function(entries) {
             psdInView = entries[0].isIntersecting;
-            setPsdVisible(psdInView && document.visibilityState === "visible");
+            setPsdVisible(psdInView && document.visibilityState === "visible", "scroll");
         }, {threshold: 0.01}).observe(liveCharts);
     }
+    // Whether the charts are on screen now, measured directly. The observer's
+    // last answer can be stale after the tab was hidden (it does not run while
+    // the page is not rendered).
+    function measureInView() {
+        if (!liveCharts) return true;
+        const r = liveCharts.getBoundingClientRect();
+        return r.bottom > 0 && r.top < window.innerHeight && r.width > 0;
+    }
     document.addEventListener("visibilitychange", function() {
-        setPsdVisible(document.visibilityState === "visible" && psdInView);
+        const visible = document.visibilityState === "visible";
+        if (visible) psdInView = measureInView();
+        setPsdVisible(visible && psdInView, "visibility");
     });
 
     let lastPowers = [];
@@ -1006,8 +1024,20 @@
     // and open a new one.
     const WS_SILENT_MS = 5000;
     let wsLastMessage = 0;
+    // Why the next socket is opened (sent to the server in a hello message).
+    let wsReason = "load";
+    let wsSilentMs = null;
+    // PSD frames should flow while the charts are visible. If none arrive for
+    // PSD_SILENT_MS the server may hold a stale view of this page, so resend
+    // it. Repeats back off to once a minute (a stopped sensor sends no PSD).
+    const PSD_SILENT_MS = 3000;
+    let lastPsdAt = 0;
+    let lastViewResend = 0;
+    let viewResendGap = PSD_SILENT_MS;
 
     function abandonAndReconnect() {
+        wsReason = "watchdog";
+        wsSilentMs = Math.round(performance.now() - wsLastMessage);
         const dead = ws;
         ws = null;
         if (dead) {
@@ -1020,8 +1050,18 @@
     }
 
     setInterval(function() {
-        if (ws && wsLastMessage && performance.now() - wsLastMessage > WS_SILENT_MS) {
+        const now = performance.now();
+        if (ws && wsLastMessage && now - wsLastMessage > WS_SILENT_MS) {
             abandonAndReconnect();
+            return;
+        }
+        if (ws && ws.readyState === WebSocket.OPEN && psdVisible
+                && now - lastPsdAt > PSD_SILENT_MS && now - lastViewResend > viewResendGap) {
+            lastViewResend = now;
+            viewResendGap = Math.min(viewResendGap * 2, 60000);
+            if (document.visibilityState === "visible") psdInView = measureInView();
+            psdVisible = document.visibilityState === "visible" && psdInView;
+            sendView("no-psd");
         }
     }, 1000);
 
@@ -1031,13 +1071,17 @@
         wsLastMessage = performance.now();
 
         ws.onopen = function() {
+            ws.send(JSON.stringify({type: "hello", reason: wsReason, silent_ms: wsSilentMs}));
+            wsReason = "closed";  // unless the watchdog says otherwise
+            wsSilentMs = null;
+            lastPsdAt = performance.now();
             // Clear "reconnecting" now; the rate shows again with the next frame.
             const el = document.getElementById("ups-counter");
             if (el && el.textContent === "reconnecting") el.textContent = "-- ups";
             if (highRes) {
                 ws.send(JSON.stringify({type: "set_mode", high_res: true}));
             }
-            sendView();
+            sendView("open");
         };
 
         ws.onmessage = function(evt) {
@@ -1048,6 +1092,8 @@
                 return;
             }
             if (data.type === "psd") {
+                lastPsdAt = performance.now();
+                viewResendGap = PSD_SILENT_MS;
                 recordUpdate();
 
                 // Timing info

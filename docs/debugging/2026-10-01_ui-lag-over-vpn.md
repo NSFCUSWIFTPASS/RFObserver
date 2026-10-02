@@ -216,3 +216,10 @@ browser's state. The header now drops "reconnecting" as soon as a reconnect open
 next screenshot shows whether reconnects succeed. Next time it happens, note the time and
 check the sensor journal for `Client set high_res=True` lines: one appears per reconnect
 that reached the server.
+
+### CORRECTION (2026-10-02)
+
+The "remaining suspect" in section 9 (the reporting browser's VPN path) is withdrawn as the
+leading explanation. The sensor journal shows the Live page telling the server
+`wants_psd=False` while the user was watching, and the stream resuming on the next `True`.
+See 2026-10-02_live-psd-paused-while-visible.md.

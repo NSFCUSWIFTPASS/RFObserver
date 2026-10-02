@@ -179,3 +179,51 @@ async def test_send_after_client_close_is_a_quiet_disconnect(caplog):
     await asyncio.wait_for(task, timeout=1)
     assert b._subscribers == set()
     assert "WebSocket handler error" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_connection_logs_reason_view_and_close_counts(caplog):
+    """hello and set_view are logged with their diagnostics, and the close
+    log carries frames sent and frames dropped on a full queue."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="rfobserver.web.websocket")
+    b = LiveBroadcast()
+    gate = asyncio.Event()
+    msgs = [
+        '{"type": "hello", "reason": "watchdog", "silent_ms": 5123}',
+        '{"type": "set_view", "psd_visible": false, "hidden": true, "in_view": true,'
+        ' "why": "visibility"}',
+    ]
+
+    class Client:
+        host = "10.0.0.9"
+        port = 4242
+
+    class FakeWS:
+        query_params: dict[str, str] = {}
+        client = Client()
+
+        async def accept(self):
+            pass
+
+        async def send_json(self, data):
+            await gate.wait()  # hold the first send so the queue fills
+
+        async def receive_text(self):
+            if msgs:
+                return msgs.pop(0)
+            await gate.wait()
+            raise WebSocketDisconnect(1000)
+
+    task = asyncio.create_task(websocket_endpoint(FakeWS(), b))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    for _ in range(15):  # publish never yields: 10 fit the queue, 5 are dropped
+        await b.publish({"type": "heartbeat"})
+    gate.set()
+    await asyncio.wait_for(task, timeout=1)
+    assert "Live client 10.0.0.9:4242 connected: reason=watchdog silent_ms=5123" in caplog.text
+    assert "set wants_psd=False (hidden=True in_view=True why=visibility)" in caplog.text
+    assert "5 frames dropped since the last warning" in caplog.text
+    assert "Live client 10.0.0.9:4242 closed after 0 s: sent=10 dropped=5" in caplog.text

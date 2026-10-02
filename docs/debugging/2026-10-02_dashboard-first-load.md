@@ -128,3 +128,50 @@ navigation; the first request after it was a tail (6 KB, against 15 KB for a ful
   stored row for that period then undercounts, and nothing detects it.
 - The 1 h range still folds 3,600 raw windows per load (no tier is fine enough for its
   6 s buckets).
+
+## 9. After deploying 199a411 on HCRO (2026-10-02)
+
+Measured from the workstation over the VPN, a minute after the restart (tiers not yet
+covering any range, so every range below used the raw windows):
+
+```
+                        before (ttfb/total, size)       after
+page /                  0.94/1.15 s                     0.51/0.68 s (configs + prefs embedded)
+averaged/configs        3.35 s                          0.61 s (stored list)
+15m waterfall           0.71/2.46 s 333 KB              0.78/1.50 s 107 KB
+1h  waterfall           1.15/2.94 s 304 KB              0.82/1.35 s  89 KB
+6h  waterfall           4.24/5.75 s 269 KB              1.61/2.15 s  83 KB
+24h waterfall           9.67/11.10 s 282 KB             3.14/3.60 s  94 KB
+24h stats               1.19/1.45 s                     1.10/1.32 s
+```
+
+A first Dashboard load (15 min) went from about 4 s of boot requests plus 2.5 s of
+waterfall, to the page plus 1.5 s.
+
+### Overflows during the 24 h stats request
+
+The overflow counter rose during the measurements: 2 in the first 90 s after the restart,
+then 1 during a single 24 h stats request. Repeated, one request at a time, read-only:
+
+```
+start 3
+24h stats x3      -> 4, 5, 5        (overflow after 2 of 3)
+24h waterfall x3  -> 5, 5, 5        (none)
+idle 20 s         -> 5
+```
+
+This was not reproduced on nano-super. A stand-in receiver thread (1 ms sleeps, measuring
+its own wake gaps) ran during the same 24 h stats fold (86,400 rows, chunks of 10,000 and
+2,000). Its worst gap was 6.2 to 8.5 ms, far from the about 125 ms an overflow needs.
+Chunk size made no difference.
+
+**Rejected (do not retry):** a smaller stats scan chunk. No effect on the stand-in
+receiver.
+
+**Open:**
+- What the 24 h stats request does on HCRO that it does not do on nano-super. The two
+  boxes differ in their competing threads (three PSD workers, the live receiver) and
+  storage. The journal's RECV STALL lines around a stats request would show whether the
+  stall is in recv() and how long.
+- The stats request will stop reading raw windows for 24 h once the 1 min tier covers a
+  day (from about 2026-10-03 07:34 local).

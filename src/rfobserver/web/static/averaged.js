@@ -305,9 +305,21 @@
 
     // --- peak finder (search the strongest recent events) ---
 
+    // Places the peaks popover under its button, kept inside the bar (the
+    // button moves with the bar's wrapping, so this cannot be fixed in CSS).
+    function positionPeaksPanel() {
+        const panel = $("avg-peaks-panel");
+        const body = panel.parentElement.getBoundingClientRect();
+        const btn = $("avg-peaks-btn").getBoundingClientRect();
+        const maxLeft = Math.max(0, body.width - panel.offsetWidth);
+        panel.style.left = Math.min(Math.max(0, btn.left - body.left), maxLeft) + "px";
+        panel.style.top = (btn.bottom - body.top + 6) + "px";
+    }
+
     function openPeaks() {
         state.peaks.open = true;
         $("avg-peaks-panel").hidden = false;
+        positionPeaksPanel();
         markPeaksButtons();
         loadPeaks();
     }
@@ -469,6 +481,8 @@
         $("avg-peaks-next").hidden = !active;
         $("avg-peaks-prev").disabled = !active || p.index === 0;
         $("avg-peaks-next").disabled = !active || p.index === p.items.length - 1;
+        // The nav arrows and label width move the button.
+        if (p.open) positionPeaksPanel();
     }
 
     // The range no longer corresponds to a peak, so stop claiming it does.
@@ -633,7 +647,7 @@
         } else {
             $("avg-updated").textContent = "";
             const st = $("avg-status");
-            st.textContent = st.textContent.replace(/ - Live$/, "").replace(/ - retrying$/, "");
+            st.textContent = st.textContent.replace(/ - retrying$/, "");
         }
     }
 
@@ -809,8 +823,8 @@
             slider.min = "0";
             slider.max = String(Math.max(0, state.wf.bucketCount - 1));
             if (!state.wf.bucketCount) {
-                $("avg-status").textContent = "No averaged windows in this range"
-                    + (state.live ? " - Live" : "");
+                // Each chart already says the range is empty.
+                $("avg-status").textContent = "";
                 $("avg-updated").textContent = "Updated " + new Date().toLocaleTimeString();
                 renderWaterfall();
                 renderStatsChart();
@@ -840,15 +854,9 @@
             slider.value = String(state.selRow);
             $("avg-time").textContent =
                 new Date(state.wf.stats[state.selRow].start_epoch * 1000).toLocaleString();
-            const windows = Math.round(state.wf.meta.total_windows);
-            const isRaw = state.wf.isRaw;
-            $("avg-status").textContent = (isRaw
-                ? windows + " windows (no averaging needed)"
-                : windows + " windows in " + state.wf.bucketCount + " buckets"
-                    + (state.wf.meta.bucket_sec >= 60
-                        ? " (" + (state.wf.meta.bucket_sec / 60).toFixed(1) + " min/row)"
-                        : " (" + state.wf.meta.bucket_sec.toFixed(1) + " s/row)"))
-                + (state.live ? " - Live" : "");
+            // The status line only carries loading and error messages; the
+            // window/bucket counts are in the waterfall label.
+            $("avg-status").textContent = "";
             $("avg-updated").textContent = "Updated " + new Date().toLocaleTimeString();
             renderAll();
             ok = true;
@@ -1612,6 +1620,7 @@
         fitCanvases();
         let resizeTimer = null;
         window.addEventListener("resize", function () {
+            if (state.peaks.open) positionPeaksPanel();
             if (resizeTimer) clearTimeout(resizeTimer);
             resizeTimer = setTimeout(function () {
                 fitCanvases();

@@ -23,6 +23,12 @@ async def averaged_page(request: Request) -> Any:
     are fetched from the JSON + binary API endpoints by averaged.js.
     """
     templates = request.app.state.templates
+    settings = request.app.state.settings
     return templates.TemplateResponse(
-        request, "averaged.html", {"ui_theme": await ui_theme(request)}
+        request,
+        "averaged.html",
+        {
+            "ui_theme": await ui_theme(request),
+            "display_name": settings.SENSOR_NAME or settings.HOSTNAME,
+        },
     )

@@ -1506,6 +1506,11 @@ body {
     margin-left: auto;
 }
 
+/* Separates the peaks group from the time-range group. */
+#avg-back {
+    margin-left: 18px;
+}
+
 .avg-picker-btn {
     min-width: 170px;
     justify-content: flex-start;
@@ -1534,8 +1539,8 @@ body {
     display: none; /* display:flex above would otherwise override [hidden] */
 }
 
-/* Peak finder popover: reuses .avg-picker (position/hidden/shadow), becomes
-   a column, and sits under its own button on the left. */
+/* Peak finder popover: reuses .avg-picker (position/hidden/shadow) and
+   becomes a column. averaged.js sets left/top to sit under the Peaks button. */
 .avg-peaks-panel {
     flex-direction: column;
     left: 16px;
@@ -1801,6 +1806,10 @@ body {
 @keyframes avg-pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.25; }
+}
+
+.avg-status-row:has(.avg-status:empty) {
+    display: none; /* only loading and error messages show here */
 }
 
 .avg-status-row {

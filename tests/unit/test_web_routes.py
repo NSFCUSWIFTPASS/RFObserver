@@ -136,6 +136,14 @@ def test_dashboard_page(client):
     assert "Dashboard" in response.text
 
 
+def test_dashboard_title_is_sensor_name(client, settings):
+    settings.SENSOR_NAME = "HCRO North"
+    assert '<span class="avg-title">HCRO North</span>' in client.get("/").text
+    settings.SENSOR_NAME = None
+    settings.HOSTNAME = "rfnano"
+    assert '<span class="avg-title">rfnano</span>' in client.get("/").text
+
+
 def test_captures_page(client):
     response = client.get("/captures")
     assert response.status_code == 200

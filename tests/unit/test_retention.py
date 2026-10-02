@@ -156,6 +156,7 @@ async def test_run_retention_normal_and_pressure():
         ("detections", 730),
         ("avg_windows", 730),
         ("avg_minutes", 730),
+        ("avg_tiers", 730),
     ]
     d.calls.clear()
     await _run_retention(s, d, pressure=True)
@@ -164,6 +165,7 @@ async def test_run_retention_normal_and_pressure():
         ("detections", 90),
         ("avg_windows", 730),  # stats rows are never cut by pressure
         ("avg_minutes", 730),
+        ("avg_tiers", 730),
     ]
 
 
@@ -302,7 +304,7 @@ async def test_cleanup_loop_interval_0_does_not_hot_loop(with_wake):
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
-    assert len(d.calls) == 4  # exactly one pass: blobs, detections, windows, minutes
+    assert len(d.calls) == 5  # exactly one pass: blobs, detections, windows, minutes, tiers
 
 
 async def test_a_failed_mark_save_does_not_abort_the_pass(db, monkeypatch):

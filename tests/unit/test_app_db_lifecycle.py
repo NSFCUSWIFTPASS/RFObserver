@@ -33,7 +33,9 @@ def reg(monkeypatch: pytest.MonkeyPatch) -> _Registry:
     registry = _Registry()
 
     class FakeDB:
-        def __init__(self, db_path: str, *, read_only: bool = False) -> None:
+        def __init__(
+            self, db_path: str, *, read_only: bool = False, psd_tiers: bool = False
+        ) -> None:
             self.read_only = read_only
             self.connected = False
             self.closed = False

@@ -159,7 +159,9 @@ async def run(settings: AppSettings) -> None:
         duration_sec=settings.DURATION_SEC,
     )
 
-    db = SensorDatabase(settings.DB_PATH)
+    # The writer keeps the avg_tiers running sums the Dashboard reads for long
+    # ranges (storage/psd_tiers.py).
+    db = SensorDatabase(settings.DB_PATH, psd_tiers=True)
     await db.connect()
 
     # Web-layer reader (spec Cut 3b): Dashboard reads get their own connection so
@@ -538,6 +540,7 @@ async def _run_retention(settings: AppSettings, db: Any, *, pressure: bool) -> N
         ),
         ("avg_windows", settings.STATS_RETENTION_DAYS),
         ("avg_minutes", settings.STATS_RETENTION_DAYS),
+        ("avg_tiers", settings.STATS_RETENTION_DAYS),
     ]
     for what, days in parts:
         if days <= 0:

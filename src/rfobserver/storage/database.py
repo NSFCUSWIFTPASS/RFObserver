@@ -23,7 +23,6 @@ import json
 import logging
 import math
 import os
-import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -31,6 +30,14 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import aiosqlite
 import numpy as np
 
+from rfobserver.storage import avg_fold
+from rfobserver.storage.psd_tiers import (
+    COVERAGE_KEY,
+    TierAccumulator,
+    TierRow,
+    Tuning,
+    choose_tier,
+)
 from rfobserver.storage.rollup import METRICS, PEAK_TIME_COLUMN, MinuteSummary, WindowRow
 
 if TYPE_CHECKING:
@@ -66,6 +73,7 @@ _RETENTION_TABLES = {
     "avg_windows": "start_time",
     "detections": "start_time",
     "avg_minutes": "minute_start",
+    "avg_tiers": "bucket_start",
 }
 
 
@@ -241,6 +249,35 @@ CREATE TABLE IF NOT EXISTS avg_minutes (
     PRIMARY KEY (minute_start, sdr_center_freq_hz)
 );
 
+-- Stored averages of avg_windows over 10 s / 1 min / 10 min periods
+-- (psd_tiers.py), one row per period and tuning, written as each period ends.
+-- Sums and counts, so periods combine exactly; psd_mean is the per-bin mean
+-- over the n_psd windows that had a PSD. Long Dashboard ranges read these
+-- instead of every window. bucket_start (ISO) is for retention.
+CREATE TABLE IF NOT EXISTS avg_tiers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    level_sec INTEGER NOT NULL,
+    bucket_epoch REAL NOT NULL,
+    bucket_start TEXT NOT NULL,
+    sdr_center_freq_hz REAL NOT NULL,
+    sample_rate_hz REAL NOT NULL,
+    gain_db REAL,
+    num_bins INTEGER NOT NULL,
+    freq_start_hz REAL NOT NULL,
+    freq_step_hz REAL NOT NULL,
+    n INTEGER NOT NULL,
+    n_psd INTEGER NOT NULL,
+    sum_avg REAL NOT NULL,
+    sum_median REAL NOT NULL,
+    sum_std REAL NOT NULL,
+    sum_kurtosis REAL NOT NULL,
+    max_max REAL,
+    min_avg REAL,
+    psd_min REAL,
+    psd_max REAL,
+    psd_mean BLOB
+);
+
 CREATE INDEX IF NOT EXISTS idx_detections_time ON detections(start_time);
 CREATE INDEX IF NOT EXISTS idx_detections_freq ON detections(center_freq_hz);
 CREATE INDEX IF NOT EXISTS idx_stats_time ON stats(timestamp);
@@ -249,6 +286,8 @@ CREATE INDEX IF NOT EXISTS idx_iq_captures_time ON iq_captures(start_time);
 CREATE INDEX IF NOT EXISTS idx_avg_windows_time ON avg_windows(start_time);
 CREATE INDEX IF NOT EXISTS idx_avg_windows_center_time
     ON avg_windows(sdr_center_freq_hz, start_time);
+CREATE INDEX IF NOT EXISTS idx_avg_tiers_level_time ON avg_tiers(level_sec, bucket_epoch);
+CREATE INDEX IF NOT EXISTS idx_avg_tiers_start ON avg_tiers(bucket_start);
 """
 
 # Columns added after the original detections schema (SDR capture-context
@@ -310,42 +349,6 @@ def _nice_bin_width(span: float) -> float:
     return max(0.5, nice * base)
 
 
-def _decode_psd_rows(
-    rows: Sequence[Sequence[Any]], blob_col: int, max_bins: int
-) -> tuple[np.ndarray[Any, np.dtype[np.float32]], np.ndarray[Any, np.dtype[np.bool_]]]:
-    """Decode a chunk's PSD blobs to a (rows, max_bins) float32 array.
-
-    Each row is downsampled by group-mean when wider than ``max_bins`` and
-    NaN-padded when narrower, as ``SensorDatabase._ds_psd`` does for one row.
-    Rows of the same width are decoded together. Returns the array and a mask
-    of the rows that had a blob (the others are all-NaN).
-    """
-    out = np.full((len(rows), max_bins), np.nan, dtype=np.float32)
-    has = np.zeros(len(rows), dtype=bool)
-    groups: dict[int, list[int]] = {}
-    for i, r in enumerate(rows):
-        blob = r[blob_col]
-        if blob is not None and len(blob) >= 4:
-            groups.setdefault(len(blob) // 4, []).append(i)
-    for width, members in groups.items():
-        sel = np.asarray(members)
-        arr = np.frombuffer(
-            b"".join(rows[i][blob_col][: width * 4] for i in members), dtype="<f4"
-        ).reshape(len(members), width)
-        if width > max_bins:
-            # Group-mean of each `factor` adjacent bins, as strided slice sums:
-            # mean(axis=2) over a short last axis is several times slower.
-            factor = width // max_bins
-            acc = arr[:, 0 : factor * max_bins : factor].astype(np.float32)
-            for j in range(1, factor):
-                acc += arr[:, j : factor * max_bins : factor]
-            out[sel] = acc / np.float32(factor)
-        else:
-            out[sel, :width] = arr
-        has[sel] = True
-    return out, has
-
-
 class WindowStatsRow(NamedTuple):
     """One averaged window's stats, as the rf-db writer reads them."""
 
@@ -365,9 +368,13 @@ class WindowStatsRow(NamedTuple):
 class SensorDatabase:
     """Async SQLite database for local sensor state."""
 
-    def __init__(self, db_path: str, *, read_only: bool = False) -> None:
+    def __init__(self, db_path: str, *, read_only: bool = False, psd_tiers: bool = False) -> None:
         self._db_path = db_path
         self._read_only = read_only
+        # The pipeline's writer keeps the avg_tiers running sums (psd_tiers.py)
+        # as it stores windows. Other connections (readers, tools) do not.
+        self._tiers = TierAccumulator() if psd_tiers and not read_only else None
+        self._tier_coverage_set: set[int] = set()
         self._db: aiosqlite.Connection | None = None
         self._write_timeout = _DB_WRITE_TIMEOUT_SEC
         self._reconnect_lock = asyncio.Lock()
@@ -574,6 +581,13 @@ class SensorDatabase:
             raise
 
     async def close(self) -> None:
+        if self._db and self._tiers is not None:
+            # The open periods, partial: the next run merges the rest of each
+            # period into its row.
+            try:
+                await self._store_tier_rows(self._tiers.drain())
+            except Exception:
+                logger.exception("Storing the open avg_tiers periods at close failed")
         if self._db:
             await self._db.close()
 
@@ -701,8 +715,119 @@ class SensorDatabase:
             rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    async def insert_avg_window(self, **window: Any) -> None:
+        """Persist one DURATION_SEC-averaged window (see _insert_avg_window_row)
+        and add it to the avg_tiers running sums. The sums are kept outside the
+        guarded write, whose retry would otherwise count the window twice."""
+        await self._insert_avg_window_row(**window)
+        if self._tiers is None:
+            return
+        try:
+            await self._add_to_tiers(window)
+        except Exception:
+            logger.exception("avg_tiers update failed; the Dashboard falls back to raw windows")
+
+    async def _add_to_tiers(self, w: Mapping[str, Any]) -> None:
+        assert self._tiers is not None
+        start: datetime = w["start_time"]
+        epoch = start.timestamp()
+        for level in self._tiers.tiers:
+            if level not in self._tier_coverage_set:
+                self._tier_coverage_set.add(level)
+                key = COVERAGE_KEY.format(level)
+                if await self.get_config(key) is None:
+                    # Complete from the first whole period from now on.
+                    await self.set_config(key, repr(math.ceil(epoch / level) * level))
+        powers = w.get("powers")
+        done = self._tiers.add(
+            epoch=epoch,
+            tuning=Tuning(
+                float(w["sdr_center_freq_hz"]),
+                float(w["sample_rate_hz"]),
+                None if w.get("gain_db") is None else float(w["gain_db"]),
+                int(w["num_bins"]),
+                float(w["freq_start_hz"]),
+                float(w["freq_step_hz"]),
+            ),
+            pwr_avg=float(w["pwr_avg"]),
+            pwr_max=None if w.get("pwr_max") is None else float(w["pwr_max"]),
+            pwr_median=float(w["pwr_median"]),
+            pwr_std=float(w["pwr_std"]),
+            kurtosis=float(w["kurtosis"]),
+            powers=None if powers is None else np.asarray(powers, dtype=np.float32),
+        )
+        if done:
+            await self._store_tier_rows(done)
+
     @_guarded_write
-    async def insert_avg_window(
+    async def _store_tier_rows(self, rows: Sequence[TierRow]) -> None:
+        """Write finished (or, at close, partial) tier rows. A row already
+        stored for the same period and tuning (a period split by a restart) is
+        merged with the new one."""
+        assert self._db is not None
+        for row in rows:
+            t = row.tuning
+            async with self._db.execute(
+                "SELECT id, n, n_psd, sum_avg, sum_median, sum_std, sum_kurtosis, max_max, "
+                "min_avg, psd_min, psd_max, psd_mean FROM avg_tiers WHERE level_sec = ? "
+                "AND bucket_epoch = ? AND sdr_center_freq_hz = ? AND sample_rate_hz = ? "
+                "AND gain_db IS ? AND num_bins = ?",
+                (row.level_sec, row.bucket_epoch, t[0], t[1], t[2], t[3]),
+            ) as cur:
+                old = await cur.fetchone()
+            if old is not None:
+                prev = TierRow(row.level_sec, row.bucket_epoch, t)
+                (
+                    _id,
+                    prev.n,
+                    prev.n_psd,
+                    prev.sum_avg,
+                    prev.sum_median,
+                    prev.sum_std,
+                    prev.sum_kurtosis,
+                    prev.max_max,
+                    prev.min_avg,
+                    prev.psd_min,
+                    prev.psd_max,
+                    blob,
+                ) = old
+                if blob is not None and prev.n_psd:
+                    prev.psd_sum = np.frombuffer(blob, dtype="<f4").astype(np.float64) * prev.n_psd
+                prev.merge(row)
+                row = prev
+                await self._db.execute("DELETE FROM avg_tiers WHERE id = ?", (_id,))
+            mean = row.psd_mean()
+            await self._db.execute(
+                """INSERT INTO avg_tiers
+                   (level_sec, bucket_epoch, bucket_start, sdr_center_freq_hz,
+                    sample_rate_hz, gain_db, num_bins, freq_start_hz, freq_step_hz,
+                    n, n_psd, sum_avg, sum_median, sum_std, sum_kurtosis, max_max,
+                    min_avg, psd_min, psd_max, psd_mean)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    row.level_sec,
+                    row.bucket_epoch,
+                    datetime.fromtimestamp(row.bucket_epoch, tz=timezone.utc)
+                    .replace(tzinfo=None)
+                    .isoformat(),
+                    *t,
+                    row.n,
+                    row.n_psd,
+                    row.sum_avg,
+                    row.sum_median,
+                    row.sum_std,
+                    row.sum_kurtosis,
+                    row.max_max,
+                    row.min_avg,
+                    row.psd_min,
+                    row.psd_max,
+                    None if mean is None else mean.astype("<f4").tobytes(),
+                ),
+            )
+        await self._db.commit()
+
+    @_guarded_write
+    async def _insert_avg_window_row(
         self,
         *,
         start_time: datetime,
@@ -1003,22 +1128,102 @@ class SensorDatabase:
             where += " AND " + " AND ".join(conditions)
         params: list[Any] = [since.isoformat(), until.isoformat()]
         params.extend(sdr_params)
-        if forced_bucket is not None and forced_bucket > 0:
-            return await self._waterfall_aggregated(
-                where, params, since, until, forced_bucket, max_rows, max_bins
+        forced = forced_bucket is not None and forced_bucket > 0
+        tier = await self._covering_tier(since, span, max_rows, forced_bucket)
+        if not forced:
+            # Count first to pick the mode; only aggregate when the windows
+            # outnumber the display rows.
+            async with self._db.execute(f"SELECT COUNT(*) FROM avg_windows {where}", params) as cur:
+                row = await cur.fetchone()
+                window_count = int(row[0]) if row else 0
+            if window_count == 0:
+                return empty
+            if window_count <= max_rows:
+                return await self._waterfall_raw(where, params, bucket_sec, max_bins)
+        if tier is not None:
+            level, tier_bucket = tier
+            fold = avg_fold.WaterfallFold(since, until, tier_bucket, max_bins)
+            await self._fold_tiered(
+                fold,
+                avg_fold.WINDOW_WF_COLUMNS,
+                avg_fold.TIER_WF_COLUMNS,
+                where,
+                params,
+                conditions,
+                sdr_params,
+                since,
+                until,
+                level,
             )
-        # Count first to pick the mode; only aggregate when the windows
-        # outnumber the display rows.
-        async with self._db.execute(f"SELECT COUNT(*) FROM avg_windows {where}", params) as cur:
-            row = await cur.fetchone()
-            window_count = int(row[0]) if row else 0
-        if window_count == 0:
-            return empty
-        if window_count <= max_rows:
-            return await self._waterfall_raw(where, params, bucket_sec, max_bins)
+            return fold.result()
         return await self._waterfall_aggregated(
-            where, params, since, until, bucket_sec, max_rows, max_bins
+            where,
+            params,
+            since,
+            until,
+            forced_bucket if forced and forced_bucket is not None else bucket_sec,
+            max_rows,
+            max_bins,
         )
+
+    async def _covering_tier(
+        self, since: datetime, span: float, max_rows: int, forced_bucket: float | None
+    ) -> tuple[int, float] | None:
+        """The avg_tiers tier and display bucket for a range, or None when the
+        range is short, or starts before that tier's stored coverage (tiers are
+        filled only from when they started running, with no backfill)."""
+        tier = choose_tier(span, max_rows, forced_bucket)
+        if tier is None:
+            return None
+        value = await self.get_config(COVERAGE_KEY.format(tier[0]))
+        if value is None or since.timestamp() < float(value):
+            return None
+        return tier
+
+    async def _fold_tiered(
+        self,
+        fold: avg_fold.WaterfallFold | avg_fold.StatsFold,
+        window_columns: str,
+        tier_columns: str,
+        where: str,
+        params: list[Any],
+        conditions: list[str],
+        sdr_params: list[Any],
+        since: datetime,
+        until: datetime,
+        level: int,
+    ) -> None:
+        """Fold a range from stored tier periods, plus raw windows for the
+        partial period at the start and the newest period(s) not yet stored."""
+        assert self._db is not None
+        s_ep, u_ep = since.timestamp(), until.timestamp()
+        lo = math.ceil(s_ep / level) * level
+        hi = max(lo, math.floor(u_ep / level) * level)
+        tier_where = "WHERE level_sec = ? AND bucket_epoch >= ? AND bucket_epoch < ?"
+        if conditions:
+            tier_where += " AND " + " AND ".join(conditions)
+        tiers = await self._db.execute_fetchall(
+            f"SELECT {tier_columns} FROM avg_tiers {tier_where} ORDER BY bucket_epoch",
+            [level, lo, hi, *sdr_params],
+        )
+        rows = list(tiers)
+        cover_end = min(hi, float(rows[-1][0]) + level) if rows else lo
+        tz = since.tzinfo or timezone.utc
+
+        async def fold_windows(a: float, b: float) -> None:
+            if b <= a:
+                return
+            sub = [
+                datetime.fromtimestamp(a, tz=tz).isoformat(),
+                datetime.fromtimestamp(b, tz=tz).isoformat(),
+                *params[2:],
+            ]
+            async for chunk in self._scan_avg_windows(window_columns, where, sub, chunk=2000):
+                fold.add_windows(chunk)
+
+        await fold_windows(s_ep, min(lo, u_ep))
+        fold.add_tiers(rows)
+        await fold_windows(max(cover_end, lo, s_ep), u_ep)
 
     @staticmethod
     def _ds_psd(blob: bytes, num_bins: int, max_bins: int) -> tuple[list[float], float, float]:
@@ -1155,111 +1360,12 @@ class SensorDatabase:
         (see the public docstring), so it has ``max_rows`` or
         ``max_rows + 1`` buckets and stays put while the range slides.
         """
-        assert self._db is not None
-        columns = (
-            "start_time, num_bins, freq_start_hz, freq_step_hz, psd_powers, "
-            "pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis"
-        )
-        since_epoch = since.timestamp()
-        until_epoch = until.timestamp()
-        anchor = math.floor(since_epoch / bucket_sec) * bucket_sec
-        n_buckets = max(1, math.ceil((until_epoch - anchor) / bucket_sec))
-        # Per-bucket accumulators. PSD uses per-bin sums + per-bin counts so a
-        # NaN-padded (short) row never poisons a bucket's mean.
-        psd_sum = np.zeros((n_buckets, max_bins), dtype=np.float64)
-        psd_cnt = np.zeros((n_buckets, max_bins), dtype=np.int64)
-        stat_avg = np.zeros(n_buckets)
-        stat_max = np.full(n_buckets, -np.inf)
-        stat_med = np.zeros(n_buckets)
-        stat_std = np.zeros(n_buckets)
-        stat_kurt = np.zeros(n_buckets)
-        stat_n = np.zeros(n_buckets, dtype=np.int64)
-        total_windows = 0
-        gmin, gmax = float("inf"), float("-inf")
-        freq_start_hz = 0.0
-        freq_step_hz = 0.0
-        first_axis_num_bins = 0
-        first_axis = True
-        async for rows in self._scan_avg_windows(columns, where, params, chunk=2000):
-            if not rows:
-                continue
-            if first_axis:
-                first_axis = False
-                first_axis_num_bins = int(rows[0][1])
-                freq_start_hz = float(rows[0][2])
-                freq_step_hz = float(rows[0][3])
-            # Whole chunk at once in numpy: a per-window Python loop held the
-            # GIL for seconds on long ranges, starving the USB receiver thread.
-            t = np.fromiter(
-                (datetime.fromisoformat(r[0]).timestamp() for r in rows), np.float64, len(rows)
-            )
-            idx = np.clip(((t - anchor) / bucket_sec).astype(np.int64), 0, n_buckets - 1)
-            # Rows arrive in time order, so each bucket is one contiguous run.
-            starts = np.flatnonzero(np.r_[True, idx[1:] != idx[:-1]])
-            at = idx[starts]
-            np.add.at(stat_n, at, np.diff(np.r_[starts, len(rows)]))
-            for arr, col in ((stat_avg, 5), (stat_med, 7), (stat_std, 8), (stat_kurt, 9)):
-                vals = np.fromiter((float(r[col]) for r in rows), np.float64, len(rows))
-                arr[at] += np.add.reduceat(vals, starts)
-            pmax = np.fromiter(
-                (-np.inf if r[6] is None else float(r[6]) for r in rows), np.float64, len(rows)
-            )
-            stat_max[at] = np.maximum(stat_max[at], np.maximum.reduceat(pmax, starts))
-            psd, has = _decode_psd_rows(rows, 4, max_bins)
-            if not has.any():
-                continue
-            total_windows += int(has.sum())
-            psd, pidx = psd[has], idx[has]
-            with np.errstate(invalid="ignore"), warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)  # an all-NaN row
-                lo, hi = np.nanmin(psd), np.nanmax(psd)
-            if np.isfinite(lo):
-                gmin, gmax = min(gmin, float(lo)), max(gmax, float(hi))
-            valid = ~np.isnan(psd)
-            pstarts = np.flatnonzero(np.r_[True, pidx[1:] != pidx[:-1]])
-            pat = pidx[pstarts]
-            psd_sum[pat] += np.add.reduceat(np.where(valid, psd, 0.0), pstarts, axis=0)
-            psd_cnt[pat] += np.add.reduceat(valid.astype(np.int64), pstarts, axis=0)
-        # The downsampled axis is still uniform: group-mean of a uniform axis
-        # shifts the start by (factor-1)*step/2 and multiplies the step.
-        if first_axis_num_bins > max_bins and freq_step_hz > 0:
-            factor = first_axis_num_bins // max_bins
-            freq_start_hz = freq_start_hz + (factor - 1) * freq_step_hz / 2.0
-            freq_step_hz = factor * freq_step_hz
-        psd_rows: list[list[float]] = []
-        for i in range(n_buckets):
-            if psd_cnt[i].any():
-                with np.errstate(invalid="ignore"):
-                    mean_row = psd_sum[i] / psd_cnt[i]
-                psd_rows.append([float(x) for x in mean_row])
-            else:
-                psd_rows.append([float("nan")] * max_bins)
-        buckets = [
-            {
-                "start_epoch": anchor + i * bucket_sec,
-                "duration_sec": bucket_sec,
-                "count": int(stat_n[i]),
-                "pwr_avg": float(stat_avg[i] / stat_n[i]) if stat_n[i] else 0.0,
-                # -inf when every window in the bucket had no pwr_max.
-                "pwr_max": float(stat_max[i]) if stat_n[i] else 0.0,
-                "pwr_median": float(stat_med[i] / stat_n[i]) if stat_n[i] else 0.0,
-                "pwr_std": float(stat_std[i] / stat_n[i]) if stat_n[i] else 0.0,
-                "kurtosis": float(stat_kurt[i] / stat_n[i]) if stat_n[i] else 0.0,
-            }
-            for i in range(n_buckets)
-        ]
-        return {
-            "bucket_sec": bucket_sec,
-            "num_bins": max_bins,
-            "min_db": gmin if gmin != float("inf") else 0.0,
-            "max_db": gmax if gmax != float("-inf") else 0.0,
-            "total_windows": total_windows,
-            "freq_start_hz": freq_start_hz,
-            "freq_step_hz": freq_step_hz,
-            "mode": 1,
-            "buckets": buckets,
-            "psd_rows": psd_rows,
-        }
+        fold = avg_fold.WaterfallFold(since, until, bucket_sec, max_bins)
+        async for rows in self._scan_avg_windows(
+            avg_fold.WINDOW_WF_COLUMNS, where, params, chunk=2000
+        ):
+            fold.add_windows(rows)
+        return fold.result()
 
     async def query_avg_stats(
         self,
@@ -1294,18 +1400,40 @@ class SensorDatabase:
             where += " AND " + " AND ".join(conditions)
         params: list[Any] = [since.isoformat(), until.isoformat()]
         params.extend(sdr_params)
-        if forced_bucket is not None and forced_bucket > 0:
-            return await self._stats_aggregated(
-                where, params, since, until, forced_bucket, max_points
+        forced = forced_bucket is not None and forced_bucket > 0
+        tier = await self._covering_tier(since, span, max_points, forced_bucket)
+        if not forced:
+            async with self._db.execute(f"SELECT COUNT(*) FROM avg_windows {where}", params) as cur:
+                row = await cur.fetchone()
+                window_count = int(row[0]) if row else 0
+            if window_count == 0:
+                return {"bucket_sec": bucket_sec, "min_pwr": 0.0, "max_pwr": 0.0, "points": []}
+            if window_count <= max_points:
+                return await self._stats_raw(where, params, bucket_sec)
+        if tier is not None:
+            level, tier_bucket = tier
+            fold = avg_fold.StatsFold(since, until, tier_bucket)
+            await self._fold_tiered(
+                fold,
+                avg_fold.WINDOW_STATS_COLUMNS,
+                avg_fold.TIER_STATS_COLUMNS,
+                where,
+                params,
+                conditions,
+                sdr_params,
+                since,
+                until,
+                level,
             )
-        async with self._db.execute(f"SELECT COUNT(*) FROM avg_windows {where}", params) as cur:
-            row = await cur.fetchone()
-            window_count = int(row[0]) if row else 0
-        if window_count == 0:
-            return {"bucket_sec": bucket_sec, "min_pwr": 0.0, "max_pwr": 0.0, "points": []}
-        if window_count <= max_points:
-            return await self._stats_raw(where, params, bucket_sec)
-        return await self._stats_aggregated(where, params, since, until, bucket_sec, max_points)
+            return fold.result()
+        return await self._stats_aggregated(
+            where,
+            params,
+            since,
+            until,
+            forced_bucket if forced and forced_bucket is not None else bucket_sec,
+            max_points,
+        )
 
     async def _stats_raw(self, where: str, params: list[Any], bucket_sec: float) -> dict[str, Any]:
         """Raw stats: one point per window (no averaging)."""
@@ -1352,50 +1480,12 @@ class SensorDatabase:
         stable while a live range slides. ``max_points`` or
         ``max_points + 1`` points.
         """
-        assert self._db is not None
-        columns = "start_time, pwr_avg, pwr_max, pwr_median, pwr_std, kurtosis"
-        anchor = math.floor(since.timestamp() / bucket_sec) * bucket_sec
-        n_points = max(1, math.ceil((until.timestamp() - anchor) / bucket_sec))
-        n = [0] * n_points
-        avg = [0.0] * n_points
-        mx = [-float("inf")] * n_points
-        med = [0.0] * n_points
-        std = [0.0] * n_points
-        kurt = [0.0] * n_points
-        gmin, gmax = float("inf"), float("-inf")
-        async for rows in self._scan_avg_windows(columns, where, params, chunk=10000):
-            for r in rows:
-                idx = int((datetime.fromisoformat(r[0]).timestamp() - anchor) / bucket_sec)
-                idx = max(0, min(idx, n_points - 1))
-                n[idx] += 1
-                avg[idx] += float(r[1])
-                med[idx] += float(r[3])
-                std[idx] += float(r[4])
-                kurt[idx] += float(r[5])
-                if r[2] is not None:
-                    mx[idx] = max(mx[idx], float(r[2]))
-                    gmin = min(gmin, float(r[1]))
-                    gmax = max(gmax, float(r[2]))
-        points = [
-            {
-                "start_time": datetime.fromtimestamp(
-                    anchor + i * bucket_sec, tz=since.tzinfo
-                ).isoformat(),
-                "count": n[i],
-                "pwr_avg": avg[i] / n[i] if n[i] else None,
-                "pwr_max": mx[i] if n[i] and mx[i] != -float("inf") else None,
-                "pwr_median": med[i] / n[i] if n[i] else None,
-                "pwr_std": std[i] / n[i] if n[i] else None,
-                "kurtosis": kurt[i] / n[i] if n[i] else None,
-            }
-            for i in range(n_points)
-        ]
-        return {
-            "bucket_sec": bucket_sec,
-            "min_pwr": gmin if gmin != float("inf") else 0.0,
-            "max_pwr": gmax if gmax != float("-inf") else 0.0,
-            "points": points,
-        }
+        fold = avg_fold.StatsFold(since, until, bucket_sec)
+        async for rows in self._scan_avg_windows(
+            avg_fold.WINDOW_STATS_COLUMNS, where, params, chunk=10000
+        ):
+            fold.add_windows(rows)
+        return fold.result()
 
     @_guarded_write
     async def upsert_avg_minutes(self, summaries: Sequence[MinuteSummary]) -> int:
@@ -1897,7 +1987,28 @@ class SensorDatabase:
         await self._save_blob_prune_mark()
         if pruned > 0:
             logger.info("Pruned PSD blobs for %d avg windows (cutoff: %s)", pruned, cutoff)
+        # The tier periods' PSD follows the same retention as the windows'.
+        tiers = 0
+        while True:
+            n: int = await self._prune_tier_blob_chunk(cutoff, chunk)
+            tiers += n
+            if n < chunk:
+                break
+            await asyncio.sleep(pause_sec)
+        if tiers > 0:
+            logger.info("Pruned PSD blobs for %d avg_tiers periods (cutoff: %s)", tiers, cutoff)
         return pruned
+
+    @_guarded_write
+    async def _prune_tier_blob_chunk(self, cutoff: str, limit: int) -> int:
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "UPDATE avg_tiers SET psd_mean = NULL WHERE rowid IN (SELECT rowid FROM avg_tiers "
+            "WHERE bucket_start < ? AND psd_mean IS NOT NULL ORDER BY bucket_start LIMIT ?)",
+            (cutoff, limit),
+        )
+        await self._db.commit()
+        return int(cursor.rowcount)
 
     @_guarded_write
     async def _delete_older_chunk(self, table: str, cutoff: str, limit: int) -> int:

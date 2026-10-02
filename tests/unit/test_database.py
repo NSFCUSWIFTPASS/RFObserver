@@ -862,6 +862,49 @@ async def test_query_avg_waterfall_buckets_anchored_while_range_slides(db):
     assert row_a == pytest.approx(row_b, abs=1e-3)
 
 
+async def test_forced_bucket_tail_matches_the_full_range_rows(db):
+    """The Dashboard's live poll fetches only the newest buckets with the
+    full range's bucket_sec forced. Those buckets must equal the full fetch's
+    rows for the same times, even though the tail alone is few enough windows
+    that the count rule would have answered raw rows."""
+    base = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    for i in range(16):
+        powers = [-80.0 + i, -70.0, -60.0, -50.0 - i]
+        await db.insert_avg_window(
+            start_time=base + timedelta(seconds=i, milliseconds=250),
+            **_avg_common(pwr_avg=-70.0 + i, powers=powers),
+        )
+    full = await db.query_avg_waterfall(
+        since=base, until=base + timedelta(seconds=16), max_rows=8, max_bins=4
+    )
+    assert full["mode"] == 1 and full["bucket_sec"] == pytest.approx(2.0)
+    tail_since = base + timedelta(seconds=10)  # a bucket boundary
+    tail = await db.query_avg_waterfall(
+        since=tail_since,
+        until=base + timedelta(seconds=16),
+        max_rows=8,
+        max_bins=4,
+        bucket_sec=full["bucket_sec"],
+    )
+    assert tail["mode"] == 1
+    assert [b["start_epoch"] for b in tail["buckets"]] == [
+        b["start_epoch"] for b in full["buckets"][5:]
+    ]
+    assert [b["count"] for b in tail["buckets"]] == [b["count"] for b in full["buckets"][5:]]
+    for got, want in zip(tail["psd_rows"], full["psd_rows"][5:], strict=True):
+        assert got == pytest.approx(want, abs=1e-4)
+    stats_full = await db.query_avg_stats(
+        since=base, until=base + timedelta(seconds=16), max_points=8
+    )
+    stats_tail = await db.query_avg_stats(
+        since=tail_since,
+        until=base + timedelta(seconds=16),
+        max_points=8,
+        bucket_sec=stats_full["bucket_sec"],
+    )
+    assert stats_tail["points"] == stats_full["points"][5:]
+
+
 async def test_query_avg_stats_anchored_while_range_slides(db):
     """Same absolute anchoring for the stats timeline (power/kurtosis charts)."""
     base = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)

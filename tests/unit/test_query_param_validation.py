@@ -97,3 +97,20 @@ async def test_non_integer_numeric_is_also_rejected(path: str, params: dict[str,
 async def test_valid_and_absent_values_still_work(path: str, params: dict[str, str]) -> None:
     resp = await _get(path, params)
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/averaged/waterfall", "/api/averaged/stats"])
+@pytest.mark.parametrize("value", ["abc", "0", "-5", "nan", "inf", "1"])
+async def test_bad_or_too_fine_bucket_sec_is_rejected(path: str, value: str) -> None:
+    # "1" over the 1-day range would force 86,400 buckets; the cap is
+    # max_rows + 1 (601 here), so a URL cannot make the server allocate them.
+    resp = await _get(path, {"bucket_sec": value})
+    assert resp.status_code == 400, f"{path} bucket_sec={value} gave {resp.status_code}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/averaged/waterfall", "/api/averaged/stats"])
+async def test_bucket_sec_within_the_cap_is_accepted(path: str) -> None:
+    resp = await _get(path, {"bucket_sec": "144"})  # 86400 / 144 = 600 buckets
+    assert resp.status_code == 200

@@ -54,6 +54,13 @@
     const MAX_BINS = 512;
     const DAY_MS = 86400000;
     const POLL_MS = 2000;
+    // Live polls fetch only the newest rows and merge them (see tailPlan);
+    // the whole range is refetched this often to resync anything a tail
+    // cannot see (retention pruning, a window inserted far out of order).
+    const FULL_RESYNC_MS = 5 * 60000;
+    // A tail re-fetches this much before the newest row it holds, so windows
+    // the DB writer inserts a little late still land in their rows.
+    const TAIL_MARGIN_SEC = 10;
     const PRESET_MS = {
         "5m": 5 * 60000,
         "15m": 15 * 60000,
@@ -101,6 +108,7 @@
         loading: false,
         loadSeq: 0,      // monotonic token: only the latest load may commit/render
         loadAbort: null, // AbortController for the in-flight load's fetches
+        inc: null,       // {key, fullAtMs} of the last full load, for tail polls
         stale: true, // displayed data lags the selected range (spinner on)
         pollTimer: null,
         pickerOpen: false,
@@ -132,6 +140,7 @@
             kurt_lo: null, kurt_hi: null,
         },
     };
+
 
     const SCALE_FIELDS = {
         wf_lo: "avg-scale-wf-lo",
@@ -200,6 +209,7 @@
 
     function parseWaterfall(buf) {
         const dv = new DataView(buf);
+        const version = dv.getInt32(4, true);
         const rowCount = dv.getInt32(8, true);
         const numBins = dv.getInt32(12, true);
         const meta = {
@@ -212,9 +222,20 @@
         };
         let off = 64;
         const rows = [];
-        for (let y = 0; y < rowCount; y++) {
-            rows.push(Array.from(new Float32Array(buf, off, numBins)));
-            off += numBins * 4;
+        if (version >= 3) {
+            // int16 centi-dB, -32768 = no data.
+            for (let y = 0; y < rowCount; y++) {
+                const q = new Int16Array(buf, off, numBins);
+                const row = new Array(numBins);
+                for (let i = 0; i < numBins; i++) row[i] = q[i] === -32768 ? NaN : q[i] / 100;
+                rows.push(row);
+                off += numBins * 2;
+            }
+        } else {
+            for (let y = 0; y < rowCount; y++) {
+                rows.push(Array.from(new Float32Array(buf, off, numBins)));
+                off += numBins * 4;
+            }
         }
         const stats = [];
         for (let y = 0; y < rowCount; y++) {
@@ -263,7 +284,97 @@
         if (document.hidden || (state.loading && !userAction)) { schedulePoll(); return; }
         state.untilMs = Date.now();
         state.sinceMs = state.untilMs - state.spanMs;
-        loadAll(true).then(schedulePoll, schedulePoll);
+        // Timer ticks may fetch just the tail; a user action reloads in full.
+        loadAll(true, !userAction).then(schedulePoll, schedulePoll);
+    }
+
+    // --- incremental live polls ---
+
+    // What a tail can be merged onto: the same tuning and span as the last
+    // full load. Anything else needs a full reload.
+    function incKey() {
+        return [$("avg-center").value, $("avg-samplerate").value, $("avg-gain").value,
+            state.spanMs].join("|");
+    }
+
+    // Where the next live poll can start instead of refetching the range, or
+    // null for a full reload. The tail starts on one of our own rows (a
+    // bucket boundary, or a raw window's start) TAIL_MARGIN_SEC before the
+    // newest, and aggregated ranges force the same bucket_sec so the server
+    // answers on the identical epoch-anchored grid.
+    function tailPlan() {
+        const wf = state.wf;
+        const inc = state.inc;
+        if (!state.live || !wf || !wf.bucketCount || !state.stats || !inc) return null;
+        if (inc.key !== incKey() || Date.now() - inc.fullAtMs > FULL_RESYNC_MS) return null;
+        const last = wf.stats[wf.bucketCount - 1].start_epoch;
+        let i = wf.bucketCount - 1;
+        while (i > 0 && wf.stats[i].start_epoch > last - TAIL_MARGIN_SEC) i--;
+        return { sinceSec: wf.stats[i].start_epoch, bucketSec: wf.isRaw ? null : wf.meta.bucket_sec };
+    }
+
+    // Splice a tail onto the held range: keep held rows before the tail's
+    // start that are still inside the (slid) range, then append the tail.
+    // Returns null when the result is not what a full load would show (axis
+    // changed, or a raw range outgrew raw mode), so the caller reloads.
+    function mergeTail(tailWf, tailStats, plan) {
+        const wf = state.wf;
+        if (wf.isRaw !== (plan.bucketSec === null)) return null;
+        if (wf.isRaw && !tailWf.isRaw) return null; // the tail itself aggregated
+        if (tailWf.bucketCount && (tailWf.numBins !== wf.numBins
+            || tailWf.meta.freq_start_hz !== wf.meta.freq_start_hz
+            || tailWf.meta.freq_step_hz !== wf.meta.freq_step_hz)) return null;
+        const cut = plan.sinceSec - 1e-6;
+        const sinceS = state.sinceMs / 1000;
+        const bucket = wf.isRaw ? 0 : wf.meta.bucket_sec;
+        // Raw rows leave when their start falls before the range (the
+        // server's filter); a bucket leaves once it ends before the range.
+        const inRange = function (t) { return wf.isRaw ? t >= sinceS : t + bucket > sinceS; };
+        const rows = [];
+        const stats = [];
+        for (let i = 0; i < wf.bucketCount; i++) {
+            const t = wf.stats[i].start_epoch;
+            if (t >= cut) break;
+            if (inRange(t)) { rows.push(wf.rows[i]); stats.push(wf.stats[i]); }
+        }
+        // A floor-rounded tail grid can open with an empty bucket before the
+        // cut; the held row there is the complete one.
+        for (let i = 0; i < tailWf.bucketCount; i++) {
+            if (tailWf.stats[i].start_epoch < cut) continue;
+            rows.push(tailWf.rows[i]);
+            stats.push(tailWf.stats[i]);
+        }
+        if (wf.isRaw && rows.length > MAX_ROWS) return null; // the server would aggregate now
+        let windows = 0;
+        for (const s of stats) windows += s.count;
+        const meta = Object.assign({}, wf.meta, { total_windows: windows });
+        if (tailWf.bucketCount) {
+            // The colour scale only widens between full loads.
+            meta.min_db = Math.min(meta.min_db, tailWf.meta.min_db);
+            meta.max_db = Math.max(meta.max_db, tailWf.meta.max_db);
+        }
+        const points = [];
+        const held = state.stats.points || [];
+        for (const p of held) {
+            const t = Date.parse(p.start_time) / 1000;
+            if (t >= cut) break;
+            if (inRange(t)) points.push(p);
+        }
+        for (const p of tailStats.points || []) {
+            if (Date.parse(p.start_time) / 1000 >= cut) points.push(p);
+        }
+        const mergedStats = Object.assign({}, state.stats, { points: points });
+        if ((tailStats.points || []).length) {
+            mergedStats.min_pwr = Math.min(state.stats.min_pwr, tailStats.min_pwr);
+            mergedStats.max_pwr = Math.max(state.stats.max_pwr, tailStats.max_pwr);
+        }
+        return {
+            wf: {
+                bucketCount: rows.length, numBins: wf.numBins, meta: meta, rows: rows,
+                stats: stats, freqs: wf.freqs, isRaw: wf.isRaw,
+            },
+            stats: mergedStats,
+        };
     }
 
     // --- range label + picker ---
@@ -752,7 +863,7 @@
         return what + " (" + why + ") after " + secs + "s - " + server;
     }
 
-    async function loadAll(background) {
+    async function loadAll(background, allowTail) {
         // Request-sequencing guard: a range change (drag-zoom, preset, Apply) can
         // fire a new load while a previous one — most often a "Now" poll for the
         // wider range — is still in flight. That older request often resolves
@@ -778,12 +889,19 @@
                 ? state.wf.stats[state.selRow].start_epoch : null;
 
             const params = tuningParams();
+            // A live poll on an unchanged range fetches only the newest rows.
+            const plan = allowTail ? tailPlan() : null;
+            const rangeParams = new URLSearchParams(params);
+            if (plan) {
+                rangeParams.set("since", new Date(plan.sinceSec * 1000).toISOString());
+                if (plan.bucketSec !== null) rangeParams.set("bucket_sec", String(plan.bucketSec));
+            }
             const startedAt = performance.now();
             let wfResp, statsResp, detResp, iqResp;
             try {
                 [wfResp, statsResp, detResp, iqResp] = await Promise.all([
-                    tagged("waterfall", "/api/averaged/waterfall?" + params.toString(), abort.signal),
-                    tagged("stats", "/api/averaged/stats?" + params.toString(), abort.signal),
+                    tagged("waterfall", "/api/averaged/waterfall?" + rangeParams.toString(), abort.signal),
+                    tagged("stats", "/api/averaged/stats?" + rangeParams.toString(), abort.signal),
                     tagged("detections", "/api/detections.json?" + params.toString(), abort.signal),
                     tagged("iq-captures", "/api/iq-captures?" + params.toString(), abort.signal),
                 ]);
@@ -808,13 +926,27 @@
             // after each await so a stale response can never render or mutate state.
             const buf = await wfResp.arrayBuffer();
             if (seq !== state.loadSeq) return;
-            const wf = parseWaterfall(buf);
-            const statsJson = statsResp.ok ? await statsResp.json() : null;
+            let wf = parseWaterfall(buf);
+            let statsJson = statsResp.ok ? await statsResp.json() : null;
             if (seq !== state.loadSeq) return;
             const detList = detResp.ok ? (await detResp.json()).detections : [];
             if (seq !== state.loadSeq) return;
             const iqList = iqResp && iqResp.ok ? (await iqResp.json()).captures : [];
             if (seq !== state.loadSeq) return;
+            if (plan) {
+                const merged = statsJson ? mergeTail(wf, statsJson, plan) : null;
+                if (!merged) {
+                    // The tail cannot stand in for the range: reload it whole.
+                    // Clearing inc makes the next tailPlan() return null.
+                    state.inc = null;
+                    state.loading = false;
+                    return await loadAll(background, false);
+                }
+                wf = merged.wf;
+                statsJson = merged.stats;
+            } else {
+                state.inc = { key: incKey(), fullAtMs: Date.now() };
+            }
             state.wf = wf;
             state.stats = statsJson;
             state.detections = detList;

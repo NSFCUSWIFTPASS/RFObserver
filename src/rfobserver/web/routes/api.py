@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
@@ -31,17 +32,19 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Binary averaged-waterfall format v2 (see the spec):
-#   struct "<4i": magic 0x52464F42, version 2, row_count, num_bins
+# Binary averaged-waterfall format v3:
+#   struct "<4i": magic 0x52464F42, version 3, row_count, num_bins
 #   struct "<6d": bucket_sec, min_db, max_db, total_windows, freq_start_hz, freq_step_hz
-#   row_count * num_bins float32 (row-major PSD means; NaN = empty/pruned)
+#   row_count * num_bins int16 (row-major PSD means in 0.01 dB;
+#                               -32768 = empty/pruned). v2 sent float32 here.
 #   row_count * struct "<8d": start_epoch, duration_sec, count, pwr_avg, pwr_max,
 #                             pwr_median, pwr_std, kurtosis
 # Rows are individual windows when the range has few (no averaging) or time
 # buckets when it has many; the client renders each row at its own
 # [start_epoch, start_epoch + duration_sec] time span.
 _WATERFALL_MAGIC = 0x52464F42
-_WATERFALL_VERSION = 2
+_WATERFALL_VERSION = 3
+_WATERFALL_NAN = -32768
 # Small LRU so repeated preset navigation (same range/tuning/rows/bins) is
 # instant after the first ~5-10 s aggregation of a week.
 _WATERFALL_CACHE: OrderedDict[tuple[Any, ...], bytes] = OrderedDict()
@@ -737,6 +740,27 @@ def _int_param(raw: str | None, default: int, name: str) -> int:
         raise HTTPException(status_code=400, detail=f"{name} must be an integer") from exc
 
 
+def _bucket_param(raw: str | None, since: datetime, until: datetime, max_rows: int) -> float | None:
+    """Parse the optional forced ``bucket_sec`` (the live poll's tail fetch).
+
+    It must be a positive number giving at most ``max_rows + 1`` buckets over
+    the range (one extra for an unaligned edge), so a URL cannot force a grid
+    that allocates millions of buckets.
+    """
+    if raw is None or raw == "":
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="bucket_sec must be a number") from exc
+    span = (until - since).total_seconds()
+    if not math.isfinite(value) or value <= 0 or span / value > max_rows + 1:
+        raise HTTPException(
+            status_code=400, detail="bucket_sec must give at most max_rows + 1 buckets"
+        )
+    return value
+
+
 def _opt_float(raw: str | None) -> float | None:
     """Parse an optional numeric query param; '' (the 'All' filter) → None."""
     if raw is None or raw == "":
@@ -1125,7 +1149,11 @@ def _pack_waterfall(result: dict[str, Any]) -> bytes:
         result["freq_start_hz"],
         result["freq_step_hz"],
     )
-    psd = b"".join(struct.pack(f"<{nb}f", *row) for row in rows)
+    # 0.01 dB steps: finer than any display or hover readout, half the bytes.
+    arr = np.asarray(rows, dtype=np.float64).reshape(n, nb)
+    nan = np.isnan(arr)
+    q = np.clip(np.round(np.where(nan, 0.0, arr) * 100.0), -32767, 32767)
+    psd = bytes(np.where(nan, _WATERFALL_NAN, q).astype("<i2").tobytes())
     stats = b"".join(
         struct.pack(
             "<8d",
@@ -1172,12 +1200,14 @@ async def averaged_waterfall(
     gain: str | None = None,
     max_rows: str | None = None,
     max_bins: str | None = None,
+    bucket_sec: str | None = None,
 ) -> Response:
     """Averaged-window waterfall over a range, as one binary body.
 
-    The response is the spec's header + meta + float32 PSD rows + float64
+    The response is the header + meta + int16 centi-dB PSD rows + float64
     per-bucket stats (little-endian). Buckets are time-averaged on the server,
-    so a full week compresses to ~1.2 MB.
+    so a full 600 x 512 range is ~0.65 MB before gzip. ``bucket_sec`` forces
+    the grid for the live poll's tail fetch.
     """
     db = _get_db(request)
     if db is None:
@@ -1185,7 +1215,8 @@ async def averaged_waterfall(
     since_dt, until_dt = _parse_range(since, until)
     mr = max(1, min(2000, _int_param(max_rows, 600, "max_rows")))
     mb = max(2, min(2048, _int_param(max_bins, 512, "max_bins")))
-    key = (since, until, sdr_center, sample_rate, gain, mr, mb)
+    forced = _bucket_param(bucket_sec, since_dt, until_dt, mr)
+    key = (since, until, sdr_center, sample_rate, gain, mr, mb, forced)
     cached = _WATERFALL_CACHE.get(key)
     if cached is not None:
         return Response(content=cached, media_type="application/octet-stream")
@@ -1203,6 +1234,7 @@ async def averaged_waterfall(
             gain=_opt_float(gain),
             max_rows=mr,
             max_bins=mb,
+            bucket_sec=forced,
         )
     return Response(content=_waterfall_cached(key, result), media_type="application/octet-stream")
 
@@ -1216,6 +1248,7 @@ async def averaged_stats(
     sample_rate: str | None = None,
     gain: str | None = None,
     max_points: str | None = None,
+    bucket_sec: str | None = None,
 ) -> dict[str, Any] | Response:
     """Scalar stats timeline for a range (blob-independent, works after PSD
     retention prunes the blobs)."""
@@ -1223,6 +1256,8 @@ async def averaged_stats(
     if db is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     since_dt, until_dt = _parse_range(since, until)
+    mp = _int_param(max_points, 600, "max_points")
+    forced = _bucket_param(bucket_sec, since_dt, until_dt, mp)
     async with request.app.state.stats_sem:
         if await request.is_disconnected():
             return Response(status_code=499)
@@ -1232,7 +1267,8 @@ async def averaged_stats(
             sdr_center_freq=_opt_float(sdr_center),
             sample_rate=_opt_float(sample_rate),
             gain=_opt_float(gain),
-            max_points=_int_param(max_points, 600, "max_points"),
+            max_points=mp,
+            bucket_sec=forced,
         )
     return result
 

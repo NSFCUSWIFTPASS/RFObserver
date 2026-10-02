@@ -912,6 +912,7 @@ class SensorDatabase:
         gain: float | None = None,
         max_rows: int = 600,
         max_bins: int = 512,
+        bucket_sec: float | None = None,
     ) -> dict[str, Any]:
         """Averaged windows over a range, adaptive to display density.
 
@@ -934,6 +935,12 @@ class SensorDatabase:
         (their row is all-NaN). Native bins are downsampled to ``max_bins`` by
         group-mean when larger. Returns plain lists/floats for the web layer's
         binary packer.
+
+        ``bucket_sec`` forces aggregation on that grid instead of choosing the
+        mode from the window count. The Dashboard's live poll uses it to fetch
+        only the newest buckets of a range it already holds, on that range's
+        epoch-anchored grid (a raw-mode range needs no forcing: a short tail
+        is raw by the count rule).
         """
         assert self._db is not None
         span = (until - since).total_seconds()
@@ -951,6 +958,7 @@ class SensorDatabase:
         }
         if span <= 0:
             return empty
+        forced_bucket = bucket_sec
         bucket_sec = span / max_rows
         conditions, sdr_params = self._sdr_conditions(sdr_center_freq, sample_rate, gain)
         where = "WHERE start_time >= ? AND start_time < ?"
@@ -958,6 +966,10 @@ class SensorDatabase:
             where += " AND " + " AND ".join(conditions)
         params: list[Any] = [since.isoformat(), until.isoformat()]
         params.extend(sdr_params)
+        if forced_bucket is not None and forced_bucket > 0:
+            return await self._waterfall_aggregated(
+                where, params, since, until, forced_bucket, max_rows, max_bins
+            )
         # Count first to pick the mode; only aggregate when the windows
         # outnumber the display rows.
         async with self._db.execute(f"SELECT COUNT(*) FROM avg_windows {where}", params) as cur:
@@ -1218,6 +1230,7 @@ class SensorDatabase:
         sample_rate: float | None = None,
         gain: float | None = None,
         max_points: int = 600,
+        bucket_sec: float | None = None,
     ) -> dict[str, Any]:
         """Scalar stats timeline for a range. Reads only the light columns, so
         it works after retention prunes PSD blobs and over any range.
@@ -1226,12 +1239,14 @@ class SensorDatabase:
         is returned as its own point (no averaging); with more, the windows are
         folded into time buckets (mean-of-means, pwr_max max-of-maxes) anchored
         to absolute epoch multiples of ``bucket_sec`` so the timeline stays
-        stable while a live range slides.
+        stable while a live range slides. ``bucket_sec`` forces the grid, as
+        in ``query_avg_waterfall``.
         """
         assert self._db is not None
         span = (until - since).total_seconds()
         if span <= 0:
             return {"bucket_sec": 0.0, "min_pwr": 0.0, "max_pwr": 0.0, "points": []}
+        forced_bucket = bucket_sec
         bucket_sec = span / max_points
         conditions, sdr_params = self._sdr_conditions(sdr_center_freq, sample_rate, gain)
         where = "WHERE start_time >= ? AND start_time < ?"
@@ -1239,6 +1254,10 @@ class SensorDatabase:
             where += " AND " + " AND ".join(conditions)
         params: list[Any] = [since.isoformat(), until.isoformat()]
         params.extend(sdr_params)
+        if forced_bucket is not None and forced_bucket > 0:
+            return await self._stats_aggregated(
+                where, params, since, until, forced_bucket, max_points
+            )
         async with self._db.execute(f"SELECT COUNT(*) FROM avg_windows {where}", params) as cur:
             row = await cur.fetchone()
             window_count = int(row[0]) if row else 0

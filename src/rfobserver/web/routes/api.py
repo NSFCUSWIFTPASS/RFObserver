@@ -43,7 +43,7 @@ router = APIRouter()
 # buckets when it has many; the client renders each row at its own
 # [start_epoch, start_epoch + duration_sec] time span.
 _WATERFALL_MAGIC = 0x52464F42
-_WATERFALL_VERSION = 3
+_WATERFALL_VERSION = 4
 _WATERFALL_NAN = -32768
 # Small LRU so repeated preset navigation (same range/tuning/rows/bins) is
 # instant after the first ~5-10 s aggregation of a week.
@@ -1152,10 +1152,12 @@ def _pack_waterfall(result: dict[str, Any]) -> bytes:
         result["freq_start_hz"],
         result["freq_step_hz"],
     )
-    # 0.01 dB steps: finer than any display or hover readout, half the bytes.
+    # 0.1 dB steps, as Live sends: the readouts show one decimal. Finer steps
+    # only carry noise that gzip cannot compress (0.01 dB made a 15 minute
+    # range 3.4x larger on the wire).
     arr = np.asarray(rows, dtype=np.float64).reshape(n, nb)
     nan = np.isnan(arr)
-    q = np.clip(np.round(np.where(nan, 0.0, arr) * 100.0), -32767, 32767)
+    q = np.clip(np.round(np.where(nan, 0.0, arr) * 10.0), -32767, 32767)
     psd = bytes(np.where(nan, _WATERFALL_NAN, q).astype("<i2").tobytes())
     stats = b"".join(
         struct.pack(

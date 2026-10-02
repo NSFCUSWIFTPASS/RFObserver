@@ -256,7 +256,7 @@ async def test_api_averaged_waterfall_binary(app_with_db):
         assert r.headers["content-type"].startswith("application/octet-stream")
         body = r.content
         magic, version, bucket_count, num_bins = struct.unpack_from("<4i", body, 0)
-        assert magic == 0x52464F42 and version == 3
+        assert magic == 0x52464F42 and version == 4
         assert bucket_count == 2 and num_bins == 2
         bucket_sec, min_db, max_db, total_windows, f_start, f_step = struct.unpack_from(
             "<6d", body, 16
@@ -264,9 +264,9 @@ async def test_api_averaged_waterfall_binary(app_with_db):
         assert bucket_sec == pytest.approx(2.0)
         assert total_windows == 4
         off = 16 + 48
-        # v3 rows are int16 centi-dB.
+        # v4 rows are int16 in 0.1 dB steps.
         psd = struct.unpack_from(f"<{bucket_count * num_bins}h", body, off)
-        assert psd[0] / 100.0 == pytest.approx(-75.0, abs=0.01)  # mean of [-80,-70]
+        assert psd[0] / 10.0 == pytest.approx(-75.0, abs=0.1)  # mean of [-80,-70]
         off += bucket_count * num_bins * 2
         stats = struct.unpack_from(f"<{bucket_count * 8}d", body, off)
         assert stats[1] == pytest.approx(2.0)  # duration_sec == bucket_sec
@@ -313,7 +313,7 @@ async def test_api_averaged_waterfall_raw_mode(app_with_db):
         assert r.status_code == 200
         body = r.content
         magic, version, row_count, num_bins = struct.unpack_from("<4i", body, 0)
-        assert magic == 0x52464F42 and version == 3
+        assert magic == 0x52464F42 and version == 4
         assert row_count == 3  # one row per window, not 600
         assert num_bins == 2
         off = 16 + 48 + row_count * num_bins * 2

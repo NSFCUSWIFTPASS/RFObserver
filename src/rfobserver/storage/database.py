@@ -23,6 +23,7 @@ import json
 import logging
 import math
 import os
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -307,6 +308,42 @@ def _nice_bin_width(span: float) -> float:
     else:
         nice = 10.0
     return max(0.5, nice * base)
+
+
+def _decode_psd_rows(
+    rows: Sequence[Sequence[Any]], blob_col: int, max_bins: int
+) -> tuple[np.ndarray[Any, np.dtype[np.float32]], np.ndarray[Any, np.dtype[np.bool_]]]:
+    """Decode a chunk's PSD blobs to a (rows, max_bins) float32 array.
+
+    Each row is downsampled by group-mean when wider than ``max_bins`` and
+    NaN-padded when narrower, as ``SensorDatabase._ds_psd`` does for one row.
+    Rows of the same width are decoded together. Returns the array and a mask
+    of the rows that had a blob (the others are all-NaN).
+    """
+    out = np.full((len(rows), max_bins), np.nan, dtype=np.float32)
+    has = np.zeros(len(rows), dtype=bool)
+    groups: dict[int, list[int]] = {}
+    for i, r in enumerate(rows):
+        blob = r[blob_col]
+        if blob is not None and len(blob) >= 4:
+            groups.setdefault(len(blob) // 4, []).append(i)
+    for width, members in groups.items():
+        sel = np.asarray(members)
+        arr = np.frombuffer(
+            b"".join(rows[i][blob_col][: width * 4] for i in members), dtype="<f4"
+        ).reshape(len(members), width)
+        if width > max_bins:
+            # Group-mean of each `factor` adjacent bins, as strided slice sums:
+            # mean(axis=2) over a short last axis is several times slower.
+            factor = width // max_bins
+            acc = arr[:, 0 : factor * max_bins : factor].astype(np.float32)
+            for j in range(1, factor):
+                acc += arr[:, j : factor * max_bins : factor]
+            out[sel] = acc / np.float32(factor)
+        else:
+            out[sel, :width] = arr
+        has[sel] = True
+    return out, has
 
 
 class WindowStatsRow(NamedTuple):
@@ -1131,56 +1168,58 @@ class SensorDatabase:
         # NaN-padded (short) row never poisons a bucket's mean.
         psd_sum = np.zeros((n_buckets, max_bins), dtype=np.float64)
         psd_cnt = np.zeros((n_buckets, max_bins), dtype=np.int64)
-        stat_avg = [0.0] * n_buckets
-        stat_max = [-float("inf")] * n_buckets
-        stat_med = [0.0] * n_buckets
-        stat_std = [0.0] * n_buckets
-        stat_kurt = [0.0] * n_buckets
-        stat_n = [0] * n_buckets
+        stat_avg = np.zeros(n_buckets)
+        stat_max = np.full(n_buckets, -np.inf)
+        stat_med = np.zeros(n_buckets)
+        stat_std = np.zeros(n_buckets)
+        stat_kurt = np.zeros(n_buckets)
+        stat_n = np.zeros(n_buckets, dtype=np.int64)
         total_windows = 0
         gmin, gmax = float("inf"), float("-inf")
         freq_start_hz = 0.0
         freq_step_hz = 0.0
         first_axis_num_bins = 0
         first_axis = True
-        async for rows in self._scan_avg_windows(columns, where, params, chunk=5000):
-            for r in rows:
-                t = datetime.fromisoformat(r[0]).timestamp()
-                idx = int((t - anchor) / bucket_sec)
-                idx = max(0, min(idx, n_buckets - 1))
-                num_bins = int(r[1])
-                if first_axis:
-                    first_axis = False
-                    first_axis_num_bins = num_bins
-                    freq_start_hz = float(r[2])
-                    freq_step_hz = float(r[3])
-                stat_n[idx] += 1
-                stat_avg[idx] += float(r[5])
-                if r[6] is not None:
-                    stat_max[idx] = max(stat_max[idx], float(r[6]))
-                stat_med[idx] += float(r[7])
-                stat_std[idx] += float(r[8])
-                stat_kurt[idx] += float(r[9])
-                blob = r[4]
-                if blob is None:
-                    continue
-                total_windows += 1
-                powers = np.frombuffer(blob, dtype="<f4")
-                if powers.size != num_bins:
-                    num_bins = int(powers.size)
-                if num_bins > max_bins:
-                    factor = num_bins // max_bins
-                    trim = factor * max_bins
-                    powers = powers[:trim].reshape(max_bins, factor).mean(axis=1)
-                else:
-                    pad = max_bins - num_bins
-                    if pad > 0:
-                        powers = np.concatenate([powers, np.full(pad, np.nan, dtype=np.float32)])
-                gmin = min(gmin, float(np.nanmin(powers)))
-                gmax = max(gmax, float(np.nanmax(powers)))
-                valid = ~np.isnan(powers)
-                psd_sum[idx] += np.where(valid, powers, 0.0)
-                psd_cnt[idx] += valid
+        async for rows in self._scan_avg_windows(columns, where, params, chunk=2000):
+            if not rows:
+                continue
+            if first_axis:
+                first_axis = False
+                first_axis_num_bins = int(rows[0][1])
+                freq_start_hz = float(rows[0][2])
+                freq_step_hz = float(rows[0][3])
+            # Whole chunk at once in numpy: a per-window Python loop held the
+            # GIL for seconds on long ranges, starving the USB receiver thread.
+            t = np.fromiter(
+                (datetime.fromisoformat(r[0]).timestamp() for r in rows), np.float64, len(rows)
+            )
+            idx = np.clip(((t - anchor) / bucket_sec).astype(np.int64), 0, n_buckets - 1)
+            # Rows arrive in time order, so each bucket is one contiguous run.
+            starts = np.flatnonzero(np.r_[True, idx[1:] != idx[:-1]])
+            at = idx[starts]
+            np.add.at(stat_n, at, np.diff(np.r_[starts, len(rows)]))
+            for arr, col in ((stat_avg, 5), (stat_med, 7), (stat_std, 8), (stat_kurt, 9)):
+                vals = np.fromiter((float(r[col]) for r in rows), np.float64, len(rows))
+                arr[at] += np.add.reduceat(vals, starts)
+            pmax = np.fromiter(
+                (-np.inf if r[6] is None else float(r[6]) for r in rows), np.float64, len(rows)
+            )
+            stat_max[at] = np.maximum(stat_max[at], np.maximum.reduceat(pmax, starts))
+            psd, has = _decode_psd_rows(rows, 4, max_bins)
+            if not has.any():
+                continue
+            total_windows += int(has.sum())
+            psd, pidx = psd[has], idx[has]
+            with np.errstate(invalid="ignore"), warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)  # an all-NaN row
+                lo, hi = np.nanmin(psd), np.nanmax(psd)
+            if np.isfinite(lo):
+                gmin, gmax = min(gmin, float(lo)), max(gmax, float(hi))
+            valid = ~np.isnan(psd)
+            pstarts = np.flatnonzero(np.r_[True, pidx[1:] != pidx[:-1]])
+            pat = pidx[pstarts]
+            psd_sum[pat] += np.add.reduceat(np.where(valid, psd, 0.0), pstarts, axis=0)
+            psd_cnt[pat] += np.add.reduceat(valid.astype(np.int64), pstarts, axis=0)
         # The downsampled axis is still uniform: group-mean of a uniform axis
         # shifts the start by (factor-1)*step/2 and multiplies the step.
         if first_axis_num_bins > max_bins and freq_step_hz > 0:
@@ -1199,12 +1238,13 @@ class SensorDatabase:
             {
                 "start_epoch": anchor + i * bucket_sec,
                 "duration_sec": bucket_sec,
-                "count": stat_n[i],
-                "pwr_avg": stat_avg[i] / stat_n[i] if stat_n[i] else 0.0,
-                "pwr_max": stat_max[i] if stat_n[i] else 0.0,
-                "pwr_median": stat_med[i] / stat_n[i] if stat_n[i] else 0.0,
-                "pwr_std": stat_std[i] / stat_n[i] if stat_n[i] else 0.0,
-                "kurtosis": stat_kurt[i] / stat_n[i] if stat_n[i] else 0.0,
+                "count": int(stat_n[i]),
+                "pwr_avg": float(stat_avg[i] / stat_n[i]) if stat_n[i] else 0.0,
+                # -inf when every window in the bucket had no pwr_max.
+                "pwr_max": float(stat_max[i]) if stat_n[i] else 0.0,
+                "pwr_median": float(stat_med[i] / stat_n[i]) if stat_n[i] else 0.0,
+                "pwr_std": float(stat_std[i] / stat_n[i]) if stat_n[i] else 0.0,
+                "kurtosis": float(stat_kurt[i] / stat_n[i]) if stat_n[i] else 0.0,
             }
             for i in range(n_buckets)
         ]

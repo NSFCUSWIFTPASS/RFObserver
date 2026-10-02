@@ -228,11 +228,12 @@
         let off = 64;
         const rows = [];
         if (version >= 3) {
-            // int16 centi-dB, -32768 = no data.
+            // int16, -32768 = no data. v4 is in 0.1 dB steps, v3 in 0.01 dB.
+            const div = version >= 4 ? 10 : 100;
             for (let y = 0; y < rowCount; y++) {
                 const q = new Int16Array(buf, off, numBins);
                 const row = new Array(numBins);
-                for (let i = 0; i < numBins; i++) row[i] = q[i] === -32768 ? NaN : q[i] / 100;
+                for (let i = 0; i < numBins; i++) row[i] = q[i] === -32768 ? NaN : q[i] / div;
                 rows.push(row);
                 off += numBins * 2;
             }

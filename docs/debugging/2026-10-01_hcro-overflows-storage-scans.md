@@ -222,3 +222,44 @@ server for 8 s: the page showed "reconnecting" at 5 s, opened a new connection, 
 back to 19.5 updates a second when the server resumed, with no reload. The Detections,
 Captures and Config heartbeat sockets have the same gap but do not freeze a display; not
 changed.
+
+## 12. Remaining overflows: the burst-archive walk (2026-10-01)
+
+With the stall logging deployed (e92eb20), every overflow on HCRO came right after a
+`RECV STALL` with the same shape:
+
+```
+22:37:32 RECV STALL: recv=129.9ms (chunk 39.4ms) work=1.9ms [ring=0.8 modules=0.0 trigger/record=1.0 queue=0.0] recording=armed
+22:37:32 WARNING UHD overflow (O): lost samples
+22:38:08 RECV STALL: recv=136.1ms ... work=2.1ms ... recording=armed   -> overflow
+22:38:31 RECV STALL: recv=143.6ms ... work=1.3ms ... recording=armed   -> overflow
+22:38:44 RECV STALL: recv=148.7ms ... work=1.4ms ... recording=armed   -> overflow
+22:37:55 RECV STALL: recv=113.1ms ... work=1.3ms ... recording=armed   (no overflow)
+```
+
+- The receiver's own work is 1 to 2 ms; the time is inside `recv()` (113 to 149 ms against
+  38 ms). Past about 125 ms, UHD overflows.
+- Every stall was in the `armed` state. Recording starts in the same window (22:38:01, :05,
+  :25, :26, :47) caused none. **Rejected:** recording start as the cause.
+
+A 60 s `py-spy --gil` profile (3,647 samples) then showed the storage executor thread
+holding the GIL in `sample()` -> `BurstArchive.scan_usage` for 35.8% of samples: a pathlib
+`rglob` of bursts/ with three stats per burst, every 10 s tick. The capture index (e06740c)
+had not covered the burst archive. The three PSD workers took about 41% (the expected
+signal processing); the receiver took 4.7%.
+
+**Fix:** a shared in-memory burst index per bursts/ root (`burst_index`), built once (at
+startup via LocalStorage). `save` adds a burst; eviction claims and removes one; the
+governor split, the usage, the cap and floor eviction read it.
+
+Benchmark on nano-super with 20,000 burst pairs; per 10 s tick, `scan_usage` plus
+`enforce_cap`, with a stand-in receiver reading /dev/zero:
+
+```
+== OLD   tick n=6 avg 1880.0 ms max 1911.0 ms   receiver: max gap 45.7 ms
+== NEW   open 0.49 s;  tick n=6 avg 0.4 ms max 0.4 ms   receiver: max gap 1.7 ms
+```
+
+The stand-in receiver has fewer competitors than the real one, which also contends with
+three PSD workers for the GIL. To confirm after deploying: the overflow rate and the
+`stalls=` count on HCRO.

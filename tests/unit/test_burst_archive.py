@@ -129,3 +129,39 @@ def test_modules_receive_isolated_bursts_and_default_is_a_noop():
     assert rec.got == [(10, 1_600_000, "b1")]
     # A module without feed_burst (like fm_demod) is unaffected.
     UpstreamModule.feed_burst(rec, np.zeros(1, dtype=np.complex64), 1, {})
+
+
+def test_index_matches_a_fresh_walk_and_hot_paths_never_walk(tmp_path, monkeypatch):
+    """Usage, the governor split and eviction read the shared index; only the
+    first use of a bursts/ root walks it."""
+    from pathlib import Path
+
+    from rfobserver.storage import burst_archive as ba
+
+    a = BurstArchive(tmp_path)
+    for i in range(5):
+        a.save(_iso(f"b{i}", n=500), {}, subdir="20261001" if i < 3 else "replay-x")
+    fresh = ba._BurstIndex((tmp_path / "bursts").resolve())  # an independent walk
+    assert (fresh.total, fresh.count()) == (a.usage_bytes(), 5)
+
+    def boom(*_a, **_k):
+        raise AssertionError("walk on a hot path")
+
+    monkeypatch.setattr(os, "walk", boom)
+    monkeypatch.setattr(Path, "rglob", boom)
+    monkeypatch.setattr(Path, "glob", boom)
+    total, old = BurstArchive.scan_usage(tmp_path, not_after=None)
+    assert total == old == a.usage_bytes()
+    one = a.usage_bytes() // 5
+    a.enforce_cap(3 * one)
+    assert ba.burst_index(tmp_path).count() == 3
+    assert len([p for p in (tmp_path / "bursts").iterdir()]) == 2  # day + replay dirs remain
+
+
+def test_archives_on_one_root_share_the_index(tmp_path):
+    # The isolation stage and the storage tick each build their own
+    # BurstArchive; a burst saved by one must count for the other.
+    writer = BurstArchive(tmp_path)
+    reader = BurstArchive(tmp_path)
+    writer.save(_iso("b1"), {})
+    assert reader.usage_bytes() == writer.usage_bytes() > 0

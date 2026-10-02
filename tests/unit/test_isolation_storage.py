@@ -43,8 +43,10 @@ def test_sample_counts_only_bursts_written_before_not_after_as_old(tmp_path):
     a = BurstArchive(tmp_path)
     old = a.save(_iso("old"), {})
     os.utime(old, (1000, 1000))
+    a.track(old)  # re-registered with the backdated mtime (the index keeps save-time mtimes)
     new = a.save(_iso("new"), {})
     os.utime(new, (3000, 3000))
+    a.track(new)
     s = ls.sample(
         db_path=tmp_path / "db",
         active_names=(),

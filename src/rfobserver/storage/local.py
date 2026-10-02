@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from rfobserver.storage.burst_archive import BurstArchive
+from rfobserver.storage.burst_archive import BurstArchive, burst_index
 from rfobserver.storage.governor import StorageSample, VolumeSample
 
 if TYPE_CHECKING:
@@ -116,6 +116,9 @@ class LocalStorage:
             self.manual_dir = manual_dir
             self.migrate_flat_captures_to_manual()
             self.rebuild_index()
+        # The burst archive's index too, so its one walk happens here (off the
+        # event loop, before streaming) rather than at the first storage tick.
+        burst_index(root)
 
     # --- capture index ---
 

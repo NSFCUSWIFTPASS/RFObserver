@@ -209,3 +209,16 @@ profile (GIL and all threads).
   25 ms, or `recv()` takes more than a chunk plus 60 ms. It includes the breakdown (ring,
   modules, trigger/record, queue) and the recording state, to tie each remaining overflow
   to its cause.
+
+## 11. Live high-res "freezes until reload" (2026-10-01)
+
+The user saw the Live page (high-res) "freeze until reload". The server feed measured
+clean (section 10), so the freeze is a connection that died without a close reaching the
+browser. Over the VPN that can be a tunnel rekey, roaming or a NAT timeout. The page
+reconnected only from `onclose`, which never fired. It now treats 5 s without any message
+as a dead connection (the server sends a heartbeat every 1 s), abandons the socket without
+waiting for its close handshake, and opens a new one. Verified locally by SIGSTOPping the
+server for 8 s: the page showed "reconnecting" at 5 s, opened a new connection, and was
+back to 19.5 updates a second when the server resumed, with no reload. The Detections,
+Captures and Config heartbeat sockets have the same gap but do not freeze a display; not
+changed.

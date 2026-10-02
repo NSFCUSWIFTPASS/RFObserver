@@ -997,8 +997,37 @@
     }
 
     // --- WebSocket ---
+    // Liveness: the server sends a heartbeat every second, so silence means the
+    // connection is dead. Over a VPN a connection can die without the browser
+    // ever seeing a close (tunnel rekey, roaming, NAT timeout); onclose then
+    // never fires and the page froze until a reload. After WS_SILENT_MS with
+    // no message, abandon the socket (do not wait for its close handshake)
+    // and open a new one.
+    const WS_SILENT_MS = 5000;
+    let wsLastMessage = 0;
+
+    function abandonAndReconnect() {
+        const dead = ws;
+        ws = null;
+        if (dead) {
+            dead.onopen = dead.onmessage = dead.onerror = dead.onclose = null;
+            try { dead.close(); } catch (_) {}
+        }
+        const el = document.getElementById("ups-counter");
+        if (el) el.textContent = "reconnecting";
+        connectWS();
+    }
+
+    setInterval(function() {
+        if (ws && wsLastMessage && performance.now() - wsLastMessage > WS_SILENT_MS) {
+            abandonAndReconnect();
+        }
+    }, 1000);
+
     function connectWS() {
         ws = new WebSocket(WS_URL);
+        // A connect that never completes counts as silence too.
+        wsLastMessage = performance.now();
 
         ws.onopen = function() {
             if (highRes) {
@@ -1008,6 +1037,7 @@
         };
 
         ws.onmessage = function(evt) {
+            wsLastMessage = performance.now();
             const data = JSON.parse(evt.data);
             if (data.type === "heartbeat") {
                 handleHeartbeat(data);

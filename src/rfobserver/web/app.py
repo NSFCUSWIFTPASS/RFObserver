@@ -13,6 +13,7 @@ from fastapi.templating import Jinja2Templates
 
 from rfobserver.__about__ import __version__
 from rfobserver.config import AppSettings
+from rfobserver.web.gzip import SafeGZipMiddleware
 from rfobserver.web.websocket import LiveBroadcast, websocket_endpoint
 
 if TYPE_CHECKING:
@@ -52,6 +53,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         docs_url=None,
         redoc_url=None,
     )
+
+    # Pages, static assets and API bodies go out gzipped; downloads do not.
+    app.add_middleware(SafeGZipMiddleware)
 
     app.state.settings = settings
     app.state.templates = Jinja2Templates(directory=str(TEMPLATES_DIR))

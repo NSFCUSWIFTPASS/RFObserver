@@ -106,6 +106,7 @@ module = [
     "aiosqlite.*",
     "asyncpg.*",
     "fastapi.*",
+    "starlette.*",
     "uvicorn.*",
     "httpx.*",
     "prometheus_client.*",

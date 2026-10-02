@@ -1021,8 +1021,10 @@
     // ever seeing a close (tunnel rekey, roaming, NAT timeout); onclose then
     // never fires and the page froze until a reload. After WS_SILENT_MS with
     // no message, abandon the socket (do not wait for its close handshake)
-    // and open a new one.
-    const WS_SILENT_MS = 5000;
+    // and open a new one. A connection can also stall for seconds while still
+    // open (TCP retransmission backoff on the VPN path, seen at HCRO), and a
+    // fresh one goes through at once, so three missed heartbeats is enough.
+    const WS_SILENT_MS = 3000;
     let wsLastMessage = 0;
     // Why the next socket is opened (sent to the server in a hello message).
     let wsReason = "load";

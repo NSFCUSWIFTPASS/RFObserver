@@ -679,10 +679,10 @@ class StreamingProcessor:
         self._recording_wall_start: float | None = None
         self._trigger_initiated: bool = False  # True if trigger fired (vs manual)
         self._below_threshold_count = 0
-        # True when the current "armed" state came from continuous auto-arm (vs a
-        # manual arm_trigger). Lets a continuous-off toggle release an auto-armed
-        # wait without disarming a deliberately manual arm.
-        self._continuous_armed: bool = False
+        # Set by a manual stop: the trigger stays armed but does not fire again
+        # until power has dropped below the threshold once, so stopping a long
+        # transmission does not immediately start a new capture of it.
+        self._rearm_hold: bool = False
 
         # Disk-streaming write queue (default mode). Items are tagged:
         # ("iq", bytes-like) for the .sc16 stream, ("grid", bytes) for the
@@ -1255,33 +1255,59 @@ class StreamingProcessor:
             self._trigger_initiated = False
             self._begin_recording()
 
+    @property
+    def trigger_armed(self) -> bool:
+        """Whether the power trigger may start captures. Persisted as
+        TRIGGER_CONTINUOUS: armed stays armed after each capture until
+        disarmed, and a capture in progress does not change it."""
+        return bool(self._settings.TRIGGER_CONTINUOUS)
+
     def arm_trigger(self) -> None:
-        """Arm the power trigger — recording starts when threshold is exceeded."""
-        if self._replay_mode:
-            return
-        if self._refused():
+        """Arm the power trigger: a capture starts whenever power exceeds the
+        threshold, and the trigger re-arms after each one."""
+        self._settings.TRIGGER_CONTINUOUS = True
+        if self._replay_mode or self._refused():
+            # Stays armed: waiting starts after the replay, or once storage
+            # accepts recordings again.
             return
         with self._rec_lock:
-            if self._recording_state in ("recording", "finalizing"):
-                return
-            self._recording_state = "armed"
-            self._continuous_armed = False  # a deliberate manual arm, not continuous
-            logger.info("Trigger armed (threshold=%.1f dB)", self._settings.TRIGGER_THRESHOLD_DB)
+            if self._recording_state == "idle":
+                self._recording_state = "armed"
+        logger.info("Trigger armed (threshold=%.1f dB)", self._settings.TRIGGER_THRESHOLD_DB)
+
+    def disarm_trigger(self) -> None:
+        """Disarm the power trigger. A capture in progress keeps running."""
+        self._settings.TRIGGER_CONTINUOUS = False
+        with self._rec_lock:
+            if self._recording_state == "armed":
+                self._recording_state = "idle"
+            self._rearm_hold = False
+        logger.info("Trigger disarmed")
 
     def stop_recording(self) -> None:
-        """Stop recording or disarm trigger, return to idle.
+        """Stop the capture in progress (manual or triggered). The arm state is
+        unchanged; while armed, the trigger waits for power to drop below the
+        threshold before it can fire again.
 
         Finalization runs on the recording-control thread; a manual stop waits
         for it so the call keeps its synchronous API semantics (the web route
         already wraps this in asyncio.to_thread).
         """
         if self._recording_state == "recording":
+            self._rearm_hold = True
             self._request_end_recording(wait=True, reason="manual")
         elif self._recording_state == "finalizing":
             self._end_done.wait(timeout=15)
-        self._recording_state = "idle"
+        else:
+            return
+        with self._rec_lock:
+            if self._recording_state != "recording":
+                self._recording_state = "armed" if self._can_wait_armed() else "idle"
         self._trigger_initiated = False
-        logger.info("Recording stopped / trigger disarmed")
+        logger.info("Recording stopped")
+
+    def _can_wait_armed(self) -> bool:
+        return self.trigger_armed and not self._replay_mode
 
     def _schedule_recctl(self, fn: Callable[[], None]) -> None:
         """Run ``fn`` on the recording-control thread; inline when the pipeline
@@ -1333,6 +1359,12 @@ class StreamingProcessor:
             duration = time.monotonic() - self._recording_start
         return {
             "state": self._recording_state,
+            "armed": self.trigger_armed,
+            # The capture in progress was started by the trigger (vs manually).
+            "triggered": self._trigger_initiated,
+            # Armed, but held after a manual stop until power drops below the
+            # threshold.
+            "hold": self._rearm_hold,
             "file": self._recording_file,
             "bytes": self._recording_bytes,
             "duration_sec": round(duration, 1),
@@ -1602,7 +1634,7 @@ class StreamingProcessor:
                     self._below_threshold_count = 0
             return
 
-        continuous = self._settings.TRIGGER_CONTINUOUS
+        armed = self._can_wait_armed()
         with self._rec_lock:
             state = self._recording_state
             if state == "recording":
@@ -1612,24 +1644,28 @@ class StreamingProcessor:
                 # The auto-stop checks run on the next chunk.
                 self._write_recording_chunk(sc16_buf, gaps, chunk_start)
                 return
-            if state == "idle" and continuous and not self._replay_mode:
-                # Continuous trigger auto-arms whenever idle -- on sensor start, when
-                # the toggle is switched on, and (since a capture's finalize job
-                # ends in the idle state) as the re-arm after each capture. While
-                # that job runs the state is "finalizing", so re-arming — and the
-                # next capture — waits for finalization to complete.
+            if state == "idle" and armed:
+                # An armed trigger waits whenever idle -- on sensor start, when
+                # it is armed, and (since a capture's finalize job ends in the
+                # idle state) as the re-arm after each capture. While that job
+                # runs the state is "finalizing", so re-arming — and the next
+                # capture — waits for finalization to complete.
                 self._recording_state = "armed"
-                self._continuous_armed = True
                 state = "armed"
-            elif state == "armed" and self._continuous_armed and not continuous:
-                # Toggling continuous off releases an auto-armed waiting state; a
-                # manual arm (_continuous_armed False) is left untouched.
+            elif state == "armed" and not armed:
+                # Disarmed elsewhere (config page, or a replay started).
                 self._recording_state = "idle"
-                self._continuous_armed = False
+                return
+            if state != "armed":
                 return
 
-            # If armed, check threshold to start recording
-            if state == "armed" and self._check_power_above_threshold(sc16_buf):
+            above = self._check_power_above_threshold(sc16_buf)
+            if self._rearm_hold:
+                # After a manual stop: fire only on a new crossing.
+                if not above:
+                    self._rearm_hold = False
+                return
+            if above:
                 # Stay armed on refusal: once space is back the next crossing fires.
                 if self._refused():
                     return

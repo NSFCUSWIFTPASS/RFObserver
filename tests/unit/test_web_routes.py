@@ -632,7 +632,11 @@ class TestRecordingAPI:
         assert data["file"] is not None
         assert data["file"].endswith(".sc16")
 
-    def test_recording_arm(self, client_with_processor):
+    def test_recording_arm(self, client_with_processor, monkeypatch):
+        from rfobserver.web.routes import api as api_mod
+
+        persisted = []
+        monkeypatch.setattr(api_mod, "_persist_settings", lambda s: persisted.append(True))
         client, _, processor = client_with_processor
         processor.recording_status.return_value = {
             "state": "armed",
@@ -645,6 +649,28 @@ class TestRecordingAPI:
         assert resp.status_code == 200
         processor.arm_trigger.assert_called_once()
         assert resp.json()["state"] == "armed"
+        assert persisted == [True]  # the arm state survives a restart
+
+    def test_recording_disarm(self, client_with_processor, monkeypatch):
+        from rfobserver.web.routes import api as api_mod
+
+        persisted = []
+        monkeypatch.setattr(api_mod, "_persist_settings", lambda s: persisted.append(True))
+        client, _, processor = client_with_processor
+        processor.recording_status.return_value = {
+            "state": "recording",
+            "armed": False,
+            "file": "x.sc16",
+            "bytes": 4,
+            "duration_sec": 1.0,
+            "dropped_chunks": 0,
+        }
+        resp = client.post("/api/recording/disarm")
+        assert resp.status_code == 200
+        processor.disarm_trigger.assert_called_once()
+        processor.stop_recording.assert_not_called()  # the capture keeps running
+        assert resp.json()["state"] == "recording"
+        assert persisted == [True]
 
     def test_recording_stop(self, client_with_processor):
         client, _, processor = client_with_processor
@@ -661,7 +687,7 @@ class TestRecordingAPI:
         assert resp.json()["state"] == "idle"
 
     def test_recording_stop_from_armed(self, client_with_processor):
-        """Stop while armed should return to idle."""
+        """Stop only ever stops a capture; the processor decides the arm state."""
         client, _, processor = client_with_processor
         processor.recording_status.return_value = {
             "state": "idle",

@@ -26,9 +26,9 @@
             </label>
             <span class="status-sep">&middot;</span>
             <span id="rec-controls">
-                <button id="rec-btn" class="rec-btn rec-start" title="Start recording">REC</button>
-                <button id="arm-btn" class="rec-btn rec-arm" title="Arm trigger">ARM</button>
-                <button id="stop-btn" class="rec-btn rec-stop" style="display:none;" title="Stop">STOP</button>
+                <button id="arm-btn" class="rec-btn rec-arm" title="Arm the power trigger">ARM</button>
+                <button id="rec-btn" class="rec-btn rec-start" title="Start a manual capture">REC</button>
+                <button id="stop-btn" class="rec-btn rec-stop" style="display:none;" title="Stop this capture">STOP</button>
                 <span id="rec-notice" class="rec-notice" style="display:none;"></span>
                 <span id="rec-status" class="rec-status-label"></span>
             </span>
@@ -1331,26 +1331,34 @@
         return (b / 1073741824).toFixed(2) + " GB";
     }
 
-    function updateRecUI(state, file, bytes, dur, dropped) {
+    // Two independent controls: ARM toggles the power trigger (it stays armed
+    // across captures), REC/STOP starts or stops the capture in progress,
+    // whether the trigger or the user started it.
+    let trigArmed = false;
+    function updateRecUI(rec) {
+        const state = rec.state;
+        trigArmed = !!rec.armed;
+        armBtn.textContent = trigArmed ? "ARMED" : "ARM";
+        armBtn.classList.toggle("rec-armed", trigArmed);
+        armBtn.title = trigArmed ? "Trigger armed. Click to disarm" : "Arm the power trigger";
+        const capturing = state === "recording" || state === "finalizing";
+        recBtn.style.display = capturing ? "none" : "";
+        stopBtn.style.display = capturing ? "" : "none";
         if (state === "recording") {
-            recBtn.style.display = "none";
-            armBtn.style.display = "none";
-            stopBtn.style.display = "";
-            let info = '<span class="pulse-red"></span> '
-                + formatBytes(bytes) + " &middot; " + dur.toFixed(1) + "s";
+            const bytes = rec.bytes || 0, dur = rec.duration_sec || 0, dropped = rec.dropped_chunks || 0;
+            let info = '<span class="pulse-red"></span> ' + (rec.triggered ? "Triggered" : "Manual")
+                + " &middot; " + formatBytes(bytes) + " &middot; " + dur.toFixed(1) + "s";
             if (dropped > 0) info += ' <span style="color:#ff3b30;">(' + dropped + ' dropped)</span>';
             recStatus.innerHTML = info;
+        } else if (state === "finalizing") {
+            recStatus.textContent = "Saving";
         } else if (state === "armed") {
-            recBtn.style.display = "none";
-            armBtn.style.display = "none";
-            stopBtn.style.display = "";
-            recStatus.innerHTML = '<span class="pulse-yellow"></span> Armed';
+            recStatus.innerHTML = '<span class="pulse-yellow"></span> ' + (rec.hold ? "Armed, held" : "Armed");
         } else {
-            recBtn.style.display = "";
-            armBtn.style.display = "";
-            stopBtn.style.display = "none";
             recStatus.textContent = "";
         }
+        recStatus.title = state === "armed" && rec.hold
+            ? "Stopped manually: the next capture waits until power drops below the threshold" : "";
     }
 
     // Replay banner's own Record toggle: opt in/out of writing the active
@@ -1444,7 +1452,14 @@
     let recNoticeTimer = null;
     async function recordRequest(url) {
         const r = await fetch(url, {method: "POST"});
-        if (r.ok) return;
+        if (r.ok) {
+            // Reflect the change now rather than at the next heartbeat.
+            try {
+                const st = await r.json();
+                if (st && st.state) updateRecUI(st);
+            } catch (e) { /* the heartbeat catches up */ }
+            return;
+        }
         let detail = "Request failed";
         try { detail = (await r.json()).detail || detail; } catch (e) { /* keep default */ }
         recNotice.textContent = detail;
@@ -1463,15 +1478,7 @@
             statusBarEl.innerHTML = d.status_bar_html;
         }
         if (d.storage !== undefined) updateStorageBanner(d.storage);
-        if (d.recording) {
-            updateRecUI(
-                d.recording.state,
-                d.recording.file,
-                d.recording.bytes || 0,
-                d.recording.duration_sec || 0,
-                d.recording.dropped_chunks || 0,
-            );
-        }
+        if (d.recording) updateRecUI(d.recording);
         if (d.modules) {
             _renderModulesFrom(d.modules);
         }
@@ -1493,10 +1500,10 @@
         await recordRequest("/api/recording/start");
     });
     armBtn.addEventListener("click", async function() {
-        await recordRequest("/api/recording/arm");
+        await recordRequest(trigArmed ? "/api/recording/disarm" : "/api/recording/arm");
     });
     stopBtn.addEventListener("click", async function() {
-        await fetch("/api/recording/stop", {method: "POST"});
+        await recordRequest("/api/recording/stop");
     });
 
     // --- Inline-editable status bar values ---

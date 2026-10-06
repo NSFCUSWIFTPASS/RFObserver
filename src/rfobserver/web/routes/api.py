@@ -514,19 +514,42 @@ async def recording_start(request: Request) -> dict[str, Any]:
     return _idle_status()
 
 
+def _persist_arm(request: Request) -> None:
+    """Persist the arm state (TRIGGER_CONTINUOUS) like a config change, so it
+    survives a restart. Skipped during a replay, whose settings hold the
+    capture's tuning; /api/replay/stop persists them afterwards."""
+    supervisor = getattr(request.app.state, "supervisor", None)
+    if supervisor is not None and getattr(supervisor, "replay_status", lambda: None)() is not None:
+        return
+    _persist_settings(request.app.state.settings)
+
+
 @router.post("/recording/arm")
 async def recording_arm(request: Request) -> dict[str, Any]:
-    """Arm the power trigger — recording starts when threshold exceeded."""
+    """Arm the power trigger: a capture starts whenever power exceeds the
+    threshold, and the trigger stays armed until disarmed."""
     proc = _get_processor(request)
     if proc is not None and hasattr(proc, "arm_trigger"):
         proc.arm_trigger()
+        _persist_arm(request)
         return _raise_if_refused(proc)
+    return _idle_status()
+
+
+@router.post("/recording/disarm")
+async def recording_disarm(request: Request) -> dict[str, Any]:
+    """Disarm the power trigger. A capture in progress keeps running."""
+    proc = _get_processor(request)
+    if proc is not None and hasattr(proc, "disarm_trigger"):
+        proc.disarm_trigger()
+        _persist_arm(request)
+        return _rec_status(proc)
     return _idle_status()
 
 
 @router.post("/recording/stop")
 async def recording_stop(request: Request) -> dict[str, Any]:
-    """Stop recording or disarm trigger."""
+    """Stop the capture in progress. The arm state is unchanged."""
     proc = _get_processor(request)
     if proc is not None and hasattr(proc, "stop_recording"):
         # Finalizing a recording does blocking file I/O; keep it off the event

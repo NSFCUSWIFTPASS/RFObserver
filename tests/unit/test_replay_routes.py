@@ -48,7 +48,9 @@ class _FakeSupervisor:
 
 
 @pytest.fixture
-def app_ctx(tmp_path):
+def app_ctx(tmp_path, monkeypatch):
+    # Replay stop persists settings to ./.env; keep it out of the repo.
+    monkeypatch.chdir(tmp_path)
     src = tmp_path / "replays"
     src.mkdir()
     # a tiny valid ci16_le raw file (100 samples)

@@ -194,7 +194,8 @@ def _client_with(proc_status: dict) -> TestClient:
 
 
 @pytest.mark.parametrize("path", ["/api/recording/start", "/api/recording/arm", "/api/trigger"])
-def test_api_answers_409_with_the_reason_when_refused(path):
+def test_api_answers_409_with_the_reason_when_refused(path, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # arm persists to ./.env; keep it out of the repo
     c = _client_with({"state": "idle", "file": None, "refused": "Recording refused: x"})
     r = c.post(path)
     assert r.status_code == 409
@@ -492,7 +493,8 @@ def test_a_tick_in_flight_at_the_stop_does_not_release_the_hold(tmp_path):
 def test_armed_trigger_does_not_fire_during_the_hold(tmp_path):
     gov = _governor_at(0)
     proc = _disk_floor_stop(tmp_path, gov)
-    proc._recording_state = "armed"  # e.g. continuous re-arm on idle
+    proc._settings.TRIGGER_CONTINUOUS = True  # armed
+    proc._recording_state = "armed"
     proc._settings.TRIGGER_THRESHOLD_DB = -200.0
     proc._check_trigger_and_record(np.full(4096, 1 << 20, dtype=np.int32), (), 0)
     assert proc.recording_status()["state"] == "armed"

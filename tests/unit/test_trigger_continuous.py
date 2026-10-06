@@ -65,7 +65,7 @@ def test_continuous_auto_arms_when_idle(tmp_path):
     assert proc._recording_state == "idle"
     proc._check_trigger_and_record(_low_power_buf())
     assert proc._recording_state == "armed"
-    assert proc._continuous_armed is True
+    assert proc.recording_status()["armed"] is True
 
 
 def test_continuous_off_does_not_auto_arm(tmp_path):
@@ -74,25 +74,99 @@ def test_continuous_off_does_not_auto_arm(tmp_path):
     assert proc._recording_state == "idle"
 
 
-def test_toggle_off_disarms_auto_armed(tmp_path):
+def test_toggle_off_disarms(tmp_path):
     proc, settings = _make_proc(tmp_path, TRIGGER_CONTINUOUS=True, TRIGGER_THRESHOLD_DB=100.0)
     proc._check_trigger_and_record(_low_power_buf())
     assert proc._recording_state == "armed"
-    # Operator turns continuous off; the auto-armed waiting state is released.
+    # Disarmed from the config page: the waiting state is released.
     settings.TRIGGER_CONTINUOUS = False
     proc._check_trigger_and_record(_low_power_buf())
     assert proc._recording_state == "idle"
-    assert proc._continuous_armed is False
 
 
-def test_manual_arm_survives_continuous_off(tmp_path):
-    proc, _ = _make_proc(tmp_path, TRIGGER_CONTINUOUS=False, TRIGGER_THRESHOLD_DB=100.0)
+def test_arm_is_the_persisted_setting(tmp_path):
+    proc, settings = _make_proc(tmp_path, TRIGGER_THRESHOLD_DB=100.0)
     proc.arm_trigger()
+    assert settings.TRIGGER_CONTINUOUS is True
     assert proc._recording_state == "armed"
-    assert proc._continuous_armed is False
-    # A manual arm is not an auto-arm, so the continuous-off rule must not touch it.
+    proc.disarm_trigger()
+    assert settings.TRIGGER_CONTINUOUS is False
+    assert proc._recording_state == "idle"
+
+
+def test_armed_trigger_rearms_after_each_capture(tmp_path):
+    proc, _ = _make_proc(tmp_path, TRIGGER_THRESHOLD_DB=-400.0)
+    proc.arm_trigger()
     proc._check_trigger_and_record(_low_power_buf())
+    assert proc._recording_state == "recording"
+    proc._request_end_recording(wait=True, reason="trigger_end")
+    assert proc._recording_state == "idle"
+    proc._check_trigger_and_record(_low_power_buf())
+    assert proc._recording_state == "recording"  # re-armed and fired again
+    proc._request_end_recording(wait=True, reason="trigger_end")
+
+
+def test_stop_keeps_armed_and_holds_until_power_drops(tmp_path):
+    """A manual stop of a triggered capture leaves the trigger armed, but it
+    must not fire again on the same signal: only after power has dropped
+    below the threshold once."""
+    proc, _ = _make_proc(tmp_path, TRIGGER_THRESHOLD_DB=-60.0)
+    loud = _constant_power_buf(1000)  # -44.3 dB, above -60
+    quiet = _low_power_buf()
+    proc.arm_trigger()
+    proc._check_trigger_and_record(loud)
+    assert proc._recording_state == "recording"
+    assert proc.recording_status()["triggered"] is True
+
+    proc.stop_recording()
+    st = proc.recording_status()
+    assert st["state"] == "armed" and st["armed"] is True and st["hold"] is True
+
+    proc._check_trigger_and_record(loud)  # same signal still on: held
     assert proc._recording_state == "armed"
+    proc._check_trigger_and_record(quiet)  # dropped: hold released
+    assert proc.recording_status()["hold"] is False
+    assert proc._recording_state == "armed"
+    proc._check_trigger_and_record(loud)  # a new crossing fires
+    assert proc._recording_state == "recording"
+    proc.stop_recording()
+
+
+def test_manual_capture_while_armed(tmp_path):
+    """REC while armed starts a manual capture that the trigger's
+    below-threshold auto-stop leaves alone; STOP returns to armed."""
+    proc, _ = _make_proc(tmp_path, TRIGGER_THRESHOLD_DB=-60.0, TRIGGER_HYSTERESIS=1)
+    proc.arm_trigger()
+    proc.start_recording()
+    assert proc._recording_state == "recording"
+    assert proc.recording_status()["triggered"] is False
+    for _ in range(3):
+        proc._check_trigger_and_record(_low_power_buf())
+    assert proc._recording_state == "recording"  # quiet, still recording
+    assert proc._recording_dir == proc._storage.manual_dir
+    proc.stop_recording()
+    assert proc._recording_state == "armed"
+
+
+def test_disarm_keeps_the_capture_in_progress(tmp_path):
+    proc, _ = _make_proc(tmp_path, TRIGGER_THRESHOLD_DB=-400.0)
+    proc.arm_trigger()
+    proc._check_trigger_and_record(_low_power_buf())
+    assert proc._recording_state == "recording"
+    proc.disarm_trigger()
+    assert proc._recording_state == "recording"
+    proc.stop_recording()
+    assert proc._recording_state == "idle"
+    proc._check_trigger_and_record(_low_power_buf())
+    assert proc._recording_state == "idle"  # disarmed: no new capture
+
+
+def test_stop_without_a_capture_does_not_disarm(tmp_path):
+    proc, _ = _make_proc(tmp_path, TRIGGER_THRESHOLD_DB=100.0)
+    proc.arm_trigger()
+    proc.stop_recording()
+    assert proc._recording_state == "armed"
+    assert proc.recording_status()["hold"] is False
 
 
 def test_end_recording_enforces_disk_cap(tmp_path):

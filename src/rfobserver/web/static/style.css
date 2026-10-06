@@ -1070,6 +1070,15 @@ body {
     background: rgba(255, 159, 10, 0.25);
 }
 
+.rec-arm.rec-armed {
+    background: #ff9f0a;
+    color: #fff;
+}
+
+.rec-arm.rec-armed:hover {
+    background: #e68e00;
+}
+
 .rec-stop {
     background: rgba(142, 142, 147, 0.15);
     color: var(--text-primary);

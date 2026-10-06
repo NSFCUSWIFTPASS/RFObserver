@@ -74,9 +74,9 @@ class AppSettings(BaseSettings):
     TRIGGER_HYSTERESIS: int = 3
     TRIGGER_PRE_SEC: float = 1.0
     TRIGGER_DETECT_SEC: float = 0.5
-    # Continuous trigger: after a triggered capture ends, re-arm immediately
-    # instead of going idle, so the sensor keeps capturing on every threshold
-    # crossing. Bounded by ARCHIVE_MAX_GB via FIFO eviction of oldest captures.
+    # Trigger armed (the ARM button on the Live page; the name predates it):
+    # capture on every threshold crossing, re-arming after each capture until
+    # disarmed. Bounded by ARCHIVE_MAX_GB via FIFO eviction of oldest captures.
     TRIGGER_CONTINUOUS: bool = False
 
     # Burst detection

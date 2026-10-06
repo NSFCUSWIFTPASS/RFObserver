@@ -154,9 +154,9 @@
             </div>
             <div class="form-row" style="align-items: center;">
                 <div class="form-group" style="flex: 0 0 auto;">
-                    <label class="toggle-label" title="Keep the trigger armed after each capture and record continuously while the sensor is active">
+                    <label class="toggle-label" title="Capture whenever power exceeds the threshold, re-arming after each capture. Same as ARM on the Live page">
                         <input type="checkbox" id="trigger-continuous" name="trigger_continuous" {% if settings.TRIGGER_CONTINUOUS %}checked{% endif %}>
-                        <span class="toggle-text">Continuous Trigger</span>
+                        <span class="toggle-text">Trigger Armed</span>
                     </label>
                 </div>
                 <div class="form-group" style="flex: 0 0 auto;">

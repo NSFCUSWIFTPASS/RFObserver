@@ -434,7 +434,7 @@ async def test_streaming_manual_recording(
 async def test_streaming_arm_trigger(
     streaming_processor: StreamingProcessor,
 ) -> None:
-    """Arm trigger, verify state, disarm, verify idle."""
+    """Arm trigger, verify state; stop leaves it armed; disarm returns to idle."""
 
     async def arm_and_stop() -> None:
         while streaming_processor._capture_count < 2:
@@ -446,7 +446,10 @@ async def test_streaming_arm_trigger(
         assert status["file"] is None  # not recording yet
         assert status["bytes"] == 0
 
-        streaming_processor.stop_recording()
+        streaming_processor.stop_recording()  # no capture: nothing to stop
+        assert streaming_processor.recording_status()["state"] == "armed"
+
+        streaming_processor.disarm_trigger()
         assert streaming_processor.recording_status()["state"] == "idle"
 
         streaming_processor.stop()
@@ -505,7 +508,7 @@ async def test_streaming_start_recording_while_armed(
             await asyncio.sleep(0.02)
 
         streaming_processor.stop_recording()
-        assert streaming_processor.recording_status()["state"] == "idle"
+        assert streaming_processor.recording_status()["state"] == "armed"  # still armed
         streaming_processor.stop()
 
     await asyncio.wait_for(

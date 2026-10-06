@@ -1432,6 +1432,14 @@ body {
     min-height: 200px;
 }
 
+/* Holds a filling chart and its tooltip: the tooltip's positioning box. */
+.avg-fill .avg-chart-hold {
+    position: relative;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+}
+
 /* Charts size to their card; the JS matches the canvas backing store to the
    displayed size and re-renders on window resize. */
 .avg-chart {

@@ -134,7 +134,7 @@
         <div class="card-body">
             <div style="position:relative;">
                 <canvas id="avg-stats-canvas" class="avg-chart avg-chart-stats" title="Drag to zoom; click a green IQ band to open that capture"></canvas>
-                <div id="avg-iq-tooltip" class="graph-tooltip" style="display:none;"></div>
+                <div id="avg-stats-tooltip" class="graph-tooltip" style="display:none;"></div>
             </div>
             <div class="graph-legend">
                 <span class="legend-label" style="color:#0071e3;">avg</span>
@@ -200,7 +200,10 @@
             </span>
         </div>
         <div class="card-body">
-            <canvas id="avg-kurt" class="avg-chart avg-chart-kurt" title="Drag to zoom the time range"></canvas>
+            <div class="avg-chart-hold">
+                <canvas id="avg-kurt" class="avg-chart avg-chart-kurt" title="Drag to zoom the time range"></canvas>
+                <div id="avg-kurt-tooltip" class="graph-tooltip" style="display:none;"></div>
+            </div>
         </div>
     </div>
 </div>

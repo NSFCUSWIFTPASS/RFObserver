@@ -139,6 +139,7 @@
         showIq: true,    // the IQ highlights switch on the power chart (remembered per browser)
         selRow: 0,
         crosshairBin: -1,
+        hoverMs: null,   // time under the cursor on the power/kurtosis charts, or null
         autoScale: {},   // the auto bound each chart last drew with, per scale key
         scale: {
             wf_lo: null, wf_hi: null,
@@ -1459,6 +1460,75 @@
         return best;
     }
 
+    // --- hover readout on the power and kurtosis charts ---
+
+    // Hovering either chart sets state.hoverMs; both draw a crosshair there so
+    // the two read against each other, and the hovered one shows a tooltip.
+    // Points are snapped to only within HOVER_SNAP_PX, so a gap in the data
+    // reads "No data" rather than the value from minutes away.
+    const HOVER_SNAP_PX = 12;
+    let pointTimesCache = { points: null, times: null };
+
+    // Start times (ms) of the stats points, parsed once per points array.
+    function pointTimes(points) {
+        if (pointTimesCache.points !== points) {
+            pointTimesCache = {
+                points: points,
+                times: points.map(function (p) { return Date.parse(p.start_time); }),
+            };
+        }
+        return pointTimesCache.times;
+    }
+
+    // The point nearest state.hoverMs that has a value, as {p, ms}, or null.
+    function hoverPoint(getVal, W) {
+        const points = state.stats && state.stats.points ? state.stats.points : [];
+        const spanMs = state.untilMs - state.sinceMs;
+        if (state.hoverMs == null || !points.length || spanMs <= 0) return null;
+        const times = pointTimes(points);
+        const t = state.hoverMs;
+        let lo = 0, hi = times.length - 1;
+        while (lo < hi) { // first point at or after t (points are in time order)
+            const mid = (lo + hi) >> 1;
+            if (times[mid] < t) lo = mid + 1; else hi = mid;
+        }
+        let best = -1;
+        let bestD = (HOVER_SNAP_PX / W) * spanMs;
+        for (let i = lo; i < times.length && Math.abs(times[i] - t) <= bestD; i++) {
+            if (getVal(points[i]) != null) { best = i; bestD = Math.abs(times[i] - t); break; }
+        }
+        for (let i = lo - 1; i >= 0 && t - times[i] <= bestD; i--) {
+            if (getVal(points[i]) != null) { if (t - times[i] < bestD) best = i; break; }
+        }
+        return best < 0 ? null : { p: points[best], ms: times[best] };
+    }
+
+    // Dashed crosshair at the hovered time, with a dot on the snapped point.
+    function drawHover(ctx, W, H, getVal, Y, color) {
+        const spanMs = state.untilMs - state.sinceMs;
+        if (state.hoverMs == null || spanMs <= 0) return;
+        const hit = hoverPoint(getVal, W);
+        const ms = hit ? hit.ms : state.hoverMs;
+        const px = Math.max(0, Math.min(W - 1, Math.round(((ms - state.sinceMs) / spanMs) * W))) + 0.5;
+        ctx.save();
+        ctx.strokeStyle = "rgba(255,255,255,0.35)";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.moveTo(px, 0);
+        ctx.lineTo(px, H);
+        ctx.stroke();
+        ctx.restore();
+        if (!hit) return;
+        ctx.beginPath();
+        ctx.arc(px, Y(getVal(hit.p)), 4, 0, 2 * Math.PI);
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = "#1a1a2e";
+        ctx.stroke();
+    }
+
     function renderStatsChart() {
         const canvas = $("avg-stats-canvas");
         const W = canvas.width;
@@ -1511,6 +1581,7 @@
         };
         drawLine(function (p) { return p.pwr_avg; }, "#0071e3");
         drawSelectionMarker(ctx, W, H);
+        drawHover(ctx, W, H, function (p) { return p.pwr_avg; }, Y, "#0071e3");
         ctx.fillStyle = "rgba(255,255,255,0.5)";
         ctx.font = "10px -apple-system, sans-serif";
         ctx.textAlign = "left";
@@ -1566,6 +1637,7 @@
         ctx.lineWidth = 1.5;
         ctx.stroke();
         drawSelectionMarker(ctx, W, H);
+        drawHover(ctx, W, H, function (p) { return p.kurtosis; }, Y, "#ff9f0a");
         ctx.fillStyle = "rgba(255,255,255,0.5)";
         ctx.font = "10px -apple-system, sans-serif";
         ctx.textAlign = "left";
@@ -1758,10 +1830,66 @@
             state.showIq = box.checked;
             try { localStorage.setItem(IQ_PREF_KEY, box.checked ? "1" : "0"); } catch (_) { /* not saved */ }
             $("avg-iq-legend").style.display = state.showIq ? "" : "none";
-            const tip = $("avg-iq-tooltip");
+            const tip = $("avg-stats-tooltip");
             if (tip) tip.style.display = "none";
             renderStatsChart();
         });
+    }
+
+    function setHover(ms) {
+        state.hoverMs = ms;
+        renderStatsChart();
+        renderKurtosisChart();
+    }
+
+    // Tooltip text, one line per entry, placed beside the cursor and flipped
+    // to its left near the right edge.
+    function showTip(tip, rect, x, lines) {
+        tip.textContent = "";
+        lines.forEach(function (line, i) {
+            if (i) tip.appendChild(document.createElement("br"));
+            tip.appendChild(document.createTextNode(line));
+        });
+        tip.style.display = "block";
+        const w = tip.offsetWidth;
+        tip.style.left = (x + 12 + w <= rect.width ? x + 12 : Math.max(0, x - 12 - w)) + "px";
+        tip.style.top = "4px";
+    }
+
+    // Hover readout on a time chart: the date-time and value of the nearest
+    // point. withIq adds the IQ capture under the cursor (power chart only).
+    function setupHover(canvas, tip, getVal, fmtVal, withIq) {
+        const hide = function () {
+            tip.style.display = "none";
+            if (withIq) canvas.style.cursor = "crosshair";
+            if (state.hoverMs != null) setHover(null);
+        };
+        canvas.addEventListener("mousemove", function (e) {
+            // A drag-zoom repaints the chart with its band; keep out of its way.
+            if (e.buttons & 1) { hide(); return; }
+            const points = state.stats && state.stats.points ? state.stats.points : [];
+            const spanMs = state.untilMs - state.sinceMs;
+            if (!points.length || spanMs <= 0) { hide(); return; }
+            const rect = canvas.getBoundingClientRect();
+            const xCss = e.clientX - rect.left;
+            const x = xCss * (canvas.width / rect.width);
+            setHover(state.sinceMs + (x / canvas.width) * spanMs);
+            const hit = hoverPoint(getVal, canvas.width);
+            const lines = hit
+                ? [new Date(hit.ms).toLocaleString(), fmtVal(getVal(hit.p))]
+                : [new Date(state.hoverMs).toLocaleString(), "No data"];
+            if (withIq) {
+                const b = iqBandAt(x);
+                canvas.style.cursor = b ? "pointer" : "crosshair";
+                if (b) {
+                    const d = b.cap.duration_sec;
+                    const dur = d == null ? "" : (d >= 1 ? d.toFixed(1) + " s" : Math.round(d * 1000) + " ms");
+                    lines.push("IQ " + b.cap.filename + (dur ? " (" + dur + ")" : "") + ", click to open");
+                }
+            }
+            showTip(tip, rect, xCss, lines);
+        });
+        canvas.addEventListener("mouseleave", hide);
     }
 
     function setupSlider() {
@@ -1776,31 +1904,13 @@
             const b = iqBandAt(x);
             if (b) window.location.href = "/captures/?file=" + encodeURIComponent(b.cap.filename);
         });
-        statsCanvas.addEventListener("mousemove", function (e) {
-            const tip = $("avg-iq-tooltip");
-            if (!tip) return;
-            const rect = statsCanvas.getBoundingClientRect();
-            const x = (e.clientX - rect.left) * (statsCanvas.width / rect.width);
-            const b = iqBandAt(x);
-            if (b) {
-                statsCanvas.style.cursor = "pointer";
-                const d = b.cap.duration_sec;
-                const dur = d == null ? "" : (d >= 1 ? d.toFixed(1) + " s" : Math.round(d * 1000) + " ms");
-                tip.style.display = "block";
-                tip.textContent = "IQ " + b.cap.filename + (dur ? " (" + dur + ")" : "") + " - click to open";
-                tip.style.left = Math.min(x + 10, rect.width - 260) + "px";
-                tip.style.top = "4px";
-            } else {
-                statsCanvas.style.cursor = "crosshair";
-                tip.style.display = "none";
-            }
-        });
-        statsCanvas.addEventListener("mouseleave", function () {
-            const tip = $("avg-iq-tooltip");
-            if (tip) tip.style.display = "none";
-            statsCanvas.style.cursor = "crosshair";
-        });
         attachDragZoom($("avg-kurt"), $("avg-kurt"), renderKurtosisChart, null);
+        setupHover(statsCanvas, $("avg-stats-tooltip"),
+            function (p) { return p.pwr_avg; },
+            function (v) { return "Avg " + v.toFixed(1) + " dB"; }, true);
+        setupHover($("avg-kurt"), $("avg-kurt-tooltip"),
+            function (p) { return p.kurtosis; },
+            function (v) { return "Kurtosis " + v.toFixed(2); }, false);
         attachDragZoom($("avg-wf"), $("avg-wf-overlay"), renderWfOverlay, function (x) {
             const idx = rowForPixelX(x);
             if (idx >= 0) selectRow(idx);

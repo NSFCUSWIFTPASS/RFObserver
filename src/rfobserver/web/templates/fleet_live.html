@@ -1,0 +1,26 @@
+{% extends "fleet_base.html" %}
+{% block title %}Live - RFObs Fleet{% endblock %}
+{% block content %}
+<script src="/static/shared-charts.js"></script>
+
+<div class="card full-width fleet-live-power">
+    <div class="card-header">
+        Power, last 5 minutes
+        <span id="fleet-live-conn" class="fleet-live-conn">Connecting</span>
+    </div>
+    <div class="card-body">
+        <div class="fleet-live-power-hold">
+            <canvas id="fleet-live-power" class="fleet-live-power-canvas"></canvas>
+            <div id="fleet-live-tip" class="graph-tooltip" style="display:none;"></div>
+        </div>
+        <div class="graph-legend"><span id="fleet-live-legend" class="fleet-legend"></span></div>
+    </div>
+</div>
+
+<div id="fleet-live-grid" class="fleet-live-grid"></div>
+<p id="fleet-live-empty" class="placeholder-text" style="display:none;">
+    No sensors shown. Add or show sensors on the <a href="/settings">Settings</a> page.
+</p>
+
+<script src="/static/fleet-live.js"></script>
+{% endblock %}

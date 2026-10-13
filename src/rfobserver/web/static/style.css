@@ -2099,3 +2099,144 @@ body {
 .fleet-offline {
     color: var(--text-secondary);
 }
+
+/* Fleet Live */
+.content:has(.fleet-live-grid) {
+    max-width: none;
+}
+
+.fleet-live-power {
+    margin-bottom: 16px;
+}
+
+.fleet-live-power .graph-legend {
+    position: static;
+    margin-top: 6px;
+}
+
+.fleet-live-power-hold {
+    position: relative;
+}
+
+.fleet-live-power-canvas {
+    display: block;
+    width: 100%;
+    height: 180px;
+    border-radius: 8px;
+    box-shadow: var(--chart-ring);
+}
+
+.fleet-live-conn {
+    margin-left: auto;
+    font-weight: 400;
+}
+
+.fleet-live-conn.ok {
+    color: var(--text-secondary);
+}
+
+.fleet-live-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
+    gap: 16px;
+}
+
+@media (max-width: 520px) {
+    .fleet-live-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.fleet-tile {
+    min-width: 0;
+}
+
+.fleet-tile-head {
+    gap: 8px;
+}
+
+.fleet-tile-head .fleet-swatch {
+    margin-right: 0;
+}
+
+.fleet-tile-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.fleet-tile-host {
+    font-size: 11px;
+}
+
+.fleet-state {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
+.fleet-state-live {
+    color: #248a3d;
+}
+
+.fleet-state-reconnecting {
+    color: #b25000;
+}
+
+:root[data-theme="dark"] .fleet-state-live {
+    color: #30d158;
+}
+
+:root[data-theme="dark"] .fleet-state-reconnecting {
+    color: #ff9f0a;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root[data-theme="auto"] .fleet-state-live {
+        color: #30d158;
+    }
+
+    :root[data-theme="auto"] .fleet-state-reconnecting {
+        color: #ff9f0a;
+    }
+}
+
+.fleet-tile-open {
+    font-size: 12px;
+    color: var(--accent);
+    text-decoration: none;
+}
+
+.fleet-tile-open:hover {
+    text-decoration: underline;
+}
+
+.fleet-tile-body canvas {
+    display: block;
+    width: 100%;
+    height: 140px;
+    background: #1a1a2e;
+}
+
+.fleet-tile-psd {
+    border-radius: 8px 8px 0 0;
+}
+
+.fleet-tile-wf {
+    border-radius: 0 0 8px 8px;
+}
+
+.fleet-tile-stale .fleet-tile-body canvas {
+    opacity: 0.55;
+}
+
+.fleet-tile-info {
+    margin-top: 6px;
+    min-height: 15px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+    white-space: pre;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}

@@ -91,6 +91,13 @@ The fleet server opens `/ws/live` once per enabled sensor, in the default
 (averaged) mode: one PSD frame per `DURATION_SEC`, about 20 KB of JSON at
 2048 bins. That is about 120 KB/s for six sensors.
 
+- **Only while watched:** the sensor sockets open when the first browser opens
+  the fleet Live page and close 30 s after the last one leaves, so an
+  unwatched fleet costs the sensors nothing.
+- **Compact frames:** browsers get the spectrum, power and kurtosis (with the
+  sensor's calibration applied), not the max-hold and noise-floor arrays; the
+  frequency axis only when it changes for that sensor.
+
 - Each frame is tagged with the sensor id and fanned out to every browser on
   the fleet Live page. A sensor serves one stream however many people watch.
 - **Browsers that cannot keep up:** a slow browser gets the newest frame
@@ -146,8 +153,11 @@ The fleet server opens `/ws/live` once per enabled sensor, in the default
 
 - A grid of tiles, one per enabled sensor: spectrum over a short waterfall,
   with the label, colour and status. Two or three columns depending on width.
-- One shared power plot across the top: each sensor's `avg_power_db` from its
-  live frames, in its colour, over the last few minutes.
+- One shared power plot across the top: each sensor's stored window average
+  power (`/fleet/api/stats`, polled every 5 s), in its colour, over the last
+  five minutes. Not the live frames' `avg_power_db`: that is only the last
+  chunk of each window and much noisier, so the two do not line up
+  (seen on the Jetsons, 2026-10-13).
 - A tile shows its own state: live, reconnecting, offline (with last seen).
 - **Load in the browser:** six waterfalls at one row per second are light.
   Rendering reuses the sensor Live page's canvas code.

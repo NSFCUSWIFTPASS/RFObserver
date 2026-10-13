@@ -1,0 +1,447 @@
+/**
+ * Fleet Live: a tile per sensor (spectrum over a short waterfall), fed by
+ * the fleet's /fleet/ws/live socket, and one shared power plot of the last
+ * five minutes from /fleet/api/stats.
+ *
+ * The fleet sends, tagged by sensor id: "sensors" (who to show), "status"
+ * (live / standby / reconnecting / offline), "psd" (the newest frame) and a
+ * "tick" every second. A frame carries "frequencies" only when that sensor's
+ * axis changed, so each tile keeps the last axis it got.
+ */
+(function () {
+    "use strict";
+
+    const POWER_WINDOW_MS = 5 * 60 * 1000;
+    const POWER_POLL_MS = 5000;
+    const WS_SILENT_MS = 6000; // the fleet ticks every second
+    const HIDDEN_KEY = "rfobs.fleet.live.hidden";
+    const BG = "#1a1a2e";
+
+    const grid = document.getElementById("fleet-live-grid");
+    const empty = document.getElementById("fleet-live-empty");
+    const conn = document.getElementById("fleet-live-conn");
+    const powerCanvas = document.getElementById("fleet-live-power");
+    const tip = document.getElementById("fleet-live-tip");
+    const legend = document.getElementById("fleet-live-legend");
+
+    const tiles = new Map(); // id -> tile
+    const series = new Map(); // id -> [[t_ms, power_db], ...]
+    let roster = [];
+    let hidden = loadHidden();
+    let powerDirty = true;
+    let hoverX = null;
+
+    function loadHidden() {
+        try {
+            return new Set(JSON.parse(localStorage.getItem(HIDDEN_KEY) || "[]"));
+        } catch (_) {
+            return new Set();
+        }
+    }
+
+    function saveHidden() {
+        try { localStorage.setItem(HIDDEN_KEY, JSON.stringify(Array.from(hidden))); } catch (_) {}
+    }
+
+    function esc(s) {
+        return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+            return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+        });
+    }
+
+    function fmtMHz(hz) {
+        return hz == null ? "" : (hz / 1e6).toFixed(1) + " MHz";
+    }
+
+    // --- tiles ---
+
+    function makeTile(s) {
+        const el = document.createElement("div");
+        el.className = "card fleet-tile";
+        el.innerHTML =
+            '<div class="card-header fleet-tile-head">'
+            + '<span class="fleet-swatch"></span>'
+            + '<span class="fleet-tile-label"></span>'
+            + '<span class="fleet-tile-host"></span>'
+            + '<span class="fleet-state"></span>'
+            + '<a class="fleet-tile-open" target="_blank" rel="noopener">Open</a>'
+            + "</div>"
+            + '<div class="card-body fleet-tile-body">'
+            + '<canvas class="fleet-tile-psd"></canvas>'
+            + '<canvas class="fleet-tile-wf"></canvas>'
+            + '<div class="fleet-tile-info"></div>'
+            + "</div>";
+        const tile = {
+            id: s.id,
+            el: el,
+            psd: el.querySelector(".fleet-tile-psd"),
+            wf: el.querySelector(".fleet-tile-wf"),
+            info: el.querySelector(".fleet-tile-info"),
+            state: el.querySelector(".fleet-state"),
+            colour: s.colour,
+            freqs: [],
+            lo: null,
+            hi: null,
+            last: null,
+        };
+        new ResizeObserver(function () { sizeTile(tile); }).observe(tile.psd);
+        updateTile(tile, s);
+        setState(tile, { state: "connecting" });
+        return tile;
+    }
+
+    function updateTile(tile, s) {
+        tile.colour = s.colour;
+        tile.el.querySelector(".fleet-swatch").style.background = s.colour;
+        tile.el.querySelector(".fleet-tile-label").textContent = s.label;
+        tile.el.querySelector(".fleet-tile-host").textContent = s.label === s.id ? "" : s.id;
+        tile.el.querySelector(".fleet-tile-open").href = s.base_url + "/live/";
+    }
+
+    function sizeTile(tile) {
+        const w = Math.max(1, Math.round(tile.psd.clientWidth));
+        if (tile.psd.width !== w || tile.psd.height !== tile.psd.clientHeight) {
+            tile.psd.width = w;
+            tile.psd.height = Math.max(1, Math.round(tile.psd.clientHeight));
+            if (tile.last) drawSpectrum(tile, tile.last);
+        }
+        const wh = Math.max(1, Math.round(tile.wf.clientHeight));
+        if (tile.wf.width !== w || tile.wf.height !== wh) {
+            // Keep the history, stretched to the new width.
+            let old = null;
+            if (tile.wf.width > 1) {
+                old = document.createElement("canvas");
+                old.width = tile.wf.width;
+                old.height = tile.wf.height;
+                old.getContext("2d").drawImage(tile.wf, 0, 0);
+            }
+            tile.wf.width = w;
+            tile.wf.height = wh;
+            const ctx = tile.wf.getContext("2d");
+            ctx.fillStyle = BG;
+            ctx.fillRect(0, 0, w, wh);
+            if (old) ctx.drawImage(old, 0, 0, old.width, old.height, 0, 0, w, old.height);
+        }
+    }
+
+    const STATE_TEXT = {
+        live: "Live",
+        standby: "Standby",
+        connecting: "Connecting",
+        reconnecting: "Reconnecting",
+        offline: "Offline",
+        idle: "Idle",
+    };
+
+    function setState(tile, st) {
+        let text = STATE_TEXT[st.state] || st.state;
+        if (st.state === "offline" && st.last_seen) {
+            text += ", last seen " + new Date(st.last_seen * 1000).toLocaleTimeString();
+        }
+        if (st.recording === "recording") text += ", recording";
+        tile.state.textContent = text;
+        tile.state.className = "fleet-state fleet-state-" + st.state;
+        tile.state.title = st.error || "";
+        tile.el.classList.toggle("fleet-tile-stale", st.state !== "live");
+    }
+
+    // Display range: the sensor's fixed scale if set, else the frame's own
+    // spread, smoothed so the trace does not jump every frame.
+    function updateRange(tile, msg) {
+        let lo, hi;
+        if (typeof msg.scale_min_db === "number" && typeof msg.scale_max_db === "number") {
+            lo = msg.scale_min_db;
+            hi = msg.scale_max_db;
+        } else {
+            const sorted = msg.powers.filter(isFinite).sort(function (a, b) { return a - b; });
+            if (!sorted.length) return;
+            lo = sorted[Math.floor(sorted.length * 0.05)] - 5;
+            hi = sorted[sorted.length - 1] + 5;
+        }
+        if (tile.lo == null) {
+            tile.lo = lo;
+            tile.hi = hi;
+        } else {
+            tile.lo += 0.2 * (lo - tile.lo);
+            tile.hi += 0.2 * (hi - tile.hi);
+        }
+        if (tile.hi - tile.lo < 10) tile.hi = tile.lo + 10;
+    }
+
+    function drawSpectrum(tile, msg) {
+        drawPSD(tile.psd.getContext("2d"), tile.psd.width, tile.psd.height, msg.powers,
+            tile.freqs, tile.lo, tile.hi, -1, null, msg.unit, tile.colour);
+    }
+
+    function addWaterfallRow(tile, msg) {
+        const W = tile.wf.width;
+        const H = tile.wf.height;
+        if (W < 2 || H < 2) return;
+        const ctx = tile.wf.getContext("2d");
+        ctx.drawImage(tile.wf, 0, 0, W, H - 1, 0, 1, W, H - 1);
+        const row = ctx.createImageData(W, 1);
+        renderWaterfallRow(row, W, 0, msg.powers, tile.lo, tile.hi);
+        ctx.putImageData(row, 0, 0);
+    }
+
+    function onPsd(msg) {
+        const tile = tiles.get(msg.id);
+        if (!tile || !Array.isArray(msg.powers) || !msg.powers.length) return;
+        if (Array.isArray(msg.frequencies)) tile.freqs = msg.frequencies;
+        updateRange(tile, msg);
+        tile.last = msg;
+        drawSpectrum(tile, msg);
+        addWaterfallRow(tile, msg);
+        const parts = [fmtMHz(msg.center_freq_hz)];
+        if (typeof msg.avg_power_db === "number") parts.push("power " + msg.avg_power_db.toFixed(1) + " dB");
+        if (typeof msg.kurtosis === "number") parts.push("kurtosis " + msg.kurtosis.toFixed(2));
+        if (msg.t) parts.push(new Date(msg.t).toLocaleTimeString());
+        tile.info.textContent = parts.join("   ");
+    }
+
+    function onSensors(msg) {
+        roster = msg.sensors;
+        const keep = new Set(roster.map(function (s) { return s.id; }));
+        for (const [id, tile] of tiles) {
+            if (!keep.has(id)) { tile.el.remove(); tiles.delete(id); series.delete(id); }
+        }
+        for (const s of roster) {
+            let tile = tiles.get(s.id);
+            if (!tile) { tile = makeTile(s); tiles.set(s.id, tile); }
+            else updateTile(tile, s);
+            grid.appendChild(tile.el); // roster order
+        }
+        empty.style.display = roster.length ? "none" : "";
+        renderLegend();
+        powerDirty = true;
+    }
+
+    // --- shared power plot ---
+
+    // The plot shows the sensors' stored window averages, the values the
+    // Dashboard shows. A live frame's avg_power_db is only its window's last
+    // chunk, much noisier, so it is not mixed in. The range is snapped to
+    // POWER_POLL_MS so every open page asks the fleet the same question and
+    // shares its cache.
+    async function loadPower() {
+        const until = Math.floor(Date.now() / POWER_POLL_MS) * POWER_POLL_MS;
+        const since = until - POWER_WINDOW_MS;
+        try {
+            const r = await fetch("/fleet/api/stats?since=" + encodeURIComponent(new Date(since).toISOString())
+                + "&until=" + encodeURIComponent(new Date(until).toISOString()) + "&max_points=300");
+            if (!r.ok) return;
+            const body = await r.json();
+            for (const s of body.sensors) {
+                if (s.error) continue; // keep what it had; its tile shows the state
+                series.set(s.id, s.points
+                    .filter(function (p) { return typeof p.pwr_avg === "number"; })
+                    .map(function (p) { return [Date.parse(p.start_time), p.pwr_avg]; }));
+            }
+            powerDirty = true;
+        } catch (_) { /* next poll */ }
+    }
+
+    function renderLegend() {
+        legend.innerHTML = roster.map(function (s) {
+            const off = hidden.has(s.id);
+            return '<button type="button" class="fleet-legend-item' + (off ? " off" : "")
+                + '" data-id="' + esc(s.id) + '" aria-pressed="' + (!off) + '">'
+                + '<span class="fleet-swatch" style="background:' + esc(s.colour) + ';"></span>'
+                + esc(s.label) + "</button>";
+        }).join("");
+    }
+
+    legend.addEventListener("click", function (e) {
+        const btn = e.target.closest(".fleet-legend-item");
+        if (!btn) return;
+        const id = btn.dataset.id;
+        if (hidden.has(id)) hidden.delete(id); else hidden.add(id);
+        saveHidden();
+        renderLegend();
+        powerDirty = true;
+    });
+
+    function visibleSeries() {
+        return roster
+            .filter(function (s) { return !hidden.has(s.id) && (series.get(s.id) || []).length; })
+            .map(function (s) { return { s: s, pts: series.get(s.id) }; });
+    }
+
+    function drawPower() {
+        const c = powerCanvas;
+        const W = Math.max(1, Math.round(c.clientWidth));
+        const H = Math.max(1, Math.round(c.clientHeight));
+        if (c.width !== W) c.width = W;
+        if (c.height !== H) c.height = H;
+        const ctx = c.getContext("2d");
+        ctx.fillStyle = BG;
+        ctx.fillRect(0, 0, W, H);
+        const t1 = Date.now();
+        const t0 = t1 - POWER_WINDOW_MS;
+        const vis = visibleSeries();
+        let lo = Infinity, hi = -Infinity;
+        for (const v of vis) {
+            for (const p of v.pts) {
+                if (p[0] < t0) continue;
+                if (p[1] < lo) lo = p[1];
+                if (p[1] > hi) hi = p[1];
+            }
+        }
+        ctx.strokeStyle = "rgba(255,255,255,0.06)";
+        ctx.lineWidth = 1;
+        for (let i = 1; i < 4; i++) {
+            const y = Math.round((H / 4) * i) + 0.5;
+            ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+        }
+        ctx.fillStyle = "rgba(255,255,255,0.5)";
+        ctx.font = "10px -apple-system, sans-serif";
+        ctx.textAlign = "center";
+        for (let m = 4; m >= 1; m--) {
+            const x = W - (m * 60000 / POWER_WINDOW_MS) * W;
+            ctx.fillText("-" + m + " min", x, H - 4);
+        }
+        if (!isFinite(lo)) {
+            ctx.textAlign = "center";
+            ctx.fillStyle = "rgba(255,255,255,0.4)";
+            ctx.font = "12px -apple-system, sans-serif";
+            ctx.fillText(roster.length ? "Waiting for sensors..." : "No sensors", W / 2, H / 2);
+            return null;
+        }
+        const pad = Math.max(1, (hi - lo) * 0.1);
+        lo -= pad; hi += pad;
+        const X = function (t) { return ((t - t0) / POWER_WINDOW_MS) * W; };
+        const Y = function (v) { return H - 14 - ((v - lo) / (hi - lo)) * (H - 26); };
+        for (const v of vis) {
+            ctx.strokeStyle = v.s.colour;
+            ctx.lineWidth = 2;
+            ctx.lineJoin = "round";
+            ctx.beginPath();
+            let started = false, prevT = null;
+            for (const p of v.pts) {
+                if (p[0] < t0) continue;
+                // A gap of over 10 s (sensor down, Standby) breaks the line.
+                if (!started || p[0] - prevT > 10000) ctx.moveTo(X(p[0]), Y(p[1]));
+                else ctx.lineTo(X(p[0]), Y(p[1]));
+                started = true;
+                prevT = p[0];
+            }
+            ctx.stroke();
+        }
+        ctx.fillStyle = "rgba(255,255,255,0.5)";
+        ctx.font = "10px -apple-system, sans-serif";
+        ctx.textAlign = "left";
+        ctx.fillText(hi.toFixed(0) + " dB", 4, 12);
+        ctx.fillText(lo.toFixed(0) + " dB", 4, H - 16);
+        return { t0: t0, X: X, Y: Y, vis: vis, W: W, H: H };
+    }
+
+    function drawHover(geo) {
+        if (!geo || hoverX == null) { tip.style.display = "none"; return; }
+        const ctx = powerCanvas.getContext("2d");
+        const t = geo.t0 + (hoverX / geo.W) * POWER_WINDOW_MS;
+        const lines = [];
+        ctx.strokeStyle = "rgba(255,255,255,0.35)";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath(); ctx.moveTo(hoverX + 0.5, 0); ctx.lineTo(hoverX + 0.5, geo.H); ctx.stroke();
+        ctx.setLineDash([]);
+        for (const v of geo.vis) {
+            let best = null;
+            for (const p of v.pts) {
+                if (best == null || Math.abs(p[0] - t) < Math.abs(best[0] - t)) best = p;
+            }
+            if (!best || Math.abs(best[0] - t) > 15000) continue;
+            ctx.fillStyle = v.s.colour;
+            ctx.strokeStyle = BG;
+            ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.arc(geo.X(best[0]), geo.Y(best[1]), 4, 0, Math.PI * 2);
+            ctx.fill(); ctx.stroke();
+            lines.push({ colour: v.s.colour, text: v.s.label + "  " + best[1].toFixed(1) + " dB" });
+        }
+        tip.textContent = "";
+        tip.appendChild(document.createTextNode(new Date(t).toLocaleTimeString()));
+        for (const l of lines) {
+            tip.appendChild(document.createElement("br"));
+            const sw = document.createElement("span");
+            sw.className = "fleet-swatch";
+            sw.style.background = l.colour;
+            tip.appendChild(sw);
+            tip.appendChild(document.createTextNode(l.text));
+        }
+        tip.style.display = "block";
+        const w = tip.offsetWidth;
+        tip.style.left = (hoverX + 12 + w <= geo.W ? hoverX + 12 : Math.max(0, hoverX - 12 - w)) + "px";
+        tip.style.top = "4px";
+    }
+
+    powerCanvas.addEventListener("mousemove", function (e) {
+        hoverX = e.clientX - powerCanvas.getBoundingClientRect().left;
+        powerDirty = true;
+    });
+    powerCanvas.addEventListener("mouseleave", function () {
+        hoverX = null;
+        powerDirty = true;
+    });
+
+    // The plot scrolls with time, so redraw at least once a second.
+    let lastPowerDraw = 0;
+    function frame(now) {
+        if (powerDirty || now - lastPowerDraw > 1000) {
+            powerDirty = false;
+            lastPowerDraw = now;
+            drawHover(drawPower());
+        }
+        requestAnimationFrame(frame);
+    }
+
+    // --- the fleet socket ---
+
+    let ws = null;
+    let lastMessage = 0;
+
+    function setConn(text, ok) {
+        conn.textContent = text;
+        conn.classList.toggle("ok", !!ok);
+    }
+
+    function connect() {
+        const proto = location.protocol === "https:" ? "wss://" : "ws://";
+        const sock = new WebSocket(proto + location.host + "/fleet/ws/live");
+        ws = sock;
+        lastMessage = performance.now();
+        sock.onopen = function () { setConn("Connected", true); };
+        sock.onmessage = function (evt) {
+            if (sock !== ws) return;
+            lastMessage = performance.now();
+            const msg = JSON.parse(evt.data);
+            if (msg.type === "psd") onPsd(msg);
+            else if (msg.type === "status") {
+                const tile = tiles.get(msg.id);
+                if (tile) setState(tile, msg);
+            } else if (msg.type === "sensors") onSensors(msg);
+        };
+        sock.onclose = function () {
+            if (sock !== ws) return;
+            ws = null;
+            setConn("Reconnecting", false);
+            setTimeout(connect, 2000);
+        };
+    }
+
+    // A socket can die without closing (VPN, sleep): reopen on silence.
+    setInterval(function () {
+        if (ws && performance.now() - lastMessage > WS_SILENT_MS) {
+            const dead = ws;
+            ws = null;
+            dead.onopen = dead.onmessage = dead.onclose = null;
+            try { dead.close(); } catch (_) {}
+            setConn("Reconnecting", false);
+            connect();
+        }
+    }, 1000);
+
+    loadPower();
+    setInterval(loadPower, POWER_POLL_MS);
+    connect();
+    requestAnimationFrame(frame);
+})();

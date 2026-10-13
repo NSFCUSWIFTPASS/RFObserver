@@ -10,11 +10,12 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from rfobserver.__about__ import __version__
+from rfobserver.fleet.live import LiveHub
 from rfobserver.fleet.registry import Registry, parse_address
 from rfobserver.fleet.sensors import SensorHub, proxy_allowed
 from rfobserver.web.app import STATIC_DIR, TEMPLATES_DIR, _RevalidatedStaticFiles
@@ -22,9 +23,10 @@ from rfobserver.web.gzip import SafeGZipMiddleware
 from rfobserver.web.uiprefs import THEME_VALUES
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
     from pathlib import Path
 
+    from rfobserver.fleet.live import LiveSocket
     from rfobserver.fleet.registry import Sensor
     from rfobserver.mdns import Found
 
@@ -63,16 +65,19 @@ def create_fleet_app(
     *,
     mdns: bool = True,
     transport: httpx.AsyncBaseTransport | None = None,
+    live_connect: Callable[[str], contextlib.AbstractAsyncContextManager[LiveSocket]] | None = None,
 ) -> FastAPI:
     """The fleet app, keeping its state (fleet.json, prefs.json) in ``state_dir``.
-    ``transport`` replaces the network in tests."""
+    ``transport`` and ``live_connect`` replace the network in tests."""
     registry = Registry(state_dir / "fleet.json")
     hub = SensorHub(registry, transport=transport)
+    live = LiveHub(registry, hub, connect=live_connect)
     prefs = _Prefs(state_dir / "prefs.json")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         hub.start()
+        live.start()
         browser = None
         if mdns:
             from rfobserver.mdns import Browser, rank_addresses
@@ -89,6 +94,7 @@ def create_fleet_app(
         finally:
             if browser is not None:
                 await browser.stop()
+            await live.close()
             await hub.close()
 
     app = FastAPI(
@@ -101,6 +107,7 @@ def create_fleet_app(
     app.add_middleware(SafeGZipMiddleware)
     app.state.registry = registry
     app.state.hub = hub
+    app.state.live = live
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     if STATIC_DIR.exists():
         app.mount("/static", _RevalidatedStaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -153,6 +160,41 @@ def create_fleet_app(
                 "fleet_nav": fleet["sensors"],
             },
         )
+
+    @app.get("/live", response_class=HTMLResponse)
+    async def live_page(request: Request) -> Any:
+        return templates.TemplateResponse(
+            request,
+            "fleet_live.html",
+            {"ui_theme": prefs.theme(), "fleet_nav": _chart_sensors()},
+        )
+
+    @app.websocket("/fleet/ws/live")
+    async def live_ws(websocket: WebSocket) -> None:
+        """Every sensor's live frames, newest per sensor (see fleet.live)."""
+        await websocket.accept()
+        viewer = live.join()
+
+        async def send_loop() -> None:
+            while True:
+                await viewer.wake.wait()
+                for msg in viewer.take():
+                    await websocket.send_json(live.shape(viewer, msg))
+
+        async def recv_loop() -> None:
+            while True:
+                await websocket.receive_text()
+
+        tasks = {asyncio.create_task(send_loop()), asyncio.create_task(recv_loop())}
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in tasks:
+                t.cancel()
+            for t in tasks:
+                with contextlib.suppress(asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
+                    await t
+            live.leave(viewer)
 
     @app.get("/settings", response_class=HTMLResponse)
     async def settings_page(request: Request) -> Any:

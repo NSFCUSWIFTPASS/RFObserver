@@ -153,6 +153,30 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             body["rfdb"] = rfdb.status()
         return body
 
+    @app.get("/api/identity")
+    async def identity() -> dict[str, Any]:
+        """Who this sensor is and how it is tuned, for a fleet server. ``id``
+        is the hostname, the fleet's key for a sensor. Cheap: settings only."""
+        s: AppSettings = app.state.settings
+        sup = getattr(app.state, "supervisor", None)
+        proc = sup.processor if sup is not None else None
+        receiver = getattr(proc, "_receiver", None) if proc is not None else None
+        return {
+            "id": s.HOSTNAME,
+            "hostname": s.HOSTNAME,
+            "sensor_name": s.SENSOR_NAME,
+            "version": __version__,
+            "serial": getattr(receiver, "serial", None),
+            "latitude": s.LATITUDE,
+            "longitude": s.LONGITUDE,
+            "center_freq_hz": float(s.FREQUENCY_START),
+            "sample_rate_hz": float(s.BANDWIDTH),
+            "gain_db": float(s.GAIN),
+            "duration_sec": float(s.DURATION_SEC),
+            "active": bool(sup.active) if sup is not None else None,
+            "uptime_sec": round(time.monotonic() - started_monotonic, 1),
+        }
+
     @app.websocket("/ws/live")
     async def ws_live(websocket: WebSocket) -> None:
         broadcast: LiveBroadcast | None = getattr(app.state, "broadcast", None)

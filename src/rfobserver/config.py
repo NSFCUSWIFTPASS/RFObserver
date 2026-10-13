@@ -166,6 +166,9 @@ class AppSettings(BaseSettings):
     # WebUI
     WEB_HOST: str = "0.0.0.0"
     WEB_PORT: int = 8080
+    # Advertise this sensor on the local network (mDNS, _rfobserver._tcp) so a
+    # fleet server on the same subnet finds it. Needs the web UI (WEB_PORT > 0).
+    MDNS_ENABLED: bool = True
 
     # Display (UI only — never applied to published or stored data)
     #

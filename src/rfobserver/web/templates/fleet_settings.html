@@ -1,0 +1,149 @@
+{% extends "fleet_base.html" %}
+{% block title %}Settings - RFObs Fleet{% endblock %}
+{% block content %}
+{% if first_run %}
+<div class="card full-width">
+    <div class="card-body">
+        No sensors yet. Sensors on this network appear here by themselves (mDNS);
+        others can be added by address below.
+    </div>
+</div>
+{% endif %}
+
+<div class="card full-width">
+    <div class="card-header">Sensors</div>
+    <div class="card-body">
+        <div class="fleet-table-wrap">
+        <table class="data-table fleet-table" id="fleet-table">
+            <thead>
+                <tr>
+                    <th></th>
+                    <th>Label</th>
+                    <th>Host</th>
+                    <th>Address</th>
+                    <th>Found by</th>
+                    <th>Version</th>
+                    <th>Tuning</th>
+                    <th>Status</th>
+                    <th>Shown</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody id="fleet-tbody">
+                <tr><td colspan="10" class="placeholder-text">Loading...</td></tr>
+            </tbody>
+        </table>
+        </div>
+        <form id="fleet-add" class="fleet-add">
+            <input type="text" id="fleet-add-address" placeholder="Address, e.g. 10.1.42.31 or 192.168.97.153:8888"
+                   aria-label="Sensor address" autocomplete="off">
+            <button type="submit" class="btn-apply">Add sensor</button>
+            <span id="fleet-add-status" class="fleet-add-status"></span>
+        </form>
+        <p class="fleet-note">
+            A sensor is identified by its hostname, so one found on mDNS and added by
+            address appears once. Removing an mDNS sensor only lasts until it is seen again;
+            hide it with Shown instead.
+        </p>
+    </div>
+</div>
+
+<script>
+(function () {
+    "use strict";
+    const tbody = document.getElementById("fleet-tbody");
+
+    function esc(s) {
+        return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+            return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+        });
+    }
+
+    function tuning(t) {
+        if (!t || t.center_freq_hz == null) return "";
+        return esc((t.center_freq_hz / 1e6).toFixed(1) + " MHz") + '<div class="fleet-sub">'
+            + esc((t.sample_rate_hz / 1e6).toFixed(0) + " Msps, " + t.gain_db + " dB") + "</div>";
+    }
+
+    function status(s) {
+        if (s.online) return '<span class="fleet-online">Online</span>' + (s.active === false ? " (standby)" : "");
+        const seen = s.last_seen ? ", last seen " + new Date(s.last_seen * 1000).toLocaleString() : "";
+        return '<span class="fleet-offline" title="' + esc(s.error) + '">Offline' + esc(seen) + "</span>";
+    }
+
+    function row(s) {
+        return "<tr data-id=\"" + esc(s.id) + "\">"
+            + '<td><span class="fleet-swatch" style="background:' + esc(s.colour) + ';"></span></td>'
+            + '<td><input type="text" class="fleet-label" value="' + esc(s.custom_label) + '" placeholder="' + esc(s.sensor_name || s.id) + '" aria-label="Label"></td>'
+            + "<td>" + esc(s.id) + "</td>"
+            + '<td><a href="' + esc(s.base_url) + '/" target="_blank" rel="noopener">' + esc(s.base_url.replace("http://", "")) + "</a></td>"
+            + "<td>" + (s.source === "mdns" ? "mDNS" : "Address") + "</td>"
+            + "<td>" + esc(s.version || "") + "</td>"
+            + "<td>" + tuning(s.tuning) + "</td>"
+            + "<td>" + status(s) + "</td>"
+            + '<td><input type="checkbox" class="fleet-enabled"' + (s.enabled ? " checked" : "") + ' aria-label="Shown"></td>'
+            + '<td><button type="button" class="btn-preset fleet-remove">Remove</button></td>'
+            + "</tr>";
+    }
+
+    async function load() {
+        try {
+            const r = await fetch("/fleet/api/sensors", { cache: "no-store" });
+            const body = await r.json();
+            tbody.innerHTML = body.sensors.length
+                ? body.sensors.map(row).join("")
+                : '<tr><td colspan="10" class="placeholder-text">No sensors yet</td></tr>';
+        } catch (_) {
+            tbody.innerHTML = '<tr><td colspan="10" class="placeholder-text">Could not load the sensor list</td></tr>';
+        }
+    }
+
+    async function patch(id, body) {
+        await fetch("/fleet/api/sensors/" + encodeURIComponent(id), {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        });
+    }
+
+    tbody.addEventListener("change", function (e) {
+        const tr = e.target.closest("tr");
+        if (!tr) return;
+        if (e.target.classList.contains("fleet-label")) patch(tr.dataset.id, { label: e.target.value });
+        if (e.target.classList.contains("fleet-enabled")) patch(tr.dataset.id, { enabled: e.target.checked });
+    });
+
+    tbody.addEventListener("click", async function (e) {
+        if (!e.target.classList.contains("fleet-remove")) return;
+        const tr = e.target.closest("tr");
+        await fetch("/fleet/api/sensors/" + encodeURIComponent(tr.dataset.id), { method: "DELETE" });
+        load();
+    });
+
+    document.getElementById("fleet-add").addEventListener("submit", async function (e) {
+        e.preventDefault();
+        const input = document.getElementById("fleet-add-address");
+        const msg = document.getElementById("fleet-add-status");
+        msg.textContent = "Checking...";
+        try {
+            const r = await fetch("/fleet/api/sensors", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ address: input.value }),
+            });
+            const body = await r.json();
+            if (!r.ok) { msg.textContent = body.detail || "Could not add"; return; }
+            msg.textContent = "Added " + body.label;
+            input.value = "";
+            load();
+        } catch (_) {
+            msg.textContent = "Could not add";
+        }
+    });
+
+    load();
+    // Not while a field in the table is being edited: the redraw would drop it.
+    setInterval(function () { if (!tbody.contains(document.activeElement)) load(); }, 15000);
+})();
+</script>
+{% endblock %}

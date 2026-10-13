@@ -51,7 +51,7 @@ browser ──HTTP/WS──> fleet server ──HTTP──> sensor /api/...
 
 ### 3.1 Registry
 
-A sensor entry: `id` (the SDR serial, else hostname), `hostname`, `address`,
+A sensor entry: `id` (the hostname; a replaced SDR keeps the same entry), `address`,
 `port`, `label`, `colour`, `source` (`mdns` or `manual`), `enabled`, plus
 what the last identity poll returned and when.
 

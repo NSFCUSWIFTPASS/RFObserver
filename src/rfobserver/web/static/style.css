@@ -1504,6 +1504,14 @@ body {
     transition: opacity 0.2s;
 }
 
+/* Under the chart, not floated: the card body is not a positioned box. */
+.avg-panel .graph-legend {
+    position: static;
+    flex-wrap: wrap;
+    align-items: center;
+    margin-top: 6px;
+}
+
 .avg-panel.stale .card-body {
     opacity: 0.45;
 }
@@ -1950,3 +1958,144 @@ body {
     background: #ff3b30;
 }
 .storage-legend { margin-top: 4px; font-size: 10px; color: var(--text-secondary); }
+
+/* --- Fleet mode --- */
+
+.fleet-swatch {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: middle;
+    flex: none;
+}
+
+.fleet-select-wrap {
+    display: inline-flex;
+    align-items: center;
+    margin-right: 8px;
+}
+
+/* The sensor shown, in the corner of its waterfall and spectrum. */
+.fleet-tag {
+    position: absolute;
+    top: 6px;
+    right: 8px;
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.92);
+    background: rgba(0, 0, 0, 0.55);
+    pointer-events: none;
+    z-index: 2;
+}
+
+.fleet-legend {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+}
+
+.fleet-legend-item {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 4px;
+    border: none;
+    border-radius: 4px;
+    background: none;
+    font: inherit;
+    font-size: 11px;
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+.fleet-legend-item:hover {
+    background: var(--divider);
+}
+
+.fleet-legend-item.off {
+    opacity: 0.4;
+    text-decoration: line-through;
+}
+
+.fleet-legend-item.error {
+    color: var(--text-secondary);
+}
+
+/* The sensor table needs more than the 960px reading column. */
+.content:has(.fleet-table) {
+    max-width: 1280px;
+}
+
+.fleet-sub {
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
+.fleet-table-wrap {
+    overflow-x: auto;
+}
+
+.fleet-table td:nth-child(3),
+.fleet-table td:nth-child(4),
+.fleet-table td:nth-child(7) {
+    white-space: nowrap;
+}
+
+.fleet-add {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-top: 14px;
+}
+
+.fleet-add input {
+    flex: 1;
+    max-width: 360px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font: inherit;
+    font-size: 13px;
+    background: var(--bg);
+    color: var(--text-primary);
+}
+
+.fleet-add-status,
+.fleet-note {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.fleet-label {
+    width: 120px;
+    padding: 3px 6px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font: inherit;
+    font-size: 12px;
+    background: var(--bg);
+    color: var(--text-primary);
+}
+
+.fleet-online {
+    color: #248a3d;
+}
+
+:root[data-theme="dark"] .fleet-online {
+    color: #30d158;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root[data-theme="auto"] .fleet-online {
+        color: #30d158;
+    }
+}
+
+.fleet-offline {
+    color: var(--text-secondary);
+}

@@ -352,6 +352,19 @@ async def run(settings: AppSettings) -> None:
             )
         )
         workers.append(web_task)
+        if settings.MDNS_ENABLED and settings.WEB_PORT > 0:
+            from rfobserver.__about__ import __version__
+            from rfobserver.mdns import Advertiser
+
+            advertiser = Advertiser(
+                hostname=settings.HOSTNAME,
+                port=settings.WEB_PORT,
+                version=__version__,
+                bind_host=settings.WEB_HOST,
+            )
+            # A worker, so startup never waits on it and shutdown cancels it.
+            # Never fatal: a sensor without mDNS can still be added by address.
+            workers.append(asyncio.create_task(advertiser.run()))
         workers.append(
             asyncio.create_task(
                 _heartbeat_loop(

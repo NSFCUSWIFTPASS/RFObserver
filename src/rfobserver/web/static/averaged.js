@@ -1791,7 +1791,8 @@
             return;
         }
         const range = psdRange();
-        drawPSD(ctx, W, H, powers, wf.freqs, range.min, range.max, state.crosshairBin, null, "dBFS");
+        drawPSD(ctx, W, H, powers, wf.freqs, range.min, range.max, state.crosshairBin, null, "dBFS",
+            FLEET ? FLEET.colour : undefined);
     }
 
     function renderBucketStats() {

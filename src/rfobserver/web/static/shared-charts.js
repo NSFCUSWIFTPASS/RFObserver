@@ -25,8 +25,12 @@ function powerToColor(val, min, max) {
  * @param {number} crosshairBin - bin index for crosshair (-1 = none)
  * @param {number|null} triggerLevel - absolute dBFS level for trigger line (null = hidden)
  * @param {string} [unit] - Y-axis unit label (default "dBFS"; "dBm/Hz" when calibrated)
+ * @param {string} [colour] - trace colour as "#rrggbb" (default system blue; the
+ *     fleet passes the sensor's colour)
  */
-function drawPSD(ctx, W, H, powers, frequencies, min, max, crosshairBin, triggerLevel, unit) {
+function drawPSD(ctx, W, H, powers, frequencies, min, max, crosshairBin, triggerLevel, unit, colour) {
+    const hex = /^#[0-9a-f]{6}$/i.test(colour || "") ? colour : "#0071e3";
+    const rgb = [1, 3, 5].map(function (i) { return parseInt(hex.slice(i, i + 2), 16); }).join(",");
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = "#1a1a2e";
     ctx.fillRect(0, 0, W, H);
@@ -52,8 +56,8 @@ function drawPSD(ctx, W, H, powers, frequencies, min, max, crosshairBin, trigger
     ctx.lineTo(W, H);
     ctx.closePath();
     const grad = ctx.createLinearGradient(0, 0, 0, H);
-    grad.addColorStop(0, "rgba(0,113,227,0.3)");
-    grad.addColorStop(1, "rgba(0,113,227,0.02)");
+    grad.addColorStop(0, "rgba(" + rgb + ",0.3)");
+    grad.addColorStop(1, "rgba(" + rgb + ",0.02)");
     ctx.fillStyle = grad;
     ctx.fill();
 
@@ -64,7 +68,7 @@ function drawPSD(ctx, W, H, powers, frequencies, min, max, crosshairBin, trigger
         const y = H - ((powers[i] - min) / (max - min)) * H;
         if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     }
-    ctx.strokeStyle = "#0071e3";
+    ctx.strokeStyle = hex;
     ctx.lineWidth = 1.5;
     ctx.stroke();
 

@@ -17,6 +17,7 @@ evict a little early, and disk safety comes from the volume's free space.
 from __future__ import annotations
 
 import bisect
+import contextlib
 import heapq
 import itertools
 import logging
@@ -30,6 +31,7 @@ from typing import TYPE_CHECKING
 
 from rfobserver.storage.burst_archive import BurstArchive, burst_index
 from rfobserver.storage.governor import StorageSample, VolumeSample
+from rfobserver.storage.priority import PRIORITY_SUFFIX
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection
@@ -40,20 +42,23 @@ logger = logging.getLogger(__name__)
 # Suffixes of the companion files a streaming capture emits alongside its
 # .sc16. A capture's full footprint (and what eviction must delete) is the
 # .sc16 plus whichever of these exist. ".npz" is a legacy grid companion kept
-# so old captures are also evicted cleanly.
-_COMPANION_SUFFIXES = (".json", ".psd", ".psd.json", ".detections.json", ".npz")
+# so old captures are also evicted cleanly. ".priority" is the zero-byte
+# priority mark (see storage/priority.py).
+_COMPANION_SUFFIXES = (".json", ".psd", ".psd.json", ".detections.json", ".npz", PRIORITY_SUFFIX)
 # Longest first, so "x.psd.json" maps to base "x", not "x.psd".
 _SUFFIXES_LONGEST_FIRST = tuple(sorted(_COMPANION_SUFFIXES, key=len, reverse=True))
 
 
 @dataclass(frozen=True)
 class CaptureEntry:
-    """One tracked capture: its .sc16 path, the .sc16's mtime, and the bytes of
-    the .sc16 plus every companion that existed when it was last measured."""
+    """One tracked capture: its .sc16 path, the .sc16's mtime, the bytes of
+    the .sc16 plus every companion that existed when it was last measured, and
+    whether it carries the priority mark."""
 
     path: Path
     mtime: float
     size: int
+    priority: bool = False
 
     @property
     def origin(self) -> str:
@@ -93,6 +98,13 @@ class LocalStorage:
         # Per directory, (mtime, path) sorted oldest first.
         self._order: dict[Path, list[tuple[float, str]]] = {}
         self._bytes: dict[Path, int] = {}
+        # The priority captures in auto/, (mtime, path) oldest first, and their
+        # bytes. They are also in _order/_bytes; these pick eviction victims.
+        self._prio_order: list[tuple[float, str]] = []
+        self._prio_bytes = 0
+        # Share of max_bytes priority captures may hold before they are
+        # evicted ahead of ordinary ones; 0 makes eviction plain FIFO.
+        self.priority_share = 0.0
         self.set_storage_path(storage_path)
 
     def set_storage_path(self, storage_path: str | Path) -> None:
@@ -134,24 +146,36 @@ class LocalStorage:
             self._entries = entries
             self._order = {self.auto_dir: [], self.manual_dir: []}
             self._bytes = {self.auto_dir: 0, self.manual_dir: 0}
+            self._prio_order = []
+            self._prio_bytes = 0
             for e in entries.values():
                 self._order[e.path.parent].append((e.mtime, str(e.path)))
                 self._bytes[e.path.parent] += e.size
+                if self._is_auto_priority(e):
+                    self._prio_order.append((e.mtime, str(e.path)))
+                    self._prio_bytes += e.size
             for lst in self._order.values():
                 lst.sort()
+            self._prio_order.sort()
         logger.info(
-            "Capture index: %d captures (%.1f GB auto, %.1f GB manual) in %.2f s",
+            "Capture index: %d captures (%.1f GB auto, of which %.1f GB priority; "
+            "%.1f GB manual) in %.2f s",
             len(entries),
             self._bytes[self.auto_dir] / 1024**3,
+            self._prio_bytes / 1024**3,
             self._bytes[self.manual_dir] / 1024**3,
             time.monotonic() - t0,
         )
         return len(entries)
 
+    def _is_auto_priority(self, e: CaptureEntry) -> bool:
+        return e.priority and e.path.parent == self.auto_dir
+
     @staticmethod
     def _scan_dir(d: Path) -> dict[Path, CaptureEntry]:
         sizes: dict[str, int] = {}
         mtimes: dict[str, float] = {}
+        marked: set[str] = set()
         try:
             it = os.scandir(d)
         except OSError:
@@ -168,10 +192,14 @@ class LocalStorage:
                 sizes[base] = sizes.get(base, 0) + st.st_size
                 if de.name.endswith(".sc16"):
                     mtimes[base] = st.st_mtime
+                elif de.name.endswith(PRIORITY_SUFFIX):
+                    marked.add(base)
         # Only bases with a .sc16 are captures; companions on their own are
         # left alone, as before.
         return {
-            d / f"{base}.sc16": CaptureEntry(d / f"{base}.sc16", mtime, sizes[base])
+            d / f"{base}.sc16": CaptureEntry(
+                d / f"{base}.sc16", mtime, sizes[base], priority=base in marked
+            )
             for base, mtime in mtimes.items()
         }
 
@@ -179,16 +207,31 @@ class LocalStorage:
         parent = path.parent
         return parent if parent in (self.auto_dir, self.manual_dir) else None
 
+    @staticmethod
+    def _remove_sorted(order: list[tuple[float, str]], key: tuple[float, str]) -> None:
+        i = bisect.bisect_left(order, key)
+        if i < len(order) and order[i] == key:
+            del order[i]
+
     def _remove_locked(self, path: Path) -> CaptureEntry | None:
         e = self._entries.pop(path, None)
         if e is not None:
-            order = self._order[e.path.parent]
             key = (e.mtime, str(e.path))
-            i = bisect.bisect_left(order, key)
-            if i < len(order) and order[i] == key:
-                del order[i]
+            self._remove_sorted(self._order[e.path.parent], key)
             self._bytes[e.path.parent] -= e.size
+            if self._is_auto_priority(e):
+                self._remove_sorted(self._prio_order, key)
+                self._prio_bytes -= e.size
         return e
+
+    def _add_locked(self, entry: CaptureEntry) -> None:
+        key = (entry.mtime, str(entry.path))
+        self._entries[entry.path] = entry
+        bisect.insort(self._order[entry.path.parent], key)
+        self._bytes[entry.path.parent] += entry.size
+        if self._is_auto_priority(entry):
+            bisect.insort(self._prio_order, key)
+            self._prio_bytes += entry.size
 
     def track(self, sc16_path: Path) -> CaptureEntry | None:
         """Add or re-measure one capture (after it is written, or a companion
@@ -204,13 +247,52 @@ class LocalStorage:
         except OSError:
             self.forget(sc16_path)
             return None
-        entry = CaptureEntry(sc16_path, mtime, size)
+        priority = self._marker_path(sc16_path).exists()
+        entry = CaptureEntry(sc16_path, mtime, size, priority=priority)
         with self._lock:
             self._remove_locked(sc16_path)
-            self._entries[sc16_path] = entry
-            bisect.insort(self._order[d], (mtime, str(sc16_path)))
-            self._bytes[d] += size
+            self._add_locked(entry)
         return entry
+
+    @staticmethod
+    def _marker_path(sc16_path: Path) -> Path:
+        return sc16_path.with_name(sc16_path.name[: -len(".sc16")] + PRIORITY_SUFFIX)
+
+    def mark_priority(self, sc16_paths: Collection[Path]) -> list[Path]:
+        """Give these auto/ captures the priority mark. Returns the ones newly
+        marked; a capture already marked, evicted, or outside auto/ is skipped.
+        The mark is a zero-byte file, so the capture's size is unchanged."""
+        marked: list[Path] = []
+        for p in sc16_paths:
+            p = Path(p)
+            with self._lock:
+                e = self._entries.get(p)
+                if e is None or e.priority or e.path.parent != self.auto_dir:
+                    continue
+            try:
+                self._marker_path(p).touch()
+            except OSError:
+                logger.warning("Could not mark %s as priority", p.name)
+                continue
+            with self._lock:
+                e = self._entries.get(p)
+                if e is None:
+                    # Evicted between the check and the touch: drop the orphan.
+                    with contextlib.suppress(OSError):
+                        self._marker_path(p).unlink()
+                    continue
+                if not e.priority:
+                    self._remove_locked(p)
+                    self._add_locked(CaptureEntry(e.path, e.mtime, e.size, priority=True))
+                    marked.append(p)
+        return marked
+
+    def auto_captures_since(self, mtime: float) -> list[Path]:
+        """auto/ captures last written at or after ``mtime`` (oldest first)."""
+        with self._lock:
+            order = self._order[self.auto_dir]
+            i = bisect.bisect_left(order, (mtime, ""))
+            return [Path(p) for _, p in order[i:]]
 
     def forget(self, sc16_path: Path) -> None:
         """Drop a capture from the index (it was deleted or moved away)."""
@@ -311,14 +393,52 @@ class LocalStorage:
         exceeds the cap. Called after each streaming recording so continuous
         triggering stays bounded by ARCHIVE_MAX_GB. Only the auto/ set is
         considered -- manual captures are never counted and never evicted.
+
+        Victims, see _cap_victim_locked: the oldest ordinary capture, unless
+        priority captures hold more than their share of the cap.
         """
         while True:
             with self._lock:
                 order = self._order[self.auto_dir]
                 if self._bytes[self.auto_dir] <= self.max_bytes or len(order) <= 1:
                     return
-                oldest = Path(order[0][1])
-            self._delete_capture(oldest)
+                victim = self._cap_victim_locked(exclude=order[-1][1])
+            if victim is None:
+                return
+            self._delete_capture(victim)
+
+    def _priority_cap_bytes(self) -> int:
+        return int(self.max_bytes * min(1.0, max(0.0, self.priority_share)))
+
+    def _oldest_ordinary_locked(self, exclude: str | None) -> Path | None:
+        """The oldest auto/ capture without the priority mark. Priority
+        captures outlive ordinary ones, so they collect at the front of the
+        order; the scan steps past them (hundreds, not the whole index)."""
+        for _, p in self._order[self.auto_dir]:
+            if p == exclude:
+                continue
+            e = self._entries.get(Path(p))
+            if e is not None and not e.priority:
+                return e.path
+        return None
+
+    def _cap_victim_locked(self, exclude: str | None) -> Path | None:
+        """Which auto/ capture to evict next, never ``exclude`` (the newest).
+
+        With priority_share 0 it is plain FIFO. Otherwise the oldest ordinary
+        capture, unless priority captures are over their share (then the oldest
+        of those), or no ordinary one is left (then the oldest priority one).
+        """
+        order = self._order[self.auto_dir]
+        if self.priority_share <= 0:
+            for _, p in order:
+                if p != exclude:
+                    return Path(p)
+            return None
+        oldest_prio = next((Path(p) for _, p in self._prio_order if p != exclude), None)
+        if self._prio_bytes > self._priority_cap_bytes() and oldest_prio is not None:
+            return oldest_prio
+        return self._oldest_ordinary_locked(exclude) or oldest_prio
 
     def get_usage_bytes(self) -> int:
         """Bytes used by the managed (auto) capture set, including companions.
@@ -351,9 +471,19 @@ class LocalStorage:
         with self._lock:
             return self._bytes[self.manual_dir]
 
-    def _auto_oldest_first(self) -> list[CaptureEntry]:
+    def get_priority_usage_bytes(self) -> int:
+        """Bytes used by priority captures in auto/ (part of get_usage_bytes)."""
         with self._lock:
-            return [self._entries[Path(p)] for _, p in self._order[self.auto_dir]]
+            return self._prio_bytes
+
+    def _auto_oldest_first(self) -> list[CaptureEntry]:
+        """auto/ captures in eviction order: ordinary ones oldest first, then
+        priority ones oldest first (plain oldest first with priority off)."""
+        with self._lock:
+            entries = [self._entries[Path(p)] for _, p in self._order[self.auto_dir]]
+            if self.priority_share <= 0:
+                return entries
+        return [e for e in entries if not e.priority] + [e for e in entries if e.priority]
 
     def evict_until_free(
         self,
@@ -365,8 +495,9 @@ class LocalStorage:
         free_bytes: Callable[[], int] | None = None,
         on_evict: Callable[[Path, float], None] | None = None,
     ) -> int:
-        """Delete the oldest auto/ captures until the volume has
-        ``target_free_bytes`` free or none is left to delete. Returns bytes freed.
+        """Delete auto/ captures until the volume has ``target_free_bytes``
+        free or none is left to delete: ordinary ones oldest first, then
+        priority ones oldest first. Returns bytes freed.
 
         The governor's step 1. Unlike enforce_cap this may take the newest
         finished capture; it never takes the capture being recorded or anything
@@ -442,6 +573,7 @@ class LocalStorage:
             )
             auto_bytes = self._bytes[self.auto_dir]
             manual_bytes = self._bytes[self.manual_dir]
+            priority_bytes = self._prio_bytes
         return StorageSample(
             data=VolumeSample(du.free, du.total),
             db_volume=db_volume,
@@ -452,4 +584,5 @@ class LocalStorage:
             evictable_auto=evictable,
             bursts_bytes=bursts_bytes,
             old_bursts_bytes=old_bursts_bytes,
+            priority_bytes=priority_bytes,
         )

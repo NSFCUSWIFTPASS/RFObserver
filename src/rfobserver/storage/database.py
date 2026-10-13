@@ -232,7 +232,10 @@ CREATE TABLE IF NOT EXISTS iq_captures (
     gain_db REAL,
     total_samples INTEGER,
     trigger_initiated INTEGER,
-    created_at TEXT DEFAULT (datetime('now'))
+    created_at TEXT DEFAULT (datetime('now')),
+    mean_power_db REAL,
+    background_db REAL,
+    priority INTEGER
 );
 
 -- One row per minute per centre frequency, summarising avg_windows so the
@@ -321,6 +324,17 @@ _DETECTION_ATTRIBUTION_COLUMNS: dict[str, str] = {
     "model": "TEXT",
     "protocol_id": "INTEGER",
     "attribution": "TEXT",
+}
+
+
+# Capture-priority columns, added after the original iq_captures schema: the
+# capture's mean power, the background it was compared with, and whether it
+# was kept as priority (see storage/priority.py). They outlive the files, so an
+# evicted capture still shows why it mattered.
+_IQ_CAPTURE_PRIORITY_COLUMNS: dict[str, str] = {
+    "mean_power_db": "REAL",
+    "background_db": "REAL",
+    "priority": "INTEGER",
 }
 
 
@@ -495,6 +509,7 @@ class SensorDatabase:
         await self._configure_writer(self._db)
         await self._db.executescript(SCHEMA)
         await self._migrate_detection_columns()
+        await self._migrate_iq_capture_columns()
         await self._migrate_avg_windows_psd_nullable()
         # Created after migration: on a pre-existing DB the indexed column is
         # added by the migration above, so this can't run inside SCHEMA.
@@ -529,6 +544,17 @@ class SensorDatabase:
             if column not in existing:
                 await self._db.execute(f"ALTER TABLE detections ADD COLUMN {column} {col_type}")
                 logger.info("Migrated detections: added column %s", column)
+
+    async def _migrate_iq_capture_columns(self) -> None:
+        """Add the capture-priority columns to an existing iq_captures table
+        (older rows read them as NULL)."""
+        assert self._db is not None
+        async with self._db.execute("PRAGMA table_info(iq_captures)") as cursor:
+            existing = {row[1] for row in await cursor.fetchall()}
+        for column, col_type in _IQ_CAPTURE_PRIORITY_COLUMNS.items():
+            if column not in existing:
+                await self._db.execute(f"ALTER TABLE iq_captures ADD COLUMN {column} {col_type}")
+                logger.info("Migrated iq_captures: added column %s", column)
 
     async def _migrate_avg_windows_psd_nullable(self) -> None:
         """Make avg_windows.psd_powers nullable on DBs created with NOT NULL.
@@ -958,6 +984,9 @@ class SensorDatabase:
         gain_db: float | None,
         total_samples: int | None,
         trigger_initiated: bool,
+        mean_power_db: float | None = None,
+        background_db: float | None = None,
+        priority: bool = False,
     ) -> None:
         """Record one IQ capture file's span so the Dashboard can highlight it.
 
@@ -971,8 +1000,8 @@ class SensorDatabase:
             """INSERT OR REPLACE INTO iq_captures
                (filename, origin, start_time, stop_time, duration_sec,
                 sdr_center_freq_hz, sample_rate_hz, gain_db, total_samples,
-                trigger_initiated)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                trigger_initiated, mean_power_db, background_db, priority)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 filename,
                 origin,
@@ -984,7 +1013,23 @@ class SensorDatabase:
                 gain_db,
                 total_samples,
                 int(trigger_initiated),
+                mean_power_db,
+                background_db,
+                int(priority),
             ),
+        )
+        await self._db.commit()
+
+    @_guarded_write
+    async def mark_iq_captures_priority(self, filenames: list[str]) -> None:
+        """Set the priority flag on captures promoted after their insert (ones
+        recorded just before a priority capture)."""
+        assert self._db is not None
+        if not filenames:
+            return
+        await self._db.executemany(
+            "UPDATE iq_captures SET priority = 1 WHERE filename = ?",
+            [(f,) for f in filenames],
         )
         await self._db.commit()
 
@@ -1019,7 +1064,8 @@ class SensorDatabase:
         params.extend(sdr_params)
         query = (
             "SELECT filename, origin, start_time, stop_time, duration_sec, "
-            "sdr_center_freq_hz, sample_rate_hz, gain_db, total_samples, trigger_initiated "
+            "sdr_center_freq_hz, sample_rate_hz, gain_db, total_samples, trigger_initiated, "
+            "mean_power_db, background_db, priority "
             f"FROM iq_captures {where} ORDER BY start_time DESC LIMIT ?"
         )
         params.append(limit)
@@ -1038,6 +1084,9 @@ class SensorDatabase:
                 "gain_db": r[7],
                 "total_samples": r[8],
                 "trigger_initiated": bool(r[9]) if r[9] is not None else None,
+                "mean_power_db": r[10],
+                "background_db": r[11],
+                "priority": bool(r[12]) if r[12] is not None else None,
             }
             for r in rows
         ]

@@ -114,6 +114,14 @@
     let listTotal = 0;
     let listSelected = null;
 
+    // Why a capture is priority (the .json's "priority"). A capture promoted
+    // later by a priority neighbour has the mark but no reason of its own.
+    const PRIORITY_REASONS = {
+        duration: "Long capture",
+        power: "Strong signal",
+        event: "Recorded during an event",
+    };
+
     function itemHtml(c) {
         const m = c.meta || {};
         const freq = m.center_freq_hz ? formatFreq(m.center_freq_hz) : "";
@@ -121,10 +129,13 @@
         const dropped = m.dropped_chunks || 0;
         const time = m.start_time ? new Date(m.start_time).toLocaleString() : "";
         const psdBadge = c.has_psd ? '<span class="psd-badge">PSD</span>' : '';
+        const prioBadge = c.priority
+            ? ' <span class="priority-badge" title="Kept longer: evicted only after ordinary captures">Priority</span>'
+            : '';
 
         let html = '<div class="capture-item" data-file="' + c.filename + '"'
             + ' data-has-psd="' + (c.has_psd ? '1' : '0') + '">';
-        html += '<div class="capture-name">' + c.filename + ' ' + psdBadge + '</div>';
+        html += '<div class="capture-name">' + c.filename + ' ' + psdBadge + prioBadge + '</div>';
         html += '<div class="capture-info">';
         html += formatBytes(c.size_bytes);
         if (dur) html += ' &middot; ' + dur;
@@ -295,6 +306,9 @@
             if (m.total_samples != null) html += row("Samples", m.total_samples.toLocaleString());
             if (m.start_time) html += row("Start Time", new Date(m.start_time).toLocaleString());
             html += row("Trigger", m.trigger_initiated ? "Power threshold" : "Manual");
+            if (m.mean_power_db != null) html += row("Mean Power", m.mean_power_db.toFixed(1) + " dB");
+            if (m.background_power_db != null) html += row("Background", m.background_power_db.toFixed(1) + " dB");
+            if (d.priority) html += row("Priority", PRIORITY_REASONS[m.priority] || PRIORITY_REASONS.event);
             html += row("Mode", m.ram_buffered ? "RAM buffered" : "Disk streaming");
             if (m.pre_trigger_sec != null) html += row("Pre-trigger", m.pre_trigger_sec + " s");
             if (m.dropped_chunks != null) {

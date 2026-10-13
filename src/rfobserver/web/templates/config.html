@@ -171,7 +171,8 @@
                 (broadband mean, dB re 50 &ohm;): recording fires when that trace crosses it.
                 Continuous trigger auto-arms whenever the sensor is active and re-arms immediately
                 after each capture, so recordings keep filling the disk as a FIFO ring bounded by
-                Storage &rarr; Archive Max (GB) (oldest captures are evicted first). Max Record 0 = no
+                Storage &rarr; Archive Max (GB) (oldest ordinary captures are evicted first, priority
+                captures last; see the Priority settings under Storage). Max Record 0 = no
                 limit. Pre-trigger prepends buffered lead-in to each capture.
             </div>
         </div>
@@ -268,12 +269,34 @@
                 <div class="form-group">
                     <label for="archive-max">Archive Max (GB)</label>
                     <input type="number" id="archive-max" name="archive_max_gb" value="{{ settings.ARCHIVE_MAX_GB }}" step="1" min="1">
-                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">IQ captures only. Over this size the oldest automatic captures are deleted; manual captures are kept.</span>
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">IQ captures only. Over this size the oldest automatic captures are deleted, ordinary ones before priority ones; manual captures are kept.</span>
+                </div>
+                <div class="form-group">
+                    <label for="priority-share">Priority Share</label>
+                    <input type="number" id="priority-share" name="priority_share" value="{{ settings.PRIORITY_SHARE }}" step="0.05" min="0" max="1">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Fraction of Archive Max that priority captures may hold before they are deleted ahead of ordinary ones. 0 = plain oldest-first.</span>
                 </div>
                 <div class="form-group">
                     <label for="history-days">PSD History (days)</label>
                     <input type="number" id="history-days" name="history_days" value="{{ settings.DB_RETENTION_DAYS }}" min="1">
                     <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Spectra older than this lose their PSD data. Stats and detections follow Stats History.</span>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="priority-min-sec">Priority: Min Duration (s)</label>
+                    <input type="number" id="priority-min-sec" name="priority_min_sec" value="{{ settings.PRIORITY_MIN_SEC }}" step="0.5" min="0">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">A triggered capture at least this long is priority. 0 = off.</span>
+                </div>
+                <div class="form-group">
+                    <label for="priority-excess-db">Priority: Above Background (dB)</label>
+                    <input type="number" id="priority-excess-db" name="priority_excess_db" value="{{ settings.PRIORITY_EXCESS_DB }}" step="1" min="0">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">A capture whose mean power is this far above the 10-minute median is priority. 0 = off.</span>
+                </div>
+                <div class="form-group">
+                    <label for="priority-span-sec">Priority: Event Span (s)</label>
+                    <input type="number" id="priority-span-sec" name="priority_span_sec" value="{{ settings.PRIORITY_SPAN_SEC }}" step="5" min="0">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Captures this close to a priority capture are kept with it. 0 = off.</span>
                 </div>
             </div>
             <div class="form-row">
@@ -971,7 +994,9 @@ async function refreshStorageBar() {
     bar.querySelector('.sb-other').style.width = pct(other);
     bar.querySelector('.sb-floor').style.left = pct(vol - s.floor_gb);
     const parts = [
-        `Manual ${s.manual_gb} GB`, `Automatic ${s.auto_gb} GB`, `Bursts ${bursts} GB`,
+        `Manual ${s.manual_gb} GB`,
+        s.priority_gb ? `Automatic ${s.auto_gb} GB (priority ${s.priority_gb} GB)` : `Automatic ${s.auto_gb} GB`,
+        `Bursts ${bursts} GB`,
         s.db_volume ? `Database ${s.db_gb} GB (other volume, ${s.db_volume.free_gb} GB free)` : `Database ${s.db_gb} GB`,
         `Other ${other.toFixed(1)} GB`, `Free ${s.free_gb} of ${vol} GB`, `Minimum free ${s.floor_gb} GB`,
     ];

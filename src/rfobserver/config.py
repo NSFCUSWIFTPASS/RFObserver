@@ -116,6 +116,17 @@ class AppSettings(BaseSettings):
     STORAGE_PATH: str = "/tmp/rfobserver"
     DB_PATH: str = "/tmp/rfobserver/rfobserver.db"
     ARCHIVE_MAX_GB: float = 50.0
+    # Priority captures. A triggered capture is priority when it lasts at least
+    # PRIORITY_MIN_SEC, or its mean power is at least PRIORITY_EXCESS_DB above
+    # the background (the median window power over the last 10 minutes); 0
+    # turns a rule off. Captures within PRIORITY_SPAN_SEC of a priority one are
+    # promoted too, so a whole event is kept. Over ARCHIVE_MAX_GB the oldest
+    # ordinary captures go first; priority captures go only once they hold
+    # more than PRIORITY_SHARE of the archive (or nothing else is left).
+    PRIORITY_MIN_SEC: float = 2.0
+    PRIORITY_EXCESS_DB: float = 10.0
+    PRIORITY_SPAN_SEC: float = 60.0
+    PRIORITY_SHARE: float = 0.5
     # Deprecated: the config page's retention field used to write this, but
     # nothing ever read it. The page now writes DB_RETENTION_DAYS; a stored
     # HISTORY_DAYS is carried into it once (see _carry_legacy_history_days) so

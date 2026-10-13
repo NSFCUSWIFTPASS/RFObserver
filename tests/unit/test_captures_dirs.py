@@ -71,3 +71,17 @@ async def test_list_leaves_out_the_per_gap_list(app, settings):
     assert entry["meta"]["lost_samples"] == 12
     # The .json on disk keeps it.
     assert json.loads(sc16.with_suffix(".json").read_text())["gaps"] == [[100, 5], [200, 7]]
+
+
+@pytest.mark.asyncio
+async def test_list_and_detail_report_the_priority_mark(app, settings):
+    sc16 = _seed(settings, "auto", "event-cap")
+    _seed(settings, "auto", "plain-cap")
+    sc16.with_name("event-cap.priority").touch()
+
+    r = await _get(app, "/captures/list")
+    by_name = {e["filename"]: e for e in r.json()}
+    assert by_name["event-cap.sc16"]["priority"] is True
+    assert by_name["plain-cap.sc16"]["priority"] is False
+    r = await _get(app, "/captures/detail/event-cap.sc16")
+    assert r.json()["priority"] is True

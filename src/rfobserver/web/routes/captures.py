@@ -15,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from rfobserver.storage import psd_grid
+from rfobserver.storage.priority import PRIORITY_SUFFIX
 from rfobserver.storage.sigmf_export import iq_sigmf_meta
 from rfobserver.web.uiprefs import ui_theme
 
@@ -94,6 +95,11 @@ def _capture_files(sc16: Path) -> list[dict[str, Any]]:
         if path.exists():
             out.append({"name": path.name, "size_bytes": path.stat().st_size})
     return out
+
+
+def _is_priority(sc16: Path) -> bool:
+    """True if the capture carries the priority mark (storage/priority.py)."""
+    return sc16.with_name(_strip_suffix(sc16.name, ".sc16") + PRIORITY_SUFFIX).exists()
 
 
 def _sigmf_names(sc16: Path) -> dict[str, str]:
@@ -202,6 +208,7 @@ def _describe_captures(page: list[tuple[Path, str]]) -> list[dict[str, Any]]:
         entry: dict[str, Any] = {
             "filename": sc16.name,
             "origin": origin,
+            "priority": _is_priority(sc16),
             "size_bytes": size,
             "has_psd": _has_psd(sc16),
             "files": _capture_files(sc16),
@@ -238,6 +245,7 @@ async def capture_detail(request: Request, filename: str) -> dict[str, Any]:
 
     result: dict[str, Any] = {
         "filename": filename,
+        "priority": _is_priority(sc16_path),
         "size_bytes": sc16_path.stat().st_size,
         "has_psd": _has_psd(sc16_path),
         "files": _capture_files(sc16_path),

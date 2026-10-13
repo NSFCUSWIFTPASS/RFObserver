@@ -56,6 +56,7 @@ from rfobserver.storage.governor import (
     is_disk_full_error,
     resolve_floor,
 )
+from rfobserver.storage.priority import BackgroundPower, MeanPower, classify
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable, Sequence
@@ -679,6 +680,16 @@ class StreamingProcessor:
         self._recording_wall_start: float | None = None
         self._trigger_initiated: bool = False  # True if trigger fired (vs manual)
         self._below_threshold_count = 0
+        # Capture priority (storage/priority.py). The trigger's per-chunk power,
+        # averaged over the current triggered recording; the background it is
+        # compared with (median averaged-window power, fed from the loop); the
+        # wall time until which new captures are promoted as part of an event;
+        # and the decision for the capture being finalized: (reason, start and
+        # stop epoch).
+        self._rec_power = MeanPower()
+        self._background = BackgroundPower()
+        self._priority_until = -math.inf
+        self._rec_priority: tuple[str | None, float, float] = (None, 0.0, 0.0)
         # Set by a manual stop: the trigger stays armed but does not fire again
         # until power has dropped below the threshold once, so stopping a long
         # transmission does not immediately start a new capture of it.
@@ -1626,7 +1637,9 @@ class StreamingProcessor:
 
             # Auto-stop for trigger-initiated recordings when power drops
             if self._trigger_initiated:
-                if not self._check_power_above_threshold(sc16_buf):
+                power_db = self._chunk_power_db(sc16_buf)
+                self._rec_power.add_db(power_db)
+                if not power_db > self._settings.TRIGGER_THRESHOLD_DB:
                     self._below_threshold_count += 1
                     if self._below_threshold_count >= self._settings.TRIGGER_HYSTERESIS:
                         self._request_end_recording(wait=False, reason="trigger_end")
@@ -1659,7 +1672,8 @@ class StreamingProcessor:
             if state != "armed":
                 return
 
-            above = self._check_power_above_threshold(sc16_buf)
+            power_db = self._chunk_power_db(sc16_buf)
+            above = power_db > self._settings.TRIGGER_THRESHOLD_DB
             if self._rearm_hold:
                 # After a manual stop: fire only on a new crossing.
                 if not above:
@@ -1671,14 +1685,16 @@ class StreamingProcessor:
                     return
                 self._trigger_initiated = True
                 self._begin_recording()
+                # The chunk that fired is in the capture (pre-roll): count it.
+                self._rec_power.add_db(power_db)
                 # No explicit write of this chunk: the pre-trigger read inside
                 # _begin_recording already includes it (it was ring-buffered
                 # before this check), so recording it here too would duplicate it.
                 # Its gaps were logged before the ring write, so the pre-roll
                 # mapping covers them too.
 
-    def _check_power_above_threshold(self, sc16_buf: np.ndarray[Any, np.dtype[Any]]) -> bool:
-        """Fast subsampled power estimate from raw SC16 data.
+    def _chunk_power_db(self, sc16_buf: np.ndarray[Any, np.dtype[Any]]) -> float:
+        """Fast subsampled mean power of raw SC16 data, in dB.
 
         Returns power in dB re 50 ohm (|z|^2 / 50) — the same scale as
         ``iq_utils.calculate_iq_statistics`` and the iq2ram reference
@@ -1691,8 +1707,7 @@ class StreamingProcessor:
         step = max(1, len(raw16) // 4096)
         sub = raw16[::step].astype(np.float32) / 32768.0
         power_sq = sub[:, 0] ** 2 + sub[:, 1] ** 2
-        mean_power_db = float(10.0 * np.log10(np.mean(power_sq) / 50.0 + 1e-30))
-        return mean_power_db > self._settings.TRIGGER_THRESHOLD_DB
+        return float(10.0 * np.log10(np.mean(power_sq) / 50.0 + 1e-30))
 
     def _write_recording_chunk(
         self,
@@ -1877,6 +1892,7 @@ class StreamingProcessor:
         self._recording_wall_start = None
         self._recording_start = time.monotonic()
         self._below_threshold_count = 0
+        self._rec_power.reset()
         self._recording_grids = []
         self._recording_freq_axis = None
         self._recording_time_res = 0.0
@@ -2262,9 +2278,12 @@ class StreamingProcessor:
         # cap from settings first -- ARCHIVE_MAX_GB may have been changed at
         # runtime via /config/apply after LocalStorage snapshotted it at startup.
         self._storage.max_bytes = int(self._settings.ARCHIVE_MAX_GB * 1024**3)
-        # Track the new capture (stats just its files), then trim the index's
-        # oldest: no directory walk per recording.
+        self._storage.priority_share = self._settings.PRIORITY_SHARE
+        # Track the new capture (stats just its files), mark it (and its event)
+        # priority if it is, then trim the index's oldest: no directory walk
+        # per recording.
         self._storage.track(self._recording_dir / base_name)
+        self._apply_priority(self._recording_dir / base_name)
         self._storage.enforce_cap()
 
     def _report_write_error(self, message: str) -> None:
@@ -2420,6 +2439,9 @@ class StreamingProcessor:
             start_dt = datetime.fromtimestamp(self._recording_wall_start, tz=timezone.utc)
         else:
             start_dt = datetime.fromtimestamp(time.time() - time_span, tz=timezone.utc)
+        mean_power_db, background_db, priority = self._decide_priority(
+            round(signal_duration, 3), start_dt.timestamp(), start_dt.timestamp() + time_span
+        )
         meta = {
             "file": filename,
             "format": "sc16",
@@ -2444,6 +2466,15 @@ class StreamingProcessor:
             "ram_buffered": s.RECORDING_RAM_BUFFER,
             "hostname": s.HOSTNAME,
             "serial": self._receiver.serial,
+            # Capture priority: mean power over the capture's chunks and the
+            # background it was compared with (both dB, triggered captures
+            # only), and why it is priority ("duration", "power", "event" for
+            # one recorded within PRIORITY_SPAN_SEC of a priority capture), or
+            # null. A capture promoted later by a priority neighbour gets its
+            # .priority mark but keeps priority null here.
+            "mean_power_db": None if mean_power_db is None else round(mean_power_db, 2),
+            "background_power_db": None if background_db is None else round(background_db, 2),
+            "priority": priority,
         }
         if write_error is not None:
             meta["write_error"] = write_error
@@ -2479,8 +2510,65 @@ class StreamingProcessor:
                         gain_db=float(s.GAIN),
                         total_samples=total_samples,
                         trigger_initiated=self._trigger_initiated,
+                        mean_power_db=mean_power_db,
+                        background_db=background_db,
+                        priority=priority is not None,
                     )
                 )
+            )
+
+    def _decide_priority(
+        self, duration_sec: float, start_ts: float, stop_ts: float
+    ) -> tuple[float | None, float | None, str | None]:
+        """(mean power, background, priority reason) of the capture being
+        finalized, also kept in _rec_priority for _apply_priority. Only
+        triggered captures (auto/) take part; manual ones are never evicted."""
+        s = self._settings
+        if not self._trigger_initiated:
+            self._rec_priority = (None, start_ts, stop_ts)
+            return None, None, None
+        mean_db = self._rec_power.db()
+        background_db = self._background.median()
+        reason = classify(
+            duration_sec=duration_sec,
+            mean_power_db=mean_db,
+            background_db=background_db,
+            min_sec=s.PRIORITY_MIN_SEC,
+            excess_db=s.PRIORITY_EXCESS_DB,
+        )
+        if reason is not None:
+            # Captures in the next PRIORITY_SPAN_SEC belong to the same event.
+            # Only a capture that qualifies by itself extends the span, so a
+            # steady stream of short captures cannot keep it open forever.
+            self._priority_until = max(self._priority_until, stop_ts + s.PRIORITY_SPAN_SEC)
+        elif start_ts <= self._priority_until:
+            reason = "event"
+        self._rec_priority = (reason, start_ts, stop_ts)
+        return mean_db, background_db, reason
+
+    def _apply_priority(self, sc16_path: Path) -> None:
+        """Mark the finalized capture as priority if it is, and if it qualified
+        by itself, the captures that ended within PRIORITY_SPAN_SEC before it.
+        Runs after it is tracked, before the cap is enforced."""
+        reason, start_ts, _ = self._rec_priority
+        self._rec_priority = (None, 0.0, 0.0)
+        if reason is None:
+            return
+        self._storage.mark_priority([sc16_path])
+        span = self._settings.PRIORITY_SPAN_SEC
+        if reason == "event" or span <= 0:
+            return
+        before = [p for p in self._storage.auto_captures_since(start_ts - span) if p != sc16_path]
+        promoted = self._storage.mark_priority(before)
+        if not promoted:
+            return
+        logger.info(
+            "Priority capture %s: kept %d earlier captures with it", sc16_path.name, len(promoted)
+        )
+        if not self._replay_mode and self._loop is not None and self._db is not None:
+            names = [p.name for p in promoted]
+            self._loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self._db.mark_iq_captures_priority(names))
             )
 
     def _file_writer_loop(
@@ -3380,6 +3468,8 @@ class StreamingProcessor:
         """
         if self._replay_mode:
             return
+        # The background a capture's power is compared with (capture priority).
+        self._background.add(iq_stats.average)
         self._db_writer.submit(
             functools.partial(
                 self._persist_avg_window,

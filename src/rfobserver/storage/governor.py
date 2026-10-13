@@ -97,6 +97,8 @@ class StorageSample:
     # they must not pin the ladder at step 1.
     bursts_bytes: int = 0
     old_bursts_bytes: int = 0
+    # Priority captures in auto/ (part of auto_bytes).
+    priority_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -170,6 +172,7 @@ class StorageState:
             "db_reusable_gb": _gb(s.db_reusable_bytes) if s else None,
             "auto_gb": _gb(s.auto_bytes) if s else None,
             "manual_gb": _gb(s.manual_bytes) if s else None,
+            "priority_gb": _gb(s.priority_bytes) if s else None,
             "bursts_gb": _gb(s.bursts_bytes) if s else None,
             "step": self.step,
             "step_text": step_text,

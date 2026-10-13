@@ -364,6 +364,37 @@ class TestConfigApply:
         processor.reconfigure.assert_called_once()
         assert "RFOBS_PSD_BACKEND=cuda" in (tmp_path / ".env").read_text()
 
+    def test_apply_priority_settings(self, client_with_processor, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        client, settings, processor = client_with_processor
+        body = {
+            "priority_min_sec": "5",
+            "priority_excess_db": "12",
+            "priority_span_sec": "30",
+            "priority_share": "0.3",
+        }
+        resp = client.post("/config/apply", json=body)
+        assert resp.status_code == 200
+        assert (
+            settings.PRIORITY_MIN_SEC,
+            settings.PRIORITY_EXCESS_DB,
+            settings.PRIORITY_SPAN_SEC,
+            settings.PRIORITY_SHARE,
+        ) == (5.0, 12.0, 30.0, 0.3)
+        processor.reconfigure.assert_not_called()  # read at each finalize
+
+    @pytest.mark.parametrize(
+        "body", [{"priority_share": "1.5"}, {"priority_share": "-0.1"}, {"priority_min_sec": "-1"}]
+    )
+    def test_apply_priority_settings_out_of_range(
+        self, client_with_processor, monkeypatch, tmp_path, body
+    ):
+        monkeypatch.chdir(tmp_path)
+        client, settings, _ = client_with_processor
+        resp = client.post("/config/apply", json=body)
+        assert resp.status_code == 400
+        assert (settings.PRIORITY_SHARE, settings.PRIORITY_MIN_SEC) == (0.5, 2.0)
+
     def test_apply_psd_backend_invalid(self, client_with_processor, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         client, settings, processor = client_with_processor

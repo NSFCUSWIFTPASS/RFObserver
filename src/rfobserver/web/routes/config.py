@@ -128,6 +128,11 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "num_fft_bins": ("NUM_FFT_BINS", int),
         "psd_backend": ("PSD_BACKEND", str),
         "archive_max_gb": ("ARCHIVE_MAX_GB", float),
+        # Capture priority; read at each capture's finalize, so no reconfigure.
+        "priority_min_sec": ("PRIORITY_MIN_SEC", float),
+        "priority_excess_db": ("PRIORITY_EXCESS_DB", float),
+        "priority_span_sec": ("PRIORITY_SPAN_SEC", float),
+        "priority_share": ("PRIORITY_SHARE", float),
         "history_days": ("DB_RETENTION_DAYS", int),
         "disk_min_free_gb": ("DISK_MIN_FREE_GB", float),
         "stats_retention_days": ("STATS_RETENTION_DAYS", int),
@@ -224,6 +229,14 @@ async def apply_config(request: Request) -> dict[str, Any]:
                     status_code=400,
                     detail=f"num_fft_bins must be one of {sorted(valid_bins)}",
                 )
+
+        if attr.startswith("PRIORITY_") and isinstance(new_val, float):
+            if attr == "PRIORITY_SHARE" and not 0.0 <= new_val <= 1.0:
+                raise HTTPException(
+                    status_code=400, detail="priority_share must be between 0 and 1"
+                )
+            if new_val < 0:
+                raise HTTPException(status_code=400, detail=f"{form_key} must be 0 or more")
 
         # Settings are set with object.__setattr__ below, which skips pydantic's
         # Literal check, so validate the backend here.

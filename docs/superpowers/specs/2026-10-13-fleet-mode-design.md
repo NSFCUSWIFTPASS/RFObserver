@@ -13,7 +13,7 @@ One place to watch, and later control, every RFObserver sensor (six at HCRO).
 - **Fleet Live:** connects to every sensor. One spectrum and waterfall per
   sensor, and one shared power plot (all sensors, same colours as the
   Dashboard). No kurtosis for now.
-- **Settings:** the sensor list (found by mDNS, plus IPs added by hand), with
+- **Sensors:** the sensor list (found by mDNS, plus IPs added by hand), with
   each sensor's label and colour, and later its configuration.
 
 ## 2. Decisions
@@ -58,12 +58,12 @@ what the last identity poll returned and when.
 - **mDNS:** the fleet browses `_rfobserver._tcp.local.`. Entries found there are
   updated as they come and go. A sensor that drops off mDNS is kept, marked
   offline, not deleted.
-- **Manual:** `host[:port]` entries added on the Settings page, for sensors
+- **Manual:** `host[:port]` entries added on the Sensors page, for sensors
   mDNS cannot see (another subnet, multicast blocked).
 - **Merging:** entries are matched by `id` from `/api/identity`, so a sensor
   that is both discovered and added by hand appears once.
 - **Stored in** `fleet.json` in the fleet's state directory (same pattern as
-  the sensor `.env`: written by the Settings page, read at start).
+  the sensor `.env`: written by the Sensors page, read at start).
 - **Order and colour:** sensors keep the order they were added, and each keeps
   its colour for good, from a fixed categorical palette in that order. A colour
   follows the sensor, never its position in a filtered list. Six sensors fit
@@ -162,7 +162,7 @@ The fleet server opens `/ws/live` once per enabled sensor, in the default
 - **Load in the browser:** six waterfalls at one row per second are light.
   Rendering reuses the sensor Live page's canvas code.
 
-## 7. Settings
+## 7. Sensors page (named Settings until 2026-10-14)
 
 - **Sensor table:** label, colour, address, source (mDNS or manual), version,
   online state, enabled switch, remove (manual entries only).
@@ -195,11 +195,11 @@ The fleet server opens `/ws/live` once per enabled sensor, in the default
 ## 10. Phases
 
 1. **Fleet Dashboard, read-only:** sensor side (`/api/identity`, mDNS), the
-   fleet process, registry with mDNS and manual entries, Settings sensor
+   fleet process, registry with mDNS and manual entries, Sensors page
    table, multi-sensor power and kurtosis, sensor selector with waterfall and
    spectrum.
 2. **Fleet Live:** live hub, tile grid, shared power plot.
-3. **Control:** sensor API token, then per-sensor configuration from Settings,
+3. **Control:** sensor API token, then per-sensor configuration from the Sensors page,
    after the AWX question is settled.
 
 ## 11. Testing

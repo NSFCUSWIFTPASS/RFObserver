@@ -351,7 +351,7 @@ def fleet_client(tmp_path: Path, fake: FakeSensors) -> Any:
         yield client
 
 
-def test_fleet_first_run_shows_settings(fleet_client: TestClient) -> None:
+def test_fleet_first_run_shows_sensors_page(fleet_client: TestClient) -> None:
     r = fleet_client.get("/")
     assert r.status_code == 200
     assert "No sensors yet" in r.text
@@ -405,8 +405,12 @@ def test_fleet_dashboard_selects_a_sensor(fleet_client: TestClient) -> None:
     assert '"/fleet/s/a"' in fleet_client.get("/?sensor=b").text
 
 
-def test_fleet_settings_page(fleet_client: TestClient) -> None:
-    r = fleet_client.get("/settings")
+def test_fleet_sensors_page(fleet_client: TestClient) -> None:
+    old = fleet_client.get("/settings", follow_redirects=False)
+    assert (old.status_code, old.headers["location"]) == (308, "/sensors")
+    r = fleet_client.get("/sensors")
+    assert "<title>Sensors - RFObs Fleet</title>" in r.text
+    assert 'href="/sensors" class="nav-link">Sensors<' in r.text
     assert r.status_code == 200
     assert 'id="fleet-table"' in r.text
 

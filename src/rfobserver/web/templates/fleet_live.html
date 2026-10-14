@@ -6,7 +6,7 @@
 <div class="fleet-live-layout">
     <div class="card fleet-live-power">
         <div class="card-header">
-            Power, last 5 minutes
+            <span id="fleet-live-power-title">Power</span>
             <span id="fleet-live-conn" class="fleet-live-conn">Connecting</span>
             <label class="toggle-label" title="A frame per chunk (about 27 a second) instead of one per averaged window">
                 <input type="checkbox" id="fleet-live-highres" checked>
@@ -25,7 +25,7 @@
     <div class="fleet-live-tiles">
         <div id="fleet-live-grid" class="fleet-live-grid"></div>
         <p id="fleet-live-empty" class="placeholder-text" style="display:none;">
-            No sensors shown. Add or show sensors on the <a href="/settings">Settings</a> page.
+            No sensors shown. Add or show sensors on the <a href="/sensors">Sensors</a> page.
         </p>
     </div>
 </div>

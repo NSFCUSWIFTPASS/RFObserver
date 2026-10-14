@@ -19,6 +19,7 @@ sensor, as the sensor itself does, so the hub remembers each sensor's axis.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import json
 import logging
@@ -46,6 +47,9 @@ OFFLINE_AFTER_FAILURES = 3
 # Keep sensor sockets this long after the last viewer leaves (page reloads).
 IDLE_GRACE_SEC = 30.0
 TICK_SEC = 1.0
+# Each sensor's recent frame powers, kept so a browser opening the Live page
+# draws the power plot at once (the plot shows this span in High Res).
+POWER_HISTORY_SEC = 60.0
 # Frames are about 60 KB of JSON; leave room for a large bin count.
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 
@@ -109,6 +113,18 @@ class _Feed:
     recording: str | None = None
     error: str | None = None
     published_status: dict[str, Any] | None = None
+    # (chunk_time_ms, avg_power_db) of recent frames, oldest first.
+    power: collections.deque[tuple[float, float]] = field(default_factory=collections.deque)
+
+    def add_power(self, t_ms: Any, value: Any) -> None:
+        if not isinstance(t_ms, (int, float)) or not isinstance(value, (int, float)):
+            return
+        if self.power and t_ms <= self.power[-1][0]:
+            return
+        self.power.append((float(t_ms), round(float(value), 2)))
+        cut = t_ms - POWER_HISTORY_SEC * 1000.0
+        while self.power and self.power[0][0] < cut:
+            self.power.popleft()
 
     def state(self, now: float) -> str:
         if self.connected:
@@ -203,6 +219,11 @@ class LiveHub:
         now = time.monotonic()
         for feed in self._feeds.values():
             viewer.put((feed.sensor_id, "status"), feed.status(now))
+            if feed.power:
+                viewer.put(
+                    (feed.sensor_id, "power_history"),
+                    {"type": "power_history", "id": feed.sensor_id, "points": list(feed.power)},
+                )
             if feed.frame is not None:
                 viewer.put((feed.sensor_id, "psd"), feed.frame)
         return viewer
@@ -324,6 +345,7 @@ class LiveHub:
             if isinstance(freqs, list) and freqs:
                 feed.frequencies = freqs
             feed.frame = compact_frame(feed.sensor_id, data)
+            feed.add_power(data.get("chunk_time_ms"), data.get("avg_power_db"))
             was_standby = now - feed.last_psd >= PSD_STALE_SEC
             feed.last_psd, feed.last_seen = now, time.time()
             self._publish((feed.sensor_id, "psd"), feed.frame)

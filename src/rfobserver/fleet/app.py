@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from rfobserver.__about__ import __version__
@@ -144,7 +144,7 @@ def create_fleet_app(
         if selected is None:
             return templates.TemplateResponse(
                 request,
-                "fleet_settings.html",
+                "fleet_sensors.html",
                 {"ui_theme": prefs.theme(), "first_run": True, "fleet_nav": _chart_sensors()},
             )
         fleet = {
@@ -207,13 +207,17 @@ def create_fleet_app(
                     await t
             live.leave(viewer)
 
-    @app.get("/settings", response_class=HTMLResponse)
-    async def settings_page(request: Request) -> Any:
+    @app.get("/sensors", response_class=HTMLResponse)
+    async def sensors_page(request: Request) -> Any:
         return templates.TemplateResponse(
             request,
-            "fleet_settings.html",
+            "fleet_sensors.html",
             {"ui_theme": prefs.theme(), "first_run": False, "fleet_nav": _chart_sensors()},
         )
+
+    @app.get("/settings", include_in_schema=False)
+    async def old_settings_page() -> RedirectResponse:
+        return RedirectResponse("/sensors", status_code=308)  # the page's old name
 
     # --- sensor list ---
 

@@ -313,6 +313,32 @@ async def test_reconnected_sensor_is_asked_for_high_res_again(
         await hub.close()
 
 
+async def test_new_viewer_gets_recent_frame_powers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(live_mod, "POWER_HISTORY_SEC", 1.0)
+    fake = FakeSensors()
+    reg, hub = make_hub(tmp_path, fake)
+    a = reg.add("a", "10.0.0.1", 80, source="manual")
+    frames = [
+        psd(-50.0, t=1000.0),
+        psd(-49.0, freqs=False, t=1500.0),
+        psd(-48.0, freqs=False, t=1500.0),  # same time: ignored
+        psd(-47.0, freqs=False, t=2400.0),
+    ]  # pushes t=1000 out of the 1 s span
+    fake.plan[live_url(a)] = frames
+    try:
+        v = hub.join()
+        await drain(hub, v, lambda m: any(f["avg_power_db"] == -47.0 for f in kinds(m, "psd")))
+        v2 = hub.join()
+        msgs = await drain(hub, v2, lambda m: bool(kinds(m, "power_history")))
+        hist = kinds(msgs, "power_history")[0]
+        assert hist["id"] == "a"
+        assert [tuple(p) for p in hist["points"]] == [(1500.0, -49.0), (2400.0, -47.0)]
+    finally:
+        await hub.close()
+
+
 # --- through the app ---
 
 

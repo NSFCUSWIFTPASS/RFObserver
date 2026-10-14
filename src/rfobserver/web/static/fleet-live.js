@@ -1,7 +1,9 @@
 /**
  * Fleet Live: a tile per sensor (spectrum over a short waterfall), fed by
- * the fleet's /fleet/ws/live socket, and one shared power plot of the last
- * five minutes from /fleet/api/stats.
+ * the fleet's /fleet/ws/live socket, and one shared power plot. In High Res
+ * the plot shows each frame's power (a point per chunk, the values the
+ * sensor's own Live page plots) over the last minute; otherwise the stored
+ * window averages over five minutes, from /fleet/api/stats.
  *
  * The fleet sends, tagged by sensor id: "sensors" (who to show), "status"
  * (live / standby / reconnecting / offline), "psd" (the newest frame) and a
@@ -12,6 +14,7 @@
     "use strict";
 
     const POWER_WINDOW_MS = 5 * 60 * 1000;
+    const LIVE_WINDOW_MS = 60 * 1000;  // the fleet keeps this much (POWER_HISTORY_SEC)
     const POWER_POLL_MS = 5000;
     const WS_SILENT_MS = 6000; // the fleet ticks every second
     const HIDDEN_KEY = "rfobs.fleet.live.hidden";
@@ -27,7 +30,9 @@
     const highResBox = document.getElementById("fleet-live-highres");
 
     const tiles = new Map(); // id -> tile
-    const series = new Map(); // id -> [[t_ms, power_db], ...]
+    const series = new Map(); // id -> [[t_ms, power_db], ...] window averages
+    const livePower = new Map(); // id -> [[t_ms, power_db], ...] per frame
+    const powerTitle = document.getElementById("fleet-live-power-title");
     let roster = [];
     let hidden = loadHidden();
     let powerDirty = true;
@@ -199,13 +204,39 @@
         if (typeof msg.kurtosis === "number") parts.push("kurtosis " + msg.kurtosis.toFixed(2));
         if (msg.t) parts.push(new Date(msg.t).toLocaleTimeString());
         tile.info.textContent = parts.join("   ");
+        if (typeof msg.avg_power_db === "number" && msg.t) addLivePoint(msg.id, msg.t, msg.avg_power_db);
+    }
+
+    function addLivePoint(id, t, v) {
+        let pts = livePower.get(id);
+        if (!pts) { pts = []; livePower.set(id, pts); }
+        if (pts.length && t <= pts[pts.length - 1][0]) return;
+        pts.push([t, v]);
+        const cut = t - LIVE_WINDOW_MS - 5000;
+        let drop = 0;
+        while (drop < pts.length && pts[drop][0] < cut) drop++;
+        if (drop) pts.splice(0, drop);
+        if (highResBox.checked) powerDirty = true;
+    }
+
+    // The fleet's recent frame powers for a sensor, sent when the page opens.
+    function onPowerHistory(msg) {
+        const have = livePower.get(msg.id) || [];
+        const first = have.length ? have[0][0] : Infinity;
+        livePower.set(msg.id, msg.points.filter(function (p) { return p[0] < first; }).concat(have));
+        powerDirty = true;
     }
 
     function onSensors(msg) {
         roster = msg.sensors;
         const keep = new Set(roster.map(function (s) { return s.id; }));
         for (const [id, tile] of tiles) {
-            if (!keep.has(id)) { tile.el.remove(); tiles.delete(id); series.delete(id); }
+            if (!keep.has(id)) {
+                tile.el.remove();
+                tiles.delete(id);
+                series.delete(id);
+                livePower.delete(id);
+            }
         }
         for (const s of roster) {
             let tile = tiles.get(s.id);
@@ -263,10 +294,26 @@
         powerDirty = true;
     });
 
-    function visibleSeries() {
+    // What the plot shows: per-frame power in High Res, else window averages.
+    function plotMode() {
+        if (highResBox.checked) {
+            return {
+                data: livePower, windowMs: LIVE_WINDOW_MS, gapMs: 2000, nearMs: 1000,
+                ticks: [[45000, "-45 s"], [30000, "-30 s"], [15000, "-15 s"]],
+                title: "Power, last minute (per chunk)",
+            };
+        }
+        return {
+            data: series, windowMs: POWER_WINDOW_MS, gapMs: 10000, nearMs: 15000,
+            ticks: [[240000, "-4 min"], [180000, "-3 min"], [120000, "-2 min"], [60000, "-1 min"]],
+            title: "Power, last 5 minutes (window averages)",
+        };
+    }
+
+    function visibleSeries(data) {
         return roster
-            .filter(function (s) { return !hidden.has(s.id) && (series.get(s.id) || []).length; })
-            .map(function (s) { return { s: s, pts: series.get(s.id) }; });
+            .filter(function (s) { return !hidden.has(s.id) && (data.get(s.id) || []).length; })
+            .map(function (s) { return { s: s, pts: data.get(s.id) }; });
     }
 
     function drawPower() {
@@ -278,9 +325,11 @@
         const ctx = c.getContext("2d");
         ctx.fillStyle = BG;
         ctx.fillRect(0, 0, W, H);
+        const mode = plotMode();
+        if (powerTitle.textContent !== mode.title) powerTitle.textContent = mode.title;
         const t1 = Date.now();
-        const t0 = t1 - POWER_WINDOW_MS;
-        const vis = visibleSeries();
+        const t0 = t1 - mode.windowMs;
+        const vis = visibleSeries(mode.data);
         let lo = Infinity, hi = -Infinity;
         for (const v of vis) {
             for (const p of v.pts) {
@@ -298,9 +347,8 @@
         ctx.fillStyle = "rgba(255,255,255,0.5)";
         ctx.font = "10px -apple-system, sans-serif";
         ctx.textAlign = "center";
-        for (let m = 4; m >= 1; m--) {
-            const x = W - (m * 60000 / POWER_WINDOW_MS) * W;
-            ctx.fillText("-" + m + " min", x, H - 4);
+        for (const tick of mode.ticks) {
+            ctx.fillText(tick[1], W - (tick[0] / mode.windowMs) * W, H - 4);
         }
         if (!isFinite(lo)) {
             ctx.textAlign = "center";
@@ -311,18 +359,18 @@
         }
         const pad = Math.max(1, (hi - lo) * 0.1);
         lo -= pad; hi += pad;
-        const X = function (t) { return ((t - t0) / POWER_WINDOW_MS) * W; };
+        const X = function (t) { return ((t - t0) / mode.windowMs) * W; };
         const Y = function (v) { return H - 14 - ((v - lo) / (hi - lo)) * (H - 26); };
         for (const v of vis) {
             ctx.strokeStyle = v.s.colour;
-            ctx.lineWidth = 2;
+            ctx.lineWidth = highResBox.checked ? 1.5 : 2;
             ctx.lineJoin = "round";
             ctx.beginPath();
             let started = false, prevT = null;
             for (const p of v.pts) {
                 if (p[0] < t0) continue;
-                // A gap of over 10 s (sensor down, Standby) breaks the line.
-                if (!started || p[0] - prevT > 10000) ctx.moveTo(X(p[0]), Y(p[1]));
+                // A gap (sensor down, Standby) breaks the line.
+                if (!started || p[0] - prevT > mode.gapMs) ctx.moveTo(X(p[0]), Y(p[1]));
                 else ctx.lineTo(X(p[0]), Y(p[1]));
                 started = true;
                 prevT = p[0];
@@ -334,13 +382,13 @@
         ctx.textAlign = "left";
         ctx.fillText(hi.toFixed(0) + " dB", 4, 12);
         ctx.fillText(lo.toFixed(0) + " dB", 4, H - 16);
-        return { t0: t0, X: X, Y: Y, vis: vis, W: W, H: H };
+        return { t0: t0, X: X, Y: Y, vis: vis, W: W, H: H, mode: mode };
     }
 
     function drawHover(geo) {
         if (!geo || hoverX == null) { tip.style.display = "none"; return; }
         const ctx = powerCanvas.getContext("2d");
-        const t = geo.t0 + (hoverX / geo.W) * POWER_WINDOW_MS;
+        const t = geo.t0 + (hoverX / geo.W) * geo.mode.windowMs;
         const lines = [];
         ctx.strokeStyle = "rgba(255,255,255,0.35)";
         ctx.lineWidth = 1;
@@ -352,7 +400,7 @@
             for (const p of v.pts) {
                 if (best == null || Math.abs(p[0] - t) < Math.abs(best[0] - t)) best = p;
             }
-            if (!best || Math.abs(best[0] - t) > 15000) continue;
+            if (!best || Math.abs(best[0] - t) > geo.mode.nearMs) continue;
             ctx.fillStyle = v.s.colour;
             ctx.strokeStyle = BG;
             ctx.lineWidth = 2;
@@ -413,6 +461,7 @@
     highResBox.addEventListener("change", function () {
         try { localStorage.setItem(HIGHRES_KEY, highResBox.checked ? "1" : "0"); } catch (_) {}
         sendMode();
+        powerDirty = true;
     });
 
     function setConn(text, ok) {
@@ -431,6 +480,7 @@
             lastMessage = performance.now();
             const msg = JSON.parse(evt.data);
             if (msg.type === "psd") onPsd(msg);
+            else if (msg.type === "power_history") onPowerHistory(msg);
             else if (msg.type === "status") {
                 const tile = tiles.get(msg.id);
                 if (tile) setState(tile, msg);

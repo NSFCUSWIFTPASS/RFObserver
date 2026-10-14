@@ -149,9 +149,24 @@ class Registry:
             self._save_locked()
             return s
 
+    def use_address(self, sensor_id: str, address: str) -> Sensor | None:
+        """Make one of a sensor's known addresses its main one, keeping the
+        others (including the old main) as alternatives."""
+        with self._lock:
+            s = self._sensors.get(sensor_id)
+            if s is None or s.address == address:
+                return s
+            known = [s.address, *s.alt_addresses]
+            s.address = address
+            s.alt_addresses = [a for a in known if a != address]
+            self._save_locked()
+            logger.info("Fleet: %s now at %s", sensor_id, address)
+            return s
+
     def seen_on_mdns(self, sensor_id: str, addresses: list[str], port: int) -> Sensor:
-        """Record an mDNS sighting. A known sensor keeps its main address if
-        mDNS still lists it (so a manual address is not swapped out)."""
+        """Record an mDNS sighting; ``addresses`` best first (the caller ranks
+        them). An mDNS sensor takes the best one; a manual sensor keeps the
+        address it was added with."""
         with self._lock:
             s = self._sensors.get(sensor_id)
             if s is None:
@@ -164,9 +179,8 @@ class Registry:
                 )
                 self._sensors[sensor_id] = s
                 logger.info("Fleet: found %s on mDNS at %s:%d", sensor_id, addresses[0], port)
-            elif s.address not in addresses or s.port != port:
-                if s.source == "mdns":
-                    s.address, s.port = addresses[0], port
+            elif s.source == "mdns":
+                s.address, s.port = addresses[0], port
             s.alt_addresses = [a for a in addresses if a != s.address]
             self._save_locked()
             return s

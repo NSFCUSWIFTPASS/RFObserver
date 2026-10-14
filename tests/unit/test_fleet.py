@@ -167,8 +167,8 @@ def test_registry_mdns_follows_an_mdns_sensor(tmp_path: Path) -> None:
     reg = Registry(tmp_path / "fleet.json")
     reg.seen_on_mdns("a", ["10.0.0.1"], 80)
     s = reg.seen_on_mdns("a", ["10.0.0.5", "10.0.0.1"], 80)
-    assert s.address == "10.0.0.1"  # still listed, kept
-    assert s.alt_addresses == ["10.0.0.5"]
+    assert s.address == "10.0.0.5"  # the best (first) address wins
+    assert s.alt_addresses == ["10.0.0.1"]
     s = reg.seen_on_mdns("a", ["10.0.0.7"], 81)
     assert (s.address, s.port, s.alt_addresses) == ("10.0.0.7", 81, [])
 
@@ -314,7 +314,15 @@ async def test_hub_waiters_share_one_request(tmp_path: Path, fake: FakeSensors) 
         await hub.close()
 
 
-async def test_hub_refresh_falls_back_to_alt_address(tmp_path: Path, fake: FakeSensors) -> None:
+async def test_hub_refresh_falls_back_and_returns_to_the_best_address(
+    tmp_path: Path, fake: FakeSensors, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import rfobserver.mdns as mdns_mod
+
+    # 10.0.0.1 is the fleet's own subnet (preferred), 10.0.0.5 a VPN address.
+    monkeypatch.setattr(
+        mdns_mod, "rank_addresses", lambda a: sorted(a, key=lambda x: x != "10.0.0.1")
+    )
     fake.add("a", "10.0.0.5")
     fake.down.add("10.0.0.1:80")
     reg = Registry(tmp_path / "fleet.json")
@@ -324,12 +332,45 @@ async def test_hub_refresh_falls_back_to_alt_address(tmp_path: Path, fake: FakeS
         await hub.refresh(s)
         st = hub.status("a")
         assert st.online and st.address_used == "10.0.0.5"
-        assert reg.get("a").address == "10.0.0.5"  # type: ignore[union-attr]
-        fake.down.add("10.0.0.5:80")
-        await hub.refresh(reg.get("a"))  # type: ignore[arg-type]
+        s = reg.get("a")
+        assert s is not None and (s.address, s.alt_addresses) == ("10.0.0.5", ["10.0.0.1"])
+        # The preferred address answers again: the next poll moves back.
+        fake.down.discard("10.0.0.1:80")
+        await hub.refresh(s)
+        s = reg.get("a")
+        assert s is not None and (s.address, s.alt_addresses) == ("10.0.0.1", ["10.0.0.5"])
+        fake.down.update({"10.0.0.1:80", "10.0.0.5:80"})
+        await hub.refresh(s)
         assert not hub.status("a").online
     finally:
         await hub.close()
+
+
+async def test_manual_sensor_keeps_its_own_address_first(
+    tmp_path: Path, fake: FakeSensors, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import rfobserver.mdns as mdns_mod
+
+    monkeypatch.setattr(mdns_mod, "rank_addresses", lambda a: sorted(a, reverse=True))
+    reg = Registry(tmp_path / "fleet.json")
+    reg.add("a", "10.0.0.1", 80, source="manual")
+    s = reg.seen_on_mdns("a", ["10.0.0.9"], 80)  # mDNS also lists another
+    fake.add("a", "10.0.0.9")
+    hub = SensorHub(reg, transport=fake.transport())
+    try:
+        await hub.refresh(s)
+        assert hub.status("a").address_used == "10.0.0.1"  # not re-ranked
+    finally:
+        await hub.close()
+
+
+def test_registry_use_address_keeps_every_address(tmp_path: Path) -> None:
+    reg = Registry(tmp_path / "fleet.json")
+    reg.seen_on_mdns("a", ["10.0.0.1", "10.0.0.5", "10.0.0.7"], 80)
+    s = reg.use_address("a", "10.0.0.5")
+    assert s is not None and (s.address, s.alt_addresses) == ("10.0.0.5", ["10.0.0.1", "10.0.0.7"])
+    assert Registry(tmp_path / "fleet.json").get("a").address == "10.0.0.5"  # type: ignore[union-attr]
+    assert reg.use_address("zz", "1.2.3.4") is None
 
 
 async def test_fetch_identity_rejects_non_sensor(tmp_path: Path) -> None:
@@ -414,7 +455,7 @@ def test_fleet_sensors_page(fleet_client: TestClient) -> None:
     assert "<title>Sensors - RFObs Fleet</title>" in r.text
     assert 'href="/sensors" class="nav-link">Sensors<' in r.text
     assert r.status_code == 200
-    assert 'id="fleet-table"' in r.text
+    assert 'id="fleet-list"' in r.text and 'id="fleet-add"' in r.text
 
 
 def test_fleet_proxy(fleet_client: TestClient, fake: FakeSensors) -> None:

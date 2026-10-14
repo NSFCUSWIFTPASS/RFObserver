@@ -221,9 +221,18 @@ class SensorHub:
         return ident
 
     async def refresh(self, sensor: Sensor) -> None:
-        """Poll one sensor's identity; on failure, try its other mDNS addresses."""
+        """Poll one sensor's identity at its best address that answers.
+
+        An mDNS sensor's addresses are tried in preference order (this host's
+        subnet first, see mdns.rank_addresses), so after falling back to
+        another address while the best one was down, it moves back once that
+        one answers again. A manual sensor tries its own address first."""
         st = self.status(sensor.id)
         candidates = [sensor.address, *sensor.alt_addresses]
+        if sensor.source == "mdns":
+            from rfobserver.mdns import rank_addresses
+
+            candidates = rank_addresses(candidates)
         last_error: str | None = None
         for addr in candidates:
             base = sensor.base_url.replace(sensor.address, addr, 1)
@@ -233,7 +242,7 @@ class SensorHub:
                 last_error = f"{type(exc).__name__}: {exc}"
                 continue
             if addr != sensor.address:
-                self.registry.add(sensor.id, addr, sensor.port, source=sensor.source)
+                self.registry.use_address(sensor.id, addr)
             st.identity, st.online, st.last_seen, st.error = ident, True, time.time(), None
             st.address_used = addr
             return

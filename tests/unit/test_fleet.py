@@ -398,7 +398,8 @@ def test_fleet_dashboard_selects_a_sensor(fleet_client: TestClient) -> None:
     assert '"/fleet/s/a"' in r.text  # first online sensor
     r = fleet_client.get("/?sensor=b")
     assert '"/fleet/s/b"' in r.text
-    assert 'id="fleet-select"' in r.text
+    assert 'id="fleet-sensors"' in r.text and 'data-id="a"' in r.text
+    assert 'id="fleet-select"' not in r.text
     # A hidden sensor is not selectable.
     fleet_client.patch("/fleet/api/sensors/b", json={"enabled": False})
     assert '"/fleet/s/a"' in fleet_client.get("/?sensor=b").text

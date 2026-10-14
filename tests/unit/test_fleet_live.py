@@ -48,8 +48,13 @@ class FakeSock:
         for f in frames:
             self.queue.put_nowait(f)
 
+        self.sent: list[dict] = []
+
     async def recv(self) -> str:
         return await self.queue.get()
+
+    async def send(self, message: str) -> None:
+        self.sent.append(json.loads(message))
 
 
 class FakeSensors:
@@ -264,6 +269,50 @@ async def test_hidden_sensor_is_dropped_from_roster_and_feeds(tmp_path: Path) ->
         await hub.close()
 
 
+async def test_high_res_follows_the_viewers(tmp_path: Path) -> None:
+    fake = FakeSensors()
+    reg, hub = make_hub(tmp_path, fake)
+    a = reg.add("a", "10.0.0.1", 80, source="manual")
+    fake.plan[live_url(a)] = [psd(-50.0)]
+    try:
+        v = hub.join()
+        await drain(hub, v, lambda m: bool(kinds(m, "psd")))
+        sock = fake.socks[live_url(a)]
+        assert sock.sent == []  # averaged mode until someone asks
+        hub.set_high_res(v, True)
+        await asyncio.sleep(0.01)
+        assert sock.sent == [{"type": "set_mode", "high_res": True}]
+        v2 = hub.join()
+        hub.set_high_res(v2, False)
+        hub.leave(v)  # v2 does not want it: back to averaged
+        await asyncio.sleep(0.01)
+        assert sock.sent[-1] == {"type": "set_mode", "high_res": False}
+    finally:
+        await hub.close()
+
+
+async def test_reconnected_sensor_is_asked_for_high_res_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(live_mod, "SILENT_SEC", 0.05)
+    monkeypatch.setattr(live_mod, "BACKOFF_MIN_SEC", 0.01)
+    fake = FakeSensors()
+    reg, hub = make_hub(tmp_path, fake)
+    a = reg.add("a", "10.0.0.1", 80, source="manual")
+    fake.plan[live_url(a)] = [psd(-50.0)]
+    try:
+        v = hub.join()
+        hub.set_high_res(v, True)
+        for _ in range(100):
+            if len(fake.connects) >= 2 and fake.socks[live_url(a)].sent:
+                break
+            await asyncio.sleep(0.01)
+        assert len(fake.connects) >= 2
+        assert fake.socks[live_url(a)].sent == [{"type": "set_mode", "high_res": True}]
+    finally:
+        await hub.close()
+
+
 # --- through the app ---
 
 
@@ -287,3 +336,7 @@ def test_fleet_live_socket_and_page(tmp_path: Path) -> None:
                 seen.append(ws.receive_json())
             assert kinds(seen, "sensors")[0]["sensors"][0]["id"] == "a"
             assert kinds(seen, "psd")[0]["frequencies"] == FREQS
+            ws.send_text(json.dumps({"type": "set_mode", "high_res": True}))
+            ws.send_text("not json")  # ignored
+            while not app.state.live.wants_high_res():
+                seen.append(ws.receive_json())

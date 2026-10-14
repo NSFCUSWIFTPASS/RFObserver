@@ -120,7 +120,13 @@ def create_fleet_app(
 
     def _chart_sensors() -> list[dict[str, Any]]:
         return [
-            {"id": s.id, "label": hub.display_label(s), "colour": s.colour}
+            {
+                "id": s.id,
+                "label": hub.display_label(s),
+                "colour": s.colour,
+                "base_url": s.base_url,
+                "online": hub.status(s.id).online,
+            }
             for s in registry.all()
             if s.enabled
         ]
@@ -183,7 +189,12 @@ def create_fleet_app(
 
         async def recv_loop() -> None:
             while True:
-                await websocket.receive_text()
+                try:
+                    msg = json.loads(await websocket.receive_text())
+                except ValueError:
+                    continue
+                if isinstance(msg, dict) and msg.get("type") == "set_mode":
+                    live.set_high_res(viewer, bool(msg.get("high_res")))
 
         tasks = {asyncio.create_task(send_loop()), asyncio.create_task(recv_loop())}
         try:

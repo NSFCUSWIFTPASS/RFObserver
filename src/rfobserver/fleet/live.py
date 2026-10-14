@@ -8,6 +8,10 @@ copy: spectrum, power and kurtosis, without the max-hold and noise-floor
 arrays the tiles do not draw. A browser that falls behind gets each
 sensor's newest frame, never a queue.
 
+High resolution (a frame per chunk, about 27 a second, instead of one per
+averaged window) is asked of every sensor while any viewer wants it, the
+same request the sensor's own Live page makes by default.
+
 The frequency axis is sent to a browser only when it changes for that
 sensor, as the sensor itself does, so the hub remembers each sensor's axis.
 """
@@ -48,6 +52,8 @@ MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 
 class LiveSocket(Protocol):
     async def recv(self) -> str | bytes: ...
+
+    async def send(self, message: str) -> None: ...
 
 
 def _websockets_connect(url: str) -> contextlib.AbstractAsyncContextManager[LiveSocket]:
@@ -91,6 +97,8 @@ class _Feed:
 
     sensor_id: str
     task: asyncio.Task[None] | None = None
+    sock: LiveSocket | None = None
+    high_res: bool = False  # what the sensor was last asked for
     connected: bool = False
     failures: int = 0
     last_message: float = 0.0  # monotonic
@@ -132,6 +140,7 @@ class _Viewer:
     # The frequency axis this browser holds, per sensor.
     freq_sig: dict[str, tuple[int, float, float]] = field(default_factory=dict)
     dropped: int = 0
+    high_res: bool = False
 
     def put(self, key: tuple[str, str], msg: dict[str, Any]) -> None:
         if key in self.pending:
@@ -202,6 +211,31 @@ class LiveHub:
         self._viewers.discard(viewer)
         if not self._viewers:
             self._idle_since = time.monotonic()
+        self._apply_mode()
+
+    def set_high_res(self, viewer: _Viewer, on: bool) -> None:
+        viewer.high_res = on
+        self._apply_mode()
+
+    def wants_high_res(self) -> bool:
+        return any(v.high_res for v in self._viewers)
+
+    def _apply_mode(self) -> None:
+        want = self.wants_high_res()
+        for feed in self._feeds.values():
+            if feed.connected and feed.high_res != want:
+                asyncio.create_task(self._send_mode(feed, want))
+
+    async def _send_mode(self, feed: _Feed, on: bool) -> None:
+        sock = feed.sock
+        if sock is None:
+            return
+        feed.high_res = on
+        try:
+            await sock.send(json.dumps({"type": "set_mode", "high_res": on}))
+        except Exception:
+            feed.high_res = not on  # retried on the next change or reconnect
+            logger.debug("Fleet live: set_mode to %s failed", feed.sensor_id, exc_info=True)
 
     def shape(self, viewer: _Viewer, msg: dict[str, Any]) -> dict[str, Any]:
         """Add the frequency axis to a frame if this browser lacks it."""
@@ -252,10 +286,13 @@ class LiveHub:
             url = live_url(sensor)
             try:
                 async with self._connect(url) as sock:
+                    feed.sock, feed.high_res = sock, False
                     feed.connected, feed.failures, feed.error = True, 0, None
                     feed.last_message = time.monotonic()
                     backoff = BACKOFF_MIN_SEC
                     self._publish_status(feed)
+                    if self.wants_high_res():
+                        await self._send_mode(feed, True)
                     while True:
                         raw = await asyncio.wait_for(sock.recv(), timeout=SILENT_SEC)
                         self._handle(feed, raw)
@@ -265,6 +302,7 @@ class LiveHub:
                 feed.error = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
             if feed.connected:
                 logger.info("Fleet live: %s disconnected (%s)", feed.sensor_id, feed.error)
+            feed.sock = None
             feed.connected = False
             feed.failures += 1
             self._publish_status(feed)

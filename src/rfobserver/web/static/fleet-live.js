@@ -15,6 +15,7 @@
     const POWER_POLL_MS = 5000;
     const WS_SILENT_MS = 6000; // the fleet ticks every second
     const HIDDEN_KEY = "rfobs.fleet.live.hidden";
+    const HIGHRES_KEY = "rfobs.fleet.live.highres";
     const BG = "#1a1a2e";
 
     const grid = document.getElementById("fleet-live-grid");
@@ -23,6 +24,7 @@
     const powerCanvas = document.getElementById("fleet-live-power");
     const tip = document.getElementById("fleet-live-tip");
     const legend = document.getElementById("fleet-live-legend");
+    const highResBox = document.getElementById("fleet-live-highres");
 
     const tiles = new Map(); // id -> tile
     const series = new Map(); // id -> [[t_ms, power_db], ...]
@@ -399,6 +401,20 @@
     let ws = null;
     let lastMessage = 0;
 
+    // High Res is on unless this browser turned it off.
+    try { highResBox.checked = localStorage.getItem(HIGHRES_KEY) !== "0"; } catch (_) {}
+
+    function sendMode() {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "set_mode", high_res: highResBox.checked }));
+        }
+    }
+
+    highResBox.addEventListener("change", function () {
+        try { localStorage.setItem(HIGHRES_KEY, highResBox.checked ? "1" : "0"); } catch (_) {}
+        sendMode();
+    });
+
     function setConn(text, ok) {
         conn.textContent = text;
         conn.classList.toggle("ok", !!ok);
@@ -409,7 +425,7 @@
         const sock = new WebSocket(proto + location.host + "/fleet/ws/live");
         ws = sock;
         lastMessage = performance.now();
-        sock.onopen = function () { setConn("Connected", true); };
+        sock.onopen = function () { setConn("Connected", true); sendMode(); };
         sock.onmessage = function (evt) {
             if (sock !== ws) return;
             lastMessage = performance.now();

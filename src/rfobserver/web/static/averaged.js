@@ -107,7 +107,7 @@
     // read-only proxy (apiBase), and every sensor on the power and kurtosis
     // charts. Display preferences (/api/ui-prefs) stay the fleet's own.
     const FLEET = window.RFOBS_FLEET || null;
-    const API = FLEET ? FLEET.apiBase : "";
+    let API = FLEET ? FLEET.apiBase : "";  // changes with the sensor buttons
     // Fleet charts refresh at most this often, over a range snapped to the
     // same step, so the fleet server's cache serves every open page.
     const FLEET_STATS_MS = 10000;
@@ -152,7 +152,8 @@
         hoverMs: null,   // time under the cursor on the power/kurtosis charts, or null
         // Fleet mode: every sensor's stats series, which ones the legend hid,
         // and the range/time of the last fetch (see loadFleetStats).
-        fleet: { series: [], loaded: false, hidden: loadFleetHidden(), key: null, at: 0 },
+        fleet: { series: [], loaded: false, hidden: loadFleetHidden(), key: null, at: 0,
+            prefetchKey: null, prefetchAt: 0 },
         autoScale: {},   // the auto bound each chart last drew with, per scale key
         scale: {
             wf_lo: null, wf_hi: null,
@@ -863,16 +864,25 @@
     // --- loading ---
 
     function tuningParams() {
+        return rangeParams(currentTuning(), state.sinceMs, state.untilMs);
+    }
+
+    function currentTuning() {
+        return {
+            center: $("avg-center").value,
+            rate: $("avg-samplerate").value,
+            gain: $("avg-gain").value,
+        };
+    }
+
+    function rangeParams(t, sinceMs, untilMs) {
         const p = new URLSearchParams({
-            since: new Date(state.sinceMs).toISOString(),
-            until: new Date(state.untilMs).toISOString(),
+            since: new Date(sinceMs).toISOString(),
+            until: new Date(untilMs).toISOString(),
         });
-        const center = $("avg-center").value;
-        const rate = $("avg-samplerate").value;
-        const gain = $("avg-gain").value;
-        if (center) p.set("sdr_center", center);
-        if (rate) p.set("sample_rate", rate);
-        if (gain) p.set("gain", gain);
+        if (t.center) p.set("sdr_center", t.center);
+        if (t.rate) p.set("sample_rate", t.rate);
+        if (t.gain) p.set("gain", t.gain);
         p.set("max_rows", String(MAX_ROWS));
         p.set("max_bins", String(MAX_BINS));
         return p;
@@ -1055,6 +1065,7 @@
             ok = true;
             saveToCache(!plan);
             loadFleetStats(!background);
+            prefetchOthers(!background);
         } finally {
             // Only the latest load owns the shared flags; a superseded load must
             // not clear loading/stale out from under the newer one still running.
@@ -2208,12 +2219,222 @@
             + "show stats and detections only.";
     }
 
+    // --- tuning selects ---
+
+    // Fill the tuning selects from a sensor's /api/averaged/configs and pick
+    // ``tuning`` ({center, rate, gain}), or the sensor's latest tuning.
+    function applyConfigs(data, tuning) {
+        const configs = (data && data.configs) || [];
+        const uniq = function (key) {
+            return [...new Set(configs.map(function (c) { return c[key]; }))].sort(function (a, b) { return a - b; });
+        };
+        fillSelect("avg-center", uniq("sdr_center_freq_hz"), function (v) { return (v / 1e6).toFixed(1) + " MHz"; }, String);
+        fillSelect("avg-samplerate", uniq("sample_rate_hz"), function (v) { return (v / 1e6).toFixed(0) + " MHz"; }, String);
+        fillSelect("avg-gain", uniq("gain_db"), function (v) { return v + " dB"; }, String);
+        const t = tuning || latestTuning(data);
+        setSelectValue("avg-center", t.center);
+        setSelectValue("avg-samplerate", t.rate);
+        setSelectValue("avg-gain", t.gain);
+    }
+
+    function latestTuning(data) {
+        const l = data && data.latest;
+        return l
+            ? { center: String(l.sdr_center_freq_hz), rate: String(l.sample_rate_hz), gain: String(l.gain_db) }
+            : { center: "", rate: "", gain: "" };
+    }
+
+    // --- fleet: switching sensors without waiting ---
+    //
+    // The page keeps every sensor's data for the shown range, refreshing the
+    // sensors not shown in the background (at most every FLEET_STATS_MS), so
+    // a sensor button swaps the charts at once and then refreshes that sensor.
+
+    const fleetData = {};  // id -> {configs, tuning, data}
+
+    function sensorEntry(id) {
+        if (!fleetData[id]) fleetData[id] = { configs: null, tuning: null, data: null };
+        return fleetData[id];
+    }
+
+    function sensorBase(id) {
+        return "/fleet/s/" + encodeURIComponent(id);
+    }
+
+    function rangeKey() {
+        return state.live ? "live|" + state.spanMs : state.sinceMs + "|" + state.untilMs;
+    }
+
+    async function sensorConfigs(id) {
+        const e = sensorEntry(id);
+        if (!e.configs) {
+            try {
+                const r = await fetch(sensorBase(id) + "/api/averaged/configs");
+                if (r.ok) e.configs = await r.json();
+            } catch (_) { /* try again next time */ }
+        }
+        return e.configs;
+    }
+
+    async function prefetchOthers(force) {
+        if (!FLEET || FLEET.sensors.length < 2) return;
+        const key = rangeKey();
+        const now = Date.now();
+        if (!force && state.fleet.prefetchKey === key && now - state.fleet.prefetchAt < FLEET_STATS_MS) return;
+        state.fleet.prefetchKey = key;
+        state.fleet.prefetchAt = now;
+        let since = state.sinceMs, until = state.untilMs;
+        if (state.live) {
+            until = Math.ceil(now / FLEET_STATS_MS) * FLEET_STATS_MS;
+            since = until - state.spanMs;
+        }
+        await Promise.all(FLEET.sensors.map(async function (s) {
+            if (s.id === FLEET.selected) return;
+            const e = sensorEntry(s.id);
+            const cfg = await sensorConfigs(s.id);
+            if (!e.tuning) e.tuning = latestTuning(cfg);
+            const qs = rangeParams(e.tuning, since, until).toString();
+            const base = sensorBase(s.id);
+            try {
+                const rs = await Promise.all([
+                    fetch(base + "/api/averaged/waterfall?" + qs),
+                    fetch(base + "/api/averaged/stats?" + qs),
+                    fetch(base + "/api/detections.json?" + qs),
+                    fetch(base + "/api/iq-captures?" + qs),
+                ]);
+                if (!rs[0].ok) return;
+                const wf = parseWaterfall(await rs[0].arrayBuffer());
+                const stats = rs[1].ok ? await rs[1].json() : null;
+                const det = rs[2].ok ? (await rs[2].json()).detections : [];
+                const iq = rs[3].ok ? (await rs[3].json()).captures : [];
+                // Shown meanwhile (its own load is fresher), or a new range.
+                if (s.id === FLEET.selected || rangeKey() !== key) return;
+                e.data = { key: key, wf: wf, stats: stats, detections: det || [], iqCaptures: iq || [] };
+            } catch (_) { /* the next round retries */ }
+        }));
+    }
+
+    // Show a sensor's kept data (newest row selected).
+    function showData(d, label) {
+        state.wf = d.wf;
+        state.stats = d.stats;
+        state.detections = d.detections;
+        state.iqCaptures = d.iqCaptures;
+        state.followLatest = true;
+        const slider = $("avg-slider");
+        slider.min = "0";
+        slider.max = String(Math.max(0, state.wf.bucketCount - 1));
+        let last = Math.max(0, state.wf.bucketCount - 1);
+        while (last > 0 && state.wf.stats[last].count === 0) last--;
+        state.selRow = last;
+        slider.value = String(last);
+        $("avg-time").textContent = state.wf.bucketCount
+            ? new Date(state.wf.stats[last].start_epoch * 1000).toLocaleString() : "";
+        $("avg-updated").textContent = label;
+        renderAll();
+    }
+
+    // Nothing kept for this sensor yet: empty charts until its load lands.
+    function showNothing(name) {
+        state.wf = null;
+        state.stats = null;
+        state.detections = [];
+        state.iqCaptures = [];
+        const c = $("avg-wf");
+        const ctx = c.getContext("2d");
+        ctx.fillStyle = "#1a1a2e";
+        ctx.fillRect(0, 0, c.width, c.height);
+        ctx.fillStyle = "rgba(255,255,255,0.4)";
+        ctx.font = "12px -apple-system, sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("Loading " + name + "...", c.width / 2, c.height / 2);
+        $("avg-wf-label").textContent = "";
+        $("avg-time").textContent = "";
+        $("avg-updated").textContent = "";
+        renderPSD();
+        renderBucketStats();
+        renderDetections();
+        renderStatsChart();
+        renderKurtosisChart();
+    }
+
+    function markSensorButtons() {
+        document.querySelectorAll(".fleet-sensor-btn").forEach(function (b) {
+            const on = b.dataset.id === FLEET.selected;
+            b.classList.toggle("selected", on);
+            b.setAttribute("aria-pressed", on ? "true" : "false");
+        });
+    }
+
+    async function selectSensor(id) {
+        if (!FLEET || id === FLEET.selected) return;
+        const next = FLEET.sensors.find(function (s) { return s.id === id; });
+        if (!next) return;
+        // Keep what this sensor shows, for switching back.
+        const cur = sensorEntry(FLEET.selected);
+        cur.tuning = currentTuning();
+        if (state.wf) {
+            cur.data = { key: rangeKey(), wf: state.wf, stats: state.stats,
+                detections: state.detections, iqCaptures: state.iqCaptures };
+        }
+        // Drop the old sensor's load in flight.
+        state.loadSeq++;
+        if (state.loadAbort) state.loadAbort.abort();
+        state.loadAbort = null;
+        state.loading = false;
+        state.inc = null;
+
+        FLEET.selected = id;
+        FLEET.apiBase = sensorBase(id);
+        FLEET.sensorUrl = next.base_url;
+        FLEET.colour = next.colour;
+        API = FLEET.apiBase;
+        markSensorButtons();
+        document.querySelectorAll(".fleet-tag .fleet-swatch").forEach(function (el) { el.style.background = next.colour; });
+        document.querySelectorAll(".fleet-name").forEach(function (el) { el.textContent = next.label; });
+        try {
+            const url = new URL(window.location.href);
+            url.searchParams.set("sensor", id);
+            history.replaceState(history.state, "", url.toString());
+        } catch (_) { /* the URL keeps the old sensor */ }
+
+        const e = sensorEntry(id);
+        if (e.configs) applyConfigs(e.configs, e.tuning);
+        // Kept data is at most FLEET_STATS_MS old: show it as is and refresh
+        // quietly. Otherwise the charts are marked stale until the load lands.
+        const kept = e.data && e.data.key === rangeKey();
+        if (kept) {
+            showData(e.data, "Updating...");
+        } else {
+            showNothing(next.label);
+            await restoreFromCache();  // this browser's last copy, if any
+            if (FLEET.selected !== id) return;
+        }
+        if (!e.configs) {
+            const cfg = await sensorConfigs(id);
+            if (FLEET.selected !== id) return;
+            applyConfigs(cfg, e.tuning);
+        }
+        setStale(!kept);
+        loadAll(true, false);
+    }
+
+    function setupSensorButtons() {
+        const bar = $("fleet-sensors");
+        if (!FLEET || !bar) return;
+        bar.addEventListener("click", function (e) {
+            const btn = e.target.closest(".fleet-sensor-btn");
+            if (btn) selectSensor(btn.dataset.id);
+        });
+    }
+
     // --- boot ---
 
     async function boot() {
         setupControls();
         setupSlider();
         setupFleetLegends();
+        setupSensorButtons();
         setupIqToggle();
         fitCanvases();
         let resizeTimer = null;
@@ -2231,19 +2452,8 @@
         try { bootData = JSON.parse($("avg-boot").textContent) || {}; } catch (_) { /* fetch below */ }
         try {
             const data = bootData.configs || await (await fetch(API + "/api/averaged/configs")).json();
-            const configs = data.configs || [];
-            const centers = [...new Set(configs.map(function (c) { return c.sdr_center_freq_hz; }))].sort(function (a, b) { return a - b; });
-            const rates = [...new Set(configs.map(function (c) { return c.sample_rate_hz; }))].sort(function (a, b) { return a - b; });
-            const gains = [...new Set(configs.map(function (c) { return c.gain_db; }))].sort(function (a, b) { return a - b; });
-            fillSelect("avg-center", centers, function (v) { return (v / 1e6).toFixed(1) + " MHz"; }, String);
-            fillSelect("avg-samplerate", rates, function (v) { return (v / 1e6).toFixed(0) + " MHz"; }, String);
-            fillSelect("avg-gain", gains, function (v) { return v + " dB"; }, String);
-            const latest = data.latest;
-            if (latest) {
-                setSelectValue("avg-center", latest.sdr_center_freq_hz);
-                setSelectValue("avg-samplerate", latest.sample_rate_hz);
-                setSelectValue("avg-gain", latest.gain_db);
-            }
+            applyConfigs(data, null);
+            if (FLEET) sensorEntry(FLEET.selected).configs = data;
         } catch (_) { /* configs are optional; defaults stay All */ }
         try {
             let doc = bootData.prefs || null;

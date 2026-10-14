@@ -5,26 +5,3 @@
 <a href="/live" class="nav-link">Live</a>
 <a href="/settings" class="nav-link">Settings</a>
 {% endblock %}
-{% block nav_extra %}
-{% if fleet %}
-<label class="fleet-select-wrap" title="Sensor shown in the waterfall and spectrum">
-    <span class="fleet-swatch" id="fleet-select-swatch" style="background:{{ fleet.colour }};"></span>
-    <select id="fleet-select" class="theme-select" aria-label="Sensor">
-        {% for s in fleet_nav %}
-        <option value="{{ s.id }}" data-colour="{{ s.colour }}"{% if s.id == fleet.selected %} selected{% endif %}>{{ s.label }}</option>
-        {% endfor %}
-    </select>
-</label>
-<script>
-    (function () {
-        const sel = document.getElementById("fleet-select");
-        sel.addEventListener("change", function () {
-            // Keep the time range (the page keeps it in the URL hash, if set).
-            const url = new URL(window.location.href);
-            url.searchParams.set("sensor", sel.value);
-            window.location.href = url.toString();
-        });
-    })();
-</script>
-{% endif %}
-{% endblock %}

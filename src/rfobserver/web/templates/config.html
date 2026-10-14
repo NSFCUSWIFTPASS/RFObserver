@@ -86,6 +86,15 @@
     <div class="card-header">Burst Detection</div>
     <div class="card-body">
         <div class="config-form">
+            <div class="form-row" style="align-items: flex-start;">
+                <div class="form-group">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="burst-detection-enabled" name="burst_detection_enabled" {% if settings.BURST_DETECTION_ENABLED %}checked{% endif %}>
+                        <span class="toggle-text">Detection</span>
+                    </label>
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Applies at once. Off: no detections, and Burst Isolation has nothing to isolate. The IQ trigger works on power and is not affected.</span>
+                </div>
+            </div>
             <div class="form-row">
                 <div class="form-group">
                     <label for="threshold">Threshold High (dB)</label>
@@ -485,7 +494,8 @@
     // Checkboxes are tracked by .checked, not FormData: an unchecked box is
     // absent from FormData, so the entries() loop below cannot see a
     // checked -> unchecked change.
-    const boolIds = ['trigger-continuous', 'recording-ram-buffer', 'isolation-enabled', 'attribution-enabled'];
+    const boolIds = ['trigger-continuous', 'recording-ram-buffer', 'isolation-enabled', 'attribution-enabled',
+        'burst-detection-enabled'];
     let initialChecks = {};
     function snapshotChecks() {
         boolIds.forEach(id => {

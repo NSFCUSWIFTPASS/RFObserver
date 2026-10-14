@@ -153,6 +153,29 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             body["rfdb"] = rfdb.status()
         return body
 
+    def _features(s: AppSettings, sup: Any) -> dict[str, bool | None]:
+        """Which features are switched on, for the fleet's Sensors page."""
+        return {
+            "active": bool(sup.active) if sup is not None else None,
+            "auto_iq_trigger": s.TRIGGER_ENABLED,
+            "burst_detection": s.BURST_DETECTION_ENABLED,
+            "burst_isolation": s.ISOLATION_ENABLED,
+            "attribution": s.ATTRIBUTION_ENABLED,
+            "rf_db": s.RFDB_ENABLED,
+            "openzms": s.ZMS_ENABLED,
+        }
+
+    def _psd_backend(s: AppSettings) -> dict[str, str | None]:
+        """The PSD backend asked for, the one in use (a GPU request falls back
+        to the CPU when the library or device is missing, or after a GPU
+        error), and why it fell back."""
+        if s.PSD_BACKEND != "cuda":
+            return {"configured": s.PSD_BACKEND, "in_use": "cpu", "reason": None}
+        from rfobserver.processing import psd_cuda
+
+        reason = psd_cuda.unavailable_reason()
+        return {"configured": "cuda", "in_use": "cpu" if reason else "cuda", "reason": reason}
+
     @app.get("/api/identity")
     async def identity() -> dict[str, Any]:
         """Who this sensor is and how it is tuned, for a fleet server. ``id``
@@ -175,6 +198,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             "duration_sec": float(s.DURATION_SEC),
             "active": bool(sup.active) if sup is not None else None,
             "uptime_sec": round(time.monotonic() - started_monotonic, 1),
+            "features": _features(s, sup),
+            "psd_backend": _psd_backend(s),
         }
 
     @app.websocket("/ws/live")

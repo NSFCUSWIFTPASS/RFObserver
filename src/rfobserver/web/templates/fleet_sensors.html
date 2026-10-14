@@ -71,8 +71,52 @@
         return '<span class="fleet-offline" title="' + esc(s.error) + '">Offline' + esc(seen) + "</span>";
     }
 
+    // Shown in this order under each sensor.
+    const FEATURES = [
+        ["active", "Active"],
+        ["auto_iq_trigger", "Auto IQ Trigger"],
+        ["burst_detection", "Burst Detection"],
+        ["burst_isolation", "Burst Isolation"],
+        ["attribution", "Attribution"],
+        ["rf_db", "RF-DB"],
+        ["openzms", "OpenZMS"],
+    ];
+
+    function features(s) {
+        const f = s.features;
+        if (!f) {
+            return s.online ? "Features: not reported by this sensor's version"
+                : "Features: unknown until the sensor answers";
+        }
+        const on = FEATURES.filter(function (x) { return f[x[0]] === true; }).map(function (x) { return x[1]; });
+        const off = FEATURES.filter(function (x) { return f[x[0]] === false; }).map(function (x) { return x[1]; });
+        let html = '<span class="fleet-feat-label">Enabled:</span> '
+            + (on.length ? esc(on.join(", ")) : "none");
+        if (off.length) {
+            html += '<span class="fleet-feat-off"><span class="fleet-feat-label">Off:</span> '
+                + esc(off.join(", ")) + "</span>";
+        }
+        html += psdBackend(s.psd_backend);
+        if (!s.online) html += '<span class="fleet-feat-off">(as last reported)</span>';
+        return html;
+    }
+
+    const BACKEND_NAMES = { cpu: "CPU", cuda: "GPU (CUDA)" };
+
+    function psdBackend(b) {
+        if (!b) return "";
+        let text = BACKEND_NAMES[b.in_use] || b.in_use;
+        let title = "";
+        if (b.configured !== b.in_use) {
+            text += ", " + (BACKEND_NAMES[b.configured] || b.configured) + " unavailable";
+            title = b.reason || "";
+        }
+        return '<span class="fleet-feat-psd" title="' + esc(title) + '"><span class="fleet-feat-label">PSD:</span> '
+            + esc(text) + "</span>";
+    }
+
     function row(s) {
-        return "<tr data-id=\"" + esc(s.id) + "\">"
+        return "<tr class=\"fleet-main\" data-id=\"" + esc(s.id) + "\">"
             + '<td><span class="fleet-swatch" style="background:' + esc(s.colour) + ';"></span></td>'
             + '<td><input type="text" class="fleet-label" value="' + esc(s.custom_label) + '" placeholder="' + esc(s.sensor_name || s.id) + '" aria-label="Label"></td>'
             + "<td>" + esc(s.id) + "</td>"
@@ -83,7 +127,8 @@
             + "<td>" + status(s) + "</td>"
             + '<td><input type="checkbox" class="fleet-enabled"' + (s.enabled ? " checked" : "") + ' aria-label="Shown"></td>'
             + '<td><button type="button" class="btn-preset fleet-remove">Remove</button></td>'
-            + "</tr>";
+            + "</tr>"
+            + '<tr class="fleet-features"><td></td><td colspan="9">' + features(s) + "</td></tr>";
     }
 
     async function load() {

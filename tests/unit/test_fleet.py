@@ -66,6 +66,7 @@ class FakeSensors:
                     "sample_rate_hz": 20e6,
                     "gain_db": 40.0,
                     "active": True,
+                    "features": {"active": True, "rf_db": True, "openzms": False},
                 },
             )
         if path == "/api/averaged/stats":
@@ -364,6 +365,7 @@ def test_fleet_add_list_patch_remove(fleet_client: TestClient) -> None:
     assert (body["id"], body["online"], body["colour"]) == ("b", True, PALETTE[0])
     assert body["sensor_name"] == "name-b"
     assert (body["label"], body["custom_label"]) == ("name-b", "")
+    assert body["features"] == {"active": True, "rf_db": True, "openzms": False}
     assert body["tuning"]["center_freq_hz"] == 915e6
 
     r = fleet_client.post("/fleet/api/sensors", json={"address": "10.0.0.1"})
@@ -471,6 +473,15 @@ def test_sensor_identity() -> None:
     assert body["sensor_name"] == "NNE 60"
     assert body["center_freq_hz"] == float(settings.FREQUENCY_START)
     assert body["active"] is None  # no pipeline attached
+    assert body["features"] == {
+        "active": None,
+        "auto_iq_trigger": settings.TRIGGER_ENABLED,
+        "burst_detection": settings.BURST_DETECTION_ENABLED,
+        "burst_isolation": settings.ISOLATION_ENABLED,
+        "attribution": settings.ATTRIBUTION_ENABLED,
+        "rf_db": settings.RFDB_ENABLED,
+        "openzms": settings.ZMS_ENABLED,
+    }
 
 
 # --- mDNS address choice ---

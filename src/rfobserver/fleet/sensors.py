@@ -131,6 +131,8 @@ class SensorHub:
             "sensor_name": ident.get("sensor_name"),
             "tuning": {k: ident.get(k) for k in ("center_freq_hz", "sample_rate_hz", "gain_db")},
             "active": ident.get("active"),
+            "features": ident.get("features"),  # None from a sensor that does not report them
+            "psd_backend": ident.get("psd_backend"),
         }
 
     def display_label(self, sensor: Sensor) -> str:

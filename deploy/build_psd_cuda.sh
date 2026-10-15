@@ -20,7 +20,12 @@ set -euo pipefail
 # Environment:
 #   NVCC        nvcc to use       (default: PATH, then /usr/local/cuda*/bin)
 #   CUDA_ARCH   nvcc -arch value  (default: native, the GPU of this machine;
-#               e.g. sm_87 for Orin when building without the GPU visible)
+#               e.g. sm_87 for Orin when building without the GPU visible).
+#               nvcc before CUDA 11.5 (JetPack 5 ships 11.4) has no "native";
+#               there a Jetson's arch is read from its device tree instead.
+#
+# JetPack 5.x / CUDA 11.4 works too; its minimal set is:
+#   sudo apt-get install cuda-nvcc-11-4 cuda-cudart-dev-11-4 libcufft-dev-11-4
 
 SRC_DIR="src/rfobserver/processing/cuda"
 SRC="$SRC_DIR/psd_cuda.cu"
@@ -69,6 +74,20 @@ done
 if [ -z "$LIB_DIR" ]; then
     echo "libcufft.so not found under $CUDA_HOME (install libcufft-dev)." >&2
     exit 2
+fi
+
+# "native" needs nvcc 11.5+. Older: a Jetson's SoC gives its arch.
+if [ "$ARCH" = "native" ] && ! "$NVCC_BIN" -arch=native --dryrun -x cu /dev/null >/dev/null 2>&1; then
+    compat="$(tr '\0' ' ' < /proc/device-tree/compatible 2>/dev/null || true)"
+    case "$compat" in
+        *tegra234*) ARCH=sm_87 ;; # Orin
+        *tegra194*) ARCH=sm_72 ;; # Xavier
+        *)
+            echo "This nvcc has no -arch=native; set CUDA_ARCH (e.g. CUDA_ARCH=sm_87)." >&2
+            exit 2
+            ;;
+    esac
+    echo "nvcc has no -arch=native; using $ARCH for this Jetson."
 fi
 
 echo "=== Building $OUT with $NVCC_BIN (arch $ARCH) ==="

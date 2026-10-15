@@ -439,7 +439,8 @@
             + '<td class="num">' + Number(r.duration_ms).toFixed(2) + " ms</td>"
             + '<td class="num">' + Number(r.peak_power_db).toFixed(1) + " dB</td>"
             + '<td class="attr"><span class="fleet-pill ' + st[1] + '">' + esc(st[0]) + "</span>" + model + "</td>"
-            + '<td class="detail">' + detail(a)
+            + '<td class="detail">' + detail(a) + "</td>"
+            + '<td class="open">'
             + (a.status === "not_tried" ? "" : '<button type="button" class="btn-preset det-open" data-sensor="'
                 + esc(r.sensor.id) + '" data-burst="' + esc(r.burst_id) + '" data-start="' + esc(r.start_time)
                 + '">Details</button>')
@@ -470,13 +471,13 @@
             state.paged = !reset;
             renderRows(body.errors || {});
         } catch (_) {
-            if (reset) $("det-rows").innerHTML = '<tr><td colspan="8" class="placeholder-text">Could not load detections</td></tr>';
+            if (reset) $("det-rows").innerHTML = '<tr><td colspan="9" class="placeholder-text">Could not load detections</td></tr>';
         }
     }
 
     function renderRows(errors) {
         $("det-rows").innerHTML = state.rows.length ? state.rows.map(rowHtml).join("")
-            : '<tr><td colspan="8" class="placeholder-text">No detections in this range</td></tr>';
+            : '<tr><td colspan="9" class="placeholder-text">No detections in this range</td></tr>';
         $("det-more").hidden = !state.nextBefore;
         const names = Object.keys(errors).map(function (id) {
             const s = SENSORS.find(function (x) { return x.id === id; });

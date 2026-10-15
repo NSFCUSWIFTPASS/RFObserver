@@ -2984,6 +2984,15 @@ class StreamingProcessor:
                     self._burst_grids_done += 1
                     continue
 
+                # Detection off: mark the grid done (the lossless lead wait
+                # counts on it) and start a fresh window when it comes back on.
+                if not s.BURST_DETECTION_ENABLED:
+                    rolling_detector = None
+                    self._active_bursts = []
+                    self._publish_burst_done(my_gen, done_end)
+                    self._burst_grids_done += 1
+                    continue
+
                 if rolling_detector is None:
                     freqs = self._build_frequency_list()
                     center_freq = freqs[0] if freqs else s.FREQUENCY_START

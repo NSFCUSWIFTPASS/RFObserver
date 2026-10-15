@@ -122,6 +122,7 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "recording_max_sec": ("RECORDING_MAX_SEC", float),
         "recording_mem_fraction": ("RECORDING_MEM_FRACTION", float),
         "recording_ram_buffer": ("RECORDING_RAM_BUFFER", _to_bool),
+        "burst_detection_enabled": ("BURST_DETECTION_ENABLED", _to_bool),
         "burst_threshold_high_db": ("BURST_THRESHOLD_HIGH_DB", float),
         "burst_threshold_low_ratio": ("BURST_THRESHOLD_LOW_RATIO", float),
         "psd_time_resolution_ms": ("PSD_TIME_RESOLUTION_MS", float),

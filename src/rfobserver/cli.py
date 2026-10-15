@@ -73,6 +73,21 @@ def main() -> None:
         help="Interleaved I/Q datatype for a raw .dat (default: ci16_le)",
     )
 
+    # fleet -- one UI for every sensor (no capture pipeline)
+    fleet_p = subparsers.add_parser(
+        "fleet", help="Start the fleet UI: every sensor on one Dashboard"
+    )
+    fleet_p.add_argument("--host", default="0.0.0.0", help="Address to serve on")
+    fleet_p.add_argument("--port", type=int, default=8080, help="Port to serve on")
+    fleet_p.add_argument(
+        "--state-dir",
+        default=".",
+        help="Directory for fleet.json (the sensor list) and prefs.json (default: .)",
+    )
+    fleet_p.add_argument(
+        "--no-mdns", action="store_true", help="Do not look for sensors on the local network"
+    )
+
     args = parser.parse_args()
 
     if args.version:
@@ -89,6 +104,8 @@ def main() -> None:
         _run_web(args)
     elif args.command == "replay":
         _run_replay(args)
+    elif args.command == "fleet":
+        _run_fleet(args)
     else:
         parser.print_help()
         sys.exit(1)
@@ -169,6 +186,21 @@ def _run_web(args: argparse.Namespace) -> None:
 
     app = create_app(settings)
     uvicorn.run(app, host=settings.WEB_HOST, port=settings.WEB_PORT)
+
+
+def _run_fleet(args: argparse.Namespace) -> None:
+    from pathlib import Path
+
+    log_level = args.log_level or "INFO"
+    log_fmt = "%(asctime)s %(name)s %(levelname)s %(message)s"
+    logging.basicConfig(level=getattr(logging, log_level), format=log_fmt)
+
+    import uvicorn
+
+    from rfobserver.fleet.app import create_fleet_app
+
+    app = create_fleet_app(Path(args.state_dir).resolve(), mdns=not args.no_mdns)
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

@@ -85,6 +85,10 @@ class AppSettings(BaseSettings):
     # noise samples: at 10 dB ~0.1% of cells cleared it, ~7,400 noise "bursts"
     # per window, which stalled the pipeline. 30 dB yields none on pure noise.
     # See docs/debugging/2026-09-22_psd-pipeline-latency.md.
+    # Off: the burst thread drains each grid without detecting, so there are
+    # no detections and isolation/attribution have nothing to work on.
+    # Read per grid, so a change applies at once.
+    BURST_DETECTION_ENABLED: bool = True
     BURST_THRESHOLD_HIGH_DB: float = 30.0
     BURST_THRESHOLD_LOW_RATIO: float = 0.6
     BURST_MERGE_FREQ_BINS: int = 5
@@ -166,6 +170,9 @@ class AppSettings(BaseSettings):
     # WebUI
     WEB_HOST: str = "0.0.0.0"
     WEB_PORT: int = 8080
+    # Advertise this sensor on the local network (mDNS, _rfobserver._tcp) so a
+    # fleet server on the same subnet finds it. Needs the web UI (WEB_PORT > 0).
+    MDNS_ENABLED: bool = True
 
     # Display (UI only — never applied to published or stored data)
     #

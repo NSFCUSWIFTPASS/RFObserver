@@ -24,6 +24,7 @@
        white gap alone; dark charts sit on a near-identical card, so they get
        a hairline. */
     --chart-ring: none;
+    --pill-bg: rgba(0, 0, 0, 0.06);
 }
 
 :root[data-theme="dark"] {
@@ -39,6 +40,7 @@
     --divider: rgba(255, 255, 255, 0.06);
     --dashed-border: rgba(255, 255, 255, 0.3);
     --chart-ring: 0 0 0 1px rgba(255, 255, 255, 0.14);
+    --pill-bg: rgba(255, 255, 255, 0.10);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -55,6 +57,7 @@
         --divider: rgba(255, 255, 255, 0.06);
         --dashed-border: rgba(255, 255, 255, 0.3);
     --chart-ring: 0 0 0 1px rgba(255, 255, 255, 0.14);
+    --pill-bg: rgba(255, 255, 255, 0.10);
     }
 }
 
@@ -1504,6 +1507,14 @@ body {
     transition: opacity 0.2s;
 }
 
+/* Under the chart, not floated: the card body is not a positioned box. */
+.avg-panel .graph-legend {
+    position: static;
+    flex-wrap: wrap;
+    align-items: center;
+    margin-top: 6px;
+}
+
 .avg-panel.stale .card-body {
     opacity: 0.45;
 }
@@ -1950,3 +1961,579 @@ body {
     background: #ff3b30;
 }
 .storage-legend { margin-top: 4px; font-size: 10px; color: var(--text-secondary); }
+
+/* --- Fleet mode --- */
+
+.fleet-swatch {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: middle;
+    flex: none;
+}
+
+.fleet-select-wrap {
+    display: inline-flex;
+    align-items: center;
+    margin-right: 8px;
+}
+
+/* The sensor shown, in the corner of its waterfall and spectrum. */
+.fleet-tag {
+    position: absolute;
+    top: 6px;
+    right: 8px;
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.92);
+    background: rgba(0, 0, 0, 0.55);
+    pointer-events: none;
+    z-index: 2;
+}
+
+.fleet-legend {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+}
+
+.fleet-legend-item {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 4px;
+    border: none;
+    border-radius: 4px;
+    background: none;
+    font: inherit;
+    font-size: 11px;
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+.fleet-legend-item:hover {
+    background: var(--divider);
+}
+
+.fleet-legend-item.off {
+    opacity: 0.4;
+    text-decoration: line-through;
+}
+
+.fleet-legend-item.error {
+    color: var(--text-secondary);
+}
+
+/* Fleet Sensors page: a grouped list, one row per sensor. */
+.content:has(.fleet-page) {
+    max-width: 1100px;
+}
+
+.fleet-page-head {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin: 4px 0 16px;
+}
+
+.fleet-page-title {
+    margin: 0;
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--text-primary);
+}
+
+.fleet-page-sub {
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+.fleet-intro {
+    margin: 0 0 16px;
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+.fleet-list {
+    margin-bottom: 16px;
+}
+
+.fleet-empty {
+    padding: 28px 16px;
+    text-align: center;
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+.fleet-row {
+    display: grid;
+    grid-template-columns: 10px minmax(0, 1fr) 150px 150px auto auto;
+    align-items: center;
+    column-gap: 16px;
+    row-gap: 10px;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+}
+
+.fleet-row:last-child {
+    border-bottom: none;
+}
+
+.fleet-row-swatch {
+    width: 10px;
+    height: 10px;
+    margin: 0;
+    align-self: start;
+    margin-top: 8px;
+}
+
+.fleet-row-main {
+    min-width: 0;
+}
+
+/* The label reads as the sensor's name until hovered or edited. */
+.fleet-label {
+    display: block;
+    width: min(100%, 280px);
+    margin-left: -7px;
+    padding: 2px 6px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    font: inherit;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-primary);
+    transition: border-color 0.15s, background 0.15s;
+}
+
+.fleet-label::placeholder {
+    color: var(--text-primary);
+    opacity: 1;
+}
+
+.fleet-label:hover {
+    border-color: var(--border);
+}
+
+.fleet-label:focus {
+    outline: none;
+    border-color: var(--accent);
+    background: var(--bg);
+}
+
+.fleet-label:focus::placeholder {
+    color: var(--text-secondary);
+}
+
+.fleet-meta {
+    margin-top: 2px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.fleet-meta a {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+.fleet-meta a:hover {
+    text-decoration: underline;
+}
+
+.fleet-dot-sep {
+    display: inline-block;
+    width: 3px;
+    height: 3px;
+    margin: 0 8px;
+    border-radius: 50%;
+    background: currentColor;
+    vertical-align: middle;
+    opacity: 0.6;
+}
+
+.fleet-freq {
+    font-size: 13px;
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+}
+
+.fleet-sub {
+    margin-top: 1px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+}
+
+.fleet-row-status {
+    font-size: 13px;
+}
+
+.fleet-row-shown {
+    font-size: 12px;
+}
+
+.fleet-row-features {
+    grid-column: 2 / -1;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 20px;
+}
+
+.fleet-feat-group {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+}
+
+.fleet-feat-label {
+    margin-right: 2px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.fleet-pill {
+    display: inline-flex;
+    align-items: center;
+    height: 20px;
+    padding: 0 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.fleet-pill.on {
+    background: var(--pill-bg);
+    color: var(--text-primary);
+}
+
+.fleet-pill.off {
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+}
+
+.fleet-row.hidden-sensor .fleet-row-main,
+.fleet-row.hidden-sensor .fleet-row-tuning,
+.fleet-row.hidden-sensor .fleet-row-status,
+.fleet-row.hidden-sensor .fleet-row-features {
+    opacity: 0.5;
+}
+
+@media (max-width: 760px) {
+    .fleet-row {
+        grid-template-columns: 10px minmax(0, 1fr) auto;
+    }
+
+    .fleet-row-tuning,
+    .fleet-row-status {
+        grid-column: 2 / -1;
+    }
+
+    .fleet-row-shown {
+        grid-column: 2;
+    }
+}
+
+.fleet-add {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.fleet-add input {
+    flex: 1;
+    max-width: 420px;
+    height: 32px;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font: inherit;
+    font-size: 13px;
+    background: var(--bg);
+    color: var(--text-primary);
+}
+
+.fleet-add input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.fleet-add .btn-apply {
+    min-width: 72px;
+    height: 32px;
+    padding: 0 18px;
+    font-size: 13px;
+}
+
+.fleet-add-status {
+    min-height: 16px;
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.fleet-add-status.ok {
+    color: #248a3d;
+}
+
+.fleet-add-status.error {
+    color: #d70015;
+}
+
+:root[data-theme="dark"] .fleet-add-status.ok {
+    color: #30d158;
+}
+
+:root[data-theme="dark"] .fleet-add-status.error {
+    color: #ff453a;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root[data-theme="auto"] .fleet-add-status.ok {
+        color: #30d158;
+    }
+
+    :root[data-theme="auto"] .fleet-add-status.error {
+        color: #ff453a;
+    }
+}
+
+.fleet-note {
+    max-width: 640px;
+    margin: 6px 0 0;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+}
+
+.fleet-online {
+    color: #248a3d;
+}
+
+:root[data-theme="dark"] .fleet-online {
+    color: #30d158;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root[data-theme="auto"] .fleet-online {
+        color: #30d158;
+    }
+}
+
+.fleet-offline {
+    color: var(--text-secondary);
+}
+
+/* Fleet Live */
+.content:has(.fleet-live-grid) {
+    max-width: none;
+}
+
+/* The square power plot on the left, the sensor tiles on the right. */
+.fleet-live-layout {
+    display: grid;
+    grid-template-columns: minmax(320px, 28%) 1fr;
+    gap: 16px;
+    align-items: start;
+}
+
+.fleet-live-power {
+    position: sticky;
+    top: 16px;
+}
+
+@media (max-width: 900px) {
+    .fleet-live-layout {
+        grid-template-columns: 1fr;
+    }
+
+    .fleet-live-power {
+        position: static;
+    }
+}
+
+.fleet-live-power .toggle-label {
+    margin-left: 0;
+}
+
+.fleet-live-power .graph-legend {
+    position: static;
+    margin-top: 6px;
+}
+
+.fleet-live-power-hold {
+    position: relative;
+}
+
+.fleet-live-power-canvas {
+    display: block;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    border-radius: 8px;
+    box-shadow: var(--chart-ring);
+}
+
+.fleet-live-conn {
+    margin-left: auto;
+    font-weight: 400;
+}
+
+.fleet-live-conn.ok {
+    color: var(--text-secondary);
+}
+
+.fleet-live-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+    gap: 16px;
+}
+
+@media (max-width: 520px) {
+    .fleet-live-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.fleet-tile {
+    min-width: 0;
+}
+
+.fleet-tile-head {
+    gap: 8px;
+}
+
+.fleet-tile-head .fleet-swatch {
+    margin-right: 0;
+}
+
+.fleet-tile-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.fleet-tile-host {
+    font-size: 11px;
+}
+
+.fleet-state {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
+.fleet-state-live {
+    color: #248a3d;
+}
+
+.fleet-state-reconnecting {
+    color: #b25000;
+}
+
+:root[data-theme="dark"] .fleet-state-live {
+    color: #30d158;
+}
+
+:root[data-theme="dark"] .fleet-state-reconnecting {
+    color: #ff9f0a;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root[data-theme="auto"] .fleet-state-live {
+        color: #30d158;
+    }
+
+    :root[data-theme="auto"] .fleet-state-reconnecting {
+        color: #ff9f0a;
+    }
+}
+
+.fleet-tile-open {
+    font-size: 12px;
+    color: var(--accent);
+    text-decoration: none;
+}
+
+.fleet-tile-open:hover {
+    text-decoration: underline;
+}
+
+.fleet-tile-body canvas {
+    display: block;
+    width: 100%;
+    height: 140px;
+    background: #1a1a2e;
+}
+
+.fleet-tile-psd {
+    border-radius: 8px 8px 0 0;
+}
+
+.fleet-tile-wf {
+    border-radius: 0 0 8px 8px;
+}
+
+.fleet-tile-stale .fleet-tile-body canvas {
+    opacity: 0.55;
+}
+
+.fleet-tile-info {
+    margin-top: 6px;
+    min-height: 15px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+    white-space: pre;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Fleet Dashboard: one button per sensor; the shown one has its colour as border. */
+.fleet-sensors {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.fleet-sensor-btn {
+    display: inline-flex;
+    align-items: center;
+    height: 28px;
+    padding: 0 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 500;
+    font-family: inherit;
+    cursor: pointer;
+    transition: border-color 0.15s, box-shadow 0.15s, color 0.15s;
+}
+
+.fleet-sensor-btn:hover {
+    color: var(--text-primary);
+}
+
+.fleet-sensor-btn.selected {
+    border-color: var(--sensor-colour);
+    box-shadow: 0 0 0 1px var(--sensor-colour);
+    color: var(--text-primary);
+}
+
+.fleet-sensor-btn.offline {
+    opacity: 0.55;
+}

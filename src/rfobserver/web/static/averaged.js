@@ -102,6 +102,16 @@
 
     const $ = function (id) { return document.getElementById(id); };
 
+    // Fleet mode (window.RFOBS_FLEET, set by the fleet server's page): the
+    // page shows one sensor's waterfall and spectrum through the fleet's
+    // read-only proxy (apiBase), and every sensor on the power and kurtosis
+    // charts. Display preferences (/api/ui-prefs) stay the fleet's own.
+    const FLEET = window.RFOBS_FLEET || null;
+    let API = FLEET ? FLEET.apiBase : "";  // changes with the sensor buttons
+    // Fleet charts refresh at most this often, over a range snapped to the
+    // same step, so the fleet server's cache serves every open page.
+    const FLEET_STATS_MS = 10000;
+
     const state = {
         sinceMs: 0,
         untilMs: 0,
@@ -140,6 +150,10 @@
         selRow: 0,
         crosshairBin: -1,
         hoverMs: null,   // time under the cursor on the power/kurtosis charts, or null
+        // Fleet mode: every sensor's stats series, which ones the legend hid,
+        // and the range/time of the last fetch (see loadFleetStats).
+        fleet: { series: [], loaded: false, hidden: loadFleetHidden(), key: null, at: 0,
+            prefetchKey: null, prefetchAt: 0 },
         autoScale: {},   // the auto bound each chart last drew with, per scale key
         scale: {
             wf_lo: null, wf_hi: null,
@@ -492,7 +506,7 @@
         $("avg-peaks-foot").textContent = "";
         const started = Date.now();
         try {
-            const res = await fetch("/api/averaged/peaks?" + params.toString());
+            const res = await fetch(API + "/api/averaged/peaks?" + params.toString());
             if (!res.ok) throw new Error("HTTP " + res.status);
             const body = await res.json();
             if (seq !== p.seq) return;   // a newer search has taken over
@@ -850,16 +864,25 @@
     // --- loading ---
 
     function tuningParams() {
+        return rangeParams(currentTuning(), state.sinceMs, state.untilMs);
+    }
+
+    function currentTuning() {
+        return {
+            center: $("avg-center").value,
+            rate: $("avg-samplerate").value,
+            gain: $("avg-gain").value,
+        };
+    }
+
+    function rangeParams(t, sinceMs, untilMs) {
         const p = new URLSearchParams({
-            since: new Date(state.sinceMs).toISOString(),
-            until: new Date(state.untilMs).toISOString(),
+            since: new Date(sinceMs).toISOString(),
+            until: new Date(untilMs).toISOString(),
         });
-        const center = $("avg-center").value;
-        const rate = $("avg-samplerate").value;
-        const gain = $("avg-gain").value;
-        if (center) p.set("sdr_center", center);
-        if (rate) p.set("sample_rate", rate);
-        if (gain) p.set("gain", gain);
+        if (t.center) p.set("sdr_center", t.center);
+        if (t.rate) p.set("sample_rate", t.rate);
+        if (t.gain) p.set("gain", t.gain);
         p.set("max_rows", String(MAX_ROWS));
         p.set("max_bins", String(MAX_BINS));
         return p;
@@ -893,7 +916,7 @@
             : (err && (err.message || err.name)) || "network error";
         let server = "server unreachable";
         try {
-            const resp = await fetch("/api/health", { cache: "no-store" });
+            const resp = await fetch(API + "/api/health", { cache: "no-store" });
             const health = resp.ok ? await resp.json() : null;
             const up = health && health.uptime_sec;
             if (up == null) {
@@ -948,10 +971,10 @@
             let wfResp, statsResp, detResp, iqResp;
             try {
                 [wfResp, statsResp, detResp, iqResp] = await Promise.all([
-                    tagged("waterfall", "/api/averaged/waterfall?" + rangeParams.toString(), abort.signal),
-                    tagged("stats", "/api/averaged/stats?" + rangeParams.toString(), abort.signal),
-                    tagged("detections", "/api/detections.json?" + params.toString(), abort.signal),
-                    tagged("iq-captures", "/api/iq-captures?" + params.toString(), abort.signal),
+                    tagged("waterfall", API + "/api/averaged/waterfall?" + rangeParams.toString(), abort.signal),
+                    tagged("stats", API + "/api/averaged/stats?" + rangeParams.toString(), abort.signal),
+                    tagged("detections", API + "/api/detections.json?" + params.toString(), abort.signal),
+                    tagged("iq-captures", API + "/api/iq-captures?" + params.toString(), abort.signal),
                 ]);
             } catch (err) {
                 // Superseded (our own abort) or a genuine network error: only the
@@ -1041,6 +1064,8 @@
             renderAll();
             ok = true;
             saveToCache(!plan);
+            loadFleetStats(!background);
+            prefetchOthers(!background);
         } finally {
             // Only the latest load owns the shared flags; a superseded load must
             // not clear loading/stale out from under the newer one still running.
@@ -1051,6 +1076,97 @@
                 // mode the flag stays on while the poll loop retries.
                 if (ok || !state.live) setStale(false);
             }
+        }
+    }
+
+    // --- fleet: every sensor's power and kurtosis ---
+
+    // A function declaration (hoisted), with its key inline: `state` calls it
+    // before any const below this point exists.
+    function loadFleetHidden() {
+        try {
+            return new Set(JSON.parse(localStorage.getItem("rfobs.fleet.hidden") || "[]"));
+        } catch (_) {
+            return new Set();
+        }
+    }
+
+    // Fetch every sensor's stats for the shown range. Live: at most every
+    // FLEET_STATS_MS, over a range whose end is snapped to that step; a
+    // changed range (or force) fetches at once.
+    async function loadFleetStats(force) {
+        if (!FLEET) return;
+        const now = Date.now();
+        const key = state.live ? "live|" + state.spanMs : state.sinceMs + "|" + state.untilMs;
+        if (!force && state.fleet.key === key && now - state.fleet.at < FLEET_STATS_MS) return;
+        state.fleet.key = key;
+        state.fleet.at = now;
+        let since = state.sinceMs, until = state.untilMs;
+        if (state.live) {
+            until = Math.ceil(now / FLEET_STATS_MS) * FLEET_STATS_MS;
+            since = until - state.spanMs;
+        }
+        const p = new URLSearchParams({
+            since: new Date(since).toISOString(),
+            until: new Date(until).toISOString(),
+            max_points: "600",
+        });
+        try {
+            const r = await fetch("/fleet/api/stats?" + p.toString());
+            if (!r.ok || state.fleet.key !== key) return;
+            const body = await r.json();
+            if (state.fleet.key !== key) return;  // a newer range was asked for
+            state.fleet.series = body.sensors || [];
+            state.fleet.loaded = true;
+            renderFleetLegends();
+            renderStatsChart();
+            renderKurtosisChart();
+        } catch (_) { /* the next load retries */ }
+    }
+
+    // The clickable sensor legend under each time chart: a click hides or
+    // shows that sensor on both charts (remembered per browser).
+    function renderFleetLegends() {
+        if (!FLEET) return;
+        const html = state.fleet.series.map(function (s) {
+            const off = state.fleet.hidden.has(s.id);
+            const title = s.error ? "No data: " + s.error : (off ? "Show " : "Hide ") + s.label;
+            return '<button type="button" class="fleet-legend-item' + (off ? " off" : "")
+                + (s.error ? " error" : "") + '" data-id="' + escapeHtml(s.id) + '" title="'
+                + escapeHtml(title) + '"><span class="fleet-swatch" style="background:'
+                + escapeHtml(s.colour) + ';"></span>' + escapeHtml(s.label)
+                + (s.error ? " (offline)" : "") + "</button>";
+        }).join("");
+        for (const id of ["fleet-legend-pwr", "fleet-legend-kurt"]) {
+            const el = $(id);
+            if (el) el.innerHTML = html;
+        }
+    }
+
+    function escapeHtml(v) {
+        return String(v == null ? "" : v).replace(/[&<>"']/g, function (c) {
+            return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+        });
+    }
+
+    function setupFleetLegends() {
+        if (!FLEET) return;
+        for (const id of ["fleet-legend-pwr", "fleet-legend-kurt"]) {
+            const el = $(id);
+            if (!el) continue;
+            el.addEventListener("click", function (e) {
+                const btn = e.target.closest(".fleet-legend-item");
+                if (!btn) return;
+                const sid = btn.dataset.id;
+                if (state.fleet.hidden.has(sid)) state.fleet.hidden.delete(sid);
+                else state.fleet.hidden.add(sid);
+                try {
+                    localStorage.setItem("rfobs.fleet.hidden", JSON.stringify(Array.from(state.fleet.hidden)));
+                } catch (_) { /* not remembered */ }
+                renderFleetLegends();
+                renderStatsChart();
+                renderKurtosisChart();
+            });
         }
     }
 
@@ -1090,8 +1206,9 @@
     // Live presets only: an absolute range has nothing to fetch a tail of.
     function cacheKey() {
         if (!state.activePreset) return null;
-        return [state.activePreset, $("avg-center").value, $("avg-samplerate").value,
-            $("avg-gain").value].join("|");
+        // In the fleet the same page shows any sensor: key by sensor too.
+        return [FLEET ? FLEET.selected : "", state.activePreset, $("avg-center").value,
+            $("avg-samplerate").value, $("avg-gain").value].join("|");
     }
 
     function idbRequest(req) {
@@ -1460,6 +1577,70 @@
         return best;
     }
 
+    // --- the power and kurtosis series ---
+
+    // What the two time charts draw. On a sensor: one series from its own
+    // stats. In the fleet: one per shown sensor, in its fixed colour, from
+    // /fleet/api/stats; the selected sensor is drawn last, on top.
+    const SINGLE_COLOUR = { pwr: "#0071e3", kurt: "#ff9f0a" };
+    const SERIES_VALUE = {
+        pwr: function (p) { return p.pwr_avg; },
+        kurt: function (p) { return p.kurtosis; },
+    };
+
+    function chartSeries(kind) {
+        const getVal = SERIES_VALUE[kind];
+        if (FLEET) {
+            const shown = state.fleet.series.filter(function (s) { return !state.fleet.hidden.has(s.id); });
+            shown.sort(function (a, b) {
+                return (a.id === FLEET.selected) - (b.id === FLEET.selected);
+            });
+            return shown.map(function (s) {
+                return { id: s.id, label: s.label, colour: s.colour, points: s.points || [], getVal: getVal };
+            });
+        }
+        const points = state.stats && state.stats.points ? state.stats.points : [];
+        return [{ id: null, label: kind === "pwr" ? "Avg" : "Kurtosis", colour: SINGLE_COLOUR[kind],
+            points: points, getVal: getVal }];
+    }
+
+    function seriesRange(series) {
+        let lo = Infinity, hi = -Infinity;
+        for (const s of series) {
+            for (const p of s.points) {
+                const v = s.getVal(p);
+                if (v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+            }
+        }
+        return { lo: lo, hi: hi };
+    }
+
+    // Line plus point markers; markers only where they stay legible.
+    function drawSeries(ctx, s, X, Y, W) {
+        const times = pointTimes(s.points);
+        ctx.beginPath();
+        let started = false;
+        for (let i = 0; i < s.points.length; i++) {
+            const v = s.getVal(s.points[i]);
+            if (v == null) { started = false; continue; }
+            const x = X(times[i]);
+            if (!started) { ctx.moveTo(x, Y(v)); started = true; }
+            else { ctx.lineTo(x, Y(v)); }
+        }
+        ctx.strokeStyle = s.colour;
+        ctx.lineWidth = FLEET ? 2 : 1.5;
+        ctx.stroke();
+        if (!FLEET || s.points.length > W / 3) return;
+        ctx.fillStyle = s.colour;
+        for (let i = 0; i < s.points.length; i++) {
+            const v = s.getVal(s.points[i]);
+            if (v == null) continue;
+            ctx.beginPath();
+            ctx.arc(X(times[i]), Y(v), 2.5, 0, 2 * Math.PI);
+            ctx.fill();
+        }
+    }
+
     // --- hover readout on the power and kurtosis charts ---
 
     // Hovering either chart sets state.hoverMs; both draw a crosshair there so
@@ -1467,22 +1648,21 @@
     // Points are snapped to only within HOVER_SNAP_PX, so a gap in the data
     // reads "No data" rather than the value from minutes away.
     const HOVER_SNAP_PX = 12;
-    let pointTimesCache = { points: null, times: null };
+    const pointTimesCache = new WeakMap();
 
-    // Start times (ms) of the stats points, parsed once per points array.
+    // Start times (ms) of a points array, parsed once per array.
     function pointTimes(points) {
-        if (pointTimesCache.points !== points) {
-            pointTimesCache = {
-                points: points,
-                times: points.map(function (p) { return Date.parse(p.start_time); }),
-            };
+        let times = pointTimesCache.get(points);
+        if (!times) {
+            times = points.map(function (p) { return Date.parse(p.start_time); });
+            pointTimesCache.set(points, times);
         }
-        return pointTimesCache.times;
+        return times;
     }
 
-    // The point nearest state.hoverMs that has a value, as {p, ms}, or null.
-    function hoverPoint(getVal, W) {
-        const points = state.stats && state.stats.points ? state.stats.points : [];
+    // The point of ``points`` nearest state.hoverMs that has a value, as
+    // {p, ms}, or null.
+    function hoverPoint(points, getVal, W) {
         const spanMs = state.untilMs - state.sinceMs;
         if (state.hoverMs == null || !points.length || spanMs <= 0) return null;
         const times = pointTimes(points);
@@ -1503,13 +1683,17 @@
         return best < 0 ? null : { p: points[best], ms: times[best] };
     }
 
-    // Dashed crosshair at the hovered time, with a dot on the snapped point.
-    function drawHover(ctx, W, H, getVal, Y, color) {
+    // Dashed crosshair at the hovered time, with a dot on each series' point
+    // there. One series: the crosshair snaps to its point; several: it stays
+    // at the cursor (their windows need not line up).
+    function drawHover(ctx, W, H, series, Y) {
         const spanMs = state.untilMs - state.sinceMs;
         if (state.hoverMs == null || spanMs <= 0) return;
-        const hit = hoverPoint(getVal, W);
-        const ms = hit ? hit.ms : state.hoverMs;
-        const px = Math.max(0, Math.min(W - 1, Math.round(((ms - state.sinceMs) / spanMs) * W))) + 0.5;
+        const hits = series.map(function (s) { return hoverPoint(s.points, s.getVal, W); });
+        const X = function (ms) {
+            return Math.max(0, Math.min(W - 1, Math.round(((ms - state.sinceMs) / spanMs) * W))) + 0.5;
+        };
+        const px = X(series.length === 1 && hits[0] ? hits[0].ms : state.hoverMs);
         ctx.save();
         ctx.strokeStyle = "rgba(255,255,255,0.35)";
         ctx.lineWidth = 1;
@@ -1519,18 +1703,23 @@
         ctx.lineTo(px, H);
         ctx.stroke();
         ctx.restore();
-        if (!hit) return;
-        ctx.beginPath();
-        ctx.arc(px, Y(getVal(hit.p)), 4, 0, 2 * Math.PI);
-        ctx.fillStyle = color;
-        ctx.fill();
-        ctx.lineWidth = 2;
-        ctx.strokeStyle = "#1a1a2e";
-        ctx.stroke();
+        series.forEach(function (s, i) {
+            const hit = hits[i];
+            if (!hit) return;
+            ctx.beginPath();
+            ctx.arc(series.length === 1 ? px : X(hit.ms), Y(s.getVal(hit.p)), 4, 0, 2 * Math.PI);
+            ctx.fillStyle = s.colour;
+            ctx.fill();
+            ctx.lineWidth = 2;
+            ctx.strokeStyle = "#1a1a2e";
+            ctx.stroke();
+        });
     }
 
-    function renderStatsChart() {
-        const canvas = $("avg-stats-canvas");
+    // One time chart: background, optional IQ bands, grid, series, selection
+    // marker, hover, axis labels.
+    function renderTimeChart(canvasId, kind, opts) {
+        const canvas = $(canvasId);
         const W = canvas.width;
         const H = canvas.height;
         const ctx = canvas.getContext("2d");
@@ -1539,23 +1728,20 @@
         ctx.fillRect(0, 0, W, H);
         // IQ-availability highlights, drawn behind the grid/line so they read as
         // a background band. Recomputes the clickable pixel rects each render.
-        drawIqBands(ctx, W, H);
-        const points = state.stats && state.stats.points ? state.stats.points : [];
+        if (opts.iqBands) drawIqBands(ctx, W, H);
+        const series = chartSeries(kind);
         const spanMs = state.untilMs - state.sinceMs;
-        if (!points.length || spanMs <= 0) {
+        let { lo, hi } = seriesRange(series);
+        if (lo === Infinity || spanMs <= 0) {
             ctx.fillStyle = "rgba(255,255,255,0.4)";
             ctx.font = "12px -apple-system, sans-serif";
             ctx.textAlign = "center";
-            ctx.fillText("No averaged windows in this range", W / 2, H / 2);
+            ctx.fillText(FLEET && !state.fleet.loaded ? "Loading sensors..."
+                : "No averaged windows in this range", W / 2, H / 2);
             return;
         }
-        let lo = Infinity, hi = -Infinity;
-        for (const p of points) {
-            if (p.pwr_avg != null) { lo = Math.min(lo, p.pwr_avg); hi = Math.max(hi, p.pwr_avg); }
-        }
-        if (lo === Infinity) { lo = -120; hi = -40; }
-        const pad = Math.max(2, (hi - lo) * 0.1);
-        const range = chartRange(lo, hi, pad, "pwr_lo", "pwr_hi");
+        const pad = Math.max(opts.minPad, (hi - lo) * 0.1);
+        const range = chartRange(lo, hi, pad, opts.loKey, opts.hiKey);
         lo = range.lo; hi = range.hi;
         const X = function (ms) { return ((ms - state.sinceMs) / spanMs) * W; };
         const Y = function (v) { return H - 2 - ((v - lo) / (hi - lo)) * (H - 4); };
@@ -1565,85 +1751,31 @@
             const y = (H / 5) * i;
             ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
         }
-        const drawLine = function (getVal, color) {
-            ctx.beginPath();
-            let started = false;
-            for (const p of points) {
-                const v = getVal(p);
-                const x = X(new Date(p.start_time).getTime());
-                if (v == null) { started = false; continue; }
-                if (!started) { ctx.moveTo(x, Y(v)); started = true; }
-                else { ctx.lineTo(x, Y(v)); }
-            }
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 1.5;
-            ctx.stroke();
-        };
-        drawLine(function (p) { return p.pwr_avg; }, "#0071e3");
+        for (const s of series) drawSeries(ctx, s, X, Y, W);
         drawSelectionMarker(ctx, W, H);
-        drawHover(ctx, W, H, function (p) { return p.pwr_avg; }, Y, "#0071e3");
+        drawHover(ctx, W, H, series, Y);
         ctx.fillStyle = "rgba(255,255,255,0.5)";
         ctx.font = "10px -apple-system, sans-serif";
         ctx.textAlign = "left";
-        ctx.fillText(hi.toFixed(0) + " dB", 4, 12);
-        ctx.fillText(lo.toFixed(0) + " dB", 4, H - 4);
+        ctx.fillText(opts.fmt(hi), 4, 12);
+        ctx.fillText(opts.fmt(lo), 4, H - 4);
         drawTimeTicks(ctx, W, H);
+    }
+
+    function renderStatsChart() {
+        renderTimeChart("avg-stats-canvas", "pwr", {
+            iqBands: true, minPad: 2, loKey: "pwr_lo", hiKey: "pwr_hi",
+            fmt: function (v) { return v.toFixed(0) + " dB"; },
+        });
     }
 
     // Kurtosis timeline from the same stats points as the power chart
     // (blob-independent, so it works beyond the PSD retention window).
     function renderKurtosisChart() {
-        const canvas = $("avg-kurt");
-        const W = canvas.width;
-        const H = canvas.height;
-        const ctx = canvas.getContext("2d");
-        ctx.clearRect(0, 0, W, H);
-        ctx.fillStyle = "#1a1a2e";
-        ctx.fillRect(0, 0, W, H);
-        const points = state.stats && state.stats.points ? state.stats.points : [];
-        const spanMs = state.untilMs - state.sinceMs;
-        let lo = Infinity, hi = -Infinity;
-        for (const p of points) {
-            if (p.kurtosis != null) { lo = Math.min(lo, p.kurtosis); hi = Math.max(hi, p.kurtosis); }
-        }
-        if (lo === Infinity || spanMs <= 0) {
-            ctx.fillStyle = "rgba(255,255,255,0.4)";
-            ctx.font = "12px -apple-system, sans-serif";
-            ctx.textAlign = "center";
-            ctx.fillText("No averaged windows in this range", W / 2, H / 2);
-            return;
-        }
-        const pad = Math.max(0.5, (hi - lo) * 0.1);
-        const range = chartRange(lo, hi, pad, "kurt_lo", "kurt_hi");
-        lo = range.lo; hi = range.hi;
-        const X = function (ms) { return ((ms - state.sinceMs) / spanMs) * W; };
-        const Y = function (v) { return H - 2 - ((v - lo) / (hi - lo)) * (H - 4); };
-        ctx.strokeStyle = "rgba(255,255,255,0.06)";
-        ctx.lineWidth = 1;
-        for (let i = 1; i < 5; i++) {
-            const y = (H / 5) * i;
-            ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
-        }
-        ctx.beginPath();
-        let started = false;
-        for (const p of points) {
-            const v = p.kurtosis;
-            if (v == null) { started = false; continue; }
-            const x = X(new Date(p.start_time).getTime());
-            if (!started) { ctx.moveTo(x, Y(v)); started = true; }
-            else { ctx.lineTo(x, Y(v)); }
-        }
-        ctx.strokeStyle = "#ff9f0a"; // same orange as the dashboard kurtosis trace
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-        drawSelectionMarker(ctx, W, H);
-        drawHover(ctx, W, H, function (p) { return p.kurtosis; }, Y, "#ff9f0a");
-        ctx.fillStyle = "rgba(255,255,255,0.5)";
-        ctx.font = "10px -apple-system, sans-serif";
-        ctx.textAlign = "left";
-        ctx.fillText(hi.toFixed(1), 4, 12);
-        ctx.fillText(lo.toFixed(1), 4, H - 4);
-        drawTimeTicks(ctx, W, H);
+        renderTimeChart("avg-kurt", "kurt", {
+            iqBands: false, minPad: 0.5, loKey: "kurt_lo", hiKey: "kurt_hi",
+            fmt: function (v) { return v.toFixed(1); },
+        });
     }
 
     function selectedPowers() {
@@ -1670,7 +1802,8 @@
             return;
         }
         const range = psdRange();
-        drawPSD(ctx, W, H, powers, wf.freqs, range.min, range.max, state.crosshairBin, null, "dBFS");
+        drawPSD(ctx, W, H, powers, wf.freqs, range.min, range.max, state.crosshairBin, null, "dBFS",
+            FLEET ? FLEET.colour : undefined);
     }
 
     function renderBucketStats() {
@@ -1843,12 +1976,21 @@
     }
 
     // Tooltip text, one line per entry, placed beside the cursor and flipped
-    // to its left near the right edge.
+    // to its left near the right edge. An entry is a string, or {text, colour}
+    // for a line with a colour swatch (one per sensor in the fleet).
     function showTip(tip, rect, x, lines) {
         tip.textContent = "";
         lines.forEach(function (line, i) {
             if (i) tip.appendChild(document.createElement("br"));
-            tip.appendChild(document.createTextNode(line));
+            if (typeof line === "string") {
+                tip.appendChild(document.createTextNode(line));
+                return;
+            }
+            const sw = document.createElement("span");
+            sw.className = "fleet-swatch";
+            sw.style.background = line.colour;
+            tip.appendChild(sw);
+            tip.appendChild(document.createTextNode(line.text));
         });
         tip.style.display = "block";
         const w = tip.offsetWidth;
@@ -1857,8 +1999,9 @@
     }
 
     // Hover readout on a time chart: the date-time and value of the nearest
-    // point. withIq adds the IQ capture under the cursor (power chart only).
-    function setupHover(canvas, tip, getVal, fmtVal, withIq) {
+    // point of each series (in the fleet, a line per sensor). withIq adds the
+    // IQ capture under the cursor (power chart only).
+    function setupHover(canvas, tip, kind, fmtVal, withIq) {
         const hide = function () {
             tip.style.display = "none";
             if (withIq) canvas.style.cursor = "crosshair";
@@ -1867,17 +2010,31 @@
         canvas.addEventListener("mousemove", function (e) {
             // A drag-zoom repaints the chart with its band; keep out of its way.
             if (e.buttons & 1) { hide(); return; }
-            const points = state.stats && state.stats.points ? state.stats.points : [];
+            const series = chartSeries(kind);
             const spanMs = state.untilMs - state.sinceMs;
-            if (!points.length || spanMs <= 0) { hide(); return; }
+            const any = series.some(function (s) { return s.points.length; });
+            if (!any || spanMs <= 0) { hide(); return; }
             const rect = canvas.getBoundingClientRect();
             const xCss = e.clientX - rect.left;
             const x = xCss * (canvas.width / rect.width);
             setHover(state.sinceMs + (x / canvas.width) * spanMs);
-            const hit = hoverPoint(getVal, canvas.width);
-            const lines = hit
-                ? [new Date(hit.ms).toLocaleString(), fmtVal(getVal(hit.p))]
-                : [new Date(state.hoverMs).toLocaleString(), "No data"];
+            let lines;
+            if (!FLEET) {
+                const s = series[0];
+                const hit = hoverPoint(s.points, s.getVal, canvas.width);
+                lines = hit
+                    ? [new Date(hit.ms).toLocaleString(), fmtVal(s.getVal(hit.p))]
+                    : [new Date(state.hoverMs).toLocaleString(), "No data"];
+            } else {
+                lines = [new Date(state.hoverMs).toLocaleString()];
+                // Selected sensor first, then the rest in their order.
+                const ordered = series.slice().reverse();
+                for (const s of ordered) {
+                    const hit = hoverPoint(s.points, s.getVal, canvas.width);
+                    lines.push({ colour: s.colour,
+                        text: s.label + "  " + (hit ? fmtVal(s.getVal(hit.p)) : "No data") });
+                }
+            }
             if (withIq) {
                 const b = iqBandAt(x);
                 canvas.style.cursor = b ? "pointer" : "crosshair";
@@ -1902,15 +2059,17 @@
         const statsCanvas = $("avg-stats-canvas");
         attachDragZoom(statsCanvas, statsCanvas, renderStatsChart, function (x) {
             const b = iqBandAt(x);
-            if (b) window.location.href = "/captures/?file=" + encodeURIComponent(b.cap.filename);
+            if (!b) return;
+            const url = "/captures/?file=" + encodeURIComponent(b.cap.filename);
+            // In the fleet the capture lives on the sensor: open its own page.
+            if (FLEET) window.open(FLEET.sensorUrl + url, "_blank", "noopener");
+            else window.location.href = url;
         });
         attachDragZoom($("avg-kurt"), $("avg-kurt"), renderKurtosisChart, null);
-        setupHover(statsCanvas, $("avg-stats-tooltip"),
-            function (p) { return p.pwr_avg; },
-            function (v) { return "Avg " + v.toFixed(1) + " dB"; }, true);
-        setupHover($("avg-kurt"), $("avg-kurt-tooltip"),
-            function (p) { return p.kurtosis; },
-            function (v) { return "Kurtosis " + v.toFixed(2); }, false);
+        setupHover(statsCanvas, $("avg-stats-tooltip"), "pwr",
+            function (v) { return (FLEET ? "" : "Avg ") + v.toFixed(1) + " dB"; }, true);
+        setupHover($("avg-kurt"), $("avg-kurt-tooltip"), "kurt",
+            function (v) { return (FLEET ? "" : "Kurtosis ") + v.toFixed(2); }, false);
         attachDragZoom($("avg-wf"), $("avg-wf-overlay"), renderWfOverlay, function (x) {
             const idx = rowForPixelX(x);
             if (idx >= 0) selectRow(idx);
@@ -2060,11 +2219,222 @@
             + "show stats and detections only.";
     }
 
+    // --- tuning selects ---
+
+    // Fill the tuning selects from a sensor's /api/averaged/configs and pick
+    // ``tuning`` ({center, rate, gain}), or the sensor's latest tuning.
+    function applyConfigs(data, tuning) {
+        const configs = (data && data.configs) || [];
+        const uniq = function (key) {
+            return [...new Set(configs.map(function (c) { return c[key]; }))].sort(function (a, b) { return a - b; });
+        };
+        fillSelect("avg-center", uniq("sdr_center_freq_hz"), function (v) { return (v / 1e6).toFixed(1) + " MHz"; }, String);
+        fillSelect("avg-samplerate", uniq("sample_rate_hz"), function (v) { return (v / 1e6).toFixed(0) + " MHz"; }, String);
+        fillSelect("avg-gain", uniq("gain_db"), function (v) { return v + " dB"; }, String);
+        const t = tuning || latestTuning(data);
+        setSelectValue("avg-center", t.center);
+        setSelectValue("avg-samplerate", t.rate);
+        setSelectValue("avg-gain", t.gain);
+    }
+
+    function latestTuning(data) {
+        const l = data && data.latest;
+        return l
+            ? { center: String(l.sdr_center_freq_hz), rate: String(l.sample_rate_hz), gain: String(l.gain_db) }
+            : { center: "", rate: "", gain: "" };
+    }
+
+    // --- fleet: switching sensors without waiting ---
+    //
+    // The page keeps every sensor's data for the shown range, refreshing the
+    // sensors not shown in the background (at most every FLEET_STATS_MS), so
+    // a sensor button swaps the charts at once and then refreshes that sensor.
+
+    const fleetData = {};  // id -> {configs, tuning, data}
+
+    function sensorEntry(id) {
+        if (!fleetData[id]) fleetData[id] = { configs: null, tuning: null, data: null };
+        return fleetData[id];
+    }
+
+    function sensorBase(id) {
+        return "/fleet/s/" + encodeURIComponent(id);
+    }
+
+    function rangeKey() {
+        return state.live ? "live|" + state.spanMs : state.sinceMs + "|" + state.untilMs;
+    }
+
+    async function sensorConfigs(id) {
+        const e = sensorEntry(id);
+        if (!e.configs) {
+            try {
+                const r = await fetch(sensorBase(id) + "/api/averaged/configs");
+                if (r.ok) e.configs = await r.json();
+            } catch (_) { /* try again next time */ }
+        }
+        return e.configs;
+    }
+
+    async function prefetchOthers(force) {
+        if (!FLEET || FLEET.sensors.length < 2) return;
+        const key = rangeKey();
+        const now = Date.now();
+        if (!force && state.fleet.prefetchKey === key && now - state.fleet.prefetchAt < FLEET_STATS_MS) return;
+        state.fleet.prefetchKey = key;
+        state.fleet.prefetchAt = now;
+        let since = state.sinceMs, until = state.untilMs;
+        if (state.live) {
+            until = Math.ceil(now / FLEET_STATS_MS) * FLEET_STATS_MS;
+            since = until - state.spanMs;
+        }
+        await Promise.all(FLEET.sensors.map(async function (s) {
+            if (s.id === FLEET.selected) return;
+            const e = sensorEntry(s.id);
+            const cfg = await sensorConfigs(s.id);
+            if (!e.tuning) e.tuning = latestTuning(cfg);
+            const qs = rangeParams(e.tuning, since, until).toString();
+            const base = sensorBase(s.id);
+            try {
+                const rs = await Promise.all([
+                    fetch(base + "/api/averaged/waterfall?" + qs),
+                    fetch(base + "/api/averaged/stats?" + qs),
+                    fetch(base + "/api/detections.json?" + qs),
+                    fetch(base + "/api/iq-captures?" + qs),
+                ]);
+                if (!rs[0].ok) return;
+                const wf = parseWaterfall(await rs[0].arrayBuffer());
+                const stats = rs[1].ok ? await rs[1].json() : null;
+                const det = rs[2].ok ? (await rs[2].json()).detections : [];
+                const iq = rs[3].ok ? (await rs[3].json()).captures : [];
+                // Shown meanwhile (its own load is fresher), or a new range.
+                if (s.id === FLEET.selected || rangeKey() !== key) return;
+                e.data = { key: key, wf: wf, stats: stats, detections: det || [], iqCaptures: iq || [] };
+            } catch (_) { /* the next round retries */ }
+        }));
+    }
+
+    // Show a sensor's kept data (newest row selected).
+    function showData(d, label) {
+        state.wf = d.wf;
+        state.stats = d.stats;
+        state.detections = d.detections;
+        state.iqCaptures = d.iqCaptures;
+        state.followLatest = true;
+        const slider = $("avg-slider");
+        slider.min = "0";
+        slider.max = String(Math.max(0, state.wf.bucketCount - 1));
+        let last = Math.max(0, state.wf.bucketCount - 1);
+        while (last > 0 && state.wf.stats[last].count === 0) last--;
+        state.selRow = last;
+        slider.value = String(last);
+        $("avg-time").textContent = state.wf.bucketCount
+            ? new Date(state.wf.stats[last].start_epoch * 1000).toLocaleString() : "";
+        $("avg-updated").textContent = label;
+        renderAll();
+    }
+
+    // Nothing kept for this sensor yet: empty charts until its load lands.
+    function showNothing(name) {
+        state.wf = null;
+        state.stats = null;
+        state.detections = [];
+        state.iqCaptures = [];
+        const c = $("avg-wf");
+        const ctx = c.getContext("2d");
+        ctx.fillStyle = "#1a1a2e";
+        ctx.fillRect(0, 0, c.width, c.height);
+        ctx.fillStyle = "rgba(255,255,255,0.4)";
+        ctx.font = "12px -apple-system, sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("Loading " + name + "...", c.width / 2, c.height / 2);
+        $("avg-wf-label").textContent = "";
+        $("avg-time").textContent = "";
+        $("avg-updated").textContent = "";
+        renderPSD();
+        renderBucketStats();
+        renderDetections();
+        renderStatsChart();
+        renderKurtosisChart();
+    }
+
+    function markSensorButtons() {
+        document.querySelectorAll(".fleet-sensor-btn").forEach(function (b) {
+            const on = b.dataset.id === FLEET.selected;
+            b.classList.toggle("selected", on);
+            b.setAttribute("aria-pressed", on ? "true" : "false");
+        });
+    }
+
+    async function selectSensor(id) {
+        if (!FLEET || id === FLEET.selected) return;
+        const next = FLEET.sensors.find(function (s) { return s.id === id; });
+        if (!next) return;
+        // Keep what this sensor shows, for switching back.
+        const cur = sensorEntry(FLEET.selected);
+        cur.tuning = currentTuning();
+        if (state.wf) {
+            cur.data = { key: rangeKey(), wf: state.wf, stats: state.stats,
+                detections: state.detections, iqCaptures: state.iqCaptures };
+        }
+        // Drop the old sensor's load in flight.
+        state.loadSeq++;
+        if (state.loadAbort) state.loadAbort.abort();
+        state.loadAbort = null;
+        state.loading = false;
+        state.inc = null;
+
+        FLEET.selected = id;
+        FLEET.apiBase = sensorBase(id);
+        FLEET.sensorUrl = next.base_url;
+        FLEET.colour = next.colour;
+        API = FLEET.apiBase;
+        markSensorButtons();
+        document.querySelectorAll(".fleet-tag .fleet-swatch").forEach(function (el) { el.style.background = next.colour; });
+        document.querySelectorAll(".fleet-name").forEach(function (el) { el.textContent = next.label; });
+        try {
+            const url = new URL(window.location.href);
+            url.searchParams.set("sensor", id);
+            history.replaceState(history.state, "", url.toString());
+        } catch (_) { /* the URL keeps the old sensor */ }
+
+        const e = sensorEntry(id);
+        if (e.configs) applyConfigs(e.configs, e.tuning);
+        // Kept data is at most FLEET_STATS_MS old: show it as is and refresh
+        // quietly. Otherwise the charts are marked stale until the load lands.
+        const kept = e.data && e.data.key === rangeKey();
+        if (kept) {
+            showData(e.data, "Updating...");
+        } else {
+            showNothing(next.label);
+            await restoreFromCache();  // this browser's last copy, if any
+            if (FLEET.selected !== id) return;
+        }
+        if (!e.configs) {
+            const cfg = await sensorConfigs(id);
+            if (FLEET.selected !== id) return;
+            applyConfigs(cfg, e.tuning);
+        }
+        setStale(!kept);
+        loadAll(true, false);
+    }
+
+    function setupSensorButtons() {
+        const bar = $("fleet-sensors");
+        if (!FLEET || !bar) return;
+        bar.addEventListener("click", function (e) {
+            const btn = e.target.closest(".fleet-sensor-btn");
+            if (btn) selectSensor(btn.dataset.id);
+        });
+    }
+
     // --- boot ---
 
     async function boot() {
         setupControls();
         setupSlider();
+        setupFleetLegends();
+        setupSensorButtons();
         setupIqToggle();
         fitCanvases();
         let resizeTimer = null;
@@ -2081,20 +2451,9 @@
         let bootData = {};
         try { bootData = JSON.parse($("avg-boot").textContent) || {}; } catch (_) { /* fetch below */ }
         try {
-            const data = bootData.configs || await (await fetch("/api/averaged/configs")).json();
-            const configs = data.configs || [];
-            const centers = [...new Set(configs.map(function (c) { return c.sdr_center_freq_hz; }))].sort(function (a, b) { return a - b; });
-            const rates = [...new Set(configs.map(function (c) { return c.sample_rate_hz; }))].sort(function (a, b) { return a - b; });
-            const gains = [...new Set(configs.map(function (c) { return c.gain_db; }))].sort(function (a, b) { return a - b; });
-            fillSelect("avg-center", centers, function (v) { return (v / 1e6).toFixed(1) + " MHz"; }, String);
-            fillSelect("avg-samplerate", rates, function (v) { return (v / 1e6).toFixed(0) + " MHz"; }, String);
-            fillSelect("avg-gain", gains, function (v) { return v + " dB"; }, String);
-            const latest = data.latest;
-            if (latest) {
-                setSelectValue("avg-center", latest.sdr_center_freq_hz);
-                setSelectValue("avg-samplerate", latest.sample_rate_hz);
-                setSelectValue("avg-gain", latest.gain_db);
-            }
+            const data = bootData.configs || await (await fetch(API + "/api/averaged/configs")).json();
+            applyConfigs(data, null);
+            if (FLEET) sensorEntry(FLEET.selected).configs = data;
         } catch (_) { /* configs are optional; defaults stay All */ }
         try {
             let doc = bootData.prefs || null;

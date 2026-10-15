@@ -18,6 +18,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+
 from rfobserver.processing.burst import BurstDetectionConfig, detect_bursts
 from rfobserver.processing.iq_utils import calculate_iq_statistics, convert_bytes_to_complex
 from rfobserver.processing.spectral import PSDGridConfig, compute_psd_grid, compute_summary_psd
@@ -444,31 +446,36 @@ def _process_capture_blocking(
     psd_grid = compute_psd_grid(data, s.BANDWIDTH, config=grid_config)
     summary_psd = compute_summary_psd(psd_grid, center_freq_hz, s.BANDWIDTH)
 
-    # Burst detection
-    burst_config = BurstDetectionConfig(
-        threshold_high_db=s.BURST_THRESHOLD_HIGH_DB,
-        threshold_low_ratio=s.BURST_THRESHOLD_LOW_RATIO,
-        merge_freq_bins=s.BURST_MERGE_FREQ_BINS,
-        merge_time_sec=s.BURST_MERGE_TIME_MS / 1000.0,
-        noise_floor_percentile=s.BURST_NOISE_FLOOR_PERCENTILE,
-    )
-    detection_result = detect_bursts(
-        psd_grid,
-        config=burst_config,
-        center_freq_hz=float(center_freq_hz),
-        capture_time=capture_time,
-    )
+    # Burst detection (off: no bursts; the noise floor as the live page's)
+    if s.BURST_DETECTION_ENABLED:
+        burst_config = BurstDetectionConfig(
+            threshold_high_db=s.BURST_THRESHOLD_HIGH_DB,
+            threshold_low_ratio=s.BURST_THRESHOLD_LOW_RATIO,
+            merge_freq_bins=s.BURST_MERGE_FREQ_BINS,
+            merge_time_sec=s.BURST_MERGE_TIME_MS / 1000.0,
+            noise_floor_percentile=s.BURST_NOISE_FLOOR_PERCENTILE,
+        )
+        detection_result = detect_bursts(
+            psd_grid,
+            config=burst_config,
+            center_freq_hz=float(center_freq_hz),
+            capture_time=capture_time,
+        )
+        bursts, noise_floor_db = detection_result.bursts, detection_result.noise_floor_db
+    else:
+        bursts = []
+        noise_floor_db = float(np.percentile(summary_psd.powers, 10))
 
     process_ms = (time.monotonic() - t0) * 1000.0
 
     return _ProcessResult(
         iq_stats=iq_stats,
         summary_psd=summary_psd,
-        bursts=detection_result.bursts,
+        bursts=bursts,
         center_freq_hz=center_freq_hz,
         capture_num=capture_num,
         process_ms=process_ms,
         filename=filename,
         iq_bytes=iq_bytes,
-        noise_floor_db=detection_result.noise_floor_db,
+        noise_floor_db=noise_floor_db,
     )

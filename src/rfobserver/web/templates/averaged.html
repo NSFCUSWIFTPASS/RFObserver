@@ -1,4 +1,4 @@
-{% extends "base.html" %}
+{% extends base_template | default("base.html") %}
 {% block title %}Dashboard - RFObs{% endblock %}
 {% block content %}
 <script src="/static/shared-charts.js"></script>
@@ -6,12 +6,24 @@
 <div class="card full-width avg-picker-card">
     <div class="card-body avg-bar-body">
         <div class="avg-bar">
-            <span class="avg-title">{{ display_name }}</span>
+            {% if not fleet %}<span class="avg-title">{{ display_name }}</span>{% endif %}
             <div class="avg-tuning">
                 <select id="avg-center" title="SDR center frequency"></select>
                 <select id="avg-samplerate" title="Sample rate"></select>
                 <select id="avg-gain" title="Gain"></select>
             </div>
+            {% if fleet %}
+            <div class="fleet-sensors" id="fleet-sensors" role="group" aria-label="Sensor shown in the waterfall and spectrum">
+                {% for s in fleet.sensors %}
+                <button type="button" class="fleet-sensor-btn{% if s.id == fleet.selected %} selected{% endif %}{% if not s.online %} offline{% endif %}"
+                        data-id="{{ s.id }}" style="--sensor-colour: {{ s.colour }};"
+                        aria-pressed="{{ 'true' if s.id == fleet.selected else 'false' }}"
+                        title="{{ s.id }}{% if not s.online %} (offline){% endif %}">
+                    <span class="fleet-swatch" style="background:{{ s.colour }};"></span>{{ s.label }}
+                </button>
+                {% endfor %}
+            </div>
+            {% endif %}
             <div class="avg-time">
                 <span class="avg-group">
                 <button type="button" id="avg-peaks-prev" class="btn-preset avg-nav"
@@ -137,9 +149,10 @@
                 <div id="avg-stats-tooltip" class="graph-tooltip" style="display:none;"></div>
             </div>
             <div class="graph-legend">
-                <span class="legend-label" style="color:#0071e3;">avg</span>
+                {% if fleet %}<span id="fleet-legend-pwr" class="fleet-legend"></span>
+                {% else %}<span class="legend-label" style="color:#0071e3;">avg</span>{% endif %}
                 <span class="legend-label" id="avg-stats-unit" style="opacity:0.5;">dB</span>
-                <span class="legend-label" id="avg-iq-legend" style="color:#30d158;">IQ available</span>
+                <span class="legend-label" id="avg-iq-legend" style="color:#30d158;">IQ available{% if fleet %} (<span class="fleet-name">{{ display_name }}</span>){% endif %}</span>
             </div>
         </div>
     </div>
@@ -157,6 +170,7 @@
             <div style="position:relative;">
                 <canvas id="avg-psd" class="avg-chart avg-chart-psd"></canvas>
                 <div id="avg-psd-tooltip" class="graph-tooltip" style="display:none;"></div>
+                {% if fleet %}<div class="fleet-tag"><span class="fleet-swatch" style="background:{{ fleet.colour }};"></span><span class="fleet-name">{{ display_name }}</span></div>{% endif %}
             </div>
             <div id="avg-bucket-stats" class="avg-bucket-stats"></div>
         </div>
@@ -176,6 +190,7 @@
             <div class="avg-wf-wrap">
                 <canvas id="avg-wf" class="avg-chart avg-chart-wf" title="Click to select a time; drag to zoom the time range"></canvas>
                 <canvas id="avg-wf-overlay" class="avg-chart-wf-overlay"></canvas>
+                {% if fleet %}<div class="fleet-tag"><span class="fleet-swatch" style="background:{{ fleet.colour }};"></span><span class="fleet-name">{{ display_name }}</span></div>{% endif %}
             </div>
             <div class="spectrogram-legend">
                 <span class="legend-label" id="avg-legend-min">--</span>
@@ -204,6 +219,7 @@
                 <canvas id="avg-kurt" class="avg-chart avg-chart-kurt" title="Drag to zoom the time range"></canvas>
                 <div id="avg-kurt-tooltip" class="graph-tooltip" style="display:none;"></div>
             </div>
+            {% if fleet %}<div class="graph-legend"><span id="fleet-legend-kurt" class="fleet-legend"></span></div>{% endif %}
         </div>
     </div>
 </div>
@@ -231,5 +247,6 @@
 </div>
 
 <script type="application/json" id="avg-boot">{{ boot | tojson }}</script>
+{% if fleet %}<script>window.RFOBS_FLEET = {{ fleet | tojson }};</script>{% endif %}
 <script src="/static/averaged.js"></script>
 {% endblock %}

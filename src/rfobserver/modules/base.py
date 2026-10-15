@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -32,6 +33,8 @@ class UpstreamModule(ABC):
 
     Modules receive raw SC16 IQ chunks from the receiver thread via
     ``feed()`` and produce output (e.g. audio PCM) on an asyncio queue.
+    The queue belongs to the event loop the module was created on and is not
+    thread-safe, so a processing thread hands output over with ``emit()``.
     All heavy DSP should run on the GPU (CuPy) to avoid CPU contention
     with the existing PSD pipeline.
     """
@@ -44,6 +47,13 @@ class UpstreamModule(ABC):
         self.module_id: str = str(uuid.uuid4())[:8]
         self._params: dict[str, Any] = params or {}
         self._output_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=64)
+        # The loop the queue's reader runs on (modules are created from a
+        # request handler); None outside one (tests), where emit() puts directly.
+        try:
+            self._loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
+        self.output_dropped = 0
 
     @classmethod
     @abstractmethod
@@ -74,6 +84,21 @@ class UpstreamModule(ABC):
     def output_queue(self) -> asyncio.Queue[bytes]:
         """Queue of output data (e.g. PCM audio) for WebSocket streaming."""
         return self._output_queue
+
+    def emit(self, data: bytes) -> None:
+        """Queue output from any thread. A full queue drops its oldest item, so
+        a slow or absent reader gets the newest output, not a growing delay."""
+        if self._loop is None:
+            self._put_latest(data)
+            return
+        with contextlib.suppress(RuntimeError):  # the loop has closed (shutdown)
+            self._loop.call_soon_threadsafe(self._put_latest, data)
+
+    def _put_latest(self, data: bytes) -> None:
+        if self._output_queue.full():
+            self._output_queue.get_nowait()
+            self.output_dropped += 1
+        self._output_queue.put_nowait(data)
 
     def feed_burst(self, iq: np.ndarray, sample_rate: int, meta: dict[str, Any]) -> None:
         """Receive one isolated burst (complex64 at ``sample_rate``, its peak at

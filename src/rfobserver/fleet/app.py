@@ -396,6 +396,51 @@ def create_fleet_app(
             "errors": errors,
         }
 
+    @app.get("/fleet/api/detection")
+    async def fleet_detection(
+        sensor: str, burst_id: str, start_time: str, download: bool = False
+    ) -> Response:
+        """One detection with its full attribution record (the popup, and its
+        download). Found through detections.json in a 1 ms window at its start
+        time, so it works with every sensor version."""
+        from datetime import datetime, timedelta
+
+        s = _sensor_or_404(sensor)
+        try:
+            start = datetime.fromisoformat(start_time)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid start_time") from None
+        params = {
+            "since": start.isoformat(),
+            "until": (start + timedelta(milliseconds=1)).isoformat(),
+            "limit": "50",
+        }
+        try:
+            data = await hub.get_json(s, "detections.json", params)
+        except (httpx.HTTPError, ValueError) as exc:
+            raise HTTPException(
+                status_code=502, detail=f"{s.id} did not answer: {type(exc).__name__}"
+            ) from None
+        row = next((r for r in data.get("detections", []) if r.get("burst_id") == burst_id), None)
+        if row is None:
+            raise HTTPException(status_code=404, detail="detection not found (pruned?)")
+        record = row.get("attribution")
+        if isinstance(record, str):
+            with contextlib.suppress(ValueError):  # else keep the text as stored
+                record = json.loads(record)
+        doc = {
+            "sensor": {"id": s.id, "label": hub.display_label(s)},
+            "detection": {k: v for k, v in row.items() if k != "attribution"},
+            "attribution": record,
+        }
+        headers = {}
+        if download:
+            safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in f"{s.id}-{burst_id}")
+            headers["Content-Disposition"] = f'attachment; filename="{safe}.json"'
+        return Response(
+            content=json.dumps(doc, indent=2), media_type="application/json", headers=headers
+        )
+
     @app.get("/fleet/s/{sensor_id}/api/{path:path}")
     async def proxy(sensor_id: str, path: str, request: Request) -> Response:
         """Read-only pass-through to one sensor's API (the Dashboard's data)."""

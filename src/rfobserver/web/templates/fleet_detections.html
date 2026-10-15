@@ -97,6 +97,20 @@
     </div>
 </div>
 
+<dialog id="det-dialog" class="fleet-dialog" aria-labelledby="det-dialog-title">
+    <div class="fleet-dialog-head">
+        <div class="fleet-dialog-heading">
+            <h2 id="det-dialog-title" class="fleet-dialog-title"></h2>
+            <div id="det-dialog-sub" class="fleet-page-sub"></div>
+        </div>
+        <div class="fleet-dialog-actions">
+            <a id="det-dialog-download" class="btn-preset" href="#" download>Download JSON</a>
+            <button type="button" id="det-dialog-close" class="btn-preset" autofocus>Close</button>
+        </div>
+    </div>
+    <div id="det-dialog-body" class="fleet-dialog-body"></div>
+</dialog>
+
 <script>window.RFOBS_SENSORS = {{ sensors | tojson }};</script>
 <script src="/static/fleet-detections.js"></script>
 {% endblock %}

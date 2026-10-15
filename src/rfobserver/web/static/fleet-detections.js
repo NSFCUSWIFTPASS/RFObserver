@@ -439,7 +439,11 @@
             + '<td class="num">' + Number(r.duration_ms).toFixed(2) + " ms</td>"
             + '<td class="num">' + Number(r.peak_power_db).toFixed(1) + " dB</td>"
             + '<td class="attr"><span class="fleet-pill ' + st[1] + '">' + esc(st[0]) + "</span>" + model + "</td>"
-            + '<td class="detail">' + detail(a) + "</td>"
+            + '<td class="detail">' + detail(a)
+            + (a.status === "not_tried" ? "" : '<button type="button" class="btn-preset det-open" data-sensor="'
+                + esc(r.sensor.id) + '" data-burst="' + esc(r.burst_id) + '" data-start="' + esc(r.start_time)
+                + '">Details</button>')
+            + "</td>"
             + "</tr>";
     }
 
@@ -484,6 +488,125 @@
     }
 
     $("det-more").addEventListener("click", function () { loadRows(false); });
+
+    // --- attribution popup ---
+    //
+    // Everything from the record is set as text, never parsed as HTML: the
+    // decoded fields and payload come from over-the-air data.
+
+    const dialog = $("det-dialog");
+
+    function el(tag, cls, text) {
+        const e = document.createElement(tag);
+        if (cls) e.className = cls;
+        if (text != null) e.textContent = String(text);
+        return e;
+    }
+
+    function section(title) {
+        const sec = el("section", "fleet-dialog-section");
+        sec.appendChild(el("h3", "fleet-dialog-h3", title));
+        return sec;
+    }
+
+    function keyValues(pairs) {
+        const dl = el("dl", "fleet-kv");
+        for (const p of pairs) {
+            if (p[1] == null || p[1] === "") continue;
+            dl.appendChild(el("dt", null, p[0]));
+            dl.appendChild(el("dd", null, typeof p[1] === "object" ? JSON.stringify(p[1]) : p[1]));
+        }
+        return dl;
+    }
+
+    function copyButton(text) {
+        const b = el("button", "btn-preset fleet-copy", "Copy");
+        b.type = "button";
+        b.addEventListener("click", async function () {
+            try { await navigator.clipboard.writeText(text); b.textContent = "Copied"; }
+            catch (_) { b.textContent = "Copy failed"; }
+            setTimeout(function () { b.textContent = "Copy"; }, 1500);
+        });
+        return b;
+    }
+
+    function renderDialog(doc) {
+        const d = doc.detection;
+        const rec = doc.attribution && typeof doc.attribution === "object" ? doc.attribution : null;
+        const decoded = !!d.model;
+        $("det-dialog-title").textContent = decoded ? d.model : "Not decoded";
+        $("det-dialog-sub").textContent = doc.sensor.label + ", " + fmtTime(d.start_time) + " UTC";
+        const body = $("det-dialog-body");
+        body.textContent = "";
+
+        const sum = section("Detection");
+        sum.appendChild(keyValues([
+            ["Sensor", doc.sensor.label + (doc.sensor.label !== doc.sensor.id ? " (" + doc.sensor.id + ")" : "")],
+            ["Start (UTC)", fmtTime(d.start_time)],
+            ["Frequency", (Number(d.center_freq_hz) / 1e6).toFixed(6) + " MHz"],
+            ["Bandwidth", (Number(d.bandwidth_hz) / 1e3).toFixed(1) + " kHz"],
+            ["Duration", Number(d.duration_ms).toFixed(3) + " ms"],
+            ["Peak power", Number(d.peak_power_db).toFixed(1) + " dB"],
+            ["Burst id", d.burst_id],
+            ["Decode", decoded ? "Decoded by rtl_433" : "rtl_433 ran, nothing decoded"],
+            [decoded ? "Decoded at" : "Tried at", rec && rec.at ? fmtTime(rec.at) + " UTC" : null],
+            ["Protocol id", d.protocol_id],
+        ]));
+        body.appendChild(sum);
+
+        const frames = rec && Array.isArray(rec.frames) ? rec.frames : [];
+        frames.forEach(function (f, i) {
+            const sec = section("Frame " + (i + 1) + (f.model ? ": " + f.model : ""));
+            const pairs = Object.keys(f).filter(function (k) { return k !== "rows" && k !== "codes"; })
+                .map(function (k) { return [k, f[k]]; });
+            sec.appendChild(keyValues(pairs));
+            const rows = Array.isArray(f.rows) ? f.rows : [];
+            rows.forEach(function (r, j) {
+                const head = el("div", "fleet-hex-head");
+                head.appendChild(el("span", null, "Row " + (j + 1) + (r.len != null ? ", " + r.len + " bits" : "")));
+                if (r.data) head.appendChild(copyButton(String(r.data)));
+                sec.appendChild(head);
+                if (r.data) sec.appendChild(el("pre", "fleet-hex", r.data));
+            });
+            body.appendChild(sec);
+        });
+
+        const raw = el("details", "fleet-dialog-raw");
+        raw.appendChild(el("summary", null, "Raw record"));
+        raw.appendChild(el("pre", "fleet-hex", JSON.stringify(doc.attribution, null, 2)));
+        body.appendChild(raw);
+    }
+
+    async function openDetail(btn) {
+        const q = new URLSearchParams({
+            sensor: btn.dataset.sensor, burst_id: btn.dataset.burst, start_time: btn.dataset.start,
+        });
+        $("det-dialog-download").href = "/fleet/api/detection?" + q.toString() + "&download=true";
+        $("det-dialog-title").textContent = "Loading...";
+        $("det-dialog-sub").textContent = "";
+        $("det-dialog-body").textContent = "";
+        if (!dialog.open) dialog.showModal();
+        try {
+            const r = await fetch("/fleet/api/detection?" + q.toString());
+            const doc = await r.json();
+            if (!r.ok) {
+                $("det-dialog-title").textContent = "Could not load";
+                $("det-dialog-body").appendChild(el("p", "fleet-det-note", doc.detail || ("HTTP " + r.status)));
+                return;
+            }
+            renderDialog(doc);
+        } catch (_) {
+            $("det-dialog-title").textContent = "Could not load";
+        }
+    }
+
+    $("det-rows").addEventListener("click", function (e) {
+        const btn = e.target.closest(".det-open");
+        if (btn) openDetail(btn);
+    });
+    $("det-dialog-close").addEventListener("click", function () { dialog.close(); });
+    // A click on the backdrop (the dialog element itself) closes it.
+    dialog.addEventListener("click", function (e) { if (e.target === dialog) dialog.close(); });
 
     $("det-sensors").addEventListener("click", function (e) {
         const btn = e.target.closest(".fleet-sensor-btn");

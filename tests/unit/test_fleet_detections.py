@@ -141,6 +141,8 @@ class Sensors:
             rows = self.rows[host]
             if "until" in q:
                 rows = [r for r in rows if r["start_time"] < q["until"]]
+            if "since" in q:
+                rows = [r for r in rows if r["start_time"] >= q["since"]]
             if host == "10.0.0.1":  # the new sensor filters
                 if q.get("attributed") == "true":
                     rows = [r for r in rows if r["model"]]
@@ -201,3 +203,26 @@ def test_detections_page_renders(fleet: Any) -> None:
     assert r.status_code == 200
     assert "fleet-detections.js" in r.text and 'href="/detections" class="nav-link"' in r.text
     assert 'data-id="new"' in r.text and 'data-id="old"' in r.text
+
+
+def test_detection_popup_and_download(fleet: Any) -> None:
+    client, _ = fleet
+    q = {"sensor": "new", "burst_id": "b1", "start_time": "2026-10-15T10:00:05+00:00"}
+    r = client.get("/fleet/api/detection", params=q)
+    assert r.status_code == 200 and "content-disposition" not in r.headers
+    doc = r.json()
+    assert doc["sensor"]["id"] == "new" and doc["detection"]["burst_id"] == "b1"
+    assert "attribution" not in doc["detection"]
+    assert doc["attribution"]["frames"][0]["rows"][0]["len"] == 592  # the full record
+
+    dl = client.get("/fleet/api/detection", params={**q, "download": "true"})
+    assert dl.headers["content-disposition"] == 'attachment; filename="new-b1.json"'
+    assert dl.json() == doc
+
+
+def test_detection_popup_errors(fleet: Any) -> None:
+    client, _ = fleet
+    q = {"sensor": "new", "burst_id": "b9", "start_time": "2026-10-15T10:00:05+00:00"}
+    assert client.get("/fleet/api/detection", params=q).status_code == 404
+    assert client.get("/fleet/api/detection", params={**q, "start_time": "x"}).status_code == 400
+    assert client.get("/fleet/api/detection", params={**q, "sensor": "nope"}).status_code == 404

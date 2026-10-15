@@ -207,6 +207,14 @@ def create_fleet_app(
                     await t
             live.leave(viewer)
 
+    @app.get("/detections", response_class=HTMLResponse)
+    async def detections_page(request: Request) -> Any:
+        return templates.TemplateResponse(
+            request,
+            "fleet_detections.html",
+            {"ui_theme": prefs.theme(), "sensors": _chart_sensors()},
+        )
+
     @app.get("/sensors", response_class=HTMLResponse)
     async def sensors_page(request: Request) -> Any:
         return templates.TemplateResponse(
@@ -301,6 +309,92 @@ def create_fleet_app(
             return out
 
         return {"sensors": await asyncio.gather(*(one(s) for s in sensors))}
+
+    @app.get("/fleet/api/detections/hourly")
+    async def fleet_detections_hourly(since: str, until: str) -> dict[str, Any]:
+        """Every enabled sensor's hourly detection counts. ``supported`` is
+        False for a sensor whose version has no hourly endpoint."""
+
+        async def one(s: Sensor) -> dict[str, Any]:
+            out: dict[str, Any] = {
+                "id": s.id,
+                "label": hub.display_label(s),
+                "colour": s.colour,
+                "supported": True,
+                "error": None,
+                "covered_since": None,
+                "hours": [],
+            }
+            try:
+                reply = await hub.get(s, "detections/hourly", {"since": since, "until": until})
+            except httpx.HTTPError as exc:
+                out["error"] = f"{type(exc).__name__}: {exc}"
+                return out
+            if reply.status == 404:
+                out["supported"] = False
+            elif reply.status != 200:
+                out["error"] = f"HTTP {reply.status}"
+            else:
+                body = json.loads(reply.body)
+                out["covered_since"] = body.get("covered_since")
+                out["hours"] = body.get("hours", [])
+            return out
+
+        sensors = [s for s in registry.all() if s.enabled]
+        return {"sensors": await asyncio.gather(*(one(s) for s in sensors))}
+
+    @app.get("/fleet/api/detections")
+    async def fleet_detections(
+        since: str,
+        until: str,
+        limit: int = 100,
+        sensor: str | None = None,
+        attributed: str | None = None,
+        model: str | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        """The newest ``limit`` detections in [since, until) across sensors (or
+        one), newest first. Page on with until = the response's next_before."""
+        from rfobserver.fleet.detections import matches, merge
+
+        limit = max(1, min(limit, 500))
+        want_attr = {"true": True, "false": False}.get(attributed or "")
+        if status in ("tried", "not_tried"):
+            want_attr = False
+        elif status == "decoded":
+            want_attr = True
+        sensors = [s for s in registry.all() if s.enabled and (not sensor or s.id == sensor)]
+        params = {"since": since, "until": until, "limit": str(limit)}
+        if want_attr is not None:
+            params["attributed"] = "true" if want_attr else "false"
+        if model:
+            params["model"] = model
+        errors: dict[str, str] = {}
+
+        async def one(s: Sensor) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+            meta = {"id": s.id, "label": hub.display_label(s), "colour": s.colour}
+            try:
+                data = await hub.get_json(s, "detections.json", params)
+            except (httpx.HTTPError, ValueError) as exc:
+                errors[s.id] = f"{type(exc).__name__}: {exc}"
+                return meta, []
+            rows = [
+                r
+                for r in data.get("detections", [])
+                if matches(r, want_attr, model or None, status or None)
+            ]
+            return meta, rows
+
+        per_sensor = await asyncio.gather(*(one(s) for s in sensors))
+        rows = merge(list(per_sensor), limit)
+        # A full page may have more behind it; the next one starts below its
+        # oldest row (until is exclusive on the sensors).
+        more = len(rows) >= limit
+        return {
+            "rows": rows,
+            "next_before": rows[-1]["start_time"] if more else None,
+            "errors": errors,
+        }
 
     @app.get("/fleet/s/{sensor_id}/api/{path:path}")
     async def proxy(sensor_id: str, path: str, request: Request) -> Response:

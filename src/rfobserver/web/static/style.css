@@ -2537,3 +2537,216 @@ body {
 .fleet-sensor-btn.offline {
     opacity: 0.55;
 }
+
+/* Fleet Detections */
+.content:has(.fleet-det-page) {
+    max-width: 1400px;
+}
+
+.fleet-det-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+.fleet-det-updated {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+/* Segmented control (Apple style). */
+.seg {
+    display: inline-flex;
+    padding: 2px;
+    border-radius: 9px;
+    background: var(--pill-bg);
+}
+
+.seg button {
+    height: 26px;
+    padding: 0 14px;
+    border: none;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--text-primary);
+    font: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+}
+
+.seg button.selected {
+    background: var(--card-bg);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12), 0 0 0 0.5px rgba(0, 0, 0, 0.06);
+}
+
+.fleet-det-charts {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 16px;
+}
+
+@media (max-width: 900px) {
+    .fleet-det-charts {
+        grid-template-columns: 1fr;
+    }
+}
+
+.fleet-det-charts .graph-legend {
+    position: static;
+    flex-wrap: wrap;
+    margin-top: 6px;
+}
+
+.fleet-det-chart-hold {
+    position: relative;
+}
+
+.fleet-det-chart {
+    display: block;
+    width: 100%;
+    height: 220px;
+    border-radius: 8px;
+    box-shadow: var(--chart-ring);
+}
+
+.fleet-det-types,
+.fleet-det-list {
+    margin-bottom: 16px;
+}
+
+.fleet-det-hint {
+    margin-left: auto;
+    font-weight: 400;
+}
+
+.fleet-det-table-wrap {
+    overflow-x: auto;
+}
+
+.data-table th.num,
+.data-table td.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.fleet-det-type-table tbody tr {
+    cursor: pointer;
+}
+
+.fleet-det-type-table tbody tr:hover {
+    background: var(--divider);
+}
+
+.fleet-det-type-table tbody tr.selected {
+    background: var(--pill-bg);
+}
+
+.fleet-det-type-table tbody tr.selected td:first-child {
+    box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.fleet-det-type-table tbody tr:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+}
+
+.fleet-det-type-table td.muted {
+    color: var(--text-secondary);
+}
+
+.fleet-det-type-table td.total {
+    font-weight: 600;
+}
+
+.fleet-det-type-table th .fleet-swatch {
+    margin-right: 5px;
+}
+
+.fleet-det-model {
+    font-weight: 500;
+    color: var(--text-primary);
+}
+
+.fleet-det-note {
+    margin: 10px 0 0;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+}
+
+.fleet-det-filter {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 400;
+    color: var(--text-primary);
+}
+
+.fleet-det-filter .btn-preset {
+    height: 24px;
+    padding: 0 10px;
+}
+
+.fleet-det-sensors {
+    margin-bottom: 12px;
+}
+
+.fleet-det-table td {
+    vertical-align: middle;
+}
+
+.fleet-det-table td.sensor,
+.fleet-det-table td.mono {
+    white-space: nowrap;
+}
+
+.fleet-det-table td.mono {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+}
+
+.fleet-det-table td.attr {
+    white-space: nowrap;
+}
+
+.fleet-det-table td.attr .fleet-pill {
+    margin-right: 6px;
+}
+
+.fleet-pill.tried {
+    background: rgba(255, 159, 10, 0.16);
+    color: var(--text-primary);
+}
+
+.fleet-det-table td.detail {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.fleet-det-field {
+    margin-right: 10px;
+    white-space: nowrap;
+}
+
+.fleet-det-field b {
+    font-weight: 500;
+    color: var(--text-primary);
+}
+
+.fleet-det-data {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
+.fleet-det-more {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 12px;
+}

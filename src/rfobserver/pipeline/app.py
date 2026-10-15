@@ -389,6 +389,7 @@ async def run(settings: AppSettings) -> None:
     )
     if settings.PEAKS_ROLLUP_INTERVAL_SEC > 0:
         workers.append(asyncio.create_task(_rollup_loop(settings, db, supervisor)))
+    workers.append(asyncio.create_task(_detection_hours_loop(db, read_db)))
     if rfdb_writer is not None:
         workers.append(asyncio.create_task(rfdb_writer.run()))
     # Serve until a stop signal. The supervisor owns the processor task
@@ -848,6 +849,58 @@ async def _rollup_loop(settings: AppSettings, db: SensorDatabase, supervisor: An
         except Exception:
             logger.exception("avg_minutes rollup pass failed")
         await asyncio.sleep(settings.PEAKS_ROLLUP_INTERVAL_SEC)
+
+
+# An hour's detection counts are stored once it has been over this long:
+# attribution (rtl_433) lands seconds after the detection row, and a stored
+# hour is not revisited.
+DET_HOURS_SETTLE = timedelta(minutes=15)
+# Hours caught up per pass (after downtime), with a pause between, so a long
+# catch-up never loads the sensor hard.
+_DET_HOURS_PER_PASS = 24
+_DET_HOURS_PAUSE_SEC = 1.0
+
+
+async def _detection_hours_pass(
+    db: SensorDatabase, read_db: SensorDatabase | None, now: datetime
+) -> None:
+    """Store the counts of every hour that has settled since the last pass.
+
+    The first pass only records the current hour as the start: history before
+    it is not counted (no backfill). The counting reads on ``read_db`` when
+    there is one, so the pipeline's writer is held only for the small insert.
+    """
+    from rfobserver.storage.database import DET_HOURS_DONE_KEY, DET_HOURS_SINCE_KEY
+
+    done_raw = await db.get_config(DET_HOURS_DONE_KEY)
+    if done_raw is None:
+        start = int(now.timestamp()) // 3600 * 3600
+        await db.set_config(DET_HOURS_SINCE_KEY, str(start))
+        await db.set_config(DET_HOURS_DONE_KEY, str(start))
+        logger.info(
+            "Detection hours: counting from %s", datetime.fromtimestamp(start, timezone.utc)
+        )
+        return
+    done = int(done_raw)
+    settled = (now - DET_HOURS_SETTLE).timestamp()
+    reader = read_db if read_db is not None else db
+    for _ in range(_DET_HOURS_PER_PASS):
+        if done + 3600 > settled:
+            return
+        rows = await reader.count_detections_by_hour(done, done + 3600)
+        await db.store_detection_hours(done, done + 3600, rows)
+        done += 3600
+        await db.set_config(DET_HOURS_DONE_KEY, str(done))
+        await asyncio.sleep(_DET_HOURS_PAUSE_SEC)
+
+
+async def _detection_hours_loop(db: SensorDatabase, read_db: SensorDatabase | None) -> None:
+    while True:
+        try:
+            await _detection_hours_pass(db, read_db, datetime.now(timezone.utc))
+        except Exception:
+            logger.exception("Detection hours pass failed")
+        await asyncio.sleep(60)
 
 
 async def _run_web_server(

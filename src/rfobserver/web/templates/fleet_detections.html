@@ -1,0 +1,117 @@
+{% extends "fleet_base.html" %}
+{% block title %}Detections - RFObs Fleet{% endblock %}
+{% block content %}
+<div class="fleet-page fleet-det-page">
+    <div class="fleet-page-head">
+        <h1 class="fleet-page-title">Detections</h1>
+        <span id="det-summary" class="fleet-page-sub"></span>
+    </div>
+
+    <div class="fleet-det-bar">
+        <div class="seg" id="det-range" role="group" aria-label="Time range">
+            <button type="button" data-hours="24" class="selected">24 hours</button>
+            <button type="button" data-hours="72">3 days</button>
+            <button type="button" data-hours="168">7 days</button>
+            <button type="button" data-hours="720">30 days</button>
+        </div>
+        <span id="det-updated" class="fleet-det-updated"></span>
+    </div>
+
+    <div class="fleet-det-charts">
+        <div class="card">
+            <div class="card-header">Detections per hour (UTC)</div>
+            <div class="card-body">
+                <div class="fleet-det-chart-hold">
+                    <canvas id="det-chart-all" class="fleet-det-chart"></canvas>
+                    <div id="det-tip-all" class="graph-tooltip" style="display:none;"></div>
+                </div>
+                <div class="graph-legend"><span id="det-legend-all" class="fleet-legend"></span></div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-header">Attributed per hour (UTC)</div>
+            <div class="card-body">
+                <div class="fleet-det-chart-hold">
+                    <canvas id="det-chart-attr" class="fleet-det-chart"></canvas>
+                    <div id="det-tip-attr" class="graph-tooltip" style="display:none;"></div>
+                </div>
+                <div class="graph-legend"><span id="det-legend-attr" class="fleet-legend"></span></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="card full-width fleet-det-types">
+        <div class="card-header">
+            By type
+            <span class="fleet-det-hint">Select a row to filter the detections below</span>
+        </div>
+        <div class="card-body">
+            <div class="fleet-det-table-wrap">
+                <table class="data-table fleet-det-type-table" id="det-types"></table>
+            </div>
+            <p id="det-coverage" class="fleet-det-note"></p>
+        </div>
+    </div>
+
+    <div class="card full-width fleet-det-list">
+        <div class="card-header">
+            <span id="det-list-title">Latest detections</span>
+            <span id="det-filter" class="fleet-det-filter" hidden>
+                <span id="det-filter-text"></span>
+                <button type="button" id="det-filter-clear" class="btn-preset">Clear filter</button>
+            </span>
+        </div>
+        <div class="card-body">
+            <div class="fleet-sensors fleet-det-sensors" id="det-sensors" role="group" aria-label="Sensor">
+                <button type="button" class="fleet-sensor-btn selected" data-id="" style="--sensor-colour: var(--accent);">All sensors</button>
+                {% for s in sensors %}
+                <button type="button" class="fleet-sensor-btn" data-id="{{ s.id }}" style="--sensor-colour: {{ s.colour }};">
+                    <span class="fleet-swatch" style="background:{{ s.colour }};"></span>{{ s.label }}
+                </button>
+                {% endfor %}
+            </div>
+            <div class="fleet-det-table-wrap">
+                <table class="data-table fleet-det-table">
+                    <thead>
+                        <tr>
+                            <th>Sensor</th>
+                            <th>Start (UTC)</th>
+                            <th class="num">Frequency</th>
+                            <th class="num">Bandwidth</th>
+                            <th class="num">Duration</th>
+                            <th class="num">Peak</th>
+                            <th>Attribution</th>
+                            <th>Detail</th>
+                            <th class="open"><span class="visually-hidden">Details</span></th>
+                        </tr>
+                    </thead>
+                    <tbody id="det-rows">
+                        <tr><td colspan="9" class="placeholder-text">Loading...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="fleet-det-more">
+                <button type="button" id="det-more" class="btn-preset" hidden>Load older</button>
+                <span id="det-errors" class="fleet-det-note"></span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<dialog id="det-dialog" class="fleet-dialog" aria-labelledby="det-dialog-title">
+    <div class="fleet-dialog-head">
+        <div class="fleet-dialog-heading">
+            <h2 id="det-dialog-title" class="fleet-dialog-title"></h2>
+            <div id="det-dialog-sub" class="fleet-page-sub"></div>
+        </div>
+        <div class="fleet-dialog-actions">
+            <a id="det-dialog-download" class="btn-preset" href="#" download>Download JSON</a>
+            <button type="button" id="det-dialog-close" class="btn-preset" autofocus>Close</button>
+        </div>
+    </div>
+    <div id="det-dialog-body" class="fleet-dialog-body"></div>
+</dialog>
+
+<script>window.RFOBS_SENSORS = {{ sensors | tojson }};</script>
+<script src="/static/fleet-detections.js"></script>
+{% endblock %}

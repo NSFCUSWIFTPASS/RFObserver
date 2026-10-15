@@ -65,6 +65,9 @@ class IReceiver(Protocol):
     last_gaps: list[tuple[int, int]]
     overflow_events: int
     overflow_lost_samples: int
+    # Device time (seconds) of the last recv_chunk()'s first sample, or None
+    # when the receiver has no clock (see capture/clock.py).
+    last_device_time: float | None
 
     # Lifecycle
     def initialize(self) -> None: ...
@@ -98,6 +101,7 @@ class Receiver:
         self.last_gaps: list[tuple[int, int]] = []
         self.overflow_events = 0
         self.overflow_lost_samples = 0
+        self.last_device_time: float | None = None
         self._stream_rate = float(receiver_config.bandwidth_hz)
         self._next_tick: int | None = None
 
@@ -263,6 +267,7 @@ class Receiver:
         target = len(out_buf)
         rx_md = uhd.types.RXMetadata()
         gaps: list[tuple[int, int]] = []
+        first_time: float | None = None
 
         while total < target:
             n = self.rx_streamer.recv(out_buf[total:], rx_md, timeout=1.0)
@@ -274,6 +279,8 @@ class Receiver:
             if n > 0:
                 if rx_md.has_time_spec:
                     tick = int(rx_md.time_spec.to_ticks(self._stream_rate))
+                    if total == 0:
+                        first_time = tick / self._stream_rate
                     if self._next_tick is not None and tick > self._next_tick:
                         lost = tick - self._next_tick
                         gaps.append((total, lost))
@@ -285,6 +292,7 @@ class Receiver:
             total += n
 
         self.last_gaps = gaps
+        self.last_device_time = first_time
         return total
 
     def stop_streaming(self) -> None:

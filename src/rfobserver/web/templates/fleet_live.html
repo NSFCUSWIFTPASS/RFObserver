@@ -7,7 +7,6 @@
     <div class="card fleet-live-power">
         <div class="card-header">
             <span id="fleet-live-power-title">Power</span>
-            <span id="fleet-live-conn" class="fleet-live-conn">Connecting</span>
             <label class="toggle-label" title="A frame per chunk (about 27 a second) instead of one per averaged window">
                 <input type="checkbox" id="fleet-live-highres" checked>
                 <span class="toggle-text">High Res</span>
@@ -18,7 +17,12 @@
                 <canvas id="fleet-live-power" class="fleet-live-power-canvas"></canvas>
                 <div id="fleet-live-tip" class="graph-tooltip" style="display:none;"></div>
             </div>
-            <div class="graph-legend"><span id="fleet-live-legend" class="fleet-legend"></span></div>
+            <div class="graph-legend fleet-live-foot">
+                <span id="fleet-live-legend" class="fleet-legend"></span>
+                <span class="fleet-live-status">
+                    <span id="fleet-live-conn" class="fleet-live-conn">Connecting</span><span id="fleet-live-delay" class="fleet-live-delay" title="Every tile shows the same moment, this far behind real time (the slowest sensor's delivery time)"></span>
+                </span>
+            </div>
         </div>
     </div>
 

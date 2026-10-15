@@ -51,7 +51,9 @@ def _result():
         sample_rate=56_000_000,
         num_bins=4,
     )
-    return SimpleNamespace(summary_psd=summary, center_freq_hz=2_437_000_000, capture_num=1)
+    return SimpleNamespace(
+        summary_psd=summary, center_freq_hz=2_437_000_000, capture_num=1, capture_time=None
+    )
 
 
 def _stats():
@@ -797,3 +799,90 @@ async def test_cancel_during_the_drain_does_not_skip_thread_shutdown(tmp_path, m
     assert signalled == [proc._chunk_queue, proc._burst_queue]
     assert joined == ["recv", "dispatch", "burst", "recctl"]
     assert proc._db_writer.idle
+
+
+@pytest.mark.asyncio
+async def test_averaged_broadcast_carries_the_capture_span(tmp_path, monkeypatch):
+    """The live frame keeps the stored window start as chunk_time_ms and adds
+    when its chunks were captured: the first chunk's start to the last one's
+    end, so the fleet can line sensors up in time."""
+    import numpy as np
+
+    clock = _FakeClock()
+    _install_fake_clock(monkeypatch, clock)
+    proc, db = _proc(tmp_path, with_sinks=False)
+    published: list[dict] = []
+
+    class _Broadcast:
+        def has_high_res_subscribers(self) -> bool:
+            return False
+
+        async def publish(self, data: dict) -> None:
+            published.append(data)
+
+    proc._broadcast = _Broadcast()
+    proc._chunk_duration = 0.1
+    n = iter(range(1000))
+
+    def result():
+        r = _stream_result()
+        r.capture_time = 500.0 + 0.1 * next(n)  # captured 0.1 s apart
+        r.psd_grid = SimpleNamespace(grid=np.zeros((2, 4)))
+        r.iq_stats = _stats()
+        r.process_ms = r.latency_ms = 1.0
+        return r
+
+    proc._result_queue = _ScheduledQueue(clock, [0.1 * (i + 1) for i in range(12)], result)
+    proc._running = True
+    await proc._result_consumer_loop()
+    await _drain(proc)
+
+    first = published[0]
+    # The window closed on its 6th result (t=0.6): chunks 0-5.
+    assert first["capture_time_ms"] == pytest.approx(500_000.0)
+    assert first["dur_ms"] == pytest.approx(600.0)
+    assert first["chunk_time_ms"] == pytest.approx(
+        (_BASE + timedelta(seconds=0.1)).timestamp() * 1000
+    )
+
+
+@pytest.mark.asyncio
+async def test_high_res_broadcast_carries_the_capture_time(tmp_path, monkeypatch):
+    """chunk_time_ms stays the publish time (the sensor page's burst overlay
+    and the stored detections share it); capture_time_ms is added."""
+    import numpy as np
+
+    clock = _FakeClock()
+    _install_fake_clock(monkeypatch, clock)
+    proc, db = _proc(tmp_path, with_sinks=False)
+    published: list[dict] = []
+
+    class _Broadcast:
+        def has_high_res_subscribers(self) -> bool:
+            return True
+
+        async def publish(self, data: dict) -> None:
+            published.append(data)
+
+    proc._broadcast = _Broadcast()
+    proc._chunk_duration = 0.1
+
+    def result():
+        r = _stream_result()
+        r.capture_time = 500.0
+        r.psd_grid = SimpleNamespace(grid=np.zeros((2, 4)))
+        r.iq_stats = _stats()
+        r.process_ms = r.latency_ms = 1.0
+        return r
+
+    proc._result_queue = _ScheduledQueue(clock, [0.3], result)
+    proc._running = True
+    await proc._result_consumer_loop()
+    await _drain(proc)
+
+    frame = published[0]
+    assert frame["capture_time_ms"] == pytest.approx(500_000.0)
+    assert frame["dur_ms"] == pytest.approx(100.0)
+    assert frame["chunk_time_ms"] == pytest.approx(
+        (_BASE + timedelta(seconds=0.3)).timestamp() * 1000
+    )

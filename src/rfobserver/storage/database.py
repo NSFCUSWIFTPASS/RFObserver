@@ -72,6 +72,13 @@ _BLOB_MARK_SAVE_EVERY_CHUNKS = 40
 # a JSON list so the Dashboard's tuning filter does not need a DISTINCT scan of
 # every window (3.4 s on the HCRO sensor).
 AVG_CONFIGS_KEY = "avg_window_configs"
+# Hourly detection counts (detection_hours). Counting a week of detections on
+# demand took 61 s on the busiest HCRO sensor (3.9 M rows), so closed hours are
+# counted once and kept. There is no backfill: COVERED_SINCE is the first hour
+# counted (the hour the table started), FINALIZED_UNTIL the end of the last
+# hour stored. Hours after it are counted live from detections.
+DET_HOURS_SINCE_KEY = "detection_hours_since"
+DET_HOURS_DONE_KEY = "detection_hours_done"
 # Tables row retention may delete from, and their time column.
 _RETENTION_TABLES = {
     "avg_windows": "start_time",
@@ -288,6 +295,17 @@ CREATE TABLE IF NOT EXISTS avg_tiers (
     psd_min REAL,
     psd_max REAL,
     psd_mean BLOB
+);
+
+-- Detections per closed hour (epoch seconds of the hour start), by rtl_433
+-- model ('' when not decoded) and whether attribution was tried (an
+-- attribution record exists). See DET_HOURS_SINCE_KEY.
+CREATE TABLE IF NOT EXISTS detection_hours (
+    hour INTEGER NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    tried INTEGER NOT NULL DEFAULT 0,
+    count INTEGER NOT NULL,
+    PRIMARY KEY (hour, model, tried)
 );
 
 CREATE INDEX IF NOT EXISTS idx_detections_time ON detections(start_time);
@@ -1881,6 +1899,50 @@ class SensorDatabase:
         assert self._db is not None
         async with self._db.execute("PRAGMA table_info(detections)") as cursor:
             return [row[1] for row in await cursor.fetchall()]
+
+    async def count_detections_by_hour(
+        self, since: int, until: int
+    ) -> list[tuple[int, str, int, int]]:
+        """(hour, model, tried, count) for detections starting in [since, until)
+        (epoch seconds), grouped by hour on idx_detections_time."""
+        assert self._db is not None
+        bounds = (
+            _utc_iso(datetime.fromtimestamp(since, tz=timezone.utc)),
+            _utc_iso(datetime.fromtimestamp(until, tz=timezone.utc)),
+        )
+        query = (
+            "SELECT CAST(strftime('%s', start_time) AS INTEGER) / 3600 * 3600 AS hour, "
+            "COALESCE(model, '') AS m, "
+            "CASE WHEN attribution IS NOT NULL THEN 1 ELSE 0 END AS tried, "
+            "COUNT(*) FROM detections WHERE start_time >= ? AND start_time < ? "
+            "GROUP BY hour, m, tried"
+        )
+        async with self._db.execute(query, bounds) as cursor:
+            return [(int(r[0]), str(r[1]), int(r[2]), int(r[3])) for r in await cursor.fetchall()]
+
+    @_guarded_write
+    async def store_detection_hours(
+        self, since: int, until: int, rows: list[tuple[int, str, int, int]]
+    ) -> None:
+        """Replace the stored counts for the hours in [since, until)."""
+        assert self._db is not None
+        await self._db.execute(
+            "DELETE FROM detection_hours WHERE hour >= ? AND hour < ?", (since, until)
+        )
+        await self._db.executemany(
+            "INSERT INTO detection_hours (hour, model, tried, count) VALUES (?, ?, ?, ?)", rows
+        )
+        await self._db.commit()
+
+    async def detection_hours(self, since: int, until: int) -> list[tuple[int, str, int, int]]:
+        """Stored (hour, model, tried, count) rows for hours in [since, until)."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT hour, model, tried, count FROM detection_hours "
+            "WHERE hour >= ? AND hour < ? ORDER BY hour",
+            (since, until),
+        ) as cursor:
+            return [(int(r[0]), str(r[1]), int(r[2]), int(r[3])) for r in await cursor.fetchall()]
 
     async def detection_models(self) -> list[str]:
         """Distinct non-empty rtl_433 model names, sorted (Detections filter).

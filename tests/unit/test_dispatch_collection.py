@@ -49,7 +49,7 @@ def test_finished_chunk_is_handled_without_waiting_for_the_next(tmp_path: Path) 
     try:
         # Exactly one chunk and no follow-up: nothing else will wake the loop.
         submitted = time.monotonic()
-        proc._chunk_queue.put((np.zeros(16, dtype=np.int32), submitted, 0))
+        proc._chunk_queue.put((np.zeros(16, dtype=np.int32), submitted, 0, None))
         assert handled.wait(2.0), "chunk was never handled"
         waited = handled_at[0] - submitted
         # Before the fix this was ~0.5 s: the loop sat in get() until its timeout.

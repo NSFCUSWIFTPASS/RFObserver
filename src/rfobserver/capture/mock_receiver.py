@@ -28,6 +28,7 @@ class MockReceiver:
         self._closed = False
         # Synthetic data never overflows; same attributes as Receiver.
         self.last_gaps: list[tuple[int, int]] = []
+        self.last_device_time: float | None = None  # no device clock
         self.overflow_events = 0
         self.overflow_lost_samples = 0
 

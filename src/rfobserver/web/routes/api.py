@@ -1109,13 +1109,19 @@ async def detections_json(
     sample_rate: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    attributed: str | None = None,
+    model: str | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
-    """JSON detections for external tooling (e.g. the OTA burst validator).
+    """JSON detections for external tooling (e.g. the OTA burst validator) and
+    the fleet's Detections page.
 
     Sibling of the HTML ``/detections`` fragment so non-browser clients don't
     scrape HTML. Rows are ``query_detections`` dicts (center_freq_hz,
     peak_freq_hz, bandwidth_hz, duration_ms, peak_power_db, start/stop_time,
-    sdr context). ``since``/``until`` scope by detection start_time.
+    sdr context, model and attribution), newest first. ``since``/``until``
+    scope by detection start_time (``until`` exclusive, so the fleet pages
+    with it); ``attributed`` ('true'/'false') and ``model`` as on the
+    Detections page.
     """
     db = _get_db(request)
     if db is None:
@@ -1127,6 +1133,8 @@ async def detections_json(
             sample_rate=_opt_float(sample_rate),
             since=_opt_dt(since),
             until=_opt_dt(until),
+            attributed=_opt_bool(attributed),
+            model=_opt_str(model),
         )
     except Exception:
         logger.exception("detections.json query failed")
@@ -1647,6 +1655,72 @@ def _fmt_count(v: float) -> str:
     if n >= 1_000:
         return f"{n / 1e3:.0f}k"
     return str(n)
+
+
+# Unfinalized hours are counted live from detections; past this many the
+# finalize pass has stalled, and a live count could load the sensor.
+_HOURLY_LIVE_MAX_HOURS = 3
+
+
+@router.get("/detections/hourly")
+async def detections_hourly(
+    request: Request, since: str | None = None, until: str | None = None
+) -> dict[str, Any]:
+    """Detections per hour in [since, until), for the fleet's Detections page.
+
+    Each hour: all, attributed (decoded by rtl_433), tried (attribution ran,
+    nothing decoded), not tried, and a count per model. Stored hours come from
+    detection_hours; the last ones, not yet stored, are counted live. Hours
+    before ``covered_since`` (when the sensor started counting) are absent.
+    """
+    from rfobserver.storage.database import DET_HOURS_DONE_KEY, DET_HOURS_SINCE_KEY
+
+    db = _get_db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    try:
+        since_dt = _opt_utc_dt(since)
+        until_dt = _opt_utc_dt(until)
+    except InvalidTimeFilterError as exc:
+        raise HTTPException(status_code=400, detail="Invalid since/until time") from exc
+    if since_dt is None or until_dt is None:
+        raise HTTPException(status_code=400, detail="since and until are required")
+    lo = int(since_dt.timestamp()) // 3600 * 3600
+    hi = -(-int(until_dt.timestamp()) // 3600) * 3600  # end of until's hour
+    covered_raw = await db.get_config(DET_HOURS_SINCE_KEY)
+    done_raw = await db.get_config(DET_HOURS_DONE_KEY)
+    out: dict[str, Any] = {
+        "bucket_sec": 3600,
+        "covered_since": int(covered_raw) if covered_raw else None,
+        "finalized_until": int(done_raw) if done_raw else None,
+        "hours": [],
+    }
+    if covered_raw is None or done_raw is None:
+        return out
+    covered, done = int(covered_raw), int(done_raw)
+    lo = max(lo, covered)
+    rows: list[tuple[int, str, int, int]] = []
+    if lo < min(hi, done):
+        rows += await db.detection_hours(lo, min(hi, done))
+    live_lo = max(lo, done, hi - _HOURLY_LIVE_MAX_HOURS * 3600)
+    if live_lo < hi:
+        rows += await db.count_detections_by_hour(live_lo, hi)
+
+    hours: dict[int, dict[str, Any]] = {}
+    for hour, model, tried, count in rows:
+        h = hours.setdefault(
+            hour, {"t": hour, "all": 0, "attributed": 0, "tried": 0, "not_tried": 0, "models": {}}
+        )
+        h["all"] += count
+        if model:
+            h["attributed"] += count
+            h["models"][model] = h["models"].get(model, 0) + count
+        elif tried:
+            h["tried"] += count
+        else:
+            h["not_tried"] += count
+    out["hours"] = [hours[k] for k in sorted(hours)]
+    return out
 
 
 @router.get("/detections/histogram", response_class=HTMLResponse)

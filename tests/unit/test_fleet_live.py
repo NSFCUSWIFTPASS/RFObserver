@@ -115,6 +115,15 @@ def test_compact_frame_drops_arrays_and_applies_calibration() -> None:
     assert compact_frame("a", json.loads(psd(-50.0)))["unit"] == "dBFS"
 
 
+def test_compact_frame_time_is_the_capture_time() -> None:
+    # chunk_time_ms is the publish time or stored window start; capture time wins.
+    avg = compact_frame("a", json.loads(psd(-50.0, t=2000.0, capture_time_ms=1500.0, dur_ms=999.0)))
+    assert (avg["t"], avg["dur_ms"]) == (1500.0, 999.0)
+    # Sensors that predate capture times: chunk_time_ms stands in.
+    hr = compact_frame("a", json.loads(psd(-50.0, t=2000.0)))
+    assert (hr["t"], hr["dur_ms"]) == (2000.0, None)
+
+
 def test_live_url() -> None:
     assert live_url(Sensor("a", "10.0.0.1")) == "ws://10.0.0.1/ws/live"
     assert live_url(Sensor("a", "10.0.0.1", 8888)) == "ws://10.0.0.1:8888/ws/live"
@@ -366,3 +375,27 @@ def test_fleet_live_socket_and_page(tmp_path: Path) -> None:
             ws.send_text("not json")  # ignored
             while not app.state.live.wants_high_res():
                 seen.append(ws.receive_json())
+
+
+async def test_frames_are_encoded_once_for_every_browser(tmp_path: Path) -> None:
+    fake = FakeSensors()
+    reg, hub = make_hub(tmp_path, fake)
+    a = reg.add("a", "10.0.0.1", 80, source="manual")
+    fake.plan[live_url(a)] = [psd(-50.0)]
+    try:
+        v1, v2 = hub.join(), hub.join()
+        for _ in range(100):
+            if hub._feeds["a"].frame is not None:
+                break
+            await asyncio.sleep(0.01)
+        frame = hub._feeds["a"].frame
+        assert frame is not None
+        first1, first2 = hub.encode(v1, frame), hub.encode(v2, frame)
+        assert first1 is first2  # the same text object, encoded once
+        assert json.loads(first1)["frequencies"] == FREQS
+        again1, again2 = hub.encode(v1, frame), hub.encode(v2, frame)
+        assert again1 is again2 and "frequencies" not in json.loads(again1)
+        # Messages that are not the current frame are encoded as shaped.
+        assert json.loads(hub.encode(v1, {"type": "tick", "t": 1.0})) == {"type": "tick", "t": 1.0}
+    finally:
+        await hub.close()

@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from rfobserver.capture.buffer import CircularBuffer, GridPreBuffer, trim_grid_rows
+from rfobserver.capture.clock import CaptureClock
 from rfobserver.processing import psd_cuda
 from rfobserver.processing.burst import BurstDetectionConfig
 from rfobserver.processing.iq_utils import (
@@ -241,6 +242,7 @@ class _StreamResult:
         "capture_num",
         "process_ms",
         "latency_ms",
+        "capture_time",
     )
 
     def __init__(
@@ -254,8 +256,11 @@ class _StreamResult:
         process_ms: float,
         latency_ms: float,
         iq_moments: IQMoments,
+        capture_time: float | None = None,
     ) -> None:
         self.summary_psd = summary_psd
+        # Host-clock time (epoch s) of the chunk's first sample (capture/clock.py).
+        self.capture_time = capture_time
         self.iq_stats = iq_stats
         self.iq_moments = iq_moments
         self.bursts = bursts
@@ -280,6 +285,7 @@ class _ChunkResult:
         "chunk_start",
         "process_ms",
         "sc16_buf",
+        "capture_time",
     )
 
     def __init__(
@@ -294,7 +300,9 @@ class _ChunkResult:
         process_ms: float,
         sc16_buf: np.ndarray[Any, np.dtype[Any]],
         iq_moments: IQMoments,
+        capture_time: float | None = None,
     ) -> None:
+        self.capture_time = capture_time
         self.psd_grid = psd_grid
         self.iq_stats = iq_stats
         self.iq_moments = iq_moments
@@ -607,6 +615,10 @@ class StreamingProcessor:
 
         # Compute chunk sizing from current settings
         self._recompute_chunk_params()
+
+        # Each chunk's capture time on the host clock, from the device time
+        # of its first sample (capture/clock.py). Receiver thread only.
+        self._capture_clock = CaptureClock()
 
         # Inter-thread queues (these survive reconfiguration)
         self._chunk_queue: queue.Queue[Any] = queue.Queue(maxsize=4)
@@ -1519,6 +1531,12 @@ class StreamingProcessor:
                         recv_time = time.monotonic()
                         n = self._receiver.recv_chunk(buf)
                         t_recv_done = time.monotonic()
+                        capture_time = self._capture_clock.chunk_start(
+                            getattr(self._receiver, "last_device_time", None),
+                            n,
+                            float(s.BANDWIDTH),
+                            time.time(),
+                        )
 
                         if n < len(buf):
                             logger.warning("recv_chunk short: %d/%d samples", n, len(buf))
@@ -1560,7 +1578,9 @@ class StreamingProcessor:
                         # a full queue.
                         if self._drop_on_overflow:
                             try:
-                                self._chunk_queue.put_nowait((buf, recv_time, chunk_start))
+                                self._chunk_queue.put_nowait(
+                                    (buf, recv_time, chunk_start, capture_time)
+                                )
                             except queue.Full:
                                 self._dropped_chunks += 1
                                 with contextlib.suppress(queue.Full):
@@ -1569,7 +1589,7 @@ class StreamingProcessor:
                             while self._running:
                                 try:
                                     self._chunk_queue.put(
-                                        (buf, recv_time, chunk_start), timeout=0.1
+                                        (buf, recv_time, chunk_start, capture_time), timeout=0.1
                                     )
                                     break
                                 except queue.Full:
@@ -2730,7 +2750,7 @@ class StreamingProcessor:
                 if item is _STOP:
                     break
 
-                sc16_buf, recv_time, chunk_start = item
+                sc16_buf, recv_time, chunk_start, capture_time = item
                 capture_num += 1
 
                 # Too many in flight: drop (live) or, in lossless mode, block on
@@ -2755,6 +2775,7 @@ class StreamingProcessor:
                     capture_num,
                     center_freq,
                     grid_config,
+                    capture_time,
                 )
                 pending_futures.append(future)
 
@@ -2787,6 +2808,7 @@ class StreamingProcessor:
         capture_num: int,
         center_freq: int,
         grid_config: PSDGridConfig,
+        capture_time: float | None = None,
     ) -> _ChunkResult:
         """Pure processing function run on a worker thread."""
         t0 = time.monotonic()
@@ -2834,6 +2856,7 @@ class StreamingProcessor:
             process_ms=process_ms,
             sc16_buf=sc16_buf,
             iq_moments=iq_moments,
+            capture_time=capture_time,
         )
 
     def _handle_chunk_result(self, cr: _ChunkResult) -> None:
@@ -2944,6 +2967,7 @@ class StreamingProcessor:
             process_ms=cr.process_ms,
             latency_ms=latency_ms,
             iq_moments=cr.iq_moments,
+            capture_time=cr.capture_time,
         )
 
         if self._loop is not None:
@@ -3137,6 +3161,13 @@ class StreamingProcessor:
         # the next window's data (see _AvgWindowClock).
         window_clock = _AvgWindowClock(max(0.2, 4.0 * self._chunk_duration))
         last_result: _StreamResult | None = None
+        # Capture time of the window's first chunk (see _broadcast_averaged).
+        first_capture: float | None = None
+
+        def capture_span(last: _StreamResult) -> tuple[float, float] | None:
+            if first_capture is None or last.capture_time is None:
+                return None
+            return first_capture, last.capture_time + self._chunk_duration
 
         async def flush_pending() -> None:
             """Emit the pending partial window, ending at its last result."""
@@ -3150,7 +3181,9 @@ class StreamingProcessor:
             assert accum_moments is not None
             interval_stats = finalize_moments(accum_moments)
             win_start, win_dur = window_clock.close(at_last_result=True)
-            await self._broadcast_averaged(avg, last_result, len(accum_powers), win_start)
+            await self._broadcast_averaged(
+                avg, last_result, len(accum_powers), win_start, capture_span(last_result)
+            )
             await self._publish_processed(
                 avg, last_result, interval_stats, start_time=win_start, duration_sec=win_dur
             )
@@ -3198,6 +3231,8 @@ class StreamingProcessor:
                 # DURATION_SEC, so dropping would lose every window.
                 await flush_pending()
             window_clock.mark_result(waited)
+            if not accum_powers:
+                first_capture = result.capture_time
             accum_powers.append(new_powers)
             accum_moments = (
                 result.iq_moments if accum_moments is None else accum_moments.add(result.iq_moments)
@@ -3222,7 +3257,9 @@ class StreamingProcessor:
 
                 # Normal-mode UI broadcast (only if no high-res subscribers)
                 if self._broadcast is not None and not self._broadcast.has_high_res_subscribers():
-                    await self._broadcast_averaged(avg, result, len(accum_powers), win_start)
+                    await self._broadcast_averaged(
+                        avg, result, len(accum_powers), win_start, capture_span(result)
+                    )
 
                 # ZMS always gets DURATION_SEC-averaged data
                 await self._publish_processed(
@@ -3268,7 +3305,15 @@ class StreamingProcessor:
                         "cal_offset_db": self._settings.CAL_OFFSET_DB,
                         "scale_min_db": self._settings.PSD_SCALE_MIN_DB,
                         "scale_max_db": self._settings.PSD_SCALE_MAX_DB,
+                        # Publish time: the time base this page's burst
+                        # rectangles (and the stored detections) share.
                         "chunk_time_ms": datetime.now(timezone.utc).timestamp() * 1000.0,
+                        # When the chunk's first sample was captured (host
+                        # clock), so the fleet can line sensors up in time.
+                        "capture_time_ms": None
+                        if result.capture_time is None
+                        else result.capture_time * 1000.0,
+                        "dur_ms": self._chunk_duration * 1000.0,
                     }
                 )
 
@@ -3278,9 +3323,15 @@ class StreamingProcessor:
         result: _StreamResult,
         chunk_count: int,
         window_start: datetime,
+        capture_span: tuple[float, float] | None = None,
     ) -> None:
         """Broadcast a DURATION_SEC-averaged PSD to the UI, stamped with the
         window's start (``chunk_time_ms``), the same time its stored row has.
+
+        ``capture_span`` is (first sample, last sample) of the averaged chunks
+        on the host clock, sent as ``capture_time_ms`` and ``dur_ms``: the
+        stored start is when the first result arrived, a processing delay
+        later, so pages that line sensors up in time use the capture span.
 
         Burst rectangles are intentionally omitted from the averaged broadcast:
         bursts are detected at PSD-grid resolution (~0.5 ms rows) but each
@@ -3320,6 +3371,10 @@ class StreamingProcessor:
                 "scale_min_db": self._settings.PSD_SCALE_MIN_DB,
                 "scale_max_db": self._settings.PSD_SCALE_MAX_DB,
                 "chunk_time_ms": window_start.timestamp() * 1000.0,
+                "capture_time_ms": None if capture_span is None else capture_span[0] * 1000.0,
+                "dur_ms": None
+                if capture_span is None
+                else (capture_span[1] - capture_span[0]) * 1000.0,
             }
         )
 

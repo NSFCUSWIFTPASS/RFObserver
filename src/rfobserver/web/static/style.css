@@ -2387,8 +2387,25 @@ body {
 }
 
 .fleet-live-conn {
-    margin-left: auto;
     font-weight: 400;
+}
+
+.fleet-live-foot {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+}
+
+.fleet-live-status {
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.fleet-live-delay:not(:empty)::before {
+    content: ", ";
 }
 
 .fleet-live-conn.ok {
@@ -2900,5 +2917,10 @@ body {
     height: 1px;
     overflow: hidden;
     clip: rect(0 0 0 0);
+    white-space: nowrap;
+}
+
+.fleet-live-power .card-header .toggle-label {
+    margin-left: auto;
     white-space: nowrap;
 }

@@ -14,6 +14,13 @@ same request the sensor's own Live page makes by default.
 
 The frequency axis is sent to a browser only when it changes for that
 sensor, as the sensor itself does, so the hub remembers each sensor's axis.
+
+A frame's ``t`` is when its first sample was captured, on the sensor's NTP
+clock, and ``dur_ms`` the span it covers, so the page can draw every sensor
+on one timeline. Each frame is encoded once, not once per browser: a frame is
+about 15 KB of JSON at 2048 bins and arrives some 27 times a second per
+sensor in High Res, and every browser gets the same bytes (one of two
+copies, with or without the frequency axis).
 """
 
 from __future__ import annotations
@@ -73,8 +80,19 @@ def live_url(sensor: Sensor) -> str:
     return sensor.base_url.replace("http://", "ws://", 1) + "/ws/live"
 
 
+def _dumps(msg: dict[str, Any]) -> str:
+    # As Starlette's send_json encodes.
+    return json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
+
+
 def compact_frame(sensor_id: str, data: dict[str, Any]) -> dict[str, Any]:
-    """The browser's copy of a sensor ``psd`` frame (calibration applied)."""
+    """The browser's copy of a sensor ``psd`` frame (calibration applied).
+
+    ``t`` is the capture time, ``capture_time_ms``. A sensor's own
+    ``chunk_time_ms`` is a processing delay later (the publish time, or the
+    stored window start), the time base its own page and database share;
+    it stands in for sensors that predate capture times.
+    """
     powers = data.get("powers") or []
     cal = data.get("cal_offset_db")
     calibrated = isinstance(cal, (int, float))
@@ -83,7 +101,8 @@ def compact_frame(sensor_id: str, data: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "psd",
         "id": sensor_id,
-        "t": data.get("chunk_time_ms"),
+        "t": data.get("capture_time_ms") or data.get("chunk_time_ms"),
+        "dur_ms": data.get("dur_ms"),
         "powers": powers,
         "unit": "dBm/Hz" if calibrated else "dBFS",
         "avg_power_db": data.get("avg_power_db"),
@@ -113,8 +132,10 @@ class _Feed:
     recording: str | None = None
     error: str | None = None
     published_status: dict[str, Any] | None = None
-    # (chunk_time_ms, avg_power_db) of recent frames, oldest first.
+    # (t, avg_power_db) of recent frames, oldest first.
     power: collections.deque[tuple[float, float]] = field(default_factory=collections.deque)
+    # ``frame`` encoded, keyed by whether it carries the frequency axis.
+    encoded: dict[bool, str] = field(default_factory=dict)
 
     def add_power(self, t_ms: Any, value: Any) -> None:
         if not isinstance(t_ms, (int, float)) or not isinstance(value, (int, float)):
@@ -258,19 +279,39 @@ class LiveHub:
             feed.high_res = not on  # retried on the next change or reconnect
             logger.debug("Fleet live: set_mode to %s failed", feed.sensor_id, exc_info=True)
 
-    def shape(self, viewer: _Viewer, msg: dict[str, Any]) -> dict[str, Any]:
-        """Add the frequency axis to a frame if this browser lacks it."""
+    def _axis_for(self, viewer: _Viewer, msg: dict[str, Any]) -> list[float] | None:
+        """The frequency axis if this browser lacks it for the frame's sensor
+        (and note that it now has it), else None."""
         if msg.get("type") != "psd":
-            return msg
+            return None
         feed = self._feeds.get(msg["id"])
         freqs = feed.frequencies if feed is not None else None
         if not freqs:
-            return msg
+            return None
         sig = (len(freqs), float(freqs[0]), float(freqs[-1]))
         if viewer.freq_sig.get(msg["id"]) == sig:
-            return msg
+            return None
         viewer.freq_sig[msg["id"]] = sig
-        return {**msg, "frequencies": freqs}
+        return freqs
+
+    def shape(self, viewer: _Viewer, msg: dict[str, Any]) -> dict[str, Any]:
+        """Add the frequency axis to a frame if this browser lacks it."""
+        freqs = self._axis_for(viewer, msg)
+        return msg if freqs is None else {**msg, "frequencies": freqs}
+
+    def encode(self, viewer: _Viewer, msg: dict[str, Any]) -> str:
+        """``shape`` as JSON text. A sensor's current frame is encoded once
+        and the text shared by every browser."""
+        feed = self._feeds.get(msg.get("id", "")) if msg.get("type") == "psd" else None
+        if feed is None or feed.frame is not msg:
+            return _dumps(self.shape(viewer, msg))
+        freqs = self._axis_for(viewer, msg)
+        with_axis = freqs is not None
+        text = feed.encoded.get(with_axis)
+        if text is None:
+            text = _dumps({**msg, "frequencies": freqs} if with_axis else msg)
+            feed.encoded[with_axis] = text
+        return text
 
     def _publish(self, key: tuple[str, str], msg: dict[str, Any]) -> None:
         for viewer in list(self._viewers):
@@ -345,7 +386,8 @@ class LiveHub:
             if isinstance(freqs, list) and freqs:
                 feed.frequencies = freqs
             feed.frame = compact_frame(feed.sensor_id, data)
-            feed.add_power(data.get("chunk_time_ms"), data.get("avg_power_db"))
+            feed.encoded = {}
+            feed.add_power(feed.frame["t"], data.get("avg_power_db"))
             was_standby = now - feed.last_psd >= PSD_STALE_SEC
             feed.last_psd, feed.last_seen = now, time.time()
             self._publish((feed.sensor_id, "psd"), feed.frame)

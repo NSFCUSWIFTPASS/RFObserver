@@ -9,6 +9,16 @@
  * (live / standby / reconnecting / offline), "psd" (the newest frame) and a
  * "tick" every second. A frame carries "frequencies" only when that sensor's
  * axis changed, so each tile keeps the last axis it got.
+ *
+ * Every tile draws on one timeline. A frame's "t" is when its first sample
+ * was captured (the sensor's NTP clock) and "dur_ms" the span it covers.
+ * Frames wait in a per-tile queue, and one row clock, a short delay behind
+ * the fleet's clock, scrolls every waterfall together: each new row is the
+ * same time slot in every tile, filled with the frame that covers it. So an
+ * emission two sensors hear at once lands on the same row in both, and the
+ * spectra above show the same moment. The delay is measured, not fixed: the
+ * slowest sensor's recent capture-to-arrival time plus a margin, so a frame
+ * is in hand before its slot is drawn.
  */
 (function () {
     "use strict";
@@ -20,6 +30,14 @@
     const HIDDEN_KEY = "rfobs.fleet.live.hidden";
     const HIGHRES_KEY = "rfobs.fleet.live.highres";
     const BG = "#1a1a2e";
+    // Timeline (see the header). High Res rows are ROW_MS_HIGHRES apart;
+    // averaged rows one window each.
+    const ROW_MS_HIGHRES = 40;
+    const DELAY_MARGIN_MS = 80;
+    const DELAY_MIN_MS = 150;
+    const DELAY_MAX_MS = 10000;
+    const LATE_WINDOW_MS = 10000; // lateness samples kept per sensor
+    const OFFSET_SAMPLES = 30; // fleet clock samples (one per tick)
 
     const grid = document.getElementById("fleet-live-grid");
     const empty = document.getElementById("fleet-live-empty");
@@ -28,6 +46,7 @@
     const tip = document.getElementById("fleet-live-tip");
     const legend = document.getElementById("fleet-live-legend");
     const highResBox = document.getElementById("fleet-live-highres");
+    const delayText = document.getElementById("fleet-live-delay");
 
     const tiles = new Map(); // id -> tile
     const series = new Map(); // id -> [[t_ms, power_db], ...] window averages
@@ -37,6 +56,22 @@
     let hidden = loadHidden();
     let powerDirty = true;
     let hoverX = null;
+
+    // The fleet's clock minus this browser's (ms), from its ticks: the
+    // largest recent (tick time - arrival time), the one that waited least.
+    const offsets = [];
+    let serverOffset = 0;
+    function serverNow() { return Date.now() + serverOffset; }
+    function onTick(msg) {
+        if (typeof msg.t !== "number") return;
+        offsets.push(msg.t * 1000 - Date.now());
+        if (offsets.length > OFFSET_SAMPLES) offsets.shift();
+        serverOffset = Math.max.apply(null, offsets);
+    }
+
+    let delayMs = 500;
+    let rowMs = ROW_MS_HIGHRES;
+    let lastRow = null; // index (displayed time / rowMs) of the newest drawn row
 
     function loadHidden() {
         try {
@@ -89,7 +124,10 @@
             freqs: [],
             lo: null,
             hi: null,
-            last: null,
+            last: null, // the frame the spectrum shows
+            queue: [], // frames by t, waiting for (or holding) their slot
+            late: [], // [arrival, capture-to-arrival ms]
+            spacing: null, // ms between frames, for sensors without dur_ms
         };
         new ResizeObserver(function () { sizeTile(tile); }).observe(tile.psd);
         updateTile(tile, s);
@@ -180,31 +218,171 @@
             tile.freqs, tile.lo, tile.hi, -1, null, msg.unit, tile.colour);
     }
 
-    function addWaterfallRow(tile, msg) {
-        const W = tile.wf.width;
-        const H = tile.wf.height;
-        if (W < 2 || H < 2) return;
-        const ctx = tile.wf.getContext("2d");
-        ctx.drawImage(tile.wf, 0, 0, W, H - 1, 0, 1, W, H - 1);
-        const row = ctx.createImageData(W, 1);
-        renderWaterfallRow(row, W, 0, msg.powers, tile.lo, tile.hi);
-        ctx.putImageData(row, 0, 0);
+    function frameDur(tile, f) {
+        return typeof f.dur_ms === "number" && f.dur_ms > 0 ? f.dur_ms : (tile.spacing || rowMs);
+    }
+
+    function fmtUTC(ms, withMs) {
+        const iso = new Date(ms).toISOString();
+        return withMs ? iso.slice(11, 23) : iso.slice(11, 19);
     }
 
     function onPsd(msg) {
         const tile = tiles.get(msg.id);
         if (!tile || !Array.isArray(msg.powers) || !msg.powers.length) return;
         if (Array.isArray(msg.frequencies)) tile.freqs = msg.frequencies;
+        if (typeof msg.t !== "number") return;
+        const now = serverNow();
+        const q = tile.queue;
+        const prev = q.length ? q[q.length - 1] : null;
+        if (prev && msg.t <= prev.t) return; // a repeat, or out of order
+        if (prev && msg.t - prev.t < 5000) {
+            const gap = msg.t - prev.t;
+            tile.spacing = tile.spacing == null ? gap : tile.spacing + 0.1 * (gap - tile.spacing);
+        }
         updateRange(tile, msg);
-        tile.last = msg;
-        drawSpectrum(tile, msg);
-        addWaterfallRow(tile, msg);
-        const parts = [fmtMHz(msg.center_freq_hz)];
-        if (typeof msg.avg_power_db === "number") parts.push("power " + msg.avg_power_db.toFixed(1) + " dB");
-        if (typeof msg.kurtosis === "number") parts.push("kurtosis " + msg.kurtosis.toFixed(2));
-        if (msg.t) parts.push(new Date(msg.t).toLocaleTimeString());
+        q.push(msg);
+        // A tile not being drawn (zero size) never takes frames: bound it.
+        while (q.length > 1 && (q.length > 2000 || q[1].t < now - DELAY_MAX_MS - 5000)) q.shift();
+        tile.late.push([now, now - msg.t]);
+        while (tile.late.length && tile.late[0][0] < now - LATE_WINDOW_MS) tile.late.shift();
+        if (typeof msg.avg_power_db === "number") addLivePoint(msg.id, msg.t, msg.avg_power_db);
+    }
+
+    // The delay that has every sensor's frame in hand before its slot: the
+    // slowest sensor's 95th-percentile capture-to-arrival time plus a margin.
+    // Rises at once, falls slowly, so it does not hunt.
+    let delayCheckedAt = 0;
+    function updateDelay() {
+        const at = performance.now();
+        if (at - delayCheckedAt < 250) return;
+        delayCheckedAt = at;
+        let need = 0;
+        for (const tile of tiles.values()) {
+            if (!tile.late.length) continue;
+            const v = tile.late.map(function (x) { return x[1]; }).sort(function (a, b) { return a - b; });
+            need = Math.max(need, v[Math.min(v.length - 1, Math.floor(v.length * 0.95))]);
+        }
+        if (!need) return;
+        const target = Math.min(DELAY_MAX_MS, Math.max(DELAY_MIN_MS, need + DELAY_MARGIN_MS));
+        delayMs = target > delayMs ? target : delayMs + 0.05 * (target - delayMs);
+    }
+
+    // Averaged rows are one window: the longest a shown sensor sends, from
+    // its smoothed frame spacing (each window's own span varies a little).
+    // Kept until it is off by a quarter, so the waterfall is not cleared for
+    // jitter.
+    function currentRowMs() {
+        if (highResBox.checked) return ROW_MS_HIGHRES;
+        let ms = 0;
+        for (const tile of tiles.values()) {
+            const f = tile.queue[tile.queue.length - 1];
+            if (f) ms = Math.max(ms, tile.spacing || frameDur(tile, f));
+        }
+        if (ms < 100) return rowMs === ROW_MS_HIGHRES ? 1000 : rowMs;
+        if (rowMs !== ROW_MS_HIGHRES && Math.abs(ms - rowMs) < 0.25 * rowMs) return rowMs;
+        return Math.round(ms / 50) * 50;
+    }
+
+    // The frame that covers [start, end): the latest one starting before the
+    // end, held for up to twice the sensor's frame spacing (a dropped chunk
+    // or two is held over, not shown as a gap). Older frames are dropped
+    // from the queue.
+    function frameFor(tile, start, end) {
+        const q = tile.queue;
+        let i = -1;
+        for (let k = 0; k < q.length && q[k].t < end; k++) i = k;
+        if (i < 0) return null;
+        if (i > 0) q.splice(0, i);
+        const f = q[0];
+        const hold = 2 * Math.max(frameDur(tile, f), tile.spacing || 0, rowMs);
+        return f.t + hold > start ? f : null;
+    }
+
+    function labelEvery() {
+        return rowMs <= 100 ? 2000 : rowMs <= 1000 ? 30000 : 120000;
+    }
+
+    // Shift every waterfall down by the rows that have come due and paint
+    // them, oldest first, each the same time slot in every tile.
+    function advanceTimeline() {
+        const ms = currentRowMs();
+        if (ms !== rowMs) {
+            // A new time scale: old rows would read wrong against it.
+            rowMs = ms;
+            lastRow = null;
+            for (const tile of tiles.values()) {
+                const ctx = tile.wf.getContext("2d");
+                ctx.fillStyle = BG;
+                ctx.fillRect(0, 0, tile.wf.width, tile.wf.height);
+            }
+        }
+        updateDelay();
+        const shown = serverNow() - delayMs;
+        const row = Math.floor(shown / rowMs);
+        if (lastRow == null) lastRow = row - 1;
+        let steps = row - lastRow;
+        if (steps <= 0) return;
+        let maxH = 0;
+        for (const tile of tiles.values()) maxH = Math.max(maxH, tile.wf.height);
+        if (steps > maxH) { lastRow = row - maxH; steps = maxH; }
+        const every = labelEvery();
+        for (const tile of tiles.values()) {
+            const W = tile.wf.width, H = tile.wf.height;
+            if (W < 2 || H < 2) continue;
+            const ctx = tile.wf.getContext("2d");
+            const n = Math.min(steps, H);
+            ctx.drawImage(tile.wf, 0, 0, W, H - n, 0, n, W, H - n);
+            const img = ctx.createImageData(W, n);
+            let newest = null;
+            for (let k = 0; k < n; k++) {
+                const r = lastRow + 1 + (steps - n) + k;
+                const f = frameFor(tile, r * rowMs, (r + 1) * rowMs);
+                const y = n - 1 - k; // newest at the top
+                if (f) {
+                    renderWaterfallRow(img, W, y, f.powers, tile.lo, tile.hi);
+                    newest = f;
+                } else {
+                    paintGap(img, W, y);
+                }
+            }
+            ctx.putImageData(img, 0, 0);
+            // Time marks, drawn with their row so they scroll with it.
+            ctx.font = "10px -apple-system, sans-serif";
+            ctx.textBaseline = "top";
+            for (let k = 0; k < n; k++) {
+                const r = lastRow + 1 + (steps - n) + k;
+                const t0 = r * rowMs;
+                if (Math.floor(t0 / every) === Math.floor((t0 - rowMs) / every)) continue;
+                const y = n - 1 - k;
+                ctx.fillStyle = "rgba(255,255,255,0.55)";
+                ctx.fillRect(0, y, 6, 1);
+                ctx.fillText(fmtUTC(Math.ceil(t0 / every) * every, false), 8, y);
+            }
+            if (newest !== tile.last) {
+                tile.last = newest;
+                if (newest) showFrame(tile, newest);
+            }
+        }
+        lastRow = row;
+        const behind = (delayMs / 1000).toFixed(1) + " s behind";
+        if (delayText.textContent !== behind) delayText.textContent = behind;
+    }
+
+    function paintGap(img, W, y) {
+        const d = img.data;
+        for (let x = 0, o = y * W * 4; x < W; x++, o += 4) {
+            d[o] = 0x1a; d[o + 1] = 0x1a; d[o + 2] = 0x2e; d[o + 3] = 255;
+        }
+    }
+
+    function showFrame(tile, f) {
+        drawSpectrum(tile, f);
+        const parts = [fmtMHz(f.center_freq_hz)];
+        if (typeof f.avg_power_db === "number") parts.push("power " + f.avg_power_db.toFixed(1) + " dB");
+        if (typeof f.kurtosis === "number") parts.push("kurtosis " + f.kurtosis.toFixed(2));
+        parts.push(fmtUTC(f.t, true) + " UTC");
         tile.info.textContent = parts.join("   ");
-        if (typeof msg.avg_power_db === "number" && msg.t) addLivePoint(msg.id, msg.t, msg.avg_power_db);
     }
 
     function addLivePoint(id, t, v) {
@@ -300,13 +478,13 @@
             return {
                 data: livePower, windowMs: LIVE_WINDOW_MS, gapMs: 2000, nearMs: 1000,
                 ticks: [[45000, "-45 s"], [30000, "-30 s"], [15000, "-15 s"]],
-                title: "Power, last minute (per chunk)",
+                title: "Power, last minute",
             };
         }
         return {
             data: series, windowMs: POWER_WINDOW_MS, gapMs: 10000, nearMs: 15000,
             ticks: [[240000, "-4 min"], [180000, "-3 min"], [120000, "-2 min"], [60000, "-1 min"]],
-            title: "Power, last 5 minutes (window averages)",
+            title: "Power, last 5 minutes",
         };
     }
 
@@ -327,7 +505,8 @@
         ctx.fillRect(0, 0, W, H);
         const mode = plotMode();
         if (powerTitle.textContent !== mode.title) powerTitle.textContent = mode.title;
-        const t1 = Date.now();
+        // In High Res the plot ends where the waterfalls do.
+        const t1 = highResBox.checked ? serverNow() - delayMs : serverNow();
         const t0 = t1 - mode.windowMs;
         const vis = visibleSeries(mode.data);
         let lo = Infinity, hi = -Infinity;
@@ -436,6 +615,7 @@
     // The plot scrolls with time, so redraw at least once a second.
     let lastPowerDraw = 0;
     function frame(now) {
+        advanceTimeline();
         if (powerDirty || now - lastPowerDraw > 1000) {
             powerDirty = false;
             lastPowerDraw = now;
@@ -481,6 +661,7 @@
             const msg = JSON.parse(evt.data);
             if (msg.type === "psd") onPsd(msg);
             else if (msg.type === "power_history") onPowerHistory(msg);
+            else if (msg.type === "tick") onTick(msg);
             else if (msg.type === "status") {
                 const tile = tiles.get(msg.id);
                 if (tile) setState(tile, msg);

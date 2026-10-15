@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import json
 import logging
@@ -29,6 +30,11 @@ NOISE_FLOOR_RESEND_SEC = 1.0
 # as are dropped frames (a full per-client queue).
 SLOW_SEND_SEC = 1.0
 LOG_EVERY_SEC = 10.0
+
+# Recent frames whose encodings are kept: a frame waits in up to 10 client
+# queues, so this covers every frame still queued in normal operation (an
+# older one is simply encoded again).
+ENCODE_CACHE_FRAMES = 32
 
 
 class _Subscriber:
@@ -62,8 +68,8 @@ class _Subscriber:
         self.last_drop_log = 0.0
 
 
-def shape_for_client(sub: _Subscriber, data: dict[str, Any], now: float) -> dict[str, Any]:
-    """Drop the parts of a psd frame this client already has.
+def _client_drops(sub: _Subscriber, data: dict[str, Any], now: float) -> tuple[str, ...]:
+    """The keys of a psd frame this client already has.
 
     ``frequencies`` is sent only when the axis changes (retune, bin count),
     and ``noise_floor_per_bin`` at most every NOISE_FLOOR_RESEND_SEC. The
@@ -71,23 +77,59 @@ def shape_for_client(sub: _Subscriber, data: dict[str, Any], now: float) -> dict
     so a frame dropped on a full queue never takes the only copy with it.
     """
     if data.get("type") != "psd":
-        return data
-    msg = data
+        return ()
+    drops: list[str] = []
     freqs = data.get("frequencies")
     if isinstance(freqs, list) and freqs:
         sig = (len(freqs), float(freqs[0]), float(freqs[-1]))
         if sig == sub.freq_sig:
-            msg = {k: v for k, v in msg.items() if k != "frequencies"}
+            drops.append("frequencies")
         else:
             sub.freq_sig = sig
     nf = data.get("noise_floor_per_bin")
     if isinstance(nf, list):
         if len(nf) == sub.nf_bins and now - sub.nf_sent_at < NOISE_FLOOR_RESEND_SEC:
-            msg = {k: v for k, v in msg.items() if k != "noise_floor_per_bin"}
+            drops.append("noise_floor_per_bin")
         else:
             sub.nf_bins = len(nf)
             sub.nf_sent_at = now
-    return msg
+    return tuple(drops)
+
+
+def shape_for_client(sub: _Subscriber, data: dict[str, Any], now: float) -> dict[str, Any]:
+    """The frame without the parts this client already has (_client_drops)."""
+    drops = _client_drops(sub, data, now)
+    if not drops:
+        return data
+    return {k: v for k, v in data.items() if k not in drops}
+
+
+class _EncodeCache:
+    """JSON text of recent frames, per variant (the keys left out), so a frame
+    sent to many clients is encoded once per variant, not once per client."""
+
+    def __init__(self, size: int = ENCODE_CACHE_FRAMES) -> None:
+        self._size = size
+        # id(frame) -> (frame, {drops: text}); the frame is held so its id
+        # cannot be reused while the entry exists.
+        self._items: collections.OrderedDict[
+            int, tuple[dict[str, Any], dict[tuple[str, ...], str]]
+        ] = collections.OrderedDict()
+
+    def encode(self, data: dict[str, Any], drops: tuple[str, ...]) -> str:
+        entry = self._items.get(id(data))
+        if entry is None or entry[0] is not data:
+            entry = (data, {})
+            self._items[id(data)] = entry
+            while len(self._items) > self._size:
+                self._items.popitem(last=False)
+        text = entry[1].get(drops)
+        if text is None:
+            msg = {k: v for k, v in data.items() if k not in drops} if drops else data
+            # As Starlette's send_json encodes.
+            text = json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
+            entry[1][drops] = text
+        return text
 
 
 def _round_db(values: Any) -> Any:
@@ -102,6 +144,14 @@ class LiveBroadcast:
 
     def __init__(self) -> None:
         self._subscribers: set[_Subscriber] = set()
+        self._encoded = _EncodeCache()
+
+    def encode_for(self, sub: _Subscriber, data: dict[str, Any], now: float) -> str:
+        """``shape_for_client`` as JSON text, shared by every client that
+        gets the same variant of the same frame."""
+        if data.get("type") != "psd":
+            return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+        return self._encoded.encode(data, _client_drops(sub, data, now))
 
     def subscribe(self) -> _Subscriber:
         sub = _Subscriber()
@@ -122,12 +172,15 @@ class LiveBroadcast:
             # Once per frame, shared by every subscriber.
             data = {**data, **{k: _round_db(data[k]) for k in _DB_ARRAYS if k in data}}
 
+        # One copy with the grid rows for every high-res client, so it too is
+        # encoded once.
+        with_rows = None if grid_rows is None else {**data, "grid_rows": grid_rows}
         for sub in list(self._subscribers):
             if is_psd and not sub.wants_psd:
                 continue
             msg = data
-            if sub.high_res and grid_rows is not None:
-                msg = {**data, "grid_rows": grid_rows}
+            if sub.high_res and with_rows is not None:
+                msg = with_rows
             try:
                 sub.queue.put_nowait(msg)
             except asyncio.QueueFull:
@@ -151,7 +204,7 @@ async def websocket_endpoint(websocket: WebSocket, broadcast: LiveBroadcast) -> 
             data = await sub.queue.get()
             t0 = time.monotonic()
             try:
-                await websocket.send_json(shape_for_client(sub, data, t0))
+                await websocket.send_text(broadcast.encode_for(sub, data, t0))
             except RuntimeError:
                 # The client closed the socket (the Live watchdog abandons a
                 # silent one) and the server already answered the close: the

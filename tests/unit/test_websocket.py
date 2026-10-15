@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 from fastapi import WebSocketDisconnect
@@ -56,8 +57,8 @@ async def test_disconnect_cancels_send_loop_no_leak():
         async def accept(self):
             pass
 
-        async def send_json(self, data):
-            sent.append(data)
+        async def send_text(self, text):
+            sent.append(json.loads(text))
 
         async def receive_text(self):
             # one control message, then disconnect
@@ -120,6 +121,23 @@ def test_shape_sends_noise_floor_at_most_once_per_second():
     assert wider["noise_floor_per_bin"] == [-1.0, -1.0, -1.0]
 
 
+@pytest.mark.asyncio
+async def test_each_frame_variant_is_encoded_once():
+    b = LiveBroadcast()
+    s1, s2 = b.subscribe(), b.subscribe()
+    await b.publish(_psd([1.0, 2.0], [-120.0, -120.0]))
+    m1, m2 = s1.queue.get_nowait(), s2.queue.get_nowait()
+    assert m1 is m2
+    t1, t2 = b.encode_for(s1, m1, 0.0), b.encode_for(s2, m2, 0.0)
+    assert t1 is t2 and json.loads(t1)["frequencies"] == [1.0, 2.0]
+    assert json.loads(t1) == shape_for_client(_Subscriber(), m1, 0.0)
+    # The next frame: both clients hold the axis, so both get the copy without it.
+    await b.publish(_psd([1.0, 2.0], [-120.0, -120.0]))
+    m = s1.queue.get_nowait()
+    u1, u2 = b.encode_for(s1, m, 0.1), b.encode_for(s2, s2.queue.get_nowait(), 0.1)
+    assert u1 is u2 and "frequencies" not in json.loads(u1)
+
+
 def test_shape_leaves_other_messages_alone():
     sub = _Subscriber()
     hb = {"type": "heartbeat", "frequencies": [1.0]}
@@ -137,8 +155,8 @@ async def test_psd_query_param_opts_out_of_psd_frames():
         async def accept(self):
             pass
 
-        async def send_json(self, data):
-            sent.append(data)
+        async def send_text(self, text):
+            sent.append(json.loads(text))
 
         async def receive_text(self):
             await asyncio.sleep(0.05)
@@ -165,7 +183,7 @@ async def test_send_after_client_close_is_a_quiet_disconnect(caplog):
         async def accept(self):
             pass
 
-        async def send_json(self, data):
+        async def send_text(self, text):
             raise RuntimeError(
                 "Unexpected ASGI message 'websocket.send', after sending 'websocket.close'."
             )
@@ -208,7 +226,7 @@ async def test_connection_logs_reason_view_and_close_counts(caplog):
         async def accept(self):
             pass
 
-        async def send_json(self, data):
+        async def send_text(self, text):
             await gate.wait()  # hold the first send so the queue fills
 
         async def receive_text(self):

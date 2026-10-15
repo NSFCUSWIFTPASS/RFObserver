@@ -87,6 +87,14 @@ def test_contiguous_packets_report_no_gap(fake_uhd: None) -> None:
     assert (rx.overflow_events, rx.overflow_lost_samples) == (0, 0)
 
 
+def test_chunk_device_time_is_its_first_packets_time(fake_uhd: None) -> None:
+    rx = _receiver([(100, NONE, 5000), (100, NONE, 5100), (100, NONE, None)])
+    rx.recv_chunk(np.zeros(200, dtype=np.int32))
+    assert rx.last_device_time == 5.0  # tick 5000 at 1000 samples/s
+    rx.recv_chunk(np.zeros(100, dtype=np.int32))
+    assert rx.last_device_time is None  # no time_spec: unknown
+
+
 def test_overflow_gap_is_measured_at_its_buffer_offset(fake_uhd: None) -> None:
     # 100 samples at tick 5000, an overflow, then data resumes at 5130:
     # 30 samples were lost right before out_buf[100].

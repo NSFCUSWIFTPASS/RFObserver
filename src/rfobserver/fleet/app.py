@@ -185,7 +185,7 @@ def create_fleet_app(
             while True:
                 await viewer.wake.wait()
                 for msg in viewer.take():
-                    await websocket.send_json(live.shape(viewer, msg))
+                    await websocket.send_text(live.encode(viewer, msg))
 
         async def recv_loop() -> None:
             while True:

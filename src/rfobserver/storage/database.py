@@ -1904,14 +1904,22 @@ class SensorDatabase:
         self, since: int, until: int
     ) -> list[tuple[int, str, int, int]]:
         """(hour, model, tried, count) for detections starting in [since, until)
-        (epoch seconds), grouped by hour on idx_detections_time."""
+        (epoch seconds), grouped by hour on idx_detections_time.
+
+        The hour is the stored UTC ISO string cut to its hour, not
+        strftime('%s') of the whole value: SQLite 3.42+ rounds to whole
+        milliseconds when it parses, so a start at hh:59:59.9995 or later
+        would land in the next hour (and outside [since, until)), while older
+        versions truncate. The string cut agrees with the range's own string
+        comparison on every version."""
         assert self._db is not None
         bounds = (
             _utc_iso(datetime.fromtimestamp(since, tz=timezone.utc)),
             _utc_iso(datetime.fromtimestamp(until, tz=timezone.utc)),
         )
         query = (
-            "SELECT CAST(strftime('%s', start_time) AS INTEGER) / 3600 * 3600 AS hour, "
+            "SELECT CAST(strftime('%s', substr(start_time, 1, 13) || ':00:00') AS INTEGER) "
+            "AS hour, "
             "COALESCE(model, '') AS m, "
             "CASE WHEN attribution IS NOT NULL THEN 1 ELSE 0 END AS tried, "
             "COUNT(*) FROM detections WHERE start_time >= ? AND start_time < ? "

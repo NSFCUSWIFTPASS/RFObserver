@@ -7,7 +7,6 @@ via a queue for WebSocket streaming to the browser.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import queue
 import threading
@@ -101,31 +100,41 @@ class FMDemodModule(UpstreamModule):
         self._input_queue: queue.Queue[tuple[np.ndarray, int, int]] = queue.Queue(maxsize=8)
         self._thread: threading.Thread | None = None
 
-        # DSP state (initialized on first chunk)
-        self._phase_acc = 0.0  # frequency shift phase accumulator
-        self._prev_sample: Any = None  # for FM demod continuity
-        self._deemph_state = 0.0  # de-emphasis filter state
-        self._lp_taps: Any = None  # GPU lowpass filter taps (stage 2)
-        self._lp_taps_a: Any = None  # GPU lowpass filter taps (stage 1)
-        self._audio_lp_taps: Any = None  # GPU audio lowpass taps
-        self._intermediate_rate = 0  # after first decimation
-        self._decim1 = 0  # total first decimation factor
-        self._decim1_a = 1  # stage 1 decimation
-        self._decim1_b = 1  # stage 2 decimation
-        self._decim2 = 0  # final decimation (to audio rate)
+        # DSP state, rebuilt by _init_dsp when the tuning, chunk size or
+        # parameters change.
+        self._dsp_key: tuple[Any, ...] | None = None
+        self._decim1 = 1  # sample rate -> intermediate (box-car average)
+        self._intermediate_rate = 0.0  # Hz, exact (sample_rate / decim1)
+        self._nco: Any = None  # GPU mixing tone for one chunk, starting at phase 0
+        self._nco_step = 0.0  # its phase advance per chunk (radians)
+        self._nco_phase = 0.0  # phase at the next chunk's first sample
+        self._prev_sample: complex | None = None  # FM discriminator continuity
+        self._deemph_zi: np.ndarray = np.zeros(1)
+        self._audio_taps: np.ndarray = np.ones(1)
+        self._audio_zi: np.ndarray = np.zeros(0)
+        self._rs_step = 1.0  # intermediate samples per output sample
+        self._rs_pos = 0.0  # next output's position, in the next chunk's samples
+        self._rs_last: float | None = None  # last intermediate sample
+
+        # Diagnostics for status().
         self._chunks_processed = 0
-        self._needs_reinit = False
+        self._chunks_dropped = 0
+        self._proc_ms = 0.0
+        self._error: str | None = None
 
     def configure(self, params: dict[str, Any]) -> None:
         for k, v in params.items():
             if k in self._DEFAULTS or k == "channel_freq_hz":
                 self._params[k] = v
-        # Flag for reinit on next chunk (don't null taps — race with processing thread)
-        self._needs_reinit = True
+        # A new frequency, bandwidth or de-emphasis changes the DSP key, so the
+        # processing thread rebuilds its state on the next chunk; volume is
+        # read per chunk and needs no rebuild (a rebuild would click).
 
     def feed(self, sc16_buf: np.ndarray, center_freq_hz: int, sample_rate: int) -> None:
-        with contextlib.suppress(queue.Full):
+        try:
             self._input_queue.put_nowait((sc16_buf.copy(), center_freq_hz, sample_rate))
+        except queue.Full:
+            self._chunks_dropped += 1  # demod behind: this chunk is a gap in the audio
 
     def start(self) -> None:
         self._running = True
@@ -154,201 +163,161 @@ class FMDemodModule(UpstreamModule):
             "audio_rate": self._params["audio_rate"],
             "volume": self._params["volume"],
             "chunks_processed": self._chunks_processed,
+            "chunks_dropped": self._chunks_dropped,
+            "audio_dropped": self.output_dropped,
+            "proc_ms": round(self._proc_ms, 1),
+            "error": self._error,
         }
 
     def _process_loop(self) -> None:
-        """Main processing thread — pulls chunks, runs GPU pipeline."""
-        try:
-            while self._running:
-                try:
-                    sc16_buf, center_freq, sample_rate = self._input_queue.get(timeout=1.0)
-                except queue.Empty:
-                    continue
+        """Main processing thread: pulls chunks, runs the GPU pipeline."""
+        import time
 
+        logged = False
+        while self._running:
+            try:
+                sc16_buf, center_freq, sample_rate = self._input_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            t0 = time.perf_counter()
+            try:
                 audio = self._demod_chunk(sc16_buf, center_freq, sample_rate)
-                if audio is not None and len(audio) > 0:
-                    # Scale and convert to int16 PCM
-                    vol = float(self._params.get("volume", 0.8))
-                    pcm = (audio * vol * 32000).astype(np.int16)
-                    with contextlib.suppress(Exception):
-                        self._output_queue.put_nowait(pcm.tobytes())
-
-                self._chunks_processed += 1
-
-        except Exception:
-            logger.exception("FM demod processing loop crashed: %s", self.module_id)
+            except Exception as exc:
+                # Keep running (a retune or new parameters may fix it) but say so.
+                self._error = f"Demodulation failed: {type(exc).__name__}: {exc}"
+                if not logged:
+                    logger.exception("FM demod failed: %s", self.module_id)
+                    logged = True
+                continue
+            if audio is not None and len(audio) > 0:
+                vol = float(self._params.get("volume", 0.8))
+                # Clip: past full deviation the int16 cast would wrap (crackle).
+                pcm = np.clip(audio * (vol * 32000.0), -32767, 32767).astype(np.int16)
+                self.emit(pcm.tobytes())
+            self._chunks_processed += 1
+            ms = (time.perf_counter() - t0) * 1000.0
+            self._proc_ms = ms if self._chunks_processed == 1 else 0.9 * self._proc_ms + 0.1 * ms
 
     def _demod_chunk(
         self, sc16_buf: np.ndarray, center_freq: int, sample_rate: int
     ) -> np.ndarray | None:
-        """GPU FM demodulation pipeline for one chunk."""
+        """GPU FM demodulation of one chunk; float32 audio at audio_rate, or
+        None when the channel is outside the captured band."""
         p = self._params
-        channel_freq = int(p["channel_freq_hz"])
-        channel_bw = int(p["channel_bw_hz"])
-        audio_rate = int(p["audio_rate"])
-        tau = float(p["deemphasis_tau"])
-
-        # Frequency offset from capture center
+        channel_freq = float(p["channel_freq_hz"])
+        channel_bw = float(p["channel_bw_hz"])
         delta_f = channel_freq - center_freq
+        n = len(sc16_buf)
 
-        # Initialize filter taps on first call or after reconfigure
-        if self._lp_taps is None or self._intermediate_rate == 0 or self._needs_reinit:
-            self._needs_reinit = False
-            self._phase_acc = 0.0
-            self._prev_sample = None
-            self._deemph_state = 0.0
-            self._init_filters(sample_rate, channel_bw, audio_rate)
+        if abs(delta_f) + channel_bw / 2 > sample_rate / 2:
+            lo, hi = (center_freq - sample_rate / 2) / 1e6, (center_freq + sample_rate / 2) / 1e6
+            self._error = (
+                f"{channel_freq / 1e6:.1f} MHz is outside the captured band "
+                f"({lo:.1f} to {hi:.1f} MHz)"
+            )
+            return None
+        self._error = None
 
-        # 1. SC16 → complex64 on GPU
-        gpu_buf = cp.asarray(sc16_buf)
-        raw16 = gpu_buf.view(cp.int16).reshape(-1, 2)
-        n = raw16.shape[0]
+        key = (sample_rate, center_freq, n, channel_freq, channel_bw, p["deemphasis_tau"])
+        if key != self._dsp_key:
+            self._init_dsp(sample_rate, delta_f, n)
+            self._dsp_key = key
+
+        # 1. SC16 -> complex64 on the GPU.
+        raw16 = cp.asarray(sc16_buf).view(cp.int16).reshape(-1, 2)
         iq = cp.empty(n, dtype=cp.complex64)
         iq.real = raw16[:, 0]
         iq.imag = raw16[:, 1]
-        iq *= cp.float32(1.0 / 32768.0)
 
-        # 2. Frequency shift
-        t = cp.arange(n, dtype=cp.float64) / sample_rate + self._phase_acc
-        phase = cp.float64(-2.0 * float(cp.pi) * delta_f) * t
-        shift = cp.exp(1j * phase).astype(cp.complex64)
-        iq *= shift
-        self._phase_acc += n / sample_rate
-        # Keep phase accumulator bounded to avoid precision loss
-        if self._phase_acc > 1e6:
-            self._phase_acc -= int(self._phase_acc)
+        # 2. Shift the channel to 0 Hz: the precomputed tone times this chunk's
+        #    starting phase (the scale to +-1 folds into the same multiply).
+        start = np.complex64(np.exp(-1j * self._nco_phase) / 32768.0)
+        iq *= self._nco
+        iq *= start
+        self._nco_phase = (self._nco_phase + self._nco_step) % (2.0 * np.pi)
 
-        # 3. Decimate to intermediate rate using box-car averaging
-        #    reshape(N, decim) + mean → sinc-shaped anti-alias filter
-        #    Fast on GPU (~2.5ms for 2.15M/224) vs FIR FFT (~40ms)
-        if self._decim1 > 1:
-            trim = (len(iq) // self._decim1) * self._decim1
-            iq_dec = iq[:trim].reshape(-1, self._decim1).mean(axis=1)
-        else:
-            iq_dec = iq
+        # 3. Decimate to the intermediate rate (~250 kHz) by box-car averaging:
+        #    a sinc anti-alias filter, fast on the GPU.
+        d = self._decim1
+        iq_dec = iq[: (n // d) * d].reshape(-1, d).mean(axis=1) if d > 1 else iq
 
-        # 4. FM demodulate: instantaneous frequency
-        if self._prev_sample is not None:
-            prev = cp.concatenate([cp.asarray([self._prev_sample]), iq_dec[:-1]])
-        else:
-            prev = cp.concatenate([cp.zeros(1, dtype=cp.complex64), iq_dec[:-1]])
-        self._prev_sample = complex(iq_dec[-1].get())
-
-        # angle(x[n] * conj(x[n-1]))
+        # 4. FM discriminator: angle(x[n] * conj(x[n-1])), continuous across chunks.
+        first = cp.asarray(
+            [self._prev_sample if self._prev_sample is not None else iq_dec[0].item()],
+            dtype=cp.complex64,
+        )
+        prev = cp.concatenate([first, iq_dec[:-1]])
+        self._prev_sample = complex(iq_dec[-1].item())
         product = iq_dec * cp.conj(prev)
         demod = cp.arctan2(product.imag, product.real)
+        # Scale to +-1 at 75 kHz deviation (broadcast FM).
+        demod *= cp.float32(self._intermediate_rate / (2.0 * np.pi * 75_000.0))
+        x = cp.asnumpy(demod).astype(np.float64)
 
-        # Scale: output = demod * fs / (2π * max_deviation)
-        max_dev = 75_000.0  # 75 kHz for broadcast FM
-        demod *= cp.float32(self._intermediate_rate / (2.0 * cp.pi * max_dev))
-
-        # 5. De-emphasis filter (IIR on GPU via cumulative sum approximation)
-        #    y[n] = alpha * x[n] + (1-alpha) * y[n-1]
-        #    Equivalent to exponential moving average — use scipy.signal.lfilter
-        #    on CPU (C-optimized, ~100x faster than Python for-loop)
-        alpha = float(1.0 / (1.0 + tau * self._intermediate_rate))
-        audio_inter = cp.asnumpy(demod).astype(np.float32)
         from scipy.signal import lfilter
 
-        b_coeff = np.array([alpha], dtype=np.float32)
-        a_coeff = np.array([1.0, -(1.0 - alpha)], dtype=np.float32)
-        audio_inter, zf = lfilter(
-            b_coeff,
-            a_coeff,
-            audio_inter,
-            zi=np.array([self._deemph_state * (1.0 - alpha)], dtype=np.float32),
-        )
-        self._deemph_state = float(zf[0] / (1.0 - alpha)) if (1.0 - alpha) != 0 else 0.0
+        # 5. De-emphasis (one-pole low-pass), state carried across chunks.
+        tau = float(p["deemphasis_tau"])
+        alpha = 1.0 / (1.0 + tau * self._intermediate_rate)
+        x, self._deemph_zi = lfilter([alpha], [1.0, alpha - 1.0], x, zi=self._deemph_zi)
 
-        # 6. Decimate to audio rate
-        result: np.ndarray = audio_inter[:: self._decim2] if self._decim2 > 1 else audio_inter
-        return result
+        # 6. Audio low-pass (15 kHz) before resampling, state carried across chunks.
+        x, self._audio_zi = lfilter(self._audio_taps, [1.0], x, zi=self._audio_zi)
 
-    def _init_filters(self, sample_rate: int, channel_bw: int, audio_rate: int) -> None:
-        """Pre-compute FIR filter taps on the GPU."""
+        # 7. Resample to exactly audio_rate by interpolating at a continuous
+        #    fractional position (the intermediate rate is rarely a multiple).
+        return self._resample(x)
 
-        from scipy.signal import firwin
-
-        # First decimation: sample_rate → intermediate (~250 kHz)
-        self._intermediate_rate = max(channel_bw, 250_000)
-        self._decim1 = max(1, sample_rate // self._intermediate_rate)
-        self._intermediate_rate = sample_rate // self._decim1
-
-        # Split large decimation into 2 stages for speed.
-        # E.g. 224 = 14 × 16: first stage filters 2.15M→154K, second 154K→9.6K
-        if self._decim1 > 16:
-            # Find a good split near sqrt(decim1)
-            best_a = 1
-            for a in range(2, int(self._decim1**0.5) + 2):
-                if self._decim1 % a == 0:
-                    best_a = a
-            self._decim1_a = best_a
-            self._decim1_b = self._decim1 // best_a
+    def _resample(self, x: np.ndarray) -> np.ndarray:
+        if self._rs_last is not None:
+            x = np.concatenate([[self._rs_last], x])
+            pos = self._rs_pos + 1.0  # positions were relative to the next chunk
         else:
-            self._decim1_a = 1
-            self._decim1_b = self._decim1
+            pos = self._rs_pos
+        last = len(x) - 1
+        if last < pos:
+            self._rs_pos = pos - len(x)
+            self._rs_last = float(x[-1])
+            return np.zeros(0, dtype=np.float32)
+        count = int((last - pos) // self._rs_step) + 1
+        at = pos + self._rs_step * np.arange(count)
+        out = np.interp(at, np.arange(len(x)), x).astype(np.float32)
+        # Where the next output falls, relative to the next chunk's first sample.
+        self._rs_pos = at[-1] + self._rs_step - len(x)
+        self._rs_last = float(x[-1])
+        return out
 
-        # Stage 1 taps: filter at full sample rate, cutoff at intermediate/2
-        if self._decim1_a > 1:
-            mid_rate = sample_rate // self._decim1_a
-            cutoff_a = mid_rate / 2 * 0.8
-            ntaps_a = min(63, self._decim1_a * 4 + 1)
-            if ntaps_a % 2 == 0:
-                ntaps_a += 1
-            taps_a = firwin(ntaps_a, cutoff_a, fs=sample_rate).astype(np.float32)
-            self._lp_taps_a = cp.asarray(taps_a)
-        else:
-            self._lp_taps_a = None
+    def _init_dsp(self, sample_rate: int, delta_f: float, n: int) -> None:
+        """Rebuild filters, mixing tone and resampler for this tuning."""
+        from scipy.signal import firwin, lfilter_zi
 
-        # Stage 2 taps: filter at mid rate, cutoff at channel BW/2
-        mid_rate = sample_rate // self._decim1_a if self._decim1_a > 1 else sample_rate
-        cutoff = channel_bw / 2
-        num_taps = min(127, self._decim1_b * 4 + 1)
-        if num_taps % 2 == 0:
-            num_taps += 1
-        taps1 = firwin(num_taps, cutoff, fs=mid_rate).astype(np.float32)
-        self._lp_taps = cp.asarray(taps1)
+        audio_rate = int(self._params["audio_rate"])
+        channel_bw = float(self._params["channel_bw_hz"])
+        self._decim1 = max(1, int(sample_rate // max(channel_bw, 250_000)))
+        self._intermediate_rate = sample_rate / self._decim1
 
-        # Second decimation: intermediate → audio_rate
-        self._decim2 = max(1, self._intermediate_rate // audio_rate)
-        if self._decim2 > 1:
-            cutoff2 = audio_rate / 2 * 0.9
-            num_taps2 = min(127, self._decim2 * 8 + 1)
-            if num_taps2 % 2 == 0:
-                num_taps2 += 1
-            taps2 = firwin(num_taps2, cutoff2, fs=self._intermediate_rate).astype(np.float32)
-            self._audio_lp_taps = cp.asarray(taps2)
-        else:
-            self._audio_lp_taps = None
+        # Mixing tone for one chunk (float64 phase, then complex64), so a chunk
+        # costs two multiplies instead of a full-rate exp().
+        w = -2.0 * np.pi * delta_f / sample_rate
+        k = cp.arange(n, dtype=cp.float64)
+        self._nco = cp.exp(1j * w * k).astype(cp.complex64)
+        self._nco_step = (2.0 * np.pi * delta_f * n / sample_rate) % (2.0 * np.pi)
+        self._nco_phase = 0.0
 
+        self._prev_sample = None
+        self._deemph_zi = np.zeros(1)
+        cutoff = min(15_000.0, 0.45 * audio_rate)
+        self._audio_taps = firwin(97, cutoff, fs=self._intermediate_rate)
+        self._audio_zi = lfilter_zi(self._audio_taps, [1.0]) * 0.0
+        self._rs_step = self._intermediate_rate / audio_rate
+        self._rs_pos = 0.0
+        self._rs_last = None
         logger.info(
-            "FM filters: %d Hz → %d Hz (÷%d) → %d Hz (÷%d), taps=%d+%d",
+            "FM demod %s: %d Hz -> %.1f Hz (/%d) -> %d Hz audio, offset %.3f MHz",
+            self.module_id,
             sample_rate,
             self._intermediate_rate,
             self._decim1,
             audio_rate,
-            self._decim2,
-            len(taps1),
-            len(taps2) if self._decim2 > 1 else 0,
+            delta_f / 1e6,
         )
-
-    @staticmethod
-    def _fir_filter_gpu(signal: Any, taps: Any) -> Any:
-        """Apply FIR filter on GPU via overlap-add FFT convolution."""
-        n = len(signal)
-        m = len(taps)
-        # Use FFT convolution for efficiency
-        fft_len = 1
-        while fft_len < n + m - 1:
-            fft_len *= 2
-
-        if signal.dtype == cp.complex64 or signal.dtype == cp.complex128:
-            sig_fft = cp.fft.fft(signal, fft_len)
-            tap_fft = cp.fft.fft(taps.astype(cp.complex64), fft_len)
-            result = cp.fft.ifft(sig_fft * tap_fft)[:n]
-            return result.astype(cp.complex64)
-        else:
-            sig_fft = cp.fft.rfft(signal.astype(cp.float32), fft_len)
-            tap_fft = cp.fft.rfft(taps.astype(cp.float32), fft_len)
-            result = cp.fft.irfft(sig_fft * tap_fft, fft_len)[:n]
-            return result.astype(cp.float32)

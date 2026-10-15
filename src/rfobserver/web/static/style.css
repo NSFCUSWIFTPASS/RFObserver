@@ -1027,6 +1027,12 @@ body {
     flex-wrap: wrap;
 }
 
+.module-error {
+    flex-basis: 100%;
+    color: #ff3b30;
+    font-size: 11px;
+}
+
 .module-type {
     font-weight: 700;
     font-size: 10px;

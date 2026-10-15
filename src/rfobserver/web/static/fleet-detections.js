@@ -6,6 +6,7 @@
  *
  * Sensors count hours from the moment they run a version with hourly counts
  * (no history before); hours before that are left out, not shown as zero.
+ * Times are UTC throughout, as on the sensors' own Detections pages.
  */
 (function () {
     "use strict";
@@ -50,11 +51,13 @@
 
     function fmtCount(n) { return Number(n || 0).toLocaleString(); }
 
+    function dayLabel(t) {
+        return new Date(t * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
+    }
+
     function hourLabel(t, withDate) {
-        const d = new Date(t * 1000);
-        const hh = String(d.getHours()).padStart(2, "0") + ":00";
-        if (!withDate) return hh;
-        return d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) + " " + hh;
+        const hh = String(new Date(t * 1000).getUTCHours()).padStart(2, "0") + ":00";
+        return withDate ? dayLabel(t) + " " + hh : hh;
     }
 
     // --- counts ---
@@ -147,11 +150,14 @@
         });
     });
 
-    function niceMax(v) {
-        if (v <= 5) return 5;
-        const p = Math.pow(10, Math.floor(Math.log10(v)));
-        for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p;
-        return 10 * p;
+    // A whole-number tick step giving about four intervals, and the top tick.
+    function niceTicks(v) {
+        const raw = Math.max(1, v) / 4;
+        const p = Math.pow(10, Math.floor(Math.log10(raw)));
+        let step = p;
+        for (const m of [1, 2, 5, 10]) { if (m * p >= raw) { step = m * p; break; } }
+        step = Math.max(1, Math.round(step));
+        return { step: step, top: Math.max(step, Math.ceil(Math.max(1, v) / step) * step) };
     }
 
     const CHARTS = {
@@ -188,7 +194,8 @@
         const vis = visibleSeries(name);
         let max = 0;
         for (const v of vis) for (const p of v.pts) if (p[1] > max) max = p[1];
-        const top = niceMax(max);
+        const ticks = niceTicks(max);
+        const top = ticks.top;
         const Y = function (v) { return g.H - g.bottom - (v / top) * (g.H - g.top - g.bottom); };
 
         // Hours before any sensor started counting.
@@ -213,11 +220,10 @@
         ctx.fillStyle = "rgba(255,255,255,0.5)";
         ctx.font = "10px -apple-system, sans-serif";
         ctx.textAlign = "right";
-        for (let i = 0; i <= 4; i++) {
-            const v = (top / 4) * i;
+        for (let v = 0; v <= top; v += ticks.step) {
             const y = Math.round(Y(v)) + 0.5;
             ctx.beginPath(); ctx.moveTo(g.left, y); ctx.lineTo(g.W - g.right, y); ctx.stroke();
-            ctx.fillText(fmtCount(Math.round(v)), g.left - 6, y + 3);
+            ctx.fillText(fmtCount(v), g.left - 6, y + 3);
         }
 
         // x labels: hours for a day, dates beyond.
@@ -226,12 +232,10 @@
         const dayStep = state.hours > 168 ? 5 : 1;
         let midnight = 0;
         for (let t = state.range.first; t <= state.range.last; t += HOUR) {
-            const d = new Date(t * 1000);
+            const h = new Date(t * 1000).getUTCHours();
             let label = null;
-            if (!days && d.getHours() % 6 === 0) label = hourLabel(t, false);
-            if (days && d.getHours() === 0 && midnight++ % dayStep === 0) {
-                label = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-            }
+            if (!days && h % 6 === 0) label = hourLabel(t, false);
+            if (days && h === 0 && midnight++ % dayStep === 0) label = dayLabel(t);
             if (label) ctx.fillText(label, g.X(t), g.H - 6);
         }
 
@@ -270,7 +274,7 @@
         ctx.beginPath(); ctx.moveTo(x + 0.5, g.top); ctx.lineTo(x + 0.5, g.H - g.bottom); ctx.stroke();
         ctx.setLineDash([]);
         tip.textContent = "";
-        const head = hourLabel(ht, true) + " to " + hourLabel(ht + HOUR, false)
+        const head = hourLabel(ht, true) + " to " + hourLabel(ht + HOUR, false) + " UTC"
             + (ht === state.range.last ? " (so far)" : "");
         tip.appendChild(document.createTextNode(head));
         for (const v of vis) {
@@ -362,7 +366,7 @@
         for (const s of sensors) {
             if (!s.supported) notes.push(s.label + " needs the sensor update to count detections per hour");
             else if (s.covered_since != null && s.covered_since > state.range.first) {
-                notes.push(s.label + " counts from " + hourLabel(s.covered_since, true));
+                notes.push(s.label + " counts from " + hourLabel(s.covered_since, true) + " UTC");
             }
         }
         notes.push("The current hour is counted so far");

@@ -1654,7 +1654,10 @@
                         let displayVal = val;
                         let displayUnit = p.unit;
                         if (p.unit === "Hz" && val >= 1e6) {
-                            displayVal = (val / 1e6).toFixed(1);
+                            // kHz precision (101.512 MHz), trailing zeros dropped
+                            // but one decimal kept (101.5, not 101.500).
+                            displayVal = String(parseFloat((val / 1e6).toFixed(3)));
+                            if (displayVal.indexOf(".") < 0) displayVal += ".0";
                             displayUnit = "MHz";
                         }
                         html += '<input type="text" class="module-freq-input" value="' + displayVal

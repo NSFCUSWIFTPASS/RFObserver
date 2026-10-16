@@ -53,7 +53,7 @@ class FMDemodModule(UpstreamModule):
                 type="number",
                 default=101_900_000,
                 unit="Hz",
-                step=100_000,
+                step=1_000,
             ),
             ParamDescriptor(
                 name="channel_bw_hz",

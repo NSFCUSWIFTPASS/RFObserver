@@ -99,3 +99,26 @@ Status while the user listened (no drops while connected; the 586 predate Play):
   and grows the buffer by 200 ms per dropout (up to 2 s); AudioWorklet would move playback off
   the main thread but needs a secure context (HTTPS or localhost).
 - One audio socket per module: two listeners split the audio.
+
+## Addendum, same day: the static is the signal, not the demod
+
+Question: "there also some static noise" (after bf19007 deployed). Answer: the station is
+too weak at this antenna; more gain does not help.
+
+Procedure: a manual IQ recording on .177 (100 MHz centre, 56 Msps), then on its GPU the
+power in each 200 kHz FM channel from the first gap-free 0.5 s, against the median of empty
+channels (100.5, 100.7, 100.9, 101.3, 101.7, 102.3 MHz). The empty channels are the noise
+reference, so the number is the station's carrier-to-noise in its channel, independent of
+gain. Then the same at 60 dB gain, then gain restored to 40.
+
+    gain 40 dB: 101.5 MHz is 5.6 dB above empty channels (101.9: 3.2); ADC clipping 0.000%; rms 0.0129
+    gain 60 dB: 101.5 MHz is 4.1 dB above empty channels (101.9: 2.2); ADC clipping 0.000%; rms 0.1079
+
+Broadcast FM needs roughly 10-12 dB carrier-to-noise to demodulate cleanly; below that,
+hiss and random "threshold clicks" are inherent. +20 dB of gain raised everything 18.5 dB
+and the station's margin fell 1.5 dB: the noise arrives with the signal (antenna and
+environment), so the fix is an antenna for 88-108 MHz, not gain or DSP.
+
+Measured and REJECTED (do not retry): RX gain 60 dB (margin 5.6 -> 4.1 dB). Adjacent-channel
+leakage through the box-car decimation: the neighbours at 101.3/101.7 are at the noise
+floor, so it cannot be the static here (it would matter next to a strong station).

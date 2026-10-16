@@ -887,11 +887,12 @@ class StreamingProcessor:
                 SNAPSHOT_MAX_BYTES, int(s.ISOLATION_MAX_PER_SEC) * max_burst_samples * 4
             )
             avail = _mem_available_bytes()
-            if avail is not None and ring_bytes + work_bytes > 0.25 * avail:
+            frac = float(s.ISOLATION_RAM_FRACTION)
+            if avail is not None and ring_bytes + work_bytes > frac * avail:
                 self._isolation_disabled_reason = (
                     f"isolation ring of {ring_bytes / 1e6:.0f} MB plus a working set of "
-                    f"{work_bytes / 1e6:.0f} MB exceeds 25% of available "
-                    f"RAM ({avail / 1e6:.0f} MB); isolation disabled"
+                    f"{work_bytes / 1e6:.0f} MB exceeds {frac * 100:.0f}% of available "
+                    f"RAM ({avail / 1e6:.0f} MB, ISOLATION_RAM_FRACTION); isolation disabled"
                 )
                 logger.error(self._isolation_disabled_reason)
                 self._halt_isolation()

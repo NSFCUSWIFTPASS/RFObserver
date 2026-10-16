@@ -84,3 +84,21 @@ def test_ram_guard_passes_when_ring_and_working_set_fit(tmp_path, monkeypatch):
     )
     assert proc._isolation_disabled_reason is None
     assert proc._pre_trigger_buf.capacity == 10_000
+
+
+def test_ram_guard_fraction_is_a_setting(tmp_path, monkeypatch):
+    # The 144 kB of the case above, against 450 kB available: over 25%
+    # (112.5 kB), under 40% (180 kB).
+    monkeypatch.setattr("rfobserver.pipeline.streaming._mem_available_bytes", lambda: 450_000)
+    sizes = {
+        "TRIGGER_PRE_SEC": 0.001,
+        "ISOLATION_ENABLED": True,
+        "ISOLATION_LOOKBACK_SEC": 0.01,
+        "ISOLATION_MAX_BURST_SEC": 0.001,
+    }
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    off = _proc(tmp_path / "a", **sizes)
+    assert "exceeds 25% of available" in off._isolation_disabled_reason
+    on = _proc(tmp_path / "b", ISOLATION_RAM_FRACTION=0.40, **sizes)
+    assert on._isolation_disabled_reason is None

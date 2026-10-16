@@ -145,6 +145,7 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "isolation_max_per_sec": ("ISOLATION_MAX_PER_SEC", int),
         "isolation_lookback_sec": ("ISOLATION_LOOKBACK_SEC", float),
         "isolation_max_burst_sec": ("ISOLATION_MAX_BURST_SEC", float),
+        "isolation_ram_fraction": ("ISOLATION_RAM_FRACTION", float),
         "burst_archive_max_gb": ("BURST_ARCHIVE_MAX_GB", float),
         # Sensor identity + location (all optional — empty input clears)
         "sensor_name": ("SENSOR_NAME", str),
@@ -221,6 +222,13 @@ async def apply_config(request: Request) -> dict[str, Any]:
                     status_code=400,
                     detail=f"Invalid value for {form_key}",
                 ) from exc
+
+        if attr == "ISOLATION_RAM_FRACTION" and not (
+            isinstance(new_val, float) and 0.05 <= new_val <= 0.9
+        ):
+            raise HTTPException(
+                status_code=400, detail="isolation_ram_fraction must be between 0.05 and 0.9"
+            )
 
         # Validate FFT bins: must be a power of 2 in [256, 8192]
         if attr == "NUM_FFT_BINS":

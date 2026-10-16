@@ -242,6 +242,12 @@ class AppSettings(BaseSettings):
     ISOLATION_LOOKBACK_SEC: float = 2.0
     # Longer bursts are isolated only up to this length.
     ISOLATION_MAX_BURST_SEC: float = 0.5
+    # Isolation stays off when its ring plus the worst-case working set (one
+    # ISOLATION_MAX_BURST_SEC burst) would exceed this fraction of the RAM
+    # available at start. 0.25 leaves room for a RAM-mode recording (up to
+    # RECORDING_MEM_FRACTION) and everything else; a box that measures more
+    # headroom can raise it. Read when the pipeline starts.
+    ISOLATION_RAM_FRACTION: float = 0.25
     # Gate: dB over the noise floor at the burst's peak bin, and the most bursts
     # isolated per second (strongest first).
     ISOLATION_SNR_DB: float = 13.0

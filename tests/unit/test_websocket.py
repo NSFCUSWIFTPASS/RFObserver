@@ -138,6 +138,29 @@ async def test_each_frame_variant_is_encoded_once():
     assert u1 is u2 and "frequencies" not in json.loads(u1)
 
 
+@pytest.mark.asyncio
+async def test_frames_are_routed_by_each_clients_mode():
+    """One client in High Res must not switch the others: each gets its own
+    mode, and a client that asked for both (the fleet) gets both."""
+    b = LiveBroadcast()
+    lo, hi, both = b.subscribe(), b.subscribe(), b.subscribe()
+    hi.high_res = both.high_res = True
+    both.also_averaged = True
+    await b.publish({"type": "psd", "mode": "high_res", "powers": [1.0]})
+    await b.publish({"type": "psd", "mode": "averaged", "powers": [2.0]})
+    await b.publish({"type": "psd", "powers": [3.0]})  # unlabelled: everyone
+
+    def modes(sub):
+        out = []
+        while not sub.queue.empty():
+            out.append(sub.queue.get_nowait().get("mode"))
+        return out
+
+    assert modes(lo) == ["averaged", None]
+    assert modes(hi) == ["high_res", None]
+    assert modes(both) == ["high_res", "averaged", None]
+
+
 def test_shape_leaves_other_messages_alone():
     sub = _Subscriber()
     hb = {"type": "heartbeat", "frequencies": [1.0]}

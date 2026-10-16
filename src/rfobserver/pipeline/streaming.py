@@ -3256,8 +3256,11 @@ class StreamingProcessor:
                 if self._settings.TONE_CHECK_ENABLED:
                     await self._run_tone_check(avg, result, win_start)
 
-                # Normal-mode UI broadcast (only if no high-res subscribers)
-                if self._broadcast is not None and not self._broadcast.has_high_res_subscribers():
+                # Averaged UI broadcast, always: each client gets the frames
+                # of the mode it asked for (LiveBroadcast routes by "mode"),
+                # so one client in High Res no longer switches every other
+                # client to it. One or two frames a second, so cheap.
+                if self._broadcast is not None:
                     await self._broadcast_averaged(
                         avg, result, len(accum_powers), win_start, capture_span(result)
                     )
@@ -3283,6 +3286,7 @@ class StreamingProcessor:
                 await self._broadcast.publish(
                     {
                         "type": "psd",
+                        "mode": "high_res",
                         "center_freq_hz": result.center_freq_hz,
                         "bandwidth_hz": self._settings.BANDWIDTH,
                         "powers": result.summary_psd.powers,
@@ -3347,6 +3351,7 @@ class StreamingProcessor:
         await self._broadcast.publish(
             {
                 "type": "psd",
+                "mode": "averaged",
                 "center_freq_hz": result.center_freq_hz,
                 "bandwidth_hz": self._settings.BANDWIDTH,
                 "powers": avg_powers,

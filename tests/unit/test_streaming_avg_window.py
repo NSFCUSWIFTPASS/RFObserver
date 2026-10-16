@@ -838,6 +838,7 @@ async def test_averaged_broadcast_carries_the_capture_span(tmp_path, monkeypatch
     await _drain(proc)
 
     first = published[0]
+    assert first["mode"] == "averaged"
     # The window closed on its 6th result (t=0.6): chunks 0-5.
     assert first["capture_time_ms"] == pytest.approx(500_000.0)
     assert first["dur_ms"] == pytest.approx(600.0)
@@ -881,8 +882,47 @@ async def test_high_res_broadcast_carries_the_capture_time(tmp_path, monkeypatch
     await _drain(proc)
 
     frame = published[0]
+    assert frame["mode"] == "high_res"
     assert frame["capture_time_ms"] == pytest.approx(500_000.0)
     assert frame["dur_ms"] == pytest.approx(100.0)
     assert frame["chunk_time_ms"] == pytest.approx(
         (_BASE + timedelta(seconds=0.3)).timestamp() * 1000
     )
+
+
+@pytest.mark.asyncio
+async def test_averaged_frames_continue_while_a_client_is_in_high_res(tmp_path, monkeypatch):
+    """Averaged frames used to stop while any client wanted High Res, which
+    switched every client to it. Now both are published, labelled by mode."""
+    import numpy as np
+
+    clock = _FakeClock()
+    _install_fake_clock(monkeypatch, clock)
+    proc, db = _proc(tmp_path, with_sinks=False)
+    published: list[dict] = []
+
+    class _Broadcast:
+        def has_high_res_subscribers(self) -> bool:
+            return True
+
+        async def publish(self, data: dict) -> None:
+            published.append(data)
+
+    proc._broadcast = _Broadcast()
+    proc._chunk_duration = 0.1
+
+    def result():
+        r = _stream_result()
+        r.capture_time = 500.0
+        r.psd_grid = SimpleNamespace(grid=np.zeros((2, 4)))
+        r.iq_stats = _stats()
+        r.process_ms = r.latency_ms = 1.0
+        return r
+
+    proc._result_queue = _ScheduledQueue(clock, [0.1 * (i + 1) for i in range(12)], result)
+    proc._running = True
+    await proc._result_consumer_loop()
+    await _drain(proc)
+
+    modes = [p["mode"] for p in published]
+    assert modes.count("high_res") == 12 and modes.count("averaged") >= 1

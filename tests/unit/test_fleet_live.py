@@ -290,12 +290,12 @@ async def test_high_res_follows_the_viewers(tmp_path: Path) -> None:
         assert sock.sent == []  # averaged mode until someone asks
         hub.set_high_res(v, True)
         await asyncio.sleep(0.01)
-        assert sock.sent == [{"type": "set_mode", "high_res": True}]
+        assert sock.sent == [{"type": "set_mode", "high_res": True, "averaged": True}]
         v2 = hub.join()
         hub.set_high_res(v2, False)
         hub.leave(v)  # v2 does not want it: back to averaged
         await asyncio.sleep(0.01)
-        assert sock.sent[-1] == {"type": "set_mode", "high_res": False}
+        assert sock.sent[-1] == {"type": "set_mode", "high_res": False, "averaged": False}
     finally:
         await hub.close()
 
@@ -317,7 +317,9 @@ async def test_reconnected_sensor_is_asked_for_high_res_again(
                 break
             await asyncio.sleep(0.01)
         assert len(fake.connects) >= 2
-        assert fake.socks[live_url(a)].sent == [{"type": "set_mode", "high_res": True}]
+        assert fake.socks[live_url(a)].sent == [
+            {"type": "set_mode", "high_res": True, "averaged": True}
+        ]
     finally:
         await hub.close()
 
@@ -399,3 +401,38 @@ async def test_frames_are_encoded_once_for_every_browser(tmp_path: Path) -> None
         assert json.loads(hub.encode(v1, {"type": "tick", "t": 1.0})) == {"type": "tick", "t": 1.0}
     finally:
         await hub.close()
+
+
+async def test_each_viewer_gets_only_its_mode(tmp_path: Path) -> None:
+    """A sensor sending both modes: the High Res viewer gets only per-chunk
+    frames, the other viewer only averaged ones (not the 27/s stream)."""
+    fake = FakeSensors()
+    reg, hub = make_hub(tmp_path, fake)
+    a = reg.add("a", "10.0.0.1", 80, source="manual")
+    frames = []
+    for i in range(6):
+        mode = "averaged" if i % 3 == 0 else "high_res"
+        frames.append(psd(-50.0 - i, t=1000.0 + i, mode=mode, freqs=i == 0))
+    fake.plan[live_url(a)] = frames
+    try:
+        hi, lo = hub.join(), hub.join()
+        hub.set_high_res(hi, True)
+        got_hi = await drain(hub, hi, lambda m: len(kinds(m, "psd")) >= 1)
+        got_lo = await drain(hub, lo, lambda m: len(kinds(m, "psd")) >= 1)
+        await asyncio.sleep(0.05)
+        got_hi += [hub.shape(hi, m) for m in hi.take()]
+        got_lo += [hub.shape(lo, m) for m in lo.take()]
+        assert {f["mode"] for f in kinds(got_hi, "psd")} == {"high_res"}
+        assert {f["mode"] for f in kinds(got_lo, "psd")} == {"averaged"}
+        # Power history holds per-chunk power only.
+        assert [p[1] for p in hub._feeds["a"].power] == [-51.0, -52.0, -54.0, -55.0]
+    finally:
+        await hub.close()
+
+
+def test_older_sensor_frames_go_to_every_viewer() -> None:
+    hi, lo = _Viewer(high_res=True), _Viewer()
+    legacy = {"type": "psd", "id": "a", "mode": None}
+    assert LiveHub._wants(hi, legacy) and LiveHub._wants(lo, legacy)
+    assert not LiveHub._wants(lo, {**legacy, "mode": "high_res"})
+    assert not LiveHub._wants(hi, {**legacy, "mode": "averaged"})

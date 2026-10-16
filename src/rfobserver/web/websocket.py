@@ -43,6 +43,7 @@ class _Subscriber:
     __slots__ = (
         "queue",
         "high_res",
+        "also_averaged",
         "wants_psd",
         "freq_sig",
         "nf_bins",
@@ -56,6 +57,9 @@ class _Subscriber:
     def __init__(self) -> None:
         self.queue: _QueueType = asyncio.Queue(maxsize=10)
         self.high_res: bool = False
+        # In High Res, also take the averaged frames (the fleet relays both,
+        # one mode to each of its viewers). Pages want one mode or the other.
+        self.also_averaged: bool = False
         self.wants_psd: bool = True
         # What this client already holds, so unchanged data is not resent.
         self.freq_sig: tuple[int, float, float] | None = None
@@ -164,6 +168,19 @@ class LiveBroadcast:
     def has_high_res_subscribers(self) -> bool:
         return any(s.high_res and s.wants_psd for s in self._subscribers)
 
+    @staticmethod
+    def _wants(sub: _Subscriber, mode: Any) -> bool:
+        """Whether a subscriber takes psd frames of this mode: High Res frames
+        only go to clients that asked for them, averaged frames only to the
+        others (and to those that asked for both). Unlabelled frames go to all."""
+        if not sub.wants_psd:
+            return False
+        if mode == "high_res":
+            return sub.high_res
+        if mode == "averaged":
+            return not sub.high_res or sub.also_averaged
+        return True
+
     async def publish(self, data: dict[str, Any]) -> None:
         # Separate grid_rows from the base message — only send to high_res clients
         grid_rows = data.pop("grid_rows", None)
@@ -175,8 +192,9 @@ class LiveBroadcast:
         # One copy with the grid rows for every high-res client, so it too is
         # encoded once.
         with_rows = None if grid_rows is None else {**data, "grid_rows": grid_rows}
+        mode = data.get("mode") if is_psd else None
         for sub in list(self._subscribers):
-            if is_psd and not sub.wants_psd:
+            if is_psd and not self._wants(sub, mode):
                 continue
             msg = data
             if sub.high_res and with_rows is not None:
@@ -253,7 +271,10 @@ async def websocket_endpoint(websocket: WebSocket, broadcast: LiveBroadcast) -> 
                 )
             elif msg.get("type") == "set_mode":
                 sub.high_res = bool(msg.get("high_res", False))
-                logger.info("Client %s set high_res=%s", peer, sub.high_res)
+                sub.also_averaged = bool(msg.get("averaged", False))
+                logger.info(
+                    "Client %s set high_res=%s averaged=%s", peer, sub.high_res, sub.also_averaged
+                )
             elif msg.get("type") == "set_view":
                 sub.wants_psd = bool(msg.get("psd_visible", True))
                 logger.info(

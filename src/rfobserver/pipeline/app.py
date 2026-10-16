@@ -251,6 +251,15 @@ async def run(settings: AppSettings) -> None:
         if settings.MOCK_RECEIVER:
             logger.info("Using mock receiver")
             return MockReceiver(receiver_config)
+        if settings.RECEIVER == "rtlsdr":
+            from rfobserver.capture.rtlsdr_receiver import RtlSdrReceiver
+
+            logger.info("Using RTL-SDR receiver (device %d)", settings.RTLSDR_DEVICE_INDEX)
+            return RtlSdrReceiver(
+                receiver_config,
+                device_index=settings.RTLSDR_DEVICE_INDEX,
+                ppm=settings.RTLSDR_PPM,
+            )
         from rfobserver.capture.receiver import Receiver
 
         return Receiver(receiver_config)

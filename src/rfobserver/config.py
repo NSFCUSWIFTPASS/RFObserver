@@ -270,6 +270,13 @@ class AppSettings(BaseSettings):
     # instead of leaving a live process with the sensor silently inactive.
     EXIT_ON_CRASH_GIVE_UP: bool = True
 
+    # Receiver hardware: "uhd" (USRP B2xx) or "rtlsdr" (RTL2832U dongle,
+    # capture/rtlsdr_receiver.py; BANDWIDTH 0.9-3.2 MS/s, 2.4 is reliable).
+    # MOCK_RECEIVER overrides both.
+    RECEIVER: Literal["uhd", "rtlsdr"] = "uhd"
+    RTLSDR_DEVICE_INDEX: int = 0
+    RTLSDR_PPM: int = 0  # tuner frequency correction, parts per million
+
     # Development
     MOCK_RECEIVER: bool = False
     LOG_LEVEL: str = "INFO"

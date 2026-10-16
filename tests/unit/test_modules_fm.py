@@ -95,3 +95,51 @@ def test_channel_outside_the_band_reports_and_returns_no_audio() -> None:
     assert m._demod_chunk(buf, 915_000_000, 56_000_000) is None
     assert m._error is not None and "outside the captured band" in m._error
     assert "887.0 to 943.0 MHz" in m._error
+
+
+def _numpy_as_cupy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the GPU path on the CPU: numpy provides everything it uses from cupy."""
+    from types import SimpleNamespace
+
+    from rfobserver.modules import fm_demod
+
+    shim = SimpleNamespace(**{k: getattr(np, k) for k in dir(np) if not k.startswith("__")})
+    shim.asnumpy = np.asarray
+    monkeypatch.setattr(fm_demod, "cp", shim, raising=False)
+    monkeypatch.setattr(fm_demod, "HAS_CUPY", True)
+
+
+def test_demod_is_seamless_across_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A synthetic station, in chunks that are not a multiple of the
+    decimation: the audio is the tone with no extra error at chunk
+    boundaries (dropping the remainder clicked 27 times a second) and comes
+    out at exactly 48 kHz."""
+    _numpy_as_cupy(monkeypatch)
+    # 22 x 9309 + 20: 20 samples left over per chunk (3.6 us; production
+    # leaves 192 at 56 Msps, 3.4 us), a jump the discriminator hears.
+    fs, n, center, offset, tone = 5_600_000, 204_818, 100_000_000, 1_300_000, 1000.0
+    m = FMDemodModule({"channel_freq_hz": center + offset})
+    assert fs // 250_000 == 22 and n % 22 == 20
+    rng = np.random.default_rng(1)
+    phase, out = 0.0, []
+    chunks = 30
+    for c in range(chunks):
+        t = (np.arange(n) + c * n) / fs
+        f_inst = offset + 37_500.0 * np.sin(2 * np.pi * tone * t)
+        ph = phase + 2 * np.pi * np.cumsum(f_inst) / fs
+        phase = ph[-1]
+        iq = 0.3 * np.exp(1j * ph) + 0.002 * (rng.standard_normal(n) + 1j * rng.standard_normal(n))
+        sc = np.empty(2 * n, dtype=np.int16)
+        sc[0::2] = np.round(iq.real * 32767)
+        sc[1::2] = np.round(iq.imag * 32767)
+        out.append(m._demod_chunk(sc.view(np.int32), center, fs))
+    audio = np.concatenate(out[3:])  # past the filters' start-up
+    assert len(np.concatenate(out)) == pytest.approx(chunks * n / fs * 48_000, abs=2)
+
+    k = np.arange(len(audio))
+    w = 2 * np.pi * tone * k / 48_000
+    basis = np.column_stack([np.sin(w), np.cos(w), np.ones(len(k))])
+    res = audio - basis @ np.linalg.lstsq(basis, audio, rcond=None)[0]
+    # The tone (amplitude 0.5) and nothing else: the old code's dropped
+    # samples left an error of about 0.14, the fixed path about 0.0003.
+    assert np.max(np.abs(res)) < 0.005

@@ -1027,6 +1027,12 @@ body {
     flex-wrap: wrap;
 }
 
+.module-audio-stats {
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+}
+
 .module-error {
     flex-basis: 100%;
     color: #ff3b30;

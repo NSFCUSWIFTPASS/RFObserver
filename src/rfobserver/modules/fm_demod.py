@@ -109,6 +109,10 @@ class FMDemodModule(UpstreamModule):
         self._nco_step = 0.0  # its phase advance per chunk (radians)
         self._nco_phase = 0.0  # phase at the next chunk's first sample
         self._prev_sample: complex | None = None  # FM discriminator continuity
+        # Mixed samples left over when a chunk is not a multiple of the
+        # decimation (2,048,000 / 224 leaves 192): they start the next chunk.
+        # Dropping them made a phase jump, a click, at every chunk boundary.
+        self._tail: Any = None
         self._deemph_zi: np.ndarray = np.zeros(1)
         self._audio_taps: np.ndarray = np.ones(1)
         self._audio_zi: np.ndarray = np.zeros(0)
@@ -237,9 +241,17 @@ class FMDemodModule(UpstreamModule):
         self._nco_phase = (self._nco_phase + self._nco_step) % (2.0 * np.pi)
 
         # 3. Decimate to the intermediate rate (~250 kHz) by box-car averaging:
-        #    a sinc anti-alias filter, fast on the GPU.
+        #    a sinc anti-alias filter, fast on the GPU. The remainder carries
+        #    over, so the stream stays contiguous.
         d = self._decim1
-        iq_dec = iq[: (n // d) * d].reshape(-1, d).mean(axis=1) if d > 1 else iq
+        if d > 1:
+            if self._tail is not None and len(self._tail):
+                iq = cp.concatenate([self._tail, iq])
+            used = (len(iq) // d) * d
+            self._tail = iq[used:].copy()
+            iq_dec = iq[:used].reshape(-1, d).mean(axis=1)
+        else:
+            iq_dec = iq
 
         # 4. FM discriminator: angle(x[n] * conj(x[n-1])), continuous across chunks.
         first = cp.asarray(
@@ -305,6 +317,7 @@ class FMDemodModule(UpstreamModule):
         self._nco_phase = 0.0
 
         self._prev_sample = None
+        self._tail = None
         self._deemph_zi = np.zeros(1)
         cutoff = min(15_000.0, 0.45 * audio_rate)
         self._audio_taps = firwin(97, cutoff, fs=self._intermediate_rate)

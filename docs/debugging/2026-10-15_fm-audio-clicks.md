@@ -122,3 +122,39 @@ environment), so the fix is an antenna for 88-108 MHz, not gain or DSP.
 Measured and REJECTED (do not retry): RX gain 60 dB (margin 5.6 -> 4.1 dB). Adjacent-channel
 leakage through the box-car decimation: the neighbours at 101.3/101.7 are at the noise
 floor, so it cannot be the static here (it would matter next to a strong station).
+
+## Addendum, 2026-10-18: faint crackle on a strong station (RTL-SDR)
+
+Question: "I have an FM antenna connected to rtl-sdr and I'm tuned to 101.5, pretty good
+quality (SNRs high), but there are still really low volume crackles (barely any)".
+Hardware: Nooelec NESDR SMArt v5 on nano-super, 2.4 MS/s at 101.0 MHz, gain 30.
+
+Answer: neighbouring stations folding into the channel. The first stage was a box-car
+average straight down to ~267 kHz (/9), which rejects a station 200 kHz away by only about
+13 dB; after decimation it lands inside the channel. Replaced by a FIR channel filter
+(Kaiser, 60 dB, flat to 100 kHz) before decimating, with a box-car only in front of large
+decimations (56 MS/s: /14 box-car to 4 MHz, whose leaks lie MHz away, then /16 FIR).
+
+Procedure: a 4.07 s gap-free IQ capture of the live sensor; the module run offline over it
+(`fm_analyze.py`, `fm_ab.py`, `fm_new.py` in the session scratchpad). Checked, in order:
+receiver drops and module chunk drops (none), ADC clipping (0.0003%), impulses above
+8 sigma in the audio (none), neighbour levels at +/-200, 400 kHz (5-9 dB below 101.5).
+Then the same audio through a 129-tap FIR before the module (A/B WAVs): -25.5 dB difference
+overall, concentrated in the treble (10-15 kHz, -5.3 dB relative), which is where folded
+neighbours and their crackle land. The module with the new filter matches that FIR
+prototype to -32 dB.
+
+    synthetic, 2.4 MS/s, neighbour +200 kHz and 10 dB stronger: tone residual rms 0.130 (box-car), < 0.005 (FIR)
+    56 MS/s bench on .177: 10.0 ms/chunk before, 11.4 after; nano-super 15.9 / 16.1
+
+Measured and REJECTED (do not retry): dropouts (receiver and module counters flat);
+clipping; impulsive interference (nothing above 8 sigma).
+
+Measurement trap: the first FIR version took 21 ms/chunk on .177 (38.9 on nano-super, slower
+than real time) although the filter itself was 2.6 ms. CuPy's `reshape(-1, d).mean(axis=1)`
+takes 9.6 ms for d = 14 against 1.1 ms for d = 224 on a 2M-sample chunk; a one-thread-per-
+output elementwise kernel takes 0.5 ms. cuBLAS (`@` with a weight vector, 0.6 ms) is not
+installed on nano-super, so the module does not use it.
+
+Open: whether any crackle remains for the listener after this change (not yet heard).
+Multipath on a strong station would need an equaliser (CMA), not a filter.

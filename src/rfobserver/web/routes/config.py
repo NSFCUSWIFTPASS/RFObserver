@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import SecretStr
 
+from rfobserver.capture.rtlsdr_receiver import valid_rate as rtlsdr_valid_rate
 from rfobserver.processing import psd_cuda
 from rfobserver.processing.spectral import PSD_BACKENDS
 from rfobserver.web.uiprefs import ui_theme
@@ -229,6 +230,21 @@ async def apply_config(request: Request) -> dict[str, Any]:
             raise HTTPException(
                 status_code=400, detail="isolation_ram_fraction must be between 0.05 and 0.9"
             )
+
+        # The field is in Hz; "0.25" meant as MHz arrives as 0 and used to
+        # crash the receiver loop (division by zero) for good.
+        if attr == "BANDWIDTH" and isinstance(new_val, int):
+            if settings.RECEIVER == "rtlsdr" and not rtlsdr_valid_rate(new_val):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"An RTL-SDR cannot sample at {new_val} Hz: use 225001-300000 "
+                    "or 900001-3200000 Hz (e.g. 250e3, 2.4e6)",
+                )
+            if new_val < 200_000:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Bandwidth is in Hz: {new_val} Hz is too low (e.g. 250e3, 56e6)",
+                )
 
         # Validate FFT bins: must be a power of 2 in [256, 8192]
         if attr == "NUM_FFT_BINS":

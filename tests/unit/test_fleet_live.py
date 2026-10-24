@@ -400,3 +400,105 @@ async def test_frames_are_encoded_once_for_every_browser(tmp_path: Path) -> None
         assert json.loads(hub.encode(v1, {"type": "tick", "t": 1.0})) == {"type": "tick", "t": 1.0}
     finally:
         await hub.close()
+
+
+# --- burst overlay ---
+
+
+def _burst(i: str, t: float, **extra: Any) -> dict[str, Any]:
+    return {
+        "id": i,
+        "freq_low_hz": 915.0e6,
+        "freq_high_hz": 915.1e6,
+        "peak_power_db": -40.0,
+        "duration_ms": 5.0,
+        "start_time_ms": t + 400.0,  # the detector's clock, late of capture
+        "stop_time_ms": t + 405.0,
+        **extra,
+    }
+
+
+def _ov_frame(t: float, bursts=(), labels=()) -> dict[str, Any]:
+    return {
+        "capture_time_ms": t,
+        "chunk_time_ms": t + 100.0,
+        "bursts": list(bursts),
+        "attributions": list(labels),
+    }
+
+
+def test_overlay_uses_capture_times_and_forwards_new_bursts_a_while() -> None:
+    ov = live_mod._Overlay()
+    b = _burst("b1", 10_000.0, capture_start_ms=10_000.0, capture_stop_ms=10_005.0)
+    out = ov.update(_ov_frame(10_050.0, [b]), now=0.0)
+    assert [(x["id"], x["t0"], x["t1"]) for x in out["bursts"]] == [("b1", 10_000.0, 10_005.0)]
+    # Repeated unchanged: still forwarded within BURST_RESEND_SEC, then not.
+    assert ov.update(_ov_frame(10_090.0, [b]), now=0.5)["bursts"]
+    assert ov.update(_ov_frame(10_130.0, [b]), now=1.5)["bursts"] == []
+    # Grown: forwarded again.
+    grown = {**b, "capture_stop_ms": 10_009.0}
+    out = ov.update(_ov_frame(10_170.0, [grown]), now=1.6)
+    assert [x["t1"] for x in out["bursts"]] == [10_009.0]
+
+
+def test_overlay_estimates_times_for_an_older_sensor() -> None:
+    ov = live_mod._Overlay()
+    out = ov.update(_ov_frame(10_050.0, [_burst("b1", 10_000.0)]), now=0.0)
+    # Detector times less the frame's publish-to-capture delay (100 ms).
+    assert (out["bursts"][0]["t0"], out["bursts"][0]["t1"]) == (10_300.0, 10_305.0)
+
+
+def test_overlay_labels_once_and_never_resent_while_the_sensor_keeps_them() -> None:
+    ov = live_mod._Overlay()
+    lab = {
+        "id": "b1",
+        "model": "SCMplus",
+        "freq_low_hz": 915.0e6,
+        "freq_high_hz": 915.1e6,
+        "capture_start_ms": 10_000.0,
+        "capture_stop_ms": 10_005.0,
+    }
+    nolabel = {**lab, "id": "b2", "model": None}  # not decoded: no label
+    out = ov.update(_ov_frame(10_050.0, labels=[lab, nolabel]), now=0.0)
+    assert [(x["id"], x["model"]) for x in out["labels"]] == [("b1", "SCMplus")]
+    assert ov.update(_ov_frame(12_000.0, labels=[lab]), now=2.5)["labels"] == []
+    # The sensor still sends it a minute on: remembered, so not sent again.
+    assert ov.update(_ov_frame(70_000.0, labels=[lab]), now=60.0)["labels"] == []
+    # Gone from the sensor for OVERLAY_FORGET_SEC: forgotten.
+    ov.update(_ov_frame(100_000.0), now=100.0)
+    assert "b1" not in ov.labels
+
+
+def test_overlay_does_not_forward_items_already_off_the_waterfall() -> None:
+    ov = live_mod._Overlay()
+    old = {
+        "id": "old",
+        "model": "SCMplus",
+        "freq_low_hz": 1.0,
+        "freq_high_hz": 2.0,
+        "capture_start_ms": 1_000.0,
+        "capture_stop_ms": 1_005.0,
+    }
+    out = ov.update(_ov_frame(60_000.0, labels=[old]), now=0.0)
+    assert out["labels"] == [] and "old" in ov.labels
+
+
+async def test_high_res_frames_carry_the_overlay_averaged_do_not(tmp_path: Path) -> None:
+    fake = FakeSensors()
+    reg, hub = make_hub(tmp_path, fake)
+    a = reg.add("a", "10.0.0.1", 80, source="manual")
+    b = _burst("b1", 1000.0, capture_start_ms=1000.0, capture_stop_ms=1005.0)
+    fake.plan[live_url(a)] = [
+        psd(-50.0, t=1000.0, bursts=[b], capture_time_ms=1000.0),
+        psd(-49.0, freqs=False, t=2000.0, bursts=[b], chunks_averaged=10),
+    ]
+    try:
+        v = hub.join()
+        msgs = await drain(
+            hub, v, lambda m: any(f["avg_power_db"] == -49.0 for f in kinds(m, "psd"))
+        )
+        frames = {f["avg_power_db"]: f for f in kinds(msgs, "psd")}
+        assert [x["id"] for x in frames[-50.0]["bursts"]] == ["b1"]
+        assert "bursts" not in frames[-49.0]
+    finally:
+        await hub.close()

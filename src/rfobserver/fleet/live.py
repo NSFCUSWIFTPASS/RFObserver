@@ -17,7 +17,15 @@ sensor, as the sensor itself does, so the hub remembers each sensor's axis.
 
 A frame's ``t`` is when its first sample was captured, on the sensor's NTP
 clock, and ``dur_ms`` the span it covers, so the page can draw every sensor
-on one timeline. Each frame is encoded once, not once per browser: a frame is
+on one timeline.
+
+High Res frames also carry the burst overlay: the sensor's detected bursts
+and rtl_433 labels, on the same capture timeline. A sensor repeats its active
+bursts and recent labels in every frame; the hub forwards a burst only while
+it is new or changing (for BURST_RESEND_SEC, so a browser that skips frames
+still gets it) and a label for LABEL_RESEND_SEC.
+
+Each frame is encoded once, not once per browser: a frame is
 about 15 KB of JSON at 2048 bins and arrives some 27 times a second per
 sensor in High Res, and every browser gets the same bytes (one of two
 copies, with or without the frequency axis).
@@ -58,6 +66,12 @@ TICK_SEC = 1.0
 # Each sensor's recent frame powers, kept so a browser opening the Live page
 # draws the power plot at once (the plot shows this span in High Res).
 POWER_HISTORY_SEC = 60.0
+BURST_RESEND_SEC = 1.0
+LABEL_RESEND_SEC = 2.0
+OVERLAY_FORGET_SEC = 30.0  # ids kept this long after the sensor stops sending them
+# Older than this behind the frame, an item is off every waterfall: noted, not
+# forwarded (a sensor's 50 kept labels, when the hub first connects).
+OVERLAY_MAX_AGE_MS = 15000.0
 # Frames are about 60 KB of JSON; leave room for a large bin count.
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 
@@ -115,6 +129,95 @@ def compact_frame(sensor_id: str, data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _overlay_times(item: dict[str, Any], data: dict[str, Any]) -> tuple[float, float] | None:
+    """A burst's or label's [start, stop] ms on the frames' capture timeline.
+
+    A sensor that sends capture-clock times has them exact. An older one
+    only has its detector's clock, which runs late of capture by however far
+    its burst thread lags; the frame's publish-to-capture delay is taken off
+    as an estimate.
+    """
+    t0, t1 = item.get("capture_start_ms"), item.get("capture_stop_ms")
+    if isinstance(t0, (int, float)) and isinstance(t1, (int, float)):
+        return float(t0), float(t1)
+    t0, t1 = item.get("start_time_ms"), item.get("stop_time_ms")
+    if not isinstance(t0, (int, float)) or not isinstance(t1, (int, float)):
+        return None
+    chunk, cap = data.get("chunk_time_ms"), data.get("capture_time_ms")
+    lag = chunk - cap if isinstance(chunk, (int, float)) and isinstance(cap, (int, float)) else 0.0
+    return float(t0) - lag, float(t1) - lag
+
+
+@dataclass
+class _Overlay:
+    """What of a sensor's burst overlay to forward with each frame."""
+
+    # id -> (entry, monotonic time it stops being forwarded, time the sensor
+    # last sent it)
+    bursts: dict[str, tuple[dict[str, Any], float, float]] = field(default_factory=dict)
+    labels: dict[str, tuple[dict[str, Any], float, float]] = field(default_factory=dict)
+
+    def update(self, data: dict[str, Any], now: float) -> dict[str, list[dict[str, Any]]]:
+        """The frame's "bursts" and "labels": new or changed ones, each sent
+        for a while after."""
+        seen: set[str] = set()
+        t = data.get("capture_time_ms") or data.get("chunk_time_ms")
+        cut = t - OVERLAY_MAX_AGE_MS if isinstance(t, (int, float)) else None
+        for b in data.get("bursts") or []:
+            if not isinstance(b, dict) or b.get("id") is None:
+                continue
+            times = _overlay_times(b, data)
+            if times is None:
+                continue
+            key = str(b["id"])
+            seen.add(key)
+            entry = {
+                "id": key,
+                "t0": round(times[0], 1),
+                "t1": round(times[1], 1),
+                "f0": b.get("freq_low_hz"),
+                "f1": b.get("freq_high_hz"),
+                "p": b.get("peak_power_db"),
+                "d": b.get("duration_ms"),
+            }
+            old = self.bursts.get(key)
+            if old is None or old[0] != entry:
+                stale = cut is not None and times[1] < cut
+                self.bursts[key] = (entry, -math.inf if stale else now + BURST_RESEND_SEC, now)
+            else:
+                self.bursts[key] = (old[0], old[1], now)  # still sent, unchanged
+        for a in data.get("attributions") or []:
+            if not isinstance(a, dict) or a.get("id") is None or not a.get("model"):
+                continue
+            key = str(a["id"])
+            seen.add(key)
+            if key in self.labels:
+                old_label = self.labels[key]
+                self.labels[key] = (old_label[0], old_label[1], now)  # still sent
+                continue
+            times = _overlay_times(a, data)
+            if times is None:
+                continue
+            entry = {
+                "id": key,
+                "t0": round(times[0], 1),
+                "t1": round(times[1], 1),
+                "f0": a.get("freq_low_hz"),
+                "f1": a.get("freq_high_hz"),
+                "model": a.get("model"),
+            }
+            stale = cut is not None and times[1] < cut
+            self.labels[key] = (entry, -math.inf if stale else now + LABEL_RESEND_SEC, now)
+        out: dict[str, list[dict[str, Any]]] = {}
+        for name, items in (("bursts", self.bursts), ("labels", self.labels)):
+            for key in [
+                k for k, v in items.items() if k not in seen and now - v[2] > OVERLAY_FORGET_SEC
+            ]:
+                del items[key]
+            out[name] = [v[0] for v in items.values() if v[1] >= now]
+        return out
+
+
 def _add_point(points: collections.deque[tuple[float, float]], t_ms: float, value: Any) -> None:
     """Append (t, value); repeats, older times and non-numbers are skipped."""
     if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
@@ -147,6 +250,7 @@ class _Feed:
     kurtosis: collections.deque[tuple[float, float]] = field(default_factory=collections.deque)
     # ``frame`` encoded, keyed by whether it carries the frequency axis.
     encoded: dict[bool, str] = field(default_factory=dict)
+    overlay: _Overlay = field(default_factory=_Overlay)
 
     def add_power(self, t_ms: Any, value: Any, kurtosis: Any = None) -> None:
         """Record a frame's power and kurtosis, keeping POWER_HISTORY_SEC of
@@ -403,6 +507,9 @@ class LiveHub:
             if isinstance(freqs, list) and freqs:
                 feed.frequencies = freqs
             feed.frame = compact_frame(feed.sensor_id, data)
+            if not data.get("chunks_averaged"):
+                # High Res: averaged rows span a window, far longer than a burst.
+                feed.frame.update(feed.overlay.update(data, now))
             feed.encoded = {}
             feed.add_power(feed.frame["t"], data.get("avg_power_db"), data.get("kurtosis"))
             was_standby = now - feed.last_psd >= PSD_STALE_SEC

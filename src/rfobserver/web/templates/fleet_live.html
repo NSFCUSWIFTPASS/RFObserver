@@ -8,10 +8,16 @@
         <div class="card fleet-live-power fleet-live-chart">
             <div class="card-header">
                 <span id="fleet-live-power-title">Power</span>
-                <label class="toggle-label" title="A frame per chunk (about 27 a second) instead of one per averaged window">
-                    <input type="checkbox" id="fleet-live-highres" checked>
-                    <span class="toggle-text">High Res</span>
-                </label>
+                <span class="fleet-live-toggles">
+                    <label class="toggle-label" id="fleet-live-bursts-label" title="Show detected bursts and their rtl_433 labels on the waterfalls (High Res only)">
+                        <input type="checkbox" id="fleet-live-bursts" checked>
+                        <span class="toggle-text">Bursts</span>
+                    </label>
+                    <label class="toggle-label" title="A frame per chunk (about 27 a second) instead of one per averaged window">
+                        <input type="checkbox" id="fleet-live-highres" checked>
+                        <span class="toggle-text">High Res</span>
+                    </label>
+                </span>
             </div>
             <div class="card-body">
                 <div class="fleet-live-chart-hold">

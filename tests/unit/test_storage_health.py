@@ -253,11 +253,21 @@ def test_dashboard_draws_attribution_labels():
     html = _client(None).get("/live/").text
     # Fed from the psd payload, cleared with the waterfall, drawn by model.
     assert "updateBurstOverlay(data.bursts, data.attributions)" in html
-    assert "attrLabels.set(a.id, a)" in html
+    assert "attrLabels.set(a.id, onRowClock(a))" in html
     assert "attrLabels.clear()" in html
     assert "fillText(text, tx, ty)" in html
     assert "String(a.model)" in html
     assert "rgba(255, 214, 10, 0.95)" in html
+
+
+def test_dashboard_places_bursts_on_the_capture_clock():
+    html = _client(None).get("/live/").text
+    # Rows by capture time, and bursts and labels by their capture times when
+    # the frame has them; chunk_time_ms and the detector times otherwise.
+    assert 'typeof data.capture_time_ms === "number"' in html
+    assert "addWaterfallLine(data.powers, rowTimeMs)" in html
+    assert "seenBursts.set(b.id, onRowClock(b))" in html
+    assert "start_time_ms: x.capture_start_ms, stop_time_ms: x.capture_stop_ms" in html
 
 
 def test_config_page_marks_the_isolation_switches_as_next_start():

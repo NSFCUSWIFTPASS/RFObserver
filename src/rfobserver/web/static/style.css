@@ -2348,26 +2348,75 @@ body {
     max-width: none;
 }
 
-/* The square power plot on the left, the sensor tiles on the right. */
+/* Three equal columns. The power and kurtosis plots stack in the first,
+   down three tile rows; the sensor tiles fill the other two, row by row,
+   in roster order, and carry on under the plots past six. */
 .fleet-live-layout {
     display: grid;
-    grid-template-columns: minmax(320px, 28%) 1fr;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 16px;
     align-items: start;
 }
 
-.fleet-live-power {
-    position: sticky;
-    top: 16px;
+.fleet-live-grid {
+    display: contents;
 }
 
-@media (max-width: 900px) {
+.fleet-live-side {
+    grid-column: 1;
+    grid-row: 1 / span 3;
+    align-self: stretch;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    min-width: 0;
+    /* Tile rows not yet filled have no height: keep the plots readable
+       with only a sensor or two. */
+    min-height: 720px;
+}
+
+.fleet-live-chart {
+    flex: 1 1 0;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.fleet-live-chart .card-body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.fleet-live-empty {
+    grid-column: 2 / span 2;
+}
+
+@media (max-width: 1200px) {
     .fleet-live-layout {
-        grid-template-columns: 1fr;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
-    .fleet-live-power {
-        position: static;
+    .fleet-live-side {
+        grid-column: 1 / -1;
+        grid-row: auto;
+        flex-direction: row;
+        min-height: 0;
+    }
+
+    .fleet-live-empty {
+        grid-column: 1 / -1;
+    }
+}
+
+@media (max-width: 700px) {
+    .fleet-live-layout {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .fleet-live-side {
+        flex-direction: column;
     }
 }
 
@@ -2380,14 +2429,18 @@ body {
     margin-top: 6px;
 }
 
-.fleet-live-power-hold {
+.fleet-live-chart-hold {
     position: relative;
+    flex: 1;
+    min-height: 220px;
 }
 
-.fleet-live-power-canvas {
+.fleet-live-chart-canvas {
+    position: absolute;
+    inset: 0;
     display: block;
     width: 100%;
-    aspect-ratio: 1 / 1;
+    height: 100%;
     border-radius: 8px;
     box-shadow: var(--chart-ring);
 }
@@ -2416,18 +2469,6 @@ body {
 
 .fleet-live-conn.ok {
     color: var(--text-secondary);
-}
-
-.fleet-live-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
-    gap: 16px;
-}
-
-@media (max-width: 520px) {
-    .fleet-live-grid {
-        grid-template-columns: 1fr;
-    }
 }
 
 .fleet-tile {

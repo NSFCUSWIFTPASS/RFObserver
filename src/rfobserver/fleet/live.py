@@ -30,6 +30,7 @@ import collections
 import contextlib
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
@@ -114,6 +115,15 @@ def compact_frame(sensor_id: str, data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _add_point(points: collections.deque[tuple[float, float]], t_ms: float, value: Any) -> None:
+    """Append (t, value); repeats, older times and non-numbers are skipped."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        return
+    if points and t_ms <= points[-1][0]:
+        return
+    points.append((float(t_ms), round(float(value), 2)))
+
+
 @dataclass
 class _Feed:
     """One sensor's live socket and what it last said."""
@@ -132,20 +142,22 @@ class _Feed:
     recording: str | None = None
     error: str | None = None
     published_status: dict[str, Any] | None = None
-    # (t, avg_power_db) of recent frames, oldest first.
+    # (t, avg_power_db) and (t, kurtosis) of recent frames, oldest first.
     power: collections.deque[tuple[float, float]] = field(default_factory=collections.deque)
+    kurtosis: collections.deque[tuple[float, float]] = field(default_factory=collections.deque)
     # ``frame`` encoded, keyed by whether it carries the frequency axis.
     encoded: dict[bool, str] = field(default_factory=dict)
 
-    def add_power(self, t_ms: Any, value: Any) -> None:
-        if not isinstance(t_ms, (int, float)) or not isinstance(value, (int, float)):
+    def add_power(self, t_ms: Any, value: Any, kurtosis: Any = None) -> None:
+        """Record a frame's power and kurtosis, keeping POWER_HISTORY_SEC of
+        both (trimmed together, so a value a frame lacks still ages out)."""
+        if not isinstance(t_ms, (int, float)) or isinstance(t_ms, bool):
             return
-        if self.power and t_ms <= self.power[-1][0]:
-            return
-        self.power.append((float(t_ms), round(float(value), 2)))
         cut = t_ms - POWER_HISTORY_SEC * 1000.0
-        while self.power and self.power[0][0] < cut:
-            self.power.popleft()
+        for points, v in ((self.power, value), (self.kurtosis, kurtosis)):
+            _add_point(points, t_ms, v)
+            while points and points[0][0] < cut:
+                points.popleft()
 
     def state(self, now: float) -> str:
         if self.connected:
@@ -240,10 +252,15 @@ class LiveHub:
         now = time.monotonic()
         for feed in self._feeds.values():
             viewer.put((feed.sensor_id, "status"), feed.status(now))
-            if feed.power:
+            if feed.power or feed.kurtosis:
                 viewer.put(
                     (feed.sensor_id, "power_history"),
-                    {"type": "power_history", "id": feed.sensor_id, "points": list(feed.power)},
+                    {
+                        "type": "power_history",
+                        "id": feed.sensor_id,
+                        "points": list(feed.power),
+                        "kurtosis": list(feed.kurtosis),
+                    },
                 )
             if feed.frame is not None:
                 viewer.put((feed.sensor_id, "psd"), feed.frame)
@@ -387,7 +404,7 @@ class LiveHub:
                 feed.frequencies = freqs
             feed.frame = compact_frame(feed.sensor_id, data)
             feed.encoded = {}
-            feed.add_power(feed.frame["t"], data.get("avg_power_db"))
+            feed.add_power(feed.frame["t"], data.get("avg_power_db"), data.get("kurtosis"))
             was_standby = now - feed.last_psd >= PSD_STALE_SEC
             feed.last_psd, feed.last_seen = now, time.time()
             self._publish((feed.sensor_id, "psd"), feed.frame)

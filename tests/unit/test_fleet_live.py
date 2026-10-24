@@ -331,9 +331,9 @@ async def test_new_viewer_gets_recent_frame_powers(
     a = reg.add("a", "10.0.0.1", 80, source="manual")
     frames = [
         psd(-50.0, t=1000.0),
-        psd(-49.0, freqs=False, t=1500.0),
+        psd(-49.0, freqs=False, t=1500.0, kurtosis=3.5),
         psd(-48.0, freqs=False, t=1500.0),  # same time: ignored
-        psd(-47.0, freqs=False, t=2400.0),
+        psd(-47.0, freqs=False, t=2400.0, kurtosis=None),  # no kurtosis: power only
     ]  # pushes t=1000 out of the 1 s span
     fake.plan[live_url(a)] = frames
     try:
@@ -344,6 +344,7 @@ async def test_new_viewer_gets_recent_frame_powers(
         hist = kinds(msgs, "power_history")[0]
         assert hist["id"] == "a"
         assert [tuple(p) for p in hist["points"]] == [(1500.0, -49.0), (2400.0, -47.0)]
+        assert [tuple(p) for p in hist["kurtosis"]] == [(1500.0, 3.5)]
     finally:
         await hub.close()
 

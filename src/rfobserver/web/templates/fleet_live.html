@@ -4,34 +4,45 @@
 <script src="/static/shared-charts.js"></script>
 
 <div class="fleet-live-layout">
-    <div class="card fleet-live-power">
-        <div class="card-header">
-            <span id="fleet-live-power-title">Power</span>
-            <label class="toggle-label" title="A frame per chunk (about 27 a second) instead of one per averaged window">
-                <input type="checkbox" id="fleet-live-highres" checked>
-                <span class="toggle-text">High Res</span>
-            </label>
-        </div>
-        <div class="card-body">
-            <div class="fleet-live-power-hold">
-                <canvas id="fleet-live-power" class="fleet-live-power-canvas"></canvas>
-                <div id="fleet-live-tip" class="graph-tooltip" style="display:none;"></div>
+    <div class="fleet-live-side">
+        <div class="card fleet-live-power fleet-live-chart">
+            <div class="card-header">
+                <span id="fleet-live-power-title">Power</span>
+                <label class="toggle-label" title="A frame per chunk (about 27 a second) instead of one per averaged window">
+                    <input type="checkbox" id="fleet-live-highres" checked>
+                    <span class="toggle-text">High Res</span>
+                </label>
             </div>
-            <div class="graph-legend fleet-live-foot">
-                <span id="fleet-live-legend" class="fleet-legend"></span>
-                <span class="fleet-live-status">
-                    <span id="fleet-live-conn" class="fleet-live-conn">Connecting</span><span id="fleet-live-delay" class="fleet-live-delay" title="Every tile shows the same moment, this far behind real time (the slowest sensor's delivery time)"></span>
-                </span>
+            <div class="card-body">
+                <div class="fleet-live-chart-hold">
+                    <canvas id="fleet-live-power" class="fleet-live-chart-canvas"></canvas>
+                    <div id="fleet-live-power-tip" class="graph-tooltip" style="display:none;"></div>
+                </div>
+                <div class="graph-legend fleet-live-foot">
+                    <span id="fleet-live-legend" class="fleet-legend"></span>
+                    <span class="fleet-live-status">
+                        <span id="fleet-live-conn" class="fleet-live-conn">Connecting</span><span id="fleet-live-delay" class="fleet-live-delay" title="Every tile shows the same moment, this far behind real time (the slowest sensor's delivery time)"></span>
+                    </span>
+                </div>
+            </div>
+        </div>
+        <div class="card fleet-live-kurtosis fleet-live-chart">
+            <div class="card-header">
+                <span id="fleet-live-kurtosis-title">Kurtosis</span>
+            </div>
+            <div class="card-body">
+                <div class="fleet-live-chart-hold">
+                    <canvas id="fleet-live-kurtosis" class="fleet-live-chart-canvas"></canvas>
+                    <div id="fleet-live-kurtosis-tip" class="graph-tooltip" style="display:none;"></div>
+                </div>
             </div>
         </div>
     </div>
 
-    <div class="fleet-live-tiles">
-        <div id="fleet-live-grid" class="fleet-live-grid"></div>
-        <p id="fleet-live-empty" class="placeholder-text" style="display:none;">
-            No sensors shown. Add or show sensors on the <a href="/sensors">Sensors</a> page.
-        </p>
-    </div>
+    <div id="fleet-live-grid" class="fleet-live-grid"></div>
+    <p id="fleet-live-empty" class="placeholder-text fleet-live-empty" style="display:none;">
+        No sensors shown. Add or show sensors on the <a href="/sensors">Sensors</a> page.
+    </p>
 </div>
 
 <script src="/static/fleet-live.js"></script>

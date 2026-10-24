@@ -8,6 +8,7 @@ import json
 from typing import TYPE_CHECKING, Any
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from rfobserver.fleet import live as live_mod
@@ -19,8 +20,6 @@ from rfobserver.fleet.sensors import SensorHub
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from pathlib import Path
-
-    import pytest
 
 FREQS = [914e6, 915e6, 916e6]
 
@@ -483,22 +482,24 @@ def test_overlay_does_not_forward_items_already_off_the_waterfall() -> None:
     assert out["labels"] == [] and "old" in ov.labels
 
 
-async def test_high_res_frames_carry_the_overlay_averaged_do_not(tmp_path: Path) -> None:
+@pytest.mark.parametrize("averaged", [False, True])
+async def test_high_res_frames_carry_the_overlay_averaged_do_not(
+    tmp_path: Path, averaged: bool
+) -> None:
+    # One frame per case: a browser that falls behind only gets the newest.
     fake = FakeSensors()
     reg, hub = make_hub(tmp_path, fake)
     a = reg.add("a", "10.0.0.1", 80, source="manual")
     b = _burst("b1", 1000.0, capture_start_ms=1000.0, capture_stop_ms=1005.0)
-    fake.plan[live_url(a)] = [
-        psd(-50.0, t=1000.0, bursts=[b], capture_time_ms=1000.0),
-        psd(-49.0, freqs=False, t=2000.0, bursts=[b], chunks_averaged=10),
-    ]
+    extra: dict[str, Any] = {"chunks_averaged": 10} if averaged else {}
+    fake.plan[live_url(a)] = [psd(-50.0, t=1000.0, bursts=[b], capture_time_ms=1000.0, **extra)]
     try:
         v = hub.join()
-        msgs = await drain(
-            hub, v, lambda m: any(f["avg_power_db"] == -49.0 for f in kinds(m, "psd"))
-        )
-        frames = {f["avg_power_db"]: f for f in kinds(msgs, "psd")}
-        assert [x["id"] for x in frames[-50.0]["bursts"]] == ["b1"]
-        assert "bursts" not in frames[-49.0]
+        msgs = await drain(hub, v, lambda m: bool(kinds(m, "psd")))
+        (frame,) = kinds(msgs, "psd")
+        if averaged:
+            assert "bursts" not in frame
+        else:
+            assert [x["id"] for x in frame["bursts"]] == ["b1"]
     finally:
         await hub.close()

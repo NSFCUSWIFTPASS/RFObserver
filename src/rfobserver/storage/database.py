@@ -1791,6 +1791,7 @@ class SensorDatabase:
         max_duration_ms: float | None = None,
         attributed: bool | None = None,
         model: str | None = None,
+        status: str | None = None,
     ) -> tuple[list[str], list[Any]]:
         """WHERE fragments shared by the detections table, histogram and CSV.
 
@@ -1832,6 +1833,18 @@ class SensorDatabase:
             conditions.append("(model IS NOT NULL AND model != '')")
         elif attributed is False:
             conditions.append("(model IS NULL OR model = '')")
+        # status splits not attributed as the Detections page's type rows do:
+        # tried (rtl_433 ran, its record is stored) or not tried (no record).
+        if status == "decoded":
+            conditions.append("(model IS NOT NULL AND model != '')")
+        elif status == "tried":
+            conditions.append(
+                "((model IS NULL OR model = '') AND attribution IS NOT NULL AND attribution != '')"
+            )
+        elif status == "not_tried":
+            conditions.append(
+                "((model IS NULL OR model = '') AND (attribution IS NULL OR attribution = ''))"
+            )
         if model is not None:
             # The redundant terms repeat idx_detections_model's WHERE so the
             # planner can prove the partial index covers a bound parameter.
@@ -1855,6 +1868,7 @@ class SensorDatabase:
         attributed: bool | None = None,
         model: str | None = None,
         before: tuple[str, int] | None = None,
+        status: str | None = None,
     ) -> list[dict[str, Any]]:
         """Detections newest first (start_time DESC, id DESC as the tiebreak).
 
@@ -1875,6 +1889,7 @@ class SensorDatabase:
             max_duration_ms=max_duration_ms,
             attributed=attributed,
             model=model,
+            status=status,
         )
         if before is not None:
             # Row-value form: SQLite walks idx_detections_time (rowid is the
@@ -1975,6 +1990,7 @@ class SensorDatabase:
         until: datetime | None = None,
         attributed: bool | None = None,
         model: str | None = None,
+        status: str | None = None,
     ) -> dict[str, Any]:
         """Bucket detection pulse lengths (duration_ms) into fixed-width bins.
 
@@ -1992,6 +2008,7 @@ class SensorDatabase:
             gain=gain,
             attributed=attributed,
             model=model,
+            status=status,
         )
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         query = f"SELECT duration_ms FROM detections {where}"

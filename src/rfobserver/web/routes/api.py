@@ -874,12 +874,14 @@ def _detection_filters(
     model: str | None = None,
     start: str | None = None,
     stop: str | None = None,
+    status: str | None = None,
 ) -> dict[str, Any]:
     """query_detections / duration_histogram kwargs for the Detections filters.
 
     Raises InvalidTimeFilterError for an unparseable non-empty start/stop.
     """
     return {
+        "status": _opt_str(status),
         "sdr_center_freq": _opt_float(sdr_center),
         "sample_rate": _opt_float(sample_rate),
         "gain": _opt_float(gain),
@@ -1025,8 +1027,10 @@ async def detections_csv(
     model: str | None = None,
     start: str | None = None,
     stop: str | None = None,
+    status: str | None = None,
 ) -> StreamingResponse:
     """Every detection matching the Detections page filters, as a CSV download.
+    ``status`` (decoded, tried or not_tried) narrows as the page's type rows do.
 
     Streams newest first in CSV_PAGE_SIZE pages with a (start_time, id) keyset
     cursor, so a long history is never held in memory. Columns are every
@@ -1046,6 +1050,7 @@ async def detections_csv(
             model=model,
             start=start,
             stop=stop,
+            status=status,
         )
     except InvalidTimeFilterError as exc:
         raise HTTPException(status_code=400, detail="Invalid start/stop time") from exc
@@ -1140,6 +1145,84 @@ async def detections_json(
         logger.exception("detections.json query failed")
         return {"detections": []}
     return {"detections": [dict(r) for r in rows]}
+
+
+# The Detections page's colour for this sensor's series (the fleet gives each
+# sensor its own).
+_SENSOR_COLOUR = "#0a84ff"
+
+
+def _sensor_meta(request: Request) -> dict[str, Any]:
+    s = request.app.state.settings
+    return {"id": s.HOSTNAME, "label": s.SENSOR_NAME or s.HOSTNAME, "colour": _SENSOR_COLOUR}
+
+
+@router.get("/detections/list")
+async def detections_list(
+    request: Request,
+    since: str,
+    until: str,
+    limit: int = 100,
+    model: str | None = None,
+    status: str | None = None,
+    duration_min: str | None = None,
+    duration_max: str | None = None,
+) -> dict[str, Any]:
+    """The Detections page's list: the newest ``limit`` detections in
+    [since, until), shaped as the fleet's /fleet/api/detections (one sensor).
+    ``status`` is decoded, tried or not_tried; duration_min/max narrow to a
+    histogram bar, [min, max) ms. Page on with until = the response's
+    next_before."""
+    from rfobserver.fleet.detections import merge
+
+    db = _get_db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    try:
+        since_dt = _opt_utc_dt(since)
+        until_dt = _opt_utc_dt(until)
+    except InvalidTimeFilterError as exc:
+        raise HTTPException(status_code=400, detail="Invalid since/until time") from exc
+    limit = max(1, min(limit, 500))
+    rows = await db.query_detections(
+        limit=limit,
+        since=since_dt,
+        until=until_dt,
+        model=_opt_str(model),
+        status=_opt_str(status),
+        min_duration_ms=_opt_float(duration_min),
+        max_duration_ms=_opt_float(duration_max),
+    )
+    out = merge([(_sensor_meta(request), rows)], limit)
+    more = len(out) >= limit
+    return {"rows": out, "next_before": out[-1]["start_time"] if more else None, "errors": {}}
+
+
+@router.get("/detection")
+async def detection_one(
+    request: Request, burst_id: str, start_time: str, download: bool = False
+) -> Response:
+    """One detection with its full attribution record, shaped as the fleet's
+    /fleet/api/detection (the Detections page popup, and its download)."""
+    from rfobserver.fleet.detections import detection_doc, download_headers
+
+    db = _get_db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    try:
+        start = datetime.fromisoformat(start_time)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid start_time") from None
+    rows = await db.query_detections(limit=50, since=start, until=start + timedelta(milliseconds=1))
+    row = next((r for r in rows if r.get("burst_id") == burst_id), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail="detection not found (pruned?)")
+    meta = _sensor_meta(request)
+    doc = detection_doc({"id": meta["id"], "label": meta["label"]}, dict(row))
+    headers = download_headers(meta["id"], burst_id) if download else {}
+    return Response(
+        content=json.dumps(doc, indent=2), media_type="application/json", headers=headers
+    )
 
 
 @router.get("/averaged")
@@ -1734,11 +1817,12 @@ async def detections_histogram_fragment(
     model: str | None = None,
     start: str | None = None,
     stop: str | None = None,
+    status: str | None = None,
 ) -> str:
     """Return the pulse-length (duration_ms) distribution as clickable HTML bars.
 
     Scoped by the same filters as the detections table (SDR capture context,
-    attribution, model, start/stop UTC). Ignores any duration_min/max params:
+    attribution, model, status, start/stop UTC). Ignores any duration_min/max params:
     the histogram always shows the full distribution for that scope while a
     bar click narrows only the table.
     """
@@ -1755,6 +1839,7 @@ async def detections_histogram_fragment(
             model=model,
             start=start,
             stop=stop,
+            status=status,
         )
     except InvalidTimeFilterError as exc:
         raise HTTPException(status_code=400, detail="Invalid start/stop time") from exc

@@ -4,6 +4,11 @@
  * the newest detections across sensors with their attribution detail (from
  * /fleet/api/detections). Selecting a type row filters the detections list.
  *
+ * A sensor's own Detections page runs the same script for itself
+ * (window.RFOBS_DET_SINGLE): its endpoints answer in the same shapes, and the
+ * sensor column, legend and sensor picker are left out. It adds a pulse-length
+ * histogram for the range and type; selecting a bar narrows the list to it.
+ *
  * Sensors count hours from the moment they run a version with hourly counts
  * (no history before); hours before that are left out, not shown as zero.
  * Times are UTC throughout, as on the sensors' own Detections pages.
@@ -12,6 +17,11 @@
     "use strict";
 
     const SENSORS = window.RFOBS_SENSORS || [];
+    const SINGLE = !!window.RFOBS_DET_SINGLE;
+    const API = SINGLE
+        ? { hourly: "/api/detections/hourly", rows: "/api/detections/list", detection: "/api/detection" }
+        : { hourly: "/fleet/api/detections/hourly", rows: "/fleet/api/detections", detection: "/fleet/api/detection" };
+    const COLS = SINGLE ? 8 : 9;
     const PAGE_ROWS = 100;
     const REFRESH_MS = 60000;
     const HIDDEN_KEY = "rfobs.fleet.det.hidden";
@@ -25,6 +35,7 @@
         hours: 24,
         sensor: "",        // "" = all sensors, for the list
         filter: null,      // {key, label, params} from the type table
+        duration: null,    // {lo, hi} ms from a histogram bar (a sensor's page)
         counts: null,      // /fleet/api/detections/hourly body
         range: null,       // {since, until, first, last} epoch seconds of the counts
         rows: [],
@@ -76,9 +87,15 @@
             until: new Date(range.until * 1000).toISOString(),
         });
         try {
-            const r = await fetch("/fleet/api/detections/hourly?" + q.toString());
+            const r = await fetch(API.hourly + "?" + q.toString());
             if (!r.ok) return;
-            state.counts = await r.json();
+            const body = await r.json();
+            // The sensor answers for itself: wrap it as the fleet's one-sensor reply.
+            state.counts = SINGLE
+                ? { sensors: [Object.assign({}, SENSORS[0], {
+                    supported: true, error: null, covered_since: body.covered_since, hours: body.hours || [],
+                }) ] }
+                : body;
             state.range = range;
             renderCounts();
             $("det-updated").textContent = "Updated " + new Date().toLocaleTimeString();
@@ -123,6 +140,7 @@
     }
 
     function renderLegends() {
+        if (SINGLE) return;
         const html = state.counts.sensors.map(function (s) {
             const off = state.hidden.has(s.id);
             const note = !s.supported ? " (update sensor)" : s.error ? " (offline)" : "";
@@ -138,6 +156,7 @@
     }
 
     ["det-legend-all", "det-legend-attr"].forEach(function (id) {
+        if (!$(id)) return;
         $(id).addEventListener("click", function (e) {
             const btn = e.target.closest(".fleet-legend-item");
             if (!btn) return;
@@ -337,11 +356,13 @@
         const sensors = state.counts.sensors;
         const tr = typeRows();
         let html = "<thead><tr><th>Type</th>";
-        for (const s of sensors) {
+        if (SINGLE) html += '<th class="num">Detections</th>';
+        else for (const s of sensors) {
             html += '<th class="num"><span class="fleet-swatch" style="background:' + esc(s.colour) + ';"></span>'
                 + esc(s.label) + "</th>";
         }
-        html += '<th class="num">Total</th></tr></thead><tbody>';
+        if (!SINGLE) html += '<th class="num">Total</th>';
+        html += "</tr></thead><tbody>";
         const selected = state.filter ? state.filter.key : "all";
         for (const row of tr.rows) {
             let total = 0;
@@ -357,7 +378,7 @@
             html += '<tr class="' + (row.key === selected ? "selected" : "") + (row.model ? " model-row" : "")
                 + '" data-key="' + esc(row.key) + '" tabindex="0">'
                 + "<td>" + (row.model ? '<span class="fleet-det-model">' + esc(row.label) + "</span>" : esc(row.label)) + "</td>"
-                + cells + '<td class="num total">' + fmtCount(total) + "</td></tr>";
+                + (SINGLE ? cells : cells + '<td class="num total">' + fmtCount(total) + "</td>") + "</tr>";
         }
         html += "</tbody>";
         $("det-types").innerHTML = html;
@@ -377,9 +398,11 @@
         const row = typeRows().rows.find(function (r) { return r.key === key; });
         if (!row) return;
         state.filter = row.filter ? { key: row.key, label: row.label, params: row.filter } : null;
+        state.duration = null;
         renderTypes();
         renderFilter();
         loadRows(true);
+        loadHistogram();
     }
 
     $("det-types").addEventListener("click", function (e) {
@@ -391,13 +414,32 @@
         if (tr && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); selectType(tr.dataset.key); }
     });
 
+    function durationLabel(d) {
+        const fmt = function (v) { const n = parseFloat(v); return Number.isInteger(n) ? String(n) : n.toFixed(1); };
+        return fmt(d.lo) + "\u2013" + fmt(d.hi) + " ms";
+    }
+
     function renderFilter() {
-        const f = state.filter;
-        $("det-filter").hidden = !f;
-        $("det-filter-text").textContent = f ? "Showing: " + f.label : "";
+        const parts = [];
+        if (state.filter) parts.push(state.filter.label);
+        if (state.duration) parts.push(durationLabel(state.duration));
+        $("det-filter").hidden = !parts.length;
+        $("det-filter-text").textContent = parts.length ? "Showing: " + parts.join(", ") : "";
     }
 
     $("det-filter-clear").addEventListener("click", function () { selectType("all"); });
+
+    // The list's type, model and duration filters, on a query.
+    function addFilters(q) {
+        const f = state.filter ? state.filter.params : null;
+        if (f && f.status) q.set("status", f.status);
+        if (f && f.model) q.set("model", f.model);
+        if (state.duration) {
+            q.set("duration_min", state.duration.lo);
+            q.set("duration_max", state.duration.hi);
+        }
+        return q;
+    }
 
     // --- the detections list ---
 
@@ -431,8 +473,8 @@
         const model = a.status === "decoded"
             ? '<span class="fleet-det-model">' + esc(r.model) + "</span>" : "";
         return "<tr>"
-            + '<td class="sensor"><span class="fleet-swatch" style="background:' + esc(r.sensor.colour) + ';"></span>'
-            + esc(r.sensor.label) + "</td>"
+            + (SINGLE ? "" : '<td class="sensor"><span class="fleet-swatch" style="background:'
+                + esc(r.sensor.colour) + ';"></span>' + esc(r.sensor.label) + "</td>")
             + '<td class="mono">' + esc(fmtTime(r.start_time)) + "</td>"
             + '<td class="num">' + (Number(r.center_freq_hz) / 1e6).toFixed(3) + " MHz</td>"
             + '<td class="num">' + (Number(r.bandwidth_hz) / 1e3).toFixed(1) + " kHz</td>"
@@ -458,11 +500,9 @@
             limit: String(PAGE_ROWS),
         });
         if (state.sensor) q.set("sensor", state.sensor);
-        const f = state.filter ? state.filter.params : null;
-        if (f && f.status) q.set("status", f.status);
-        if (f && f.model) q.set("model", f.model);
+        addFilters(q);
         try {
-            const r = await fetch("/fleet/api/detections?" + q.toString());
+            const r = await fetch(API.rows + "?" + q.toString());
             if (!r.ok || seq !== state.loadSeq) return;
             const body = await r.json();
             if (seq !== state.loadSeq) return;
@@ -471,13 +511,13 @@
             state.paged = !reset;
             renderRows(body.errors || {});
         } catch (_) {
-            if (reset) $("det-rows").innerHTML = '<tr><td colspan="9" class="placeholder-text">Could not load detections</td></tr>';
+            if (reset) $("det-rows").innerHTML = '<tr><td colspan="' + COLS + '" class="placeholder-text">Could not load detections</td></tr>';
         }
     }
 
     function renderRows(errors) {
         $("det-rows").innerHTML = state.rows.length ? state.rows.map(rowHtml).join("")
-            : '<tr><td colspan="9" class="placeholder-text">No detections in this range</td></tr>';
+            : '<tr><td colspan="' + COLS + '" class="placeholder-text">No detections in this range</td></tr>';
         $("det-more").hidden = !state.nextBefore;
         const names = Object.keys(errors).map(function (id) {
             const s = SENSORS.find(function (x) { return x.id === id; });
@@ -582,13 +622,13 @@
         const q = new URLSearchParams({
             sensor: btn.dataset.sensor, burst_id: btn.dataset.burst, start_time: btn.dataset.start,
         });
-        $("det-dialog-download").href = "/fleet/api/detection?" + q.toString() + "&download=true";
+        $("det-dialog-download").href = API.detection + "?" + q.toString() + "&download=true";
         $("det-dialog-title").textContent = "Loading...";
         $("det-dialog-sub").textContent = "";
         $("det-dialog-body").textContent = "";
         if (!dialog.open) dialog.showModal();
         try {
-            const r = await fetch("/fleet/api/detection?" + q.toString());
+            const r = await fetch(API.detection + "?" + q.toString());
             const doc = await r.json();
             if (!r.ok) {
                 $("det-dialog-title").textContent = "Could not load";
@@ -609,7 +649,7 @@
     // A click on the backdrop (the dialog element itself) closes it.
     dialog.addEventListener("click", function (e) { if (e.target === dialog) dialog.close(); });
 
-    $("det-sensors").addEventListener("click", function (e) {
+    if ($("det-sensors")) $("det-sensors").addEventListener("click", function (e) {
         const btn = e.target.closest(".fleet-sensor-btn");
         if (!btn) return;
         state.sensor = btn.dataset.id;
@@ -617,6 +657,78 @@
             b.classList.toggle("selected", b === btn);
         });
         loadRows(true);
+    });
+
+    // --- pulse-length histogram (a sensor's page) ---
+    //
+    // The sensor renders the bars for the range and type. Selecting a bar
+    // narrows the list to that duration bucket; selecting it again clears it.
+
+    const hist = $("det-hist");
+    let histSeq = 0;
+
+    function rangeQuery() {
+        const range = currentRange();
+        return new URLSearchParams({
+            start: new Date(range.since * 1000).toISOString(),
+            stop: new Date(range.until * 1000).toISOString(),
+        });
+    }
+
+    function markBar() {
+        hist.querySelectorAll(".hist-bar.is-selected").forEach(function (b) { b.classList.remove("is-selected"); });
+        if (!state.duration) return true;
+        const bar = hist.querySelector('.hist-bar[data-lo="' + state.duration.lo + '"][data-hi="' + state.duration.hi + '"]');
+        if (bar) bar.classList.add("is-selected");
+        return !!bar;
+    }
+
+    async function loadHistogram() {
+        if (!hist) return;
+        const seq = ++histSeq;
+        const q = rangeQuery();
+        const f = state.filter ? state.filter.params : null;
+        if (f && f.status) q.set("status", f.status);
+        if (f && f.model) q.set("model", f.model);
+        const bw = $("det-hist-bin").value;
+        if (bw) q.set("bin_width", bw);
+        try {
+            const r = await fetch("/api/detections/histogram?" + q.toString());
+            if (!r.ok || seq !== histSeq) return;
+            hist.innerHTML = await r.text();
+        } catch (_) { return; /* the next refresh retries */ }
+        // A refresh keeps the same bins; a bar that is gone ends the selection.
+        if (!markBar()) setDuration(null);
+    }
+
+    function setDuration(d) {
+        state.duration = d;
+        markBar();
+        renderFilter();
+        loadRows(true);
+    }
+
+    if (hist) {
+        hist.addEventListener("click", function (e) {
+            const bar = e.target.closest(".hist-bar");
+            if (!bar) return;
+            const d = state.duration;
+            setDuration(d && d.lo === bar.dataset.lo && d.hi === bar.dataset.hi
+                ? null : { lo: bar.dataset.lo, hi: bar.dataset.hi });
+        });
+        $("det-hist-bin").addEventListener("change", function () {
+            state.duration = null;
+            renderFilter();
+            loadRows(true);
+            loadHistogram();
+        });
+    }
+
+    // --- CSV export (a sensor's page): every detection in the range and
+    // filters, not just the rows shown. The sensor streams it.
+
+    if ($("det-export")) $("det-export").addEventListener("click", function () {
+        window.location.href = "/api/detections.csv?" + addFilters(rangeQuery()).toString();
     });
 
     // --- range and refresh ---
@@ -627,8 +739,11 @@
         $("det-range").querySelectorAll("button").forEach(function (b) {
             b.classList.toggle("selected", Number(b.dataset.hours) === hours);
         });
+        state.duration = null;
+        renderFilter();
         loadCounts();
         loadRows(true);
+        loadHistogram();
     }
 
     $("det-range").addEventListener("click", function (e) {
@@ -646,6 +761,7 @@
         if (document.hidden) return;
         loadCounts();
         if (!state.paged) loadRows(true);
+        loadHistogram();
     }, REFRESH_MS);
 
     let saved = 24;

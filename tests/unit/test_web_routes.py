@@ -314,7 +314,7 @@ def test_config_page(client):
 def test_detections_page(client):
     response = client.get("/detections")
     assert response.status_code == 200
-    assert "<h1>Detections</h1>" in response.text
+    assert '<h1 class="fleet-page-title">Detections</h1>' in response.text
 
 
 def test_history_redirects_to_detections(client):

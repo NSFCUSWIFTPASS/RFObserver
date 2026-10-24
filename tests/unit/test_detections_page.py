@@ -92,7 +92,7 @@ def test_detections_page_renders(settings):
         r = client.get(path, follow_redirects=False)
         assert r.status_code == 200, path
         assert "<title>Detections - RFObs</title>" in r.text
-        assert "<h1>Detections</h1>" in r.text
+        assert '<h1 class="fleet-page-title">Detections</h1>' in r.text
 
 
 def test_nav_says_detections(settings):
@@ -111,16 +111,119 @@ def test_history_redirects_to_detections(settings, path):
     assert r.headers["location"] == "/detections"
 
 
-async def test_page_lists_distinct_models_in_filter(settings, seeded):
+async def test_page_is_the_fleet_layout_for_one_sensor(settings, seeded):
+    settings.SENSOR_NAME = "Roof"
     async with await _client(settings, seeded) as ac:
         r = await ac.get("/detections")
     assert r.status_code == 200
-    assert '<option value="SilverSpring-Mesh">SilverSpring-Mesh</option>' in r.text
-    assert '<option value="Acurite-Tower">Acurite-Tower</option>' in r.text
-    for name in ("attributed", "model", "start", "stop"):
-        assert f'name="{name}"' in r.text
-    assert "Start (UTC)" in r.text and "Stop (UTC)" in r.text
-    assert 'id="export-csv"' in r.text
+    assert "fleet-detections.js" in r.text and "window.RFOBS_DET_SINGLE = true" in r.text
+    assert '"label": "Roof"' in r.text
+    for el in (
+        "det-chart-all",
+        "det-chart-attr",
+        "det-types",
+        "det-hist",
+        "det-hist-bin",
+        "det-rows",
+        "det-export",
+    ):
+        assert f'id="{el}"' in r.text, el
+    assert 'id="det-sensors"' not in r.text and "<th>Sensor</th>" not in r.text
+
+
+async def test_list_shapes_rows_as_the_fleet(settings, seeded):
+    q = {"since": "2026-03-01T00:00:00Z", "until": "2026-03-02T00:00:00Z"}
+    async with await _client(settings, seeded) as ac:
+        body = (await ac.get("/api/detections/list", params=q)).json()
+        assert [r["burst_id"] for r in body["rows"]] == ["e", "d", "c", "b", "a"]
+        assert body["next_before"] is None and body["errors"] == {}
+        a = body["rows"][-1]
+        assert a["attribution"]["status"] == "decoded" and a["model"] == "SilverSpring-Mesh"
+        assert a["sensor"]["id"] == settings.HOSTNAME
+        page = (await ac.get("/api/detections/list", params={**q, "limit": 2})).json()
+        assert [r["burst_id"] for r in page["rows"]] == ["e", "d"]
+        older = (
+            await ac.get(
+                "/api/detections/list", params={**q, "limit": 2, "until": page["next_before"]}
+            )
+        ).json()
+        assert [r["burst_id"] for r in older["rows"]] == ["c", "b"]
+
+        async def ids(**params: str) -> list[str]:
+            r = await ac.get("/api/detections/list", params={**q, **params})
+            return [x["burst_id"] for x in r.json()["rows"]]
+
+        assert await ids(status="decoded") == ["b", "a"]
+        assert await ids(status="tried") == ["c"]
+        assert await ids(status="not_tried") == ["e", "d"]
+        assert await ids(model="Acurite-Tower") == ["b"]
+
+
+async def test_query_status_splits_not_attributed(seeded):
+    assert _ids(await seeded.query_detections(status="decoded")) == {"a", "b"}
+    assert _ids(await seeded.query_detections(status="tried")) == {"c"}
+    assert _ids(await seeded.query_detections(status="not_tried")) == {"d", "e"}
+    assert (await seeded.duration_histogram(status="tried"))["count"] == 1
+    assert (await seeded.duration_histogram(status="not_tried"))["count"] == 2
+
+
+async def test_list_duration_bucket_and_full_pages(settings, seeded):
+    q = {"since": "2026-03-01T00:00:00Z", "until": "2026-03-02T00:00:00Z"}
+    async with await _client(settings, seeded) as ac:
+        r = await ac.get(
+            "/api/detections/list", params={**q, "duration_min": 20, "duration_max": 40}
+        )
+        assert [x["burst_id"] for x in r.json()["rows"]] == ["d", "c"]
+        # The status filter runs in the query, so a page is full when more exist.
+        r = await ac.get("/api/detections/list", params={**q, "status": "not_tried", "limit": 1})
+        assert [x["burst_id"] for x in r.json()["rows"]] == ["e"]
+        assert r.json()["next_before"] is not None
+
+
+async def test_histogram_endpoint_status(settings, seeded):
+    async with await _client(settings, seeded) as ac:
+        r = await ac.get("/api/detections/histogram?bin_width=10&status=not_tried")
+    assert 'data-lo="30"' in r.text and 'data-lo="40"' in r.text
+    assert r.text.count('data-count="1"') == 2
+
+
+async def test_list_errors(settings, seeded):
+    async with await _client(settings, seeded) as ac:
+        r = await ac.get("/api/detections/list", params={"since": "x", "until": "y"})
+    assert r.status_code == 400
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(settings)), base_url="http://test"
+    ) as ac:
+        r = await ac.get("/api/detections/list", params={"since": "x", "until": "y"})
+    assert r.status_code == 503
+
+
+async def test_one_detection_and_download(settings, seeded):
+    q = {"burst_id": "b", "start_time": (T0 + timedelta(minutes=1)).isoformat()}
+    async with await _client(settings, seeded) as ac:
+        r = await ac.get("/api/detection", params=q)
+        assert r.status_code == 200
+        doc = r.json()
+        assert doc["detection"]["burst_id"] == "b" and "attribution" not in doc["detection"]
+        assert doc["attribution"] == {"model": "Acurite-Tower"}
+        assert doc["sensor"]["id"] == settings.HOSTNAME
+        dl = await ac.get("/api/detection", params={**q, "download": "true"})
+        assert dl.headers["content-disposition"].endswith('-b.json"')
+        assert (await ac.get("/api/detection", params={**q, "burst_id": "zz"})).status_code == 404
+        bad = await ac.get("/api/detection", params={**q, "start_time": "x"})
+        assert bad.status_code == 400
+
+
+async def test_csv_status_matches_the_type_rows(settings, seeded):
+    async with await _client(settings, seeded) as ac:
+
+        async def ids(status: str) -> list[str]:
+            r = await ac.get(f"/api/detections.csv?status={status}")
+            return [x["burst_id"] for x in _parse_csv(r.text)]
+
+        assert await ids("decoded") == ["b", "a"]
+        assert await ids("tried") == ["c"]
+        assert await ids("not_tried") == ["e", "d"]
 
 
 # -- DB layer ----------------------------------------------------------------

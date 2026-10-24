@@ -355,14 +355,10 @@ def create_fleet_app(
     ) -> dict[str, Any]:
         """The newest ``limit`` detections in [since, until) across sensors (or
         one), newest first. Page on with until = the response's next_before."""
-        from rfobserver.fleet.detections import matches, merge
+        from rfobserver.fleet.detections import matches, merge, want_attributed
 
         limit = max(1, min(limit, 500))
-        want_attr = {"true": True, "false": False}.get(attributed or "")
-        if status in ("tried", "not_tried"):
-            want_attr = False
-        elif status == "decoded":
-            want_attr = True
+        want_attr = want_attributed(attributed, status)
         sensors = [s for s in registry.all() if s.enabled and (not sensor or s.id == sensor)]
         params = {"since": since, "until": until, "limit": str(limit)}
         if want_attr is not None:
@@ -405,6 +401,8 @@ def create_fleet_app(
         time, so it works with every sensor version."""
         from datetime import datetime, timedelta
 
+        from rfobserver.fleet.detections import detection_doc, download_headers
+
         s = _sensor_or_404(sensor)
         try:
             start = datetime.fromisoformat(start_time)
@@ -424,19 +422,8 @@ def create_fleet_app(
         row = next((r for r in data.get("detections", []) if r.get("burst_id") == burst_id), None)
         if row is None:
             raise HTTPException(status_code=404, detail="detection not found (pruned?)")
-        record = row.get("attribution")
-        if isinstance(record, str):
-            with contextlib.suppress(ValueError):  # else keep the text as stored
-                record = json.loads(record)
-        doc = {
-            "sensor": {"id": s.id, "label": hub.display_label(s)},
-            "detection": {k: v for k, v in row.items() if k != "attribution"},
-            "attribution": record,
-        }
-        headers = {}
-        if download:
-            safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in f"{s.id}-{burst_id}")
-            headers["Content-Disposition"] = f'attachment; filename="{safe}.json"'
+        doc = detection_doc({"id": s.id, "label": hub.display_label(s)}, row)
+        headers = download_headers(s.id, burst_id) if download else {}
         return Response(
             content=json.dumps(doc, indent=2), media_type="application/json", headers=headers
         )

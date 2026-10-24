@@ -10,6 +10,7 @@ the page escapes them like any other untrusted text.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from datetime import datetime, timezone
 from typing import Any
@@ -87,6 +88,16 @@ def _start_key(row: dict[str, Any]) -> float:
     return dt.timestamp()
 
 
+def want_attributed(attributed: str | None, status: str | None) -> bool | None:
+    """The sensor-side ``attributed`` filter for a page's attributed/status
+    parameters: tried and not tried are both not attributed."""
+    if status in ("tried", "not_tried"):
+        return False
+    if status == "decoded":
+        return True
+    return {"true": True, "false": False}.get(attributed or "")
+
+
 def matches(
     row: dict[str, Any], attributed: bool | None, model: str | None, status: str | None
 ) -> bool:
@@ -115,3 +126,22 @@ def merge(
             out.append(item)
     out.sort(key=_start_key, reverse=True)
     return out[:limit]
+
+
+def detection_doc(sensor: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    """One detection with its full attribution record (the popup, and its
+    download)."""
+    record = row.get("attribution")
+    if isinstance(record, str):
+        with contextlib.suppress(ValueError):  # else keep the text as stored
+            record = json.loads(record)
+    return {
+        "sensor": sensor,
+        "detection": {k: v for k, v in row.items() if k != "attribution"},
+        "attribution": record,
+    }
+
+
+def download_headers(sensor_id: str, burst_id: str) -> dict[str, str]:
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in f"{sensor_id}-{burst_id}")
+    return {"Content-Disposition": f'attachment; filename="{safe}.json"'}

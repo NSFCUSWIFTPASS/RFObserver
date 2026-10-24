@@ -8,7 +8,12 @@
  *
  * The fleet sends, tagged by sensor id: "sensors" (who to show), "status"
  * (live / standby / reconnecting / offline), "psd" (the newest frame) and a
- * "tick" every second. A frame carries "frequencies" only when that sensor's
+ * "tick" every second. In High Res a frame also carries the burst overlay,
+ * on the same capture timeline: "bursts" new or changed and rtl_433
+ * "labels" new, each repeated for a moment so a skipped frame loses none.
+ * Bursts shows them over every waterfall; High Res off hides it, as on a
+ * sensor's own Live page (an averaged row spans a window, far longer than a
+ * burst). A frame carries "frequencies" only when that sensor's
  * axis changed, so each tile keeps the last axis it got.
  *
  * Every tile draws on one timeline. A frame's "t" is when its first sample
@@ -30,6 +35,7 @@
     const WS_SILENT_MS = 6000; // the fleet ticks every second
     const HIDDEN_KEY = "rfobs.fleet.live.hidden";
     const HIGHRES_KEY = "rfobs.fleet.live.highres";
+    const BURSTS_KEY = "rfobs.fleet.live.bursts";
     const BG = "#1a1a2e";
     // Timeline (see the header). High Res rows are ROW_MS_HIGHRES apart;
     // averaged rows one window each.
@@ -45,6 +51,8 @@
     const conn = document.getElementById("fleet-live-conn");
     const legend = document.getElementById("fleet-live-legend");
     const highResBox = document.getElementById("fleet-live-highres");
+    const burstsBox = document.getElementById("fleet-live-bursts");
+    const burstsLabel = document.getElementById("fleet-live-bursts-label");
     const delayText = document.getElementById("fleet-live-delay");
 
     const tiles = new Map(); // id -> tile
@@ -122,7 +130,11 @@
             + "</div>"
             + '<div class="card-body fleet-tile-body">'
             + '<canvas class="fleet-tile-psd"></canvas>'
+            + '<div class="fleet-tile-wf-hold">'
             + '<canvas class="fleet-tile-wf"></canvas>'
+            + '<canvas class="fleet-tile-overlay"></canvas>'
+            + '<div class="graph-tooltip" style="display:none;"></div>'
+            + "</div>"
             + '<div class="fleet-tile-info"></div>'
             + "</div>";
         const tile = {
@@ -130,6 +142,11 @@
             el: el,
             psd: el.querySelector(".fleet-tile-psd"),
             wf: el.querySelector(".fleet-tile-wf"),
+            overlay: el.querySelector(".fleet-tile-overlay"),
+            tip: el.querySelector(".fleet-tile-wf-hold .graph-tooltip"),
+            bursts: new Map(), // id -> {t0, t1, f0, f1, p, d}, capture ms
+            labels: new Map(), // id -> {t0, t1, f0, f1, model}
+            rects: [], // drawn bursts, for the tooltip
             info: el.querySelector(".fleet-tile-info"),
             state: el.querySelector(".fleet-state"),
             colour: s.colour,
@@ -142,6 +159,9 @@
             spacing: null, // ms between frames, for sensors without dur_ms
         };
         new ResizeObserver(function () { sizeTile(tile); }).observe(tile.psd);
+        const hold = el.querySelector(".fleet-tile-wf-hold");
+        hold.addEventListener("mousemove", function (e) { burstTip(tile, hold, e); });
+        hold.addEventListener("mouseleave", function () { tile.tip.style.display = "none"; });
         updateTile(tile, s);
         setState(tile, { state: "connecting" });
         return tile;
@@ -178,6 +198,9 @@
             ctx.fillStyle = BG;
             ctx.fillRect(0, 0, w, wh);
             if (old) ctx.drawImage(old, 0, 0, old.width, old.height, 0, 0, w, old.height);
+            tile.overlay.width = w;
+            tile.overlay.height = wh;
+            drawOverlay(tile);
         }
     }
 
@@ -253,6 +276,7 @@
             tile.spacing = tile.spacing == null ? gap : tile.spacing + 0.1 * (gap - tile.spacing);
         }
         updateRange(tile, msg);
+        takeOverlay(tile, msg);
         q.push(msg);
         // A tile not being drawn (zero size) never takes frames: bound it.
         while (q.length > 1 && (q.length > 2000 || q[1].t < now - DELAY_MAX_MS - 5000)) q.shift();
@@ -379,8 +403,103 @@
             }
         }
         lastRow = row;
+        for (const tile of tiles.values()) drawOverlay(tile);
         const behind = (delayMs / 1000).toFixed(1) + " s behind";
         if (delayText.textContent !== behind) delayText.textContent = behind;
+    }
+
+    // --- burst overlay ---
+
+    function overlayOn() { return highResBox.checked && burstsBox.checked; }
+
+    function takeOverlay(tile, msg) {
+        for (const b of msg.bursts || []) tile.bursts.set(b.id, b);
+        for (const a of msg.labels || []) tile.labels.set(a.id, a);
+    }
+
+    // Rows and columns of an item on a tile's waterfall: the newest row
+    // (lastRow) is y = 0; null when it is off the waterfall.
+    function overlayBox(tile, it) {
+        const W = tile.overlay.width, H = tile.overlay.height;
+        const f = tile.freqs;
+        if (lastRow == null || f.length < 2 || typeof it.f0 !== "number" || typeof it.f1 !== "number") return null;
+        const lo = f[0], span = f[f.length - 1] - f[0];
+        if (span <= 0) return null;
+        const yTop = lastRow - Math.floor(it.t1 / rowMs);
+        const yBot = lastRow - Math.floor(it.t0 / rowMs) + 1;
+        if (yBot <= 0 || yTop >= H) return null;
+        const h = Math.max(3, yBot - yTop);
+        const y = Math.round((yTop + yBot) / 2 - h / 2);
+        const x0 = ((it.f0 - lo) / span) * W, x1 = ((it.f1 - lo) / span) * W;
+        const w = Math.max(3, x1 - x0);
+        const x = Math.round((x0 + x1) / 2 - w / 2);
+        return { x: x, y: y, w: w, h: h };
+    }
+
+    // Same look as a sensor's Live page: red boxes, yellow rtl_433 labels at
+    // each box's top-left, a label that would overlap one drawn is skipped.
+    function drawOverlay(tile) {
+        const W = tile.overlay.width, H = tile.overlay.height;
+        if (W < 2 || H < 2) return;
+        const ctx = tile.overlay.getContext("2d");
+        ctx.clearRect(0, 0, W, H);
+        tile.rects = [];
+        if (lastRow == null) return;
+        // Forget what has scrolled off the bottom.
+        const oldest = (lastRow - H) * rowMs;
+        for (const m of [tile.bursts, tile.labels]) {
+            for (const [id, it] of m) if (it.t1 < oldest) m.delete(id);
+        }
+        if (!overlayOn()) return;
+        ctx.strokeStyle = "rgba(255, 60, 60, 0.9)";
+        ctx.fillStyle = "rgba(255, 60, 60, 0.08)";
+        ctx.lineWidth = 1.5;
+        for (const b of tile.bursts.values()) {
+            const r = overlayBox(tile, b);
+            if (!r) continue;
+            ctx.strokeRect(r.x, r.y, r.w, r.h);
+            ctx.fillRect(r.x, r.y, r.w, r.h);
+            tile.rects.push({ r: r, b: b });
+        }
+        const drawn = [];
+        ctx.font = "11px -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif";
+        ctx.textBaseline = "bottom";
+        ctx.fillStyle = "rgba(255, 214, 10, 0.95)";
+        for (const a of tile.labels.values()) {
+            const r = overlayBox(tile, a);
+            if (!r) continue;
+            const ty = r.y >= 12 ? r.y - 1 : r.y + 12;
+            const tx = Math.max(0, r.x);
+            const text = String(a.model);
+            const tw = ctx.measureText(text).width;
+            if (drawn.some(function (d) {
+                return tx < d.x + d.w && d.x < tx + tw && ty - 11 < d.y && d.y - 11 < ty;
+            })) continue;
+            drawn.push({ x: tx, y: ty, w: tw });
+            ctx.fillText(text, tx, ty);
+        }
+    }
+
+    function burstTip(tile, hold, e) {
+        const rect = hold.getBoundingClientRect();
+        const mx = (e.clientX - rect.left) * (tile.overlay.width / rect.width);
+        const my = (e.clientY - rect.top) * (tile.overlay.height / rect.height);
+        const hit = tile.rects.find(function (d) {
+            return mx >= d.r.x && mx <= d.r.x + d.r.w && my >= d.r.y && my <= d.r.y + d.r.h;
+        });
+        if (!hit) { tile.tip.style.display = "none"; return; }
+        const b = hit.b;
+        const parts = [((b.f0 + b.f1) / 2e6).toFixed(3) + " MHz", "BW " + ((b.f1 - b.f0) / 1e3).toFixed(1) + " kHz"];
+        if (typeof b.p === "number") parts.push(b.p.toFixed(1) + " dB");
+        if (typeof b.d === "number") parts.push(b.d.toFixed(2) + " ms");
+        const label = Array.from(tile.labels.values()).find(function (a) {
+            return a.t0 < b.t1 && b.t0 < a.t1 && a.f0 < b.f1 && b.f0 < a.f1;
+        });
+        tile.tip.textContent = (label ? label.model + "   " : "") + parts.join("   ");
+        tile.tip.style.display = "block";
+        const x = e.clientX - rect.left, w = tile.tip.offsetWidth;
+        tile.tip.style.left = (x + 12 + w <= rect.width ? x + 12 : Math.max(0, x - 12 - w)) + "px";
+        tile.tip.style.top = Math.max(4, e.clientY - rect.top - 28) + "px";
     }
 
     function paintGap(img, W, y) {
@@ -655,8 +774,23 @@
     let ws = null;
     let lastMessage = 0;
 
-    // High Res is on unless this browser turned it off.
+    // High Res and Bursts are on unless this browser turned them off.
     try { highResBox.checked = localStorage.getItem(HIGHRES_KEY) !== "0"; } catch (_) {}
+    try { burstsBox.checked = localStorage.getItem(BURSTS_KEY) !== "0"; } catch (_) {}
+
+    // Bursts is offered only in High Res, as on a sensor's Live page.
+    function applyBurstsToggle() {
+        burstsLabel.style.display = highResBox.checked ? "" : "none";
+        for (const tile of tiles.values()) {
+            drawOverlay(tile);
+            if (!overlayOn()) tile.tip.style.display = "none";
+        }
+    }
+
+    burstsBox.addEventListener("change", function () {
+        try { localStorage.setItem(BURSTS_KEY, burstsBox.checked ? "1" : "0"); } catch (_) {}
+        applyBurstsToggle();
+    });
 
     function sendMode() {
         if (ws && ws.readyState === WebSocket.OPEN) {
@@ -668,6 +802,7 @@
         try { localStorage.setItem(HIGHRES_KEY, highResBox.checked ? "1" : "0"); } catch (_) {}
         sendMode();
         powerDirty = true;
+        applyBurstsToggle();
     });
 
     function setConn(text, ok) {
@@ -713,6 +848,7 @@
         }
     }, 1000);
 
+    applyBurstsToggle();
     loadPower();
     setInterval(loadPower, POWER_POLL_MS);
     connect();

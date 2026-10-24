@@ -85,3 +85,25 @@ def test_reset_forgets_positions():
     det.feed(_grid(64), chunk_start=0, slice_samples=SLICE)
     det.reset()
     assert (det._row_pos == -1).all()
+
+
+def test_active_burst_samples_from_the_last_evaluation():
+    # The overlay's active bursts (last_detection) map to the same samples,
+    # also across a dropped chunk.
+    det = _det()
+    det.feed(_grid(64), chunk_start=0, slice_samples=SLICE)
+    det.feed(_grid(64, range(20, 40)), chunk_start=128 * SLICE, slice_samples=SLICE)
+    detection = det.last_detection
+    assert detection is not None
+    (b,) = [b for b in detection.bursts if b.peak_power_db > -60]
+    assert det.window_samples(b) == (128 * SLICE + 20 * SLICE, 128 * SLICE + 40 * SLICE)
+
+
+def test_active_burst_samples_unknown_without_positions():
+    det = _det()
+    det.feed(_grid(64))
+    det.feed(_grid(64, range(20, 40)))
+    detection = det.last_detection
+    assert detection is not None
+    (b,) = [b for b in detection.bursts if b.peak_power_db > -60]
+    assert det.window_samples(b) is None

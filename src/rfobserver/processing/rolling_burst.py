@@ -84,6 +84,8 @@ class RollingBurstDetector:
         self._eval_count = 0
         self._tracked: list[_TrackedBurst] = []
         self._last_detection: BurstDetectionResult | None = None
+        # Absolute row of the last evaluated window's first row.
+        self._eval_base_abs: int | None = None
 
         bin_hz = abs(float(freq_axis[1] - freq_axis[0])) if len(freq_axis) > 1 else 0.0
         # Frequency slop when matching a re-detected burst to a tracked one.
@@ -186,6 +188,7 @@ class RollingBurstDetector:
 
         self._eval_count += 1
         window_base_abs = self._total_rows_written - n_rows
+        self._eval_base_abs = window_base_abs
         # A burst whose newest row is within margin_rows of the window's trailing
         # (newest) edge may still be arriving, so it is not yet "done".
         margin_rows = 3
@@ -362,6 +365,27 @@ class RollingBurstDetector:
             stop_sample=stop_sample,
         )
 
+    def window_samples(self, burst: BurstFingerprint) -> tuple[int, int] | None:
+        """Stream samples [start, stop) of a burst from the last evaluation's
+        ``last_detection``, from the rows' recorded positions; None when they
+        are unknown (no chunk_start fed) or no longer kept."""
+        base = self._eval_base_abs
+        if self._slice_samples is None or base is None:
+            return None
+        tres = self._time_resolution_s
+        t_start = (burst.start_time - burst.detection_timestamp).total_seconds()
+        t_end = (burst.stop_time - burst.detection_timestamp).total_seconds()
+        first = base + int(round(t_start / tres))
+        last = base + int(round(t_end / tres)) - 1  # t_end is exclusive
+        L = self._row_pos.shape[0]
+        if first < self._total_rows_written - L or last < first:
+            return None
+        p0 = int(self._row_pos[first % L])
+        p1 = int(self._row_pos[last % L])
+        if p0 < 0 or p1 < p0:
+            return None
+        return p0, p1 + self._slice_samples
+
     def reset(self) -> None:
         """Clear window and pending state. Called on frequency retune."""
         self._window[:] = -200.0
@@ -375,3 +399,4 @@ class RollingBurstDetector:
         self._tracked.clear()
         self._rebuild_index()
         self._last_detection = None
+        self._eval_base_abs = None

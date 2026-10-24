@@ -19,6 +19,7 @@ Five threads coordinate via bounded queues:
 from __future__ import annotations
 
 import asyncio
+import bisect
 import collections
 import contextlib
 import functools
@@ -269,6 +270,41 @@ class _StreamResult:
         self.capture_num = capture_num
         self.process_ms = process_ms
         self.latency_ms = latency_ms
+
+
+class _ChunkTimes:
+    """Recent chunks' first stream sample and its capture time (host clock),
+    to give any recent sample its capture time. A stream sample counter that
+    goes back (a restart) starts over."""
+
+    KEEP = 4096
+
+    def __init__(self) -> None:
+        self._starts: list[int] = []
+        self._times: list[float] = []
+
+    def add(self, chunk_start: int, capture_time: float) -> None:
+        if self._starts and chunk_start <= self._starts[-1]:
+            if chunk_start == self._starts[-1]:
+                return
+            self._starts.clear()
+            self._times.clear()
+        self._starts.append(chunk_start)
+        self._times.append(capture_time)
+        if len(self._starts) > 2 * self.KEEP:
+            del self._starts[: self.KEEP]
+            del self._times[: self.KEEP]
+
+    def time_ms(self, sample: int, rate: float, *, end: bool = False) -> float | None:
+        """Capture time (epoch ms) of stream sample ``sample``, from the chunk
+        holding it; None if it predates the kept chunks. ``end``: the sample
+        is an exclusive end, timed from the chunk it ends (chunks need not be
+        back to back in time, so a chunk boundary belongs to the chunk before
+        it)."""
+        i = (bisect.bisect_left if end else bisect.bisect_right)(self._starts, sample) - 1
+        if i < 0 or rate <= 0:
+            return None
+        return (self._times[i] + (sample - self._starts[i]) / rate) * 1000.0
 
 
 class _ChunkResult:
@@ -796,6 +832,16 @@ class StreamingProcessor:
         self._rtl_status: str | None = None
         # Newest decoded attributions, for the live overlay labels.
         self._labels: collections.deque[dict[str, Any]] = collections.deque(maxlen=50)
+        # Burst times are the detector's clock: when it evaluated, minus rows
+        # back, so they run late of capture by the burst thread's lag. Bursts
+        # also get capture-clock times (the fleet's timeline), from their
+        # stream samples and recent chunks' capture times; completed bursts'
+        # are kept by id for their attribution labels.
+        self._chunk_times = _ChunkTimes()
+        self._burst_capture_ms: collections.OrderedDict[str, tuple[float, float]] = (
+            collections.OrderedDict()
+        )
+        self._burst_capture_lock = threading.Lock()
         self._isolation_log_at = 0.0
         self._isolation_logged: dict[str, int] = {}
 
@@ -1159,22 +1205,44 @@ class StreamingProcessor:
                 await self._attrib_task
             self._attrib_task = None
 
+    # Completed bursts whose capture-clock times are kept, for their labels.
+    _BURST_CAPTURE_KEEP = 2000
+
+    def _note_capture_times(self, bursts: list[BurstFingerprint]) -> None:
+        """Remember completed bursts' capture-clock [start, stop) in ms (burst
+        thread), for their attribution labels later (the loop)."""
+        rate = float(self._settings.BANDWIDTH)
+        with self._burst_capture_lock:
+            for b in bursts:
+                if b.start_sample is None or b.stop_sample is None:
+                    continue
+                t0 = self._chunk_times.time_ms(b.start_sample, rate)
+                t1 = self._chunk_times.time_ms(b.stop_sample, rate, end=True)
+                if t0 is not None and t1 is not None:
+                    self._burst_capture_ms[b.burst_id] = (t0, t1)
+            while len(self._burst_capture_ms) > self._BURST_CAPTURE_KEEP:
+                self._burst_capture_ms.popitem(last=False)
+
     def _add_label(self, r: AttributionResult) -> None:
         """Attribution sink (runs on the loop): keep decoded labels for the overlay."""
+        burst_id = r.item.burst_id
+        with self._burst_capture_lock:
+            span = self._burst_capture_ms.pop(burst_id, None)
         if r.outcome != "decoded":
             return
         meta = r.item.meta
-        self._labels.append(
-            {
-                "id": r.item.burst_id,
-                "freq_low_hz": meta.get("freq_low_hz"),
-                "freq_high_hz": meta.get("freq_high_hz"),
-                "start_time_ms": meta.get("start_time_ms"),
-                "stop_time_ms": meta.get("stop_time_ms"),
-                "model": r.model,
-                "protocol_id": r.protocol_id,
-            }
-        )
+        label: dict[str, Any] = {
+            "id": burst_id,
+            "freq_low_hz": meta.get("freq_low_hz"),
+            "freq_high_hz": meta.get("freq_high_hz"),
+            "start_time_ms": meta.get("start_time_ms"),
+            "stop_time_ms": meta.get("stop_time_ms"),
+            "model": r.model,
+            "protocol_id": r.protocol_id,
+        }
+        if span is not None:
+            label["capture_start_ms"], label["capture_stop_ms"] = span
+        self._labels.append(label)
 
     def _isolation_counts(self) -> dict[str, int]:
         """Stage counters plus attr_dropped (attribution queue evictions)."""
@@ -2867,7 +2935,7 @@ class StreamingProcessor:
         # Live: drop the grid rather than stall dispatch when the burst thread
         # is behind. Lossless (offline replay): wait for room, like the chunk
         # queue, so every grid reaches the detector.
-        item = (cr.psd_grid, cr.center_freq_hz, cr.capture_num, cr.chunk_start)
+        item = (cr.psd_grid, cr.center_freq_hz, cr.capture_num, cr.chunk_start, cr.capture_time)
         if self._drop_on_overflow:
             with contextlib.suppress(queue.Full):
                 self._burst_queue.put_nowait(item)
@@ -2998,7 +3066,10 @@ class StreamingProcessor:
                 if item is _STOP:
                     break
 
-                psd_grid, freq_hz, capture_num, chunk_start = item
+                psd_grid, freq_hz, capture_num, chunk_start, *rest = item
+                capture_time = rest[0] if rest else None
+                if capture_time is not None and chunk_start is not None:
+                    self._chunk_times.add(int(chunk_start), float(capture_time))
 
                 # Skip grids whose bin count doesn't match current config
                 # (stale grids from before a reconfiguration)
@@ -3048,6 +3119,8 @@ class StreamingProcessor:
                     last_det = rolling_detector._last_detection
                     if last_det is not None and last_det.noise_floor_per_bin is not None:
                         self._noise_floor_per_bin = last_det.noise_floor_per_bin.tolist()
+                    if completed_bursts and self._attrib_worker is not None:
+                        self._note_capture_times(completed_bursts)
 
                 stage = self._isolation if self._isolation_on else None
                 if completed_bursts and stage is not None:
@@ -3076,22 +3149,31 @@ class StreamingProcessor:
                     time_res = rolling_detector._time_resolution_s
                     window_dur = rolling_detector._rows_filled * time_res
                     active: list[dict[str, object]] = []
+                    rate = float(s.BANDWIDTH)
                     for b in detection.bursts:
-                        real_start = b.start_time - timedelta(seconds=window_dur)
-                        real_stop = b.stop_time - timedelta(seconds=window_dur)
-                        active.append(
-                            {
-                                "id": b.burst_id,
-                                "center_freq_hz": b.center_freq_hz,
-                                "bandwidth_hz": b.bandwidth_hz,
-                                "freq_low_hz": b.center_freq_hz - b.bandwidth_hz / 2,
-                                "freq_high_hz": b.center_freq_hz + b.bandwidth_hz / 2,
-                                "peak_power_db": round(b.peak_power_db, 1),
-                                "duration_ms": round(b.duration_ms, 2),
-                                "start_time_ms": real_start.timestamp() * 1000.0,
-                                "stop_time_ms": real_stop.timestamp() * 1000.0,
-                            }
-                        )
+                        start_ms = (
+                            b.start_time - timedelta(seconds=window_dur)
+                        ).timestamp() * 1000.0
+                        stop_ms = (b.stop_time - timedelta(seconds=window_dur)).timestamp() * 1000.0
+                        entry: dict[str, object] = {
+                            "id": b.burst_id,
+                            "center_freq_hz": b.center_freq_hz,
+                            "bandwidth_hz": b.bandwidth_hz,
+                            "freq_low_hz": b.center_freq_hz - b.bandwidth_hz / 2,
+                            "freq_high_hz": b.center_freq_hz + b.bandwidth_hz / 2,
+                            "peak_power_db": round(b.peak_power_db, 1),
+                            "duration_ms": round(b.duration_ms, 2),
+                            "start_time_ms": start_ms,
+                            "stop_time_ms": stop_ms,
+                        }
+                        span = rolling_detector.window_samples(b)
+                        if span is not None:
+                            t0 = self._chunk_times.time_ms(span[0], rate)
+                            t1 = self._chunk_times.time_ms(span[1], rate, end=True)
+                            if t0 is not None and t1 is not None:
+                                entry["capture_start_ms"] = t0
+                                entry["capture_stop_ms"] = t1
+                        active.append(entry)
                     self._active_bursts = active
                 else:
                     self._active_bursts = []

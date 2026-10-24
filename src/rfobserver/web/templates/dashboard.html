@@ -787,11 +787,23 @@
     const burstTooltip = document.getElementById("burst-tooltip");
     const wfWrapper = document.getElementById("wf-wrapper");
 
-    // Per-spectrum-line timestamps: wfRowTimes[i] is the chunk_time_ms of
-    // the line currently displayed at row i (0 = top = newest). The
-    // backend stamps every broadcast; the frontend uses that + each
-    // burst's start/stop_time_ms to place rectangles by absolute time.
+    // Per-spectrum-line timestamps: wfRowTimes[i] is the capture time of
+    // the line currently displayed at row i (0 = top = newest), and each
+    // burst's capture_start/stop_ms places its rectangle by absolute time.
+    // Both are on the capture clock: a burst's start/stop_time_ms are when
+    // the detector ran, late of capture by the burst thread's lag. Without
+    // capture times (replay), rows use chunk_time_ms and bursts
+    // start/stop_time_ms, as before.
     let wfRowTimes = [];
+    let rowsOnCapture = false; // rows stamped with capture times (see above)
+    // A burst or label with its times on the rows' clock.
+    function onRowClock(x) {
+        if (rowsOnCapture && typeof x.capture_start_ms === "number"
+                && typeof x.capture_stop_ms === "number") {
+            return Object.assign({}, x, {start_time_ms: x.capture_start_ms, stop_time_ms: x.capture_stop_ms});
+        }
+        return x;
+    }
     // Bursts the backend has reported recently. Keyed by burst id (uuid)
     // so re-detection of the same physical burst in subsequent rolling
     // evaluations keeps refining its anchor instead of stacking.
@@ -863,7 +875,7 @@
         // for an id is the most accurate (the burst may have grown).
         if (newBursts && newBursts.length > 0) {
             for (const b of newBursts) {
-                if (b.id != null) seenBursts.set(b.id, b);
+                if (b.id != null) seenBursts.set(b.id, onRowClock(b));
             }
         }
         if (Array.isArray(newAttributions)) {
@@ -872,7 +884,7 @@
                         && typeof a.stop_time_ms === "number"
                         && typeof a.freq_low_hz === "number"
                         && typeof a.freq_high_hz === "number") {
-                    attrLabels.set(a.id, a);
+                    attrLabels.set(a.id, onRowClock(a));
                 }
             }
         }
@@ -1197,9 +1209,11 @@
                 }
                 redrawPSD();
                 drawBurstTuning();
-                const chunkTimeMs = typeof data.chunk_time_ms === "number"
-                    ? data.chunk_time_ms : Date.now();
-                addWaterfallLine(data.powers, chunkTimeMs);
+                const onCapture = typeof data.capture_time_ms === "number";
+                const rowTimeMs = onCapture ? data.capture_time_ms
+                    : typeof data.chunk_time_ms === "number" ? data.chunk_time_ms : Date.now();
+                addWaterfallLine(data.powers, rowTimeMs);
+                rowsOnCapture = onCapture;
                 updateBurstOverlay(data.bursts, data.attributions);
                 drawLegendBar();
 

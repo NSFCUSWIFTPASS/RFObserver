@@ -1,9 +1,10 @@
 /**
  * Fleet Live: a tile per sensor (spectrum over a short waterfall), fed by
- * the fleet's /fleet/ws/live socket, and one shared power plot. In High Res
- * the plot shows each frame's power (a point per chunk, the values the
- * sensor's own Live page plots) over the last minute; otherwise the stored
- * window averages over five minutes, from /fleet/api/stats.
+ * the fleet's /fleet/ws/live socket, and two shared plots, power and
+ * kurtosis, every sensor on each. In High Res a plot shows each frame's
+ * value (a point per chunk, the values the sensor's own Live page plots)
+ * over the last minute; otherwise the stored window averages over five
+ * minutes, from /fleet/api/stats.
  *
  * The fleet sends, tagged by sensor id: "sensors" (who to show), "status"
  * (live / standby / reconnecting / offline), "psd" (the newest frame) and a
@@ -42,20 +43,31 @@
     const grid = document.getElementById("fleet-live-grid");
     const empty = document.getElementById("fleet-live-empty");
     const conn = document.getElementById("fleet-live-conn");
-    const powerCanvas = document.getElementById("fleet-live-power");
-    const tip = document.getElementById("fleet-live-tip");
     const legend = document.getElementById("fleet-live-legend");
     const highResBox = document.getElementById("fleet-live-highres");
     const delayText = document.getElementById("fleet-live-delay");
 
     const tiles = new Map(); // id -> tile
-    const series = new Map(); // id -> [[t_ms, power_db], ...] window averages
-    const livePower = new Map(); // id -> [[t_ms, power_db], ...] per frame
-    const powerTitle = document.getElementById("fleet-live-power-title");
+
+    // The shared plots. Each keeps, per sensor id, [[t_ms, value], ...]:
+    // "avg" the stored window averages (stat: their /fleet/api/stats key),
+    // "live" the per-frame values (frame: their key in a psd frame).
+    function metric(id, name, stat, frame, unit, digits, minPad) {
+        return {
+            canvas: document.getElementById("fleet-live-" + id),
+            tip: document.getElementById("fleet-live-" + id + "-tip"),
+            title: document.getElementById("fleet-live-" + id + "-title"),
+            name: name, stat: stat, frame: frame, unit: unit, digits: digits, minPad: minPad,
+            avg: new Map(), live: new Map(), hoverX: null,
+        };
+    }
+    const METRICS = [
+        metric("power", "Power", "pwr_avg", "avg_power_db", " dB", 1, 1),
+        metric("kurtosis", "Kurtosis", "kurtosis", "kurtosis", "", 2, 0.1),
+    ];
     let roster = [];
     let hidden = loadHidden();
-    let powerDirty = true;
-    let hoverX = null;
+    let powerDirty = true; // redraw the plots
 
     // The fleet's clock minus this browser's (ms), from its ticks: the
     // largest recent (tick time - arrival time), the one that waited least.
@@ -246,7 +258,9 @@
         while (q.length > 1 && (q.length > 2000 || q[1].t < now - DELAY_MAX_MS - 5000)) q.shift();
         tile.late.push([now, now - msg.t]);
         while (tile.late.length && tile.late[0][0] < now - LATE_WINDOW_MS) tile.late.shift();
-        if (typeof msg.avg_power_db === "number") addLivePoint(msg.id, msg.t, msg.avg_power_db);
+        for (const m of METRICS) {
+            if (typeof msg[m.frame] === "number") addLivePoint(m, msg.id, msg.t, msg[m.frame]);
+        }
     }
 
     // The delay that has every sensor's frame in hand before its slot: the
@@ -385,9 +399,9 @@
         tile.info.textContent = parts.join("   ");
     }
 
-    function addLivePoint(id, t, v) {
-        let pts = livePower.get(id);
-        if (!pts) { pts = []; livePower.set(id, pts); }
+    function addLivePoint(m, id, t, v) {
+        let pts = m.live.get(id);
+        if (!pts) { pts = []; m.live.set(id, pts); }
         if (pts.length && t <= pts[pts.length - 1][0]) return;
         pts.push([t, v]);
         const cut = t - LIVE_WINDOW_MS - 5000;
@@ -397,11 +411,16 @@
         if (highResBox.checked) powerDirty = true;
     }
 
-    // The fleet's recent frame powers for a sensor, sent when the page opens.
+    // The fleet's recent frame powers and kurtoses for a sensor, sent when
+    // the page opens (a fleet before kurtosis history sends power only).
     function onPowerHistory(msg) {
-        const have = livePower.get(msg.id) || [];
-        const first = have.length ? have[0][0] : Infinity;
-        livePower.set(msg.id, msg.points.filter(function (p) { return p[0] < first; }).concat(have));
+        [[METRICS[0], msg.points], [METRICS[1], msg.kurtosis]].forEach(function (pair) {
+            const m = pair[0], points = pair[1];
+            if (!Array.isArray(points)) return;
+            const have = m.live.get(msg.id) || [];
+            const first = have.length ? have[0][0] : Infinity;
+            m.live.set(msg.id, points.filter(function (p) { return p[0] < first; }).concat(have));
+        });
         powerDirty = true;
     }
 
@@ -412,8 +431,7 @@
             if (!keep.has(id)) {
                 tile.el.remove();
                 tiles.delete(id);
-                series.delete(id);
-                livePower.delete(id);
+                for (const m of METRICS) { m.avg.delete(id); m.live.delete(id); }
             }
         }
         for (const s of roster) {
@@ -427,13 +445,13 @@
         powerDirty = true;
     }
 
-    // --- shared power plot ---
+    // --- shared plots (power, kurtosis) ---
 
-    // The plot shows the sensors' stored window averages, the values the
-    // Dashboard shows. A live frame's avg_power_db is only its window's last
-    // chunk, much noisier, so it is not mixed in. The range is snapped to
-    // POWER_POLL_MS so every open page asks the fleet the same question and
-    // shares its cache.
+    // Without High Res the plots show the sensors' stored window averages,
+    // the values the Dashboard shows. A live frame's values are only its
+    // window's last chunk, much noisier, so they are not mixed in. The range
+    // is snapped to POWER_POLL_MS so every open page asks the fleet the same
+    // question and shares its cache.
     async function loadPower() {
         const until = Math.floor(Date.now() / POWER_POLL_MS) * POWER_POLL_MS;
         const since = until - POWER_WINDOW_MS;
@@ -444,9 +462,11 @@
             const body = await r.json();
             for (const s of body.sensors) {
                 if (s.error) continue; // keep what it had; its tile shows the state
-                series.set(s.id, s.points
-                    .filter(function (p) { return typeof p.pwr_avg === "number"; })
-                    .map(function (p) { return [Date.parse(p.start_time), p.pwr_avg]; }));
+                for (const m of METRICS) {
+                    m.avg.set(s.id, s.points
+                        .filter(function (p) { return typeof p[m.stat] === "number"; })
+                        .map(function (p) { return [Date.parse(p.start_time), p[m.stat]]; }));
+                }
             }
             powerDirty = true;
         } catch (_) { /* next poll */ }
@@ -462,6 +482,7 @@
         }).join("");
     }
 
+    // One legend for both plots.
     legend.addEventListener("click", function (e) {
         const btn = e.target.closest(".fleet-legend-item");
         if (!btn) return;
@@ -472,19 +493,19 @@
         powerDirty = true;
     });
 
-    // What the plot shows: per-frame power in High Res, else window averages.
-    function plotMode() {
+    // What a plot shows: per-frame values in High Res, else window averages.
+    function plotMode(m) {
         if (highResBox.checked) {
             return {
-                data: livePower, windowMs: LIVE_WINDOW_MS, gapMs: 2000, nearMs: 1000,
+                data: m.live, windowMs: LIVE_WINDOW_MS, gapMs: 2000, nearMs: 1000,
                 ticks: [[45000, "-45 s"], [30000, "-30 s"], [15000, "-15 s"]],
-                title: "Power, last minute",
+                title: m.name + ", last minute",
             };
         }
         return {
-            data: series, windowMs: POWER_WINDOW_MS, gapMs: 10000, nearMs: 15000,
+            data: m.avg, windowMs: POWER_WINDOW_MS, gapMs: 10000, nearMs: 15000,
             ticks: [[240000, "-4 min"], [180000, "-3 min"], [120000, "-2 min"], [60000, "-1 min"]],
-            title: "Power, last 5 minutes",
+            title: m.name + ", last 5 minutes",
         };
     }
 
@@ -494,8 +515,8 @@
             .map(function (s) { return { s: s, pts: data.get(s.id) }; });
     }
 
-    function drawPower() {
-        const c = powerCanvas;
+    function drawPlot(m) {
+        const c = m.canvas;
         const W = Math.max(1, Math.round(c.clientWidth));
         const H = Math.max(1, Math.round(c.clientHeight));
         if (c.width !== W) c.width = W;
@@ -503,8 +524,8 @@
         const ctx = c.getContext("2d");
         ctx.fillStyle = BG;
         ctx.fillRect(0, 0, W, H);
-        const mode = plotMode();
-        if (powerTitle.textContent !== mode.title) powerTitle.textContent = mode.title;
+        const mode = plotMode(m);
+        if (m.title.textContent !== mode.title) m.title.textContent = mode.title;
         // In High Res the plot ends where the waterfalls do.
         const t1 = highResBox.checked ? serverNow() - delayMs : serverNow();
         const t0 = t1 - mode.windowMs;
@@ -536,7 +557,7 @@
             ctx.fillText(roster.length ? "Waiting for sensors..." : "No sensors", W / 2, H / 2);
             return null;
         }
-        const pad = Math.max(1, (hi - lo) * 0.1);
+        const pad = Math.max(m.minPad, (hi - lo) * 0.1);
         lo -= pad; hi += pad;
         const X = function (t) { return ((t - t0) / mode.windowMs) * W; };
         const Y = function (v) { return H - 14 - ((v - lo) / (hi - lo)) * (H - 26); };
@@ -556,17 +577,20 @@
             }
             ctx.stroke();
         }
+        const axisDigits = Math.max(0, m.digits - 1);
         ctx.fillStyle = "rgba(255,255,255,0.5)";
         ctx.font = "10px -apple-system, sans-serif";
         ctx.textAlign = "left";
-        ctx.fillText(hi.toFixed(0) + " dB", 4, 12);
-        ctx.fillText(lo.toFixed(0) + " dB", 4, H - 16);
+        ctx.fillText(hi.toFixed(axisDigits) + m.unit, 4, 12);
+        ctx.fillText(lo.toFixed(axisDigits) + m.unit, 4, H - 16);
         return { t0: t0, X: X, Y: Y, vis: vis, W: W, H: H, mode: mode };
     }
 
-    function drawHover(geo) {
-        if (!geo || hoverX == null) { tip.style.display = "none"; return; }
-        const ctx = powerCanvas.getContext("2d");
+    function drawHover(m, geo) {
+        const tip = m.tip;
+        if (!geo || m.hoverX == null) { tip.style.display = "none"; return; }
+        const hoverX = m.hoverX;
+        const ctx = m.canvas.getContext("2d");
         const t = geo.t0 + (hoverX / geo.W) * geo.mode.windowMs;
         const lines = [];
         ctx.strokeStyle = "rgba(255,255,255,0.35)";
@@ -585,7 +609,7 @@
             ctx.lineWidth = 2;
             ctx.beginPath(); ctx.arc(geo.X(best[0]), geo.Y(best[1]), 4, 0, Math.PI * 2);
             ctx.fill(); ctx.stroke();
-            lines.push({ colour: v.s.colour, text: v.s.label + "  " + best[1].toFixed(1) + " dB" });
+            lines.push({ colour: v.s.colour, text: v.s.label + "  " + best[1].toFixed(m.digits) + m.unit });
         }
         tip.textContent = "";
         tip.appendChild(document.createTextNode(new Date(t).toLocaleTimeString()));
@@ -603,23 +627,25 @@
         tip.style.top = "4px";
     }
 
-    powerCanvas.addEventListener("mousemove", function (e) {
-        hoverX = e.clientX - powerCanvas.getBoundingClientRect().left;
-        powerDirty = true;
-    });
-    powerCanvas.addEventListener("mouseleave", function () {
-        hoverX = null;
-        powerDirty = true;
+    METRICS.forEach(function (m) {
+        m.canvas.addEventListener("mousemove", function (e) {
+            m.hoverX = e.clientX - m.canvas.getBoundingClientRect().left;
+            powerDirty = true;
+        });
+        m.canvas.addEventListener("mouseleave", function () {
+            m.hoverX = null;
+            powerDirty = true;
+        });
     });
 
-    // The plot scrolls with time, so redraw at least once a second.
+    // The plots scroll with time, so redraw at least once a second.
     let lastPowerDraw = 0;
     function frame(now) {
         advanceTimeline();
         if (powerDirty || now - lastPowerDraw > 1000) {
             powerDirty = false;
             lastPowerDraw = now;
-            drawHover(drawPower());
+            for (const m of METRICS) drawHover(m, drawPlot(m));
         }
         requestAnimationFrame(frame);
     }

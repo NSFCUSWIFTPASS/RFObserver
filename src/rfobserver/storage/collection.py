@@ -200,26 +200,75 @@ def _usable_zone_at(lat: float, lon: float) -> ZoneInfo | None:
         return None
 
 
+def _zone_at_location(settings: AppSettings) -> ZoneInfo | None:
+    lat, lon = settings.LATITUDE, settings.LONGITUDE
+    if lat is None or lon is None:
+        return None
+    try:
+        return _usable_zone_at(float(lat), float(lon))
+    except Exception:  # never stop the API over the lookup
+        logger.exception("Time zone lookup for %s, %s failed", lat, lon)
+        return None
+
+
 def sensor_zone(settings: AppSettings, requested: str | None = None) -> tuple[tzinfo, str]:
     """The zone days are counted in, and where it came from: ``requested``
     ("request", ValueError if it is not a whole-hour zone), else the zone at
-    the sensor's LATITUDE/LONGITUDE ("location"), else Pacific ("default").
-    UTC is the built-in one when the host has no time-zone database."""
+    the sensor's LATITUDE/LONGITUDE ("location"), else the TIMEZONE setting
+    ("setting": set by hand, or the last zone found at a location), else
+    Pacific ("default"). UTC is the built-in one when the host has no
+    time-zone database."""
     if requested:
         return whole_hour_zone(requested), "request"
-    lat, lon = settings.LATITUDE, settings.LONGITUDE
-    if lat is not None and lon is not None:
+    at_location = _zone_at_location(settings)
+    if at_location is not None:
+        return at_location, "location"
+    name = (settings.TIMEZONE or "").strip()
+    if name:
         try:
-            tz = _usable_zone_at(float(lat), float(lon))
-        except Exception:  # never stop the API over the lookup
-            logger.exception("Time zone lookup for %s, %s failed", lat, lon)
-            tz = None
-        if tz is not None:
-            return tz, "location"
+            return whole_hour_zone(name), "setting"
+        except ValueError as exc:
+            if f"TIMEZONE={name}" not in _warned_zones:
+                _warned_zones.add(f"TIMEZONE={name}")
+                logger.warning("TIMEZONE %r is not usable (%s); ignoring it", name, exc)
     try:
         return whole_hour_zone(DEFAULT_ZONE), "default"
     except ValueError:
         return timezone.utc, "default"
+
+
+class SensorZone:
+    """The sensor's zone, resolved at startup and again whenever the
+    settings it depends on change (Config apply calls ``refresh``), so a
+    request never waits for the location lookup. A zone found at the
+    location is written into TIMEZONE, so the setting shows it (and Config
+    apply saves it to .env); TIMEZONE set by hand counts only without a
+    location."""
+
+    def __init__(self, settings: AppSettings) -> None:
+        self._key: tuple[object, ...] | None = None
+        self._zone: tuple[tzinfo, str] = (timezone.utc, "default")
+        self.refresh(settings)
+
+    @staticmethod
+    def _key_of(settings: AppSettings) -> tuple[object, ...]:
+        return (settings.TIMEZONE, settings.LATITUDE, settings.LONGITUDE)
+
+    def refresh(self, settings: AppSettings) -> tuple[tzinfo, str]:
+        if self._key_of(settings) != self._key:
+            self._zone = tz, source = sensor_zone(settings)
+            if source == "location" and zone_name(tz) != settings.TIMEZONE:
+                object.__setattr__(settings, "TIMEZONE", zone_name(tz))
+            self._key = self._key_of(settings)
+            logger.info("Collection statistics time zone: %s (%s)", zone_name(tz), source)
+        return self._zone
+
+    def get(self, settings: AppSettings) -> tuple[tzinfo, str]:
+        """The resolved zone (re-resolved if the settings changed some other way)."""
+        return self.refresh(settings)
+
+    def current(self) -> tuple[tzinfo, str]:
+        return self._zone
 
 
 def zone_name(tz: tzinfo) -> str:

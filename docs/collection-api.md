@@ -11,7 +11,8 @@ day.
   counters (every 15 s). There is no backfill: captures recorded before that
   are not counted. `covered_since` in every response says when counting began.
 - Days are local days in a time zone: the one you ask for with `tz`, else the
-  zone at the sensor's location, else Pacific (see [Time zone](#time-zone)).
+  zone at the sensor's location, else its `TIMEZONE` setting, else Pacific
+  (see [Time zone](#time-zone)).
   Hours are stored in UTC, so a daylight-saving day has 23 or 25 hours.
 
 Every example below runs in the test suite (`tests/unit/test_collection_api_doc.py`)
@@ -288,10 +289,21 @@ curl -s "$SENSOR/api/collection/hourly?since=yesterday&until=today"
 ## Time zone
 
 Every endpoint takes an optional `tz`, an IANA name such as `America/New_York`.
-Without it, days are in the zone at the sensor's `LATITUDE`/`LONGITUDE` (looked
-up offline on the sensor), and in Pacific time (`America/Los_Angeles`) when
-the sensor has no location. `timezone_source` in every response says which:
-`request`, `location` or `default`.
+Without it, days are in the sensor's zone, the first of:
+
+1. the zone at the sensor's `LATITUDE`/`LONGITUDE`, looked up offline on the
+   sensor;
+2. `TIMEZONE`, for a sensor with no location: set it by hand in the sensor's
+   environment or `.env` (`RFOBS_TIMEZONE=America/Denver`);
+3. Pacific time (`America/Los_Angeles`).
+
+The sensor works this out once when it starts, and again as soon as its
+location is changed on the Config page, and logs it ("Collection statistics
+time zone: America/Denver (location)"). A zone found at the location is
+written into `TIMEZONE` (and saved to `.env` with the next Config change), so
+if the location is later cleared, the sensor keeps the last zone it found.
+`timezone_source` in every response says which was used: `request`,
+`location`, `setting` or `default`.
 
 ```bash
 curl -s "$SENSOR/api/collection/daily?date=2026-10-25&tz=America/New_York"
@@ -310,8 +322,9 @@ curl -s "$SENSOR/api/collection/daily?date=2026-10-25&tz=America/New_York"
 ```
 
 Only zones a whole number of hours from UTC work, since days are built from
-whole UTC hours. Asking for another (for example `Asia/Kolkata`) is `400`; a
-sensor whose location is in one uses Pacific time, with a warning in its log.
+whole UTC hours. Asking for another (for example `Asia/Kolkata`) is `400`. A
+location in such a zone is passed over for `TIMEZONE`, and an unusable
+`TIMEZONE` for Pacific time, each with a warning in the sensor's log.
 Changing the zone never changes what is stored, only how hours are grouped
 into days.
 
@@ -349,7 +362,7 @@ Day and response fields:
 | Field | Meaning |
 |---|---|
 | `timezone` | The time zone the days are in |
-| `timezone_source` | Where it came from: `request` (`tz`), `location` or `default` (Pacific) |
+| `timezone_source` | Where it came from: `request` (`tz`), `location`, `setting` (`TIMEZONE`) or `default` (Pacific) |
 | `covered_since` | When counting began (local time), or `null` before the first flush |
 | `date` | The local date |
 | `start` | Local midnight starting the day |

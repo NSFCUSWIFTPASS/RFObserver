@@ -58,6 +58,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.add_middleware(SafeGZipMiddleware)
 
     app.state.settings = settings
+    # The collection statistics' time zone, looked up now rather than on the
+    # first request (Config apply refreshes it when the location changes).
+    from rfobserver.storage.collection import SensorZone
+
+    app.state.collection_zone = SensorZone(settings)
     app.state.templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     app.state.processor = None
     app.state.database = None

@@ -7,9 +7,11 @@ from datetime import date
 from zoneinfo import ZoneInfo
 
 import pytest
+from fastapi.testclient import TestClient
 
 from rfobserver.config import AppSettings
 from rfobserver.storage.collection import local_day_bounds, sensor_zone, whole_hour_zone
+from rfobserver.web.app import create_app
 
 
 def test_day_bounds_utc_and_denver():
@@ -71,6 +73,46 @@ def test_a_requested_zone_wins():
 def test_the_location_lookup_is_cached(monkeypatch):
     from rfobserver.storage import collection as coll
 
+    calls = _counting_lookup(monkeypatch)
+    for _ in range(3):
+        sensor_zone(_settings(DENVER))
+    assert calls == [DENVER]
+    coll.location_zone.cache_clear()
+
+
+def test_the_location_wins_over_the_timezone_setting():
+    s = AppSettings(_env_file=None, TIMEZONE="Asia/Tokyo", LATITUDE=40.01, LONGITUDE=-105.27)
+    assert sensor_zone(s) == (ZoneInfo("America/Denver"), "location")
+    assert sensor_zone(s, "Asia/Tokyo") == (ZoneInfo("Asia/Tokyo"), "request")
+
+
+def test_timezone_setting_is_used_without_a_location():
+    s = AppSettings(_env_file=None, TIMEZONE="Asia/Tokyo")
+    assert sensor_zone(s) == (ZoneInfo("Asia/Tokyo"), "setting")
+    assert AppSettings(_env_file=None).TIMEZONE == ""  # not set
+
+
+def test_timezone_setting_from_the_environment(monkeypatch):
+    monkeypatch.setenv("RFOBS_TIMEZONE", "America/Chicago")
+    assert sensor_zone(AppSettings(_env_file=None)) == (ZoneInfo("America/Chicago"), "setting")
+
+
+@pytest.mark.parametrize("bad", ["Not/AZone", "Asia/Kolkata"])
+def test_an_unusable_timezone_setting_falls_back_to_pacific(caplog, bad):
+    s = AppSettings(_env_file=None, TIMEZONE=bad)
+    with caplog.at_level(logging.WARNING):
+        assert sensor_zone(s) == (ZoneInfo("America/Los_Angeles"), "default")
+    assert bad in caplog.text
+
+
+def test_a_fractional_zone_at_the_location_uses_the_setting():
+    s = AppSettings(_env_file=None, TIMEZONE="Asia/Dubai", LATITUDE=DELHI[0], LONGITUDE=DELHI[1])
+    assert sensor_zone(s) == (ZoneInfo("Asia/Dubai"), "setting")
+
+
+def _counting_lookup(monkeypatch):
+    from rfobserver.storage import collection as coll
+
     coll.location_zone.cache_clear()
     calls = []
     real = coll._lookup_zone_name
@@ -80,11 +122,39 @@ def test_the_location_lookup_is_cached(monkeypatch):
         return real(lat, lon)
 
     monkeypatch.setattr(coll, "_lookup_zone_name", counting)
+    return calls
+
+
+def test_the_zone_is_resolved_at_startup(monkeypatch, caplog):
+    calls = _counting_lookup(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        app = create_app(_settings(DENVER))
+    assert calls == [DENVER]  # before any request
+    assert app.state.collection_zone.current() == (ZoneInfo("America/Denver"), "location")
+    assert app.state.settings.TIMEZONE == "America/Denver"  # set from the location
+    assert "America/Denver" in caplog.text
+
+
+def test_a_location_change_resolves_the_zone_at_once(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # Config apply persists to ./.env
+    calls = _counting_lookup(monkeypatch)
+    app = create_app(_settings(DENVER))
+    c = TestClient(app)
+    r = c.post("/config/apply", json={"latitude": HCRO[0], "longitude": HCRO[1]})
+    assert r.status_code == 200, r.text
+    assert calls == [DENVER, HCRO]  # looked up by the apply, not a later request
+    assert app.state.collection_zone.current() == (ZoneInfo("America/Los_Angeles"), "location")
+    assert app.state.settings.TIMEZONE == "America/Los_Angeles"
+    assert "RFOBS_TIMEZONE=America/Los_Angeles" in (tmp_path / ".env").read_text()
+    # Without a location, TIMEZONE (the last one found, or set by hand) is used.
+    c.post("/config/apply", json={"latitude": "", "longitude": ""})
+    assert app.state.collection_zone.current() == (ZoneInfo("America/Los_Angeles"), "setting")
+
+
+def test_requests_use_the_resolved_zone(monkeypatch):
+    calls = _counting_lookup(monkeypatch)
+    app = create_app(_settings(DENVER))
+    zone = app.state.collection_zone
     for _ in range(3):
-        sensor_zone(_settings(DENVER))
+        assert zone.get(app.state.settings)[1] == "location"
     assert calls == [DENVER]
-    coll.location_zone.cache_clear()
-
-
-def test_the_timezone_setting_is_gone():
-    assert not hasattr(AppSettings(_env_file=None), "TIMEZONE")

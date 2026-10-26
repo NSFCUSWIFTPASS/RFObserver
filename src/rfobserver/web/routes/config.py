@@ -312,6 +312,10 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "BURST_THRESHOLD_HIGH_DB",
         "BURST_THRESHOLD_LOW_RATIO",
     }
+    zone = getattr(request.app.state, "collection_zone", None)
+    if zone is not None and {"LATITUDE", "LONGITUDE"} & set(changed):
+        zone.refresh(settings)
+
     if pipeline_fields & set(changed) and processor is not None:
         reconfigure = getattr(processor, "reconfigure", None)
         if reconfigure is not None:

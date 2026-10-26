@@ -106,6 +106,11 @@ class AppSettings(BaseSettings):
     # filenames, OpenZMS observations) keeps using HOSTNAME as identity.
     HOSTNAME: str = Field(default_factory=socket.gethostname)
     SENSOR_NAME: str | None = None
+    # IANA zone for the IQ collection statistics' days (/api/collection). Set
+    # from LATITUDE/LONGITUDE at startup and when they change; set it by hand
+    # only for a sensor with no location (empty: America/Los_Angeles).
+    # Whole-hour zones only; an unusable value is ignored with a warning.
+    TIMEZONE: str = ""
     LATITUDE: float | None = None
     LONGITUDE: float | None = None
     ORGANIZATION: str = "DefaultOrg"

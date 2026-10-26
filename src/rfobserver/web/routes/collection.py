@@ -40,9 +40,15 @@ def _db(request: Request) -> Any:
 
 def _zone(request: Request) -> tuple[tzinfo, str]:
     """The request's ``tz`` (400 if unusable), else the sensor's zone."""
+    settings = request.app.state.settings
     requested = request.query_params.get("tz") or None
+    if requested is None:
+        resolved = getattr(request.app.state, "collection_zone", None)
+        if resolved is not None:
+            zone: tuple[tzinfo, str] = resolved.get(settings)
+            return zone
     try:
-        return sensor_zone(request.app.state.settings, requested)
+        return sensor_zone(settings, requested)
     except ValueError as exc:
         raise HTTPException(
             status_code=400,

@@ -456,6 +456,18 @@ class LocalStorage:
             return oldest_prio
         return self._oldest_ordinary_locked(exclude) or oldest_prio
 
+    def snapshot(self) -> dict[str, int]:
+        """Captures and their footprint (with companions, as the cap counts
+        them) by folder now, and the cap. From the index, not a disk scan."""
+        with self._lock:
+            return {
+                "auto_captures": len(self._order[self.auto_dir]),
+                "manual_captures": len(self._order[self.manual_dir]),
+                "auto_bytes": self._bytes[self.auto_dir],
+                "manual_bytes": self._bytes[self.manual_dir],
+                "cap_bytes": self.max_bytes,
+            }
+
     def get_usage_bytes(self) -> int:
         """Bytes used by the managed (auto) capture set, including companions.
 

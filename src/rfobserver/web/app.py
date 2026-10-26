@@ -84,6 +84,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         api,
         averaged,
         captures,
+        collection,
         config,
         dashboard,
         detections,
@@ -97,6 +98,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.include_router(detections.legacy_router)
     app.include_router(captures.router, prefix="/captures")
     app.include_router(averaged.router)
+    app.include_router(collection.router, prefix="/api/collection")
     app.include_router(api.router, prefix="/api")
     app.include_router(modules.router, prefix="/api")
 

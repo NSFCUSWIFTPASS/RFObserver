@@ -79,6 +79,8 @@ AVG_CONFIGS_KEY = "avg_window_configs"
 # hour stored. Hours after it are counted live from detections.
 DET_HOURS_SINCE_KEY = "detection_hours_since"
 DET_HOURS_DONE_KEY = "detection_hours_done"
+# The first hour counted in collection_hours (storage/collection.py).
+COLLECTION_SINCE_KEY = "collection_hours_since"
 # Tables row retention may delete from, and their time column.
 _RETENTION_TABLES = {
     "avg_windows": "start_time",
@@ -306,6 +308,24 @@ CREATE TABLE IF NOT EXISTS detection_hours (
     tried INTEGER NOT NULL DEFAULT 0,
     count INTEGER NOT NULL,
     PRIMARY KEY (hour, model, tried)
+);
+
+-- Raw IQ recorded, IQ deleted automatically and live RF time per UTC hour
+-- (epoch seconds of the hour start), only ever added to. See
+-- storage/collection.py and COLLECTION_SINCE_KEY. Not under retention.
+CREATE TABLE IF NOT EXISTS collection_hours (
+    hour INTEGER PRIMARY KEY,
+    auto_captures INTEGER NOT NULL DEFAULT 0,
+    manual_captures INTEGER NOT NULL DEFAULT 0,
+    auto_bytes INTEGER NOT NULL DEFAULT 0,
+    manual_bytes INTEGER NOT NULL DEFAULT 0,
+    auto_seconds REAL NOT NULL DEFAULT 0,
+    manual_seconds REAL NOT NULL DEFAULT 0,
+    deleted_cap_captures INTEGER NOT NULL DEFAULT 0,
+    deleted_cap_bytes INTEGER NOT NULL DEFAULT 0,
+    deleted_space_captures INTEGER NOT NULL DEFAULT 0,
+    deleted_space_bytes INTEGER NOT NULL DEFAULT 0,
+    active_seconds REAL NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_detections_time ON detections(start_time);
@@ -1966,6 +1986,44 @@ class SensorDatabase:
             (since, until),
         ) as cursor:
             return [(int(r[0]), str(r[1]), int(r[2]), int(r[3])) for r in await cursor.fetchall()]
+
+    @_guarded_write
+    async def add_collection_hours(self, rows: dict[int, dict[str, float]]) -> None:
+        """Add each hour's figures to its collection_hours row."""
+        from rfobserver.storage.collection import FIELDS
+
+        assert self._db is not None
+        cols = ", ".join(FIELDS)
+        marks = ", ".join("?" for _ in FIELDS)
+        sums = ", ".join(f"{f} = {f} + excluded.{f}" for f in FIELDS)
+        integer = {f for f in FIELDS if not f.endswith("_seconds")}
+        await self._db.executemany(
+            f"INSERT INTO collection_hours (hour, {cols}) VALUES (?, {marks}) "
+            f"ON CONFLICT(hour) DO UPDATE SET {sums}",
+            [
+                (
+                    hour,
+                    *(
+                        int(round(v.get(f, 0))) if f in integer else float(v.get(f, 0.0))
+                        for f in FIELDS
+                    ),
+                )
+                for hour, v in rows.items()
+            ],
+        )
+        await self._db.commit()
+
+    async def collection_hours(self, since: int, until: int) -> list[dict[str, Any]]:
+        """collection_hours rows for hours in [since, until), oldest first."""
+        from rfobserver.storage.collection import FIELDS
+
+        assert self._db is not None
+        async with self._db.execute(
+            f"SELECT hour, {', '.join(FIELDS)} FROM collection_hours "
+            "WHERE hour >= ? AND hour < ? ORDER BY hour",
+            (since, until),
+        ) as cursor:
+            return [dict(zip(("hour", *FIELDS), r, strict=True)) for r in await cursor.fetchall()]
 
     async def detection_models(self) -> list[str]:
         """Distinct non-empty rtl_433 model names, sorted (Detections filter).

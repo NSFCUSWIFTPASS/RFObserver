@@ -7,11 +7,9 @@ from datetime import date
 from zoneinfo import ZoneInfo
 
 import pytest
-from fastapi.testclient import TestClient
 
 from rfobserver.config import AppSettings
 from rfobserver.storage.collection import local_day_bounds, sensor_zone, whole_hour_zone
-from rfobserver.web.app import create_app
 
 
 def test_day_bounds_utc_and_denver():
@@ -35,40 +33,58 @@ def test_whole_hour_zone_rejects_fractional_and_unknown(bad):
         whole_hour_zone(bad)
 
 
-def test_default_is_utc():
-    assert AppSettings(_env_file=None).TIMEZONE == "UTC"
-    assert sensor_zone(AppSettings(_env_file=None)) == ZoneInfo("UTC")
+DENVER = (40.01, -105.27)  # Boulder
+HCRO = (40.82, -121.47)
+DELHI = (28.61, 77.21)  # Asia/Kolkata: UTC+5:30
 
 
-def test_sensor_zone_uses_the_setting():
-    s = AppSettings(_env_file=None, TIMEZONE="America/Denver")
-    assert sensor_zone(s) == ZoneInfo("America/Denver")
+def _settings(loc: tuple[float, float] | None) -> AppSettings:
+    lat, lon = loc if loc else (None, None)
+    return AppSettings(_env_file=None, LATITUDE=lat, LONGITUDE=lon)
 
 
-def test_a_bad_setting_falls_back_to_utc_with_a_warning(caplog):
-    s = AppSettings(_env_file=None, TIMEZONE="Bad/Zone")  # the sensor still starts
+def test_zone_comes_from_the_sensor_location():
+    assert sensor_zone(_settings(DENVER)) == (ZoneInfo("America/Denver"), "location")
+    assert sensor_zone(_settings(HCRO)) == (ZoneInfo("America/Los_Angeles"), "location")
+
+
+def test_no_location_is_pacific():
+    assert sensor_zone(_settings(None)) == (ZoneInfo("America/Los_Angeles"), "default")
+    half = AppSettings(_env_file=None, LATITUDE=40.0, LONGITUDE=None)
+    assert sensor_zone(half) == (ZoneInfo("America/Los_Angeles"), "default")
+
+
+def test_a_fractional_zone_at_the_location_falls_back_to_pacific(caplog):
     with caplog.at_level(logging.WARNING):
-        assert sensor_zone(s) == ZoneInfo("UTC")
-    assert "Bad/Zone" in caplog.text
+        assert sensor_zone(_settings(DELHI)) == (ZoneInfo("America/Los_Angeles"), "default")
+    assert "Asia/Kolkata" in caplog.text
 
 
-@pytest.fixture
-def client(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)  # Config apply persists to ./.env
-    app = create_app(AppSettings(_env_file=None))
-    return TestClient(app), app
+def test_a_requested_zone_wins():
+    assert sensor_zone(_settings(DENVER), "Asia/Tokyo") == (ZoneInfo("Asia/Tokyo"), "request")
+    with pytest.raises(ValueError):
+        sensor_zone(_settings(DENVER), "Asia/Kolkata")
+    with pytest.raises(ValueError):
+        sensor_zone(_settings(DENVER), "Not/AZone")
 
 
-def test_config_apply_sets_the_timezone(client):
-    c, app = client
-    r = c.post("/config/apply", json={"timezone": "America/Denver"})
-    assert r.status_code == 200, r.text
-    assert app.state.settings.TIMEZONE == "America/Denver"
+def test_the_location_lookup_is_cached(monkeypatch):
+    from rfobserver.storage import collection as coll
+
+    coll.location_zone.cache_clear()
+    calls = []
+    real = coll._lookup_zone_name
+
+    def counting(lat, lon):
+        calls.append((lat, lon))
+        return real(lat, lon)
+
+    monkeypatch.setattr(coll, "_lookup_zone_name", counting)
+    for _ in range(3):
+        sensor_zone(_settings(DENVER))
+    assert calls == [DENVER]
+    coll.location_zone.cache_clear()
 
 
-@pytest.mark.parametrize("bad", ["Asia/Kolkata", "Not/AZone"])
-def test_config_apply_rejects_a_bad_timezone(client, bad):
-    c, app = client
-    r = c.post("/config/apply", json={"timezone": bad})
-    assert r.status_code == 400
-    assert app.state.settings.TIMEZONE == "UTC"
+def test_the_timezone_setting_is_gone():
+    assert not hasattr(AppSettings(_env_file=None), "TIMEZONE")

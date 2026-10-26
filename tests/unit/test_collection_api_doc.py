@@ -31,7 +31,7 @@ def _ts(*a: int) -> int:
     return int(datetime(*a, tzinfo=UTC).timestamp())
 
 
-# The doc's example sensor: TIMEZONE America/Denver (UTC-6 in October), counting
+# The doc's example sensor: in Boulder, so America/Denver (UTC-6 in October), counting
 # since local midnight on 2026-10-18, and "now" is 12:00 local on 2026-10-26.
 SINCE = _ts(2026, 10, 18, 6)
 NOW = _ts(2026, 10, 26, 18)
@@ -79,7 +79,7 @@ async def client(tmp_path, monkeypatch):
     await db.connect()
     await db.set_config(COLLECTION_SINCE_KEY, str(SINCE))
     await db.add_collection_hours(example_hours())
-    app = create_app(AppSettings(_env_file=None, TIMEZONE="America/Denver"))
+    app = create_app(AppSettings(_env_file=None, LATITUDE=40.01, LONGITUDE=-105.27))
     app.state.database = db
     app.state.local_storage = SimpleNamespace(
         snapshot=lambda: dict(SNAPSHOT), storage_path=str(tmp_path)

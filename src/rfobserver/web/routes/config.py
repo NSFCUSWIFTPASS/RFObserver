@@ -31,15 +31,6 @@ def _to_bool(raw: Any) -> bool:
     return str(raw).strip().lower() in ("true", "on", "1", "yes")
 
 
-def _to_zone_name(raw: Any) -> str:
-    """A time-zone name the collection statistics can use (ValueError if not)."""
-    from rfobserver.storage.collection import whole_hour_zone
-
-    name = str(raw).strip()
-    whole_hour_zone(name)
-    return name
-
-
 @router.get("/", response_class=HTMLResponse)
 async def config_page(request: Request) -> Any:
     templates = request.app.state.templates
@@ -159,7 +150,6 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "burst_archive_max_gb": ("BURST_ARCHIVE_MAX_GB", float),
         # Sensor identity + location (all optional — empty input clears)
         "sensor_name": ("SENSOR_NAME", str),
-        "timezone": ("TIMEZONE", _to_zone_name),
         "latitude": ("LATITUDE", float),
         "longitude": ("LONGITUDE", float),
         # Display (all optional — empty input reverts to uncalibrated/auto)

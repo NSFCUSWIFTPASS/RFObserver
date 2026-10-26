@@ -11,6 +11,7 @@ backfill: counting starts at the hour of the first flush
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import threading
@@ -138,42 +139,87 @@ class CollectionStats:
 
 # --- days in the sensor's time zone ---
 
+DEFAULT_ZONE = "America/Los_Angeles"  # a sensor with no location
+
 _warned_zones: set[str] = set()
+_whole_hour_ok: dict[tuple[str, int], ZoneInfo] = {}
 
 
 def whole_hour_zone(name: str) -> ZoneInfo:
     """The IANA zone ``name``, if its UTC offset is a whole number of hours on
     every day of this year and next (days are built from UTC hours).
-    Raises ValueError otherwise."""
+    Raises ValueError otherwise. A zone that passes is remembered for the year."""
+    year = datetime.now(timezone.utc).year
+    known = _whole_hour_ok.get((name, year))
+    if known is not None:
+        return known
     try:
         tz = ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError) as exc:
         raise ValueError(f"unknown time zone {name!r}") from exc
-    year = datetime.now(timezone.utc).year
     day = datetime(year, 1, 1, 12, tzinfo=timezone.utc)
     for _ in range(731):
         offset = day.astimezone(tz).utcoffset()
         if offset is not None and offset.total_seconds() % HOUR:
             raise ValueError(f"time zone {name!r} is not a whole number of hours from UTC")
         day += timedelta(days=1)
+    _whole_hour_ok[(name, year)] = tz
     return tz
 
 
-def sensor_zone(settings: AppSettings) -> tzinfo:
-    """The sensor's TIMEZONE, or UTC (with a warning, once) when it is not a
-    usable zone, so a bad setting never stops the sensor. UTC is the built-in
-    one when the host has no time-zone database at all."""
-    name = settings.TIMEZONE
+def _lookup_zone_name(lat: float, lon: float) -> str:
+    """The IANA zone at a location (offline, from tzfpy's bundled map)."""
+    from tzfpy import get_tz
+
+    return str(get_tz(lon, lat))
+
+
+@functools.lru_cache(maxsize=16)
+def location_zone(lat: float, lon: float) -> str:
+    """The IANA zone name at a location, looked up once per location."""
+    return _lookup_zone_name(lat, lon)
+
+
+def _usable_zone_at(lat: float, lon: float) -> ZoneInfo | None:
+    """The whole-hour zone at a location, or None (with a warning, once)
+    when there is none: a fractional zone, or an unknown name."""
+    name = location_zone(lat, lon)
     try:
         return whole_hour_zone(name)
     except ValueError as exc:
         if name not in _warned_zones:
             _warned_zones.add(name)
-            logger.warning("TIMEZONE %r is not usable (%s); using UTC", name, exc)
+            logger.warning(
+                "The zone at %.4f, %.4f (%s) is not usable (%s); using %s",
+                lat,
+                lon,
+                name,
+                exc,
+                DEFAULT_ZONE,
+            )
+        return None
+
+
+def sensor_zone(settings: AppSettings, requested: str | None = None) -> tuple[tzinfo, str]:
+    """The zone days are counted in, and where it came from: ``requested``
+    ("request", ValueError if it is not a whole-hour zone), else the zone at
+    the sensor's LATITUDE/LONGITUDE ("location"), else Pacific ("default").
+    UTC is the built-in one when the host has no time-zone database."""
+    if requested:
+        return whole_hour_zone(requested), "request"
+    lat, lon = settings.LATITUDE, settings.LONGITUDE
+    if lat is not None and lon is not None:
+        try:
+            tz = _usable_zone_at(float(lat), float(lon))
+        except Exception:  # never stop the API over the lookup
+            logger.exception("Time zone lookup for %s, %s failed", lat, lon)
+            tz = None
+        if tz is not None:
+            return tz, "location"
     try:
-        return ZoneInfo("UTC")
-    except (ZoneInfoNotFoundError, ValueError):
-        return timezone.utc
+        return whole_hour_zone(DEFAULT_ZONE), "default"
+    except ValueError:
+        return timezone.utc, "default"
 
 
 def zone_name(tz: tzinfo) -> str:

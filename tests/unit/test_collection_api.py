@@ -24,12 +24,21 @@ def _ts(*a: int) -> int:
 NOW = _ts(2026, 10, 26, 18)  # Monday 2026-10-26 18:00Z (12:00 in Denver)
 
 
+# A sensor location in each zone the tests use; "UTC" is mid-ocean (Etc/GMT).
+LOCATIONS = {
+    "UTC": (0.0, 0.0),
+    "America/Denver": (40.01, -105.27),
+    "Asia/Tokyo": (35.68, 139.69),
+    None: (None, None),
+}
+
+
 @pytest.fixture
 async def make_client(tmp_path, monkeypatch):
     monkeypatch.setattr(routes, "_now", lambda: float(NOW))
     dbs: list[SensorDatabase] = []
 
-    async def make(tz: str = "UTC", since: int | None = None, hours=None):
+    async def make(tz: str | None = "UTC", since: int | None = None, hours=None):
         db = SensorDatabase(str(tmp_path / f"c{len(dbs)}.db"))
         await db.connect()
         dbs.append(db)
@@ -37,7 +46,10 @@ async def make_client(tmp_path, monkeypatch):
             await db.set_config(COLLECTION_SINCE_KEY, str(since))
         if hours:
             await db.add_collection_hours(hours)
-        app = create_app(AppSettings(_env_file=None, TIMEZONE=tz, STORAGE_PATH=str(tmp_path)))
+        lat, lon = LOCATIONS[tz]
+        app = create_app(
+            AppSettings(_env_file=None, LATITUDE=lat, LONGITUDE=lon, STORAGE_PATH=str(tmp_path))
+        )
         app.state.database = db
         app.state.local_storage = LocalStorage(str(tmp_path), max_gb=1)
         return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
@@ -238,8 +250,47 @@ async def test_no_tz_database_falls_back_to_builtin_utc(make_client, monkeypatch
         raise coll.ZoneInfoNotFoundError(name)
 
     monkeypatch.setattr(coll, "ZoneInfo", no_db)
+    monkeypatch.setattr(coll, "_whole_hour_ok", {})
     c = await make_client("America/Denver", since=_ts(2026, 10, 1))
     async with c:
         r = await c.get("/api/collection/daily", params={"date": "2026-10-25"})
     assert r.status_code == 200
     assert r.json()["timezone"] == "UTC"
+
+
+async def test_zone_from_location_by_default(make_client):
+    c = await make_client("America/Denver")
+    async with c:
+        d = (await c.get("/api/collection/daily", params={"date": "2026-10-25"})).json()
+    assert (d["timezone"], d["timezone_source"]) == ("America/Denver", "location")
+    assert d["start"] == "2026-10-25T00:00:00-06:00"
+
+
+async def test_no_location_is_pacific(make_client):
+    c = await make_client(None)
+    async with c:
+        d = (await c.get("/api/collection/daily", params={"date": "2026-10-25"})).json()
+    assert (d["timezone"], d["timezone_source"]) == ("America/Los_Angeles", "default")
+    assert d["start"] == "2026-10-25T00:00:00-07:00"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/collection/daily?date=2026-10-25",
+        "/api/collection/daily?start=2026-10-24&end=2026-10-25",
+        "/api/collection/average",
+        "/api/collection/hourly?since=2026-10-25T00:00:00Z&until=2026-10-26T00:00:00Z",
+        "/api/collection/storage",
+    ],
+)
+async def test_tz_param_overrides_on_every_endpoint(make_client, path):
+    c = await make_client("America/Denver", since=_ts(2026, 10, 1))
+    async with c:
+        sep = "&" if "?" in path else "?"
+        r = await c.get(f"{path}{sep}tz=Asia/Tokyo")
+        bad = await c.get(f"{path}{sep}tz=Asia/Kolkata")
+    body = r.json()
+    assert (body["timezone"], body["timezone_source"]) == ("Asia/Tokyo", "request")
+    assert body["covered_since"] == "2026-10-01T09:00:00+09:00"
+    assert bad.status_code == 400 and "tz" in bad.json()["detail"]

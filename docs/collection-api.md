@@ -10,8 +10,9 @@ day.
 - Counting starts the first time a sensor running this version flushes its
   counters (every 15 s). There is no backfill: captures recorded before that
   are not counted. `covered_since` in every response says when counting began.
-- Days are local days in the sensor's time zone (`TIMEZONE`, below). Hours
-  are stored in UTC, so a daylight-saving day has 23 or 25 hours.
+- Days are local days in a time zone: the one you ask for with `tz`, else the
+  zone at the sensor's location, else Pacific (see [Time zone](#time-zone)).
+  Hours are stored in UTC, so a daylight-saving day has 23 or 25 hours.
 
 Every example below runs in the test suite (`tests/unit/test_collection_api_doc.py`)
 against a sensor holding the example data, and must return what is shown. The
@@ -19,8 +20,8 @@ same requests were also run against a live mock sensor.
 
 ## The example sensor
 
-The examples use a sensor with `TIMEZONE=America/Denver` (UTC-6 in October)
-that started counting at local midnight on 2026-10-18. It is now 12:00 local on
+The examples use a sensor in Boulder, Colorado (`LATITUDE=40.01`,
+`LONGITUDE=-105.27`, so `America/Denver`, UTC-6 in October) that started counting at local midnight on 2026-10-18. It is now 12:00 local on
 2026-10-26. Every hour it recorded one 1 s automatic capture at 56 MS/s
 (224,000,000 bytes) and was live the whole hour. On 2026-10-25 it also recorded
 a 4 s manual capture at 09:00, and the storage cap deleted two captures at
@@ -39,6 +40,7 @@ curl -s "$SENSOR/api/collection/daily?date=2026-10-25"
 ```json
 {
   "timezone": "America/Denver",
+  "timezone_source": "location",
   "covered_since": "2026-10-18T00:00:00-06:00",
   "date": "2026-10-25",
   "start": "2026-10-25T00:00:00-06:00",
@@ -106,6 +108,7 @@ curl -s "$SENSOR/api/collection/daily?start=2026-10-24&end=2026-10-25"
 ```json
 {
   "timezone": "America/Denver",
+  "timezone_source": "location",
   "covered_since": "2026-10-18T00:00:00-06:00",
   "days": [
     {"date": "2026-10-24", "covered": true, "captures": 24, "bytes": 5376000000},
@@ -143,6 +146,7 @@ curl -s "$SENSOR/api/collection/average"
 ```json
 {
   "timezone": "America/Denver",
+  "timezone_source": "location",
   "covered_since": "2026-10-18T00:00:00-06:00",
   "days_counted": 7,
   "average": {
@@ -196,6 +200,7 @@ curl -s "$SENSOR/api/collection/hourly?since=2026-10-25T15:00:00Z&until=2026-10-
 ```json
 {
   "timezone": "America/Denver",
+  "timezone_source": "location",
   "covered_since": "2026-10-18T00:00:00-06:00",
   "hours": [
     {
@@ -231,6 +236,7 @@ curl -s "$SENSOR/api/collection/storage"
 ```json
 {
   "timezone": "America/Denver",
+  "timezone_source": "location",
   "covered_since": "2026-10-18T00:00:00-06:00",
   "auto_captures": 180,
   "manual_captures": 1,
@@ -279,21 +285,43 @@ curl -s "$SENSOR/api/collection/hourly?since=yesterday&until=today"
 {"detail": "since and until must be ISO times"}
 ```
 
-## Setting the time zone
+## Time zone
 
-`TIMEZONE` is an IANA name such as `America/Denver`, default `UTC`. Zones
-whose offset is not a whole number of hours (for example `Asia/Kolkata`) are
-refused, since days are built from whole UTC hours. Set it in the sensor's
-`.env` (`RFOBS_TIMEZONE=America/Denver`) or live, which also saves it:
+Every endpoint takes an optional `tz`, an IANA name such as `America/New_York`.
+Without it, days are in the zone at the sensor's `LATITUDE`/`LONGITUDE` (looked
+up offline on the sensor), and in Pacific time (`America/Los_Angeles`) when
+the sensor has no location. `timezone_source` in every response says which:
+`request`, `location` or `default`.
 
 ```bash
-curl -s -X POST -H 'Content-Type: application/json' \
-  -d '{"timezone": "America/Denver"}' "$SENSOR/config/apply"
+curl -s "$SENSOR/api/collection/daily?date=2026-10-25&tz=America/New_York"
 ```
 
-A change applies to the next request; stored hours are not touched, only how
-they are grouped into days. An unusable value in `.env` falls back to UTC with
-a warning in the log.
+```json
+{
+  "timezone": "America/New_York",
+  "timezone_source": "request",
+  "covered_since": "2026-10-18T02:00:00-04:00",
+  "date": "2026-10-25",
+  "start": "2026-10-25T00:00:00-04:00",
+  "end": "2026-10-26T00:00:00-04:00",
+  "bytes": 6272000000
+}
+```
+
+Only zones a whole number of hours from UTC work, since days are built from
+whole UTC hours. Asking for another (for example `Asia/Kolkata`) is `400`; a
+sensor whose location is in one uses Pacific time, with a warning in its log.
+Changing the zone never changes what is stored, only how hours are grouped
+into days.
+
+```bash
+curl -s "$SENSOR/api/collection/average?tz=Asia/Kolkata"
+```
+
+```json
+{"detail": "tz must be an IANA zone a whole number of hours from UTC: time zone 'Asia/Kolkata' is not a whole number of hours from UTC"}
+```
 
 ## Field reference
 
@@ -320,7 +348,8 @@ Day and response fields:
 
 | Field | Meaning |
 |---|---|
-| `timezone` | The sensor's `TIMEZONE` in use |
+| `timezone` | The time zone the days are in |
+| `timezone_source` | Where it came from: `request` (`tz`), `location` or `default` (Pacific) |
 | `covered_since` | When counting began (local time), or `null` before the first flush |
 | `date` | The local date |
 | `start` | Local midnight starting the day |

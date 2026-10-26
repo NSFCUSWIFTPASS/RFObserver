@@ -167,3 +167,50 @@ async def test_collection_loop_flushes_and_logs_failures(tmp_path, monkeypatch, 
     finally:
         task.cancel()
         await db.close()
+
+
+def test_a_capture_already_gone_from_the_index_is_not_counted_again(tmp_path):
+    # evict_until_free works from a snapshot; enforce_cap on another thread can
+    # delete the same capture first. Only the deletion that removed it counts.
+    ls = LocalStorage(str(tmp_path), max_gb=100)
+    calls = _recorder(ls)
+    a = _cap(ls, "a", 4000, 1)
+    ls._delete_capture(a, "cap")
+    ls._delete_capture(a, "space")  # the stale snapshot's turn
+    assert calls == [("cap", 4000)]
+
+
+def test_eviction_racing_inside_on_evict_counts_each_capture_once(tmp_path):
+    ls = LocalStorage(str(tmp_path), max_gb=100)
+    calls = _recorder(ls)
+    caps = [_cap(ls, n, 4000, i + 1) for i, n in enumerate("abc")]
+
+    def race(path, age):
+        # The cap path deletes the next capture while the guard is mid-loop.
+        nxt = {caps[0]: caps[1]}.get(path)
+        if nxt is not None:
+            ls._delete_capture(nxt, "cap")
+
+    ls.evict_until_free(10**12, free_bytes=lambda: 0, on_evict=race)
+    assert sorted(calls) == sorted([("space", 4000), ("cap", 4000), ("space", 4000)])
+
+
+def test_a_failing_counter_does_not_stop_the_capture_row(tmp_path, monkeypatch):
+    proc = _proc(tmp_path)
+
+    class Boom:
+        def add_recorded(self, *a):
+            raise ValueError("bad timestamp")
+
+    scheduled = []
+
+    class Loop:
+        def call_soon_threadsafe(self, fn):
+            scheduled.append(fn)
+
+    proc._collection = Boom()
+    proc._loop = Loop()
+    proc._recording_dir = proc._storage.manual_dir
+    proc._recording_bytes = 4000
+    proc._write_recording_metadata("x.sc16", 0.01)
+    assert len(scheduled) == 1  # the iq_captures insert

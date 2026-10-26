@@ -2585,12 +2585,15 @@ class StreamingProcessor:
         # Count the raw IQ recorded (live only): its signal seconds from the
         # capture's start, its .sc16 bytes.
         if self._collection is not None and not self._replay_mode:
-            self._collection.add_recorded(
-                "auto" if self._trigger_initiated else "manual",
-                start_dt.timestamp(),
-                start_dt.timestamp() + signal_duration,
-                total_samples * 4,
-            )
+            try:
+                self._collection.add_recorded(
+                    "auto" if self._trigger_initiated else "manual",
+                    start_dt.timestamp(),
+                    start_dt.timestamp() + signal_duration,
+                    total_samples * 4,
+                )
+            except Exception:  # never lose the iq_captures row below for it
+                logger.exception("Collection statistics: could not count %s", filename)
 
         # Record the capture's span in the DB so the Dashboard can highlight
         # where IQ is available and link straight to it. Uses the settings-

@@ -151,14 +151,6 @@ async def test_bad_daily_queries_are_400(make_client, q):
     assert r.status_code == 400 and r.json()["detail"]
 
 
-@pytest.mark.parametrize("days", [0, 61, "x"])
-async def test_average_days_out_of_range_is_400(make_client, days):
-    c = await make_client()
-    async with c:
-        r = await c.get("/api/collection/average", params={"days": days})
-    assert r.status_code in (400, 422)
-
-
 async def test_hourly_lists_hours_with_local_time(make_client):
     hours = {_ts(2026, 10, 25, 6): {"active_seconds": 12.5}}
     c = await make_client("America/Denver", since=_ts(2026, 10, 1), hours=hours)
@@ -212,3 +204,42 @@ async def test_flushed_figures_reach_the_api(make_client):
         d = (await c.get("/api/collection/daily", params={"date": "2026-10-25"})).json()
     assert (d["auto_captures"], d["auto_bytes"]) == (1, 8000)
     assert d["covered"] is True
+
+
+@pytest.mark.parametrize("d", ["9999-12-31", "0001-01-01"])
+async def test_extreme_dates_are_400(make_client, d):
+    c = await make_client("Asia/Tokyo")
+    async with c:
+        r = await c.get("/api/collection/daily", params={"date": d})
+        rng = await c.get("/api/collection/daily", params={"start": d, "end": d})
+    assert (r.status_code, rng.status_code) == (400, 400)
+
+
+@pytest.mark.parametrize("days", [0, 61, "x"])
+async def test_average_days_out_of_range_is_exactly_400(make_client, days):
+    c = await make_client()
+    async with c:
+        r = await c.get("/api/collection/average", params={"days": days})
+    assert r.status_code == 400 and r.json()["detail"]
+
+
+async def test_storage_carries_timezone_and_coverage(make_client):
+    c = await make_client("America/Denver", since=_ts(2026, 10, 1, 6))
+    async with c:
+        s = (await c.get("/api/collection/storage")).json()
+    assert s["timezone"] == "America/Denver"
+    assert s["covered_since"] == "2026-10-01T00:00:00-06:00"
+
+
+async def test_no_tz_database_falls_back_to_builtin_utc(make_client, monkeypatch):
+    from rfobserver.storage import collection as coll
+
+    def no_db(name):
+        raise coll.ZoneInfoNotFoundError(name)
+
+    monkeypatch.setattr(coll, "ZoneInfo", no_db)
+    c = await make_client("America/Denver", since=_ts(2026, 10, 1))
+    async with c:
+        r = await c.get("/api/collection/daily", params={"date": "2026-10-25"})
+    assert r.status_code == 200
+    assert r.json()["timezone"] == "UTC"

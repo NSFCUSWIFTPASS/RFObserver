@@ -373,8 +373,11 @@ class LocalStorage:
         with self._lock:
             entry = self._remove_locked(sc16_path)
         freed = entry.size if entry is not None else self._size_or_zero(sc16_path)
+        # Report only the deletion that took the capture out of the index: an
+        # evictor working from an older snapshot may reach one already gone.
+        report = reason is not None and self.on_deleted is not None and entry is not None
         sc16_bytes = 0
-        if reason is not None and self.on_deleted is not None:
+        if report:
             try:
                 sc16_bytes = sc16_path.stat().st_size
             except OSError:
@@ -385,7 +388,7 @@ class LocalStorage:
             except OSError:
                 logger.warning("Could not unlink %s during eviction", p)
         logger.info("Rotated old capture: %s (freed %d bytes)", sc16_path.name, freed)
-        if reason is not None and self.on_deleted is not None:
+        if report and self.on_deleted is not None and reason is not None:
             try:
                 self.on_deleted(reason, sc16_bytes)
             except Exception:

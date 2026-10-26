@@ -9,19 +9,19 @@ from __future__ import annotations
 import shutil
 import time
 from datetime import date, datetime, timedelta, timezone, tzinfo
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from rfobserver.storage.collection import FIELDS, local_day_bounds, sensor_zone
-
-if TYPE_CHECKING:
-    from zoneinfo import ZoneInfo
+from rfobserver.storage.collection import FIELDS, local_day_bounds, sensor_zone, zone_name
 
 router = APIRouter()
 
 MAX_RANGE_DAYS = 366
 MAX_HOURLY_DAYS = 31
+MAX_AVERAGE_DAYS = 60
+# Dates outside these years cannot be turned into epoch seconds everywhere.
+MIN_YEAR, MAX_YEAR = 1970, 9998
 
 _COUNT_FIELDS = {f for f in FIELDS if not f.endswith("_seconds")}
 
@@ -37,7 +37,7 @@ def _db(request: Request) -> Any:
     return db
 
 
-async def _context(request: Request) -> tuple[Any, ZoneInfo, int | None]:
+async def _context(request: Request) -> tuple[Any, tzinfo, int | None]:
     from rfobserver.storage.database import COLLECTION_SINCE_KEY
 
     db = _db(request)
@@ -50,8 +50,8 @@ def _iso(ts: int, tz: tzinfo) -> str:
     return datetime.fromtimestamp(ts, tz).isoformat()
 
 
-def _header(tz: ZoneInfo, since: int | None) -> dict[str, Any]:
-    return {"timezone": tz.key, "covered_since": None if since is None else _iso(since, tz)}
+def _header(tz: tzinfo, since: int | None) -> dict[str, Any]:
+    return {"timezone": zone_name(tz), "covered_since": None if since is None else _iso(since, tz)}
 
 
 def _empty() -> dict[str, float]:
@@ -67,13 +67,18 @@ def _with_totals(fig: dict[str, Any]) -> dict[str, Any]:
 
 def _parse_date(raw: str, name: str) -> date:
     try:
-        return date.fromisoformat(raw)
+        day = date.fromisoformat(raw)
     except ValueError:
         raise HTTPException(status_code=400, detail=f"{name} must be YYYY-MM-DD") from None
+    if not MIN_YEAR <= day.year <= MAX_YEAR:
+        raise HTTPException(
+            status_code=400, detail=f"{name} must be in the years {MIN_YEAR} to {MAX_YEAR}"
+        )
+    return day
 
 
 async def _days(
-    db: Any, tz: ZoneInfo, since: int | None, first: date, last: date
+    db: Any, tz: tzinfo, since: int | None, first: date, last: date
 ) -> list[dict[str, Any]]:
     """Each local day in [first, last] with its figures, from one read."""
     bounds = [
@@ -141,17 +146,26 @@ async def daily(
 
 
 @router.get("/average")
-async def average(request: Request, days: int = Query(7, ge=1, le=60)) -> dict[str, Any]:
+async def average(request: Request, days: str = "7") -> dict[str, Any]:
     """The mean per day over the last ``days`` complete local days; null until
     that many complete days have been counted."""
+    try:
+        n = int(days)
+    except ValueError:
+        n = 0
+    if not 1 <= n <= MAX_AVERAGE_DAYS:
+        raise HTTPException(
+            status_code=400, detail=f"days must be a whole number from 1 to {MAX_AVERAGE_DAYS}"
+        )
+    days_n = n
     db, tz, since = await _context(request)
     today = datetime.fromtimestamp(_now(), tz).date()
-    window = await _days(db, tz, since, today - timedelta(days=days), today - timedelta(days=1))
+    window = await _days(db, tz, since, today - timedelta(days=days_n), today - timedelta(days=1))
     counted = [d for d in window if d["covered"] and d["complete"]]
     avg = None
-    if len(counted) == days:
+    if len(counted) == days_n:
         total = _sum(counted)
-        avg = {k: v / days for k, v in total.items()}
+        avg = {k: v / days_n for k, v in total.items()}
     return {**_header(tz, since), "days_counted": len(counted), "average": avg, "days": window}
 
 
@@ -190,7 +204,8 @@ async def storage(request: Request) -> dict[str, Any]:
     ls = getattr(request.app.state, "local_storage", None)
     if ls is None:
         raise HTTPException(status_code=503, detail="Storage not available")
-    snap: dict[str, Any] = dict(ls.snapshot())
+    _, tz, since = await _context(request)
+    snap: dict[str, Any] = {**_header(tz, since), **ls.snapshot()}
     try:
         usage = shutil.disk_usage(ls.storage_path)
         snap["volume_free_bytes"], snap["volume_total_bytes"] = usage.free, usage.total

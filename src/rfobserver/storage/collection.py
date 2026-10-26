@@ -15,7 +15,7 @@ import logging
 import math
 import threading
 from collections import defaultdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -159,9 +159,10 @@ def whole_hour_zone(name: str) -> ZoneInfo:
     return tz
 
 
-def sensor_zone(settings: AppSettings) -> ZoneInfo:
+def sensor_zone(settings: AppSettings) -> tzinfo:
     """The sensor's TIMEZONE, or UTC (with a warning, once) when it is not a
-    usable zone, so a bad setting never stops the sensor."""
+    usable zone, so a bad setting never stops the sensor. UTC is the built-in
+    one when the host has no time-zone database at all."""
     name = settings.TIMEZONE
     try:
         return whole_hour_zone(name)
@@ -169,10 +170,18 @@ def sensor_zone(settings: AppSettings) -> ZoneInfo:
         if name not in _warned_zones:
             _warned_zones.add(name)
             logger.warning("TIMEZONE %r is not usable (%s); using UTC", name, exc)
+    try:
         return ZoneInfo("UTC")
+    except (ZoneInfoNotFoundError, ValueError):
+        return timezone.utc
 
 
-def local_day_bounds(day: date, tz: ZoneInfo) -> tuple[int, int]:
+def zone_name(tz: tzinfo) -> str:
+    """The IANA name of a zone from sensor_zone ("UTC" for the built-in one)."""
+    return str(getattr(tz, "key", "UTC"))
+
+
+def local_day_bounds(day: date, tz: tzinfo) -> tuple[int, int]:
     """UTC epoch seconds of ``day``'s local midnight and the next one."""
     start = datetime(day.year, day.month, day.day, tzinfo=tz)
     nxt = day + timedelta(days=1)

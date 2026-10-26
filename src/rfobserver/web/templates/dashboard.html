@@ -1668,7 +1668,10 @@
                         let displayVal = val;
                         let displayUnit = p.unit;
                         if (p.unit === "Hz" && val >= 1e6) {
-                            displayVal = (val / 1e6).toFixed(1);
+                            // kHz precision (101.512 MHz), trailing zeros dropped
+                            // but one decimal kept (101.5, not 101.500).
+                            displayVal = String(parseFloat((val / 1e6).toFixed(3)));
+                            if (displayVal.indexOf(".") < 0) displayVal += ".0";
                             displayUnit = "MHz";
                         }
                         html += '<input type="text" class="module-freq-input" value="' + displayVal
@@ -1695,6 +1698,11 @@
                 if (m.has_audio) {
                     html += '<button class="rec-btn rec-start" onclick="toggleAudio(\'' + mid + '\')">'
                         + (playing ? '■ Stop' : '▶ Play') + '</button> ';
+                    if (playing && audioContexts[mid].stats) {
+                        const st = audioContexts[mid].stats;
+                        html += '<span class="module-audio-stats" title="Audio queued in this browser before playing, and how often it ran dry (silence while it refills)">'
+                            + 'Buffer ' + st.bufferSec.toFixed(1) + ' s, dropouts ' + st.underruns + '</span> ';
+                    }
                 }
                 html += '<button class="rec-btn rec-stop" onclick="removeModule(\'' + mid + '\')">✕</button>';
                 if (m.error) {
@@ -1786,7 +1794,11 @@
             if (typeof evt.data === "string") {
                 const cfg = JSON.parse(evt.data);
                 audioCtx = new AudioContext({sampleRate: cfg.sample_rate});
-                preBufferSamples = cfg.sample_rate * 0.3;  // 300ms pre-buffer
+                // 300 ms to start; each time it runs dry, 200 ms more (up to
+                // 2 s), so a link with more jitter settles at a buffer that
+                // covers it instead of dropping out repeatedly.
+                preBufferSamples = cfg.sample_rate * 0.3;
+                const stats = {underruns: 0, bufferSec: 0.3};
 
                 const bufSize = 8192;
                 scriptNode = audioCtx.createScriptProcessor(bufSize, 0, 1);
@@ -1801,10 +1813,16 @@
                     out.set(pcmBuffer.subarray(0, n));
                     out.fill(0, n);
                     pcmBuffer = pcmBuffer.slice(n);
-                    if (n < out.length) buffering = true;
+                    if (n < out.length) {
+                        buffering = true;
+                        stats.underruns += 1;
+                        preBufferSamples = Math.min(preBufferSamples + audioCtx.sampleRate * 0.2,
+                            audioCtx.sampleRate * 2);
+                        stats.bufferSec = preBufferSamples / audioCtx.sampleRate;
+                    }
                 };
                 scriptNode.connect(audioCtx.destination);
-                audioContexts[moduleId] = {ctx: audioCtx, ws: aws, node: scriptNode};
+                audioContexts[moduleId] = {ctx: audioCtx, ws: aws, node: scriptNode, stats: stats};
                 refreshModules();
             } else {
                 const int16 = new Int16Array(evt.data);
@@ -1815,8 +1833,9 @@
                 newBuf.set(f32, pcmBuffer.length);
                 pcmBuffer = newBuf;
 
-                // Cap the backlog at 1.5 s, so the delay cannot build up.
-                const maxSamples = (audioCtx ? audioCtx.sampleRate : 48000) * 1.5;
+                // Cap the backlog at the buffer plus 1 s, so the delay cannot
+                // build up.
+                const maxSamples = preBufferSamples + (audioCtx ? audioCtx.sampleRate : 48000);
                 if (pcmBuffer.length > maxSamples) {
                     pcmBuffer = pcmBuffer.slice(pcmBuffer.length - maxSamples);
                 }

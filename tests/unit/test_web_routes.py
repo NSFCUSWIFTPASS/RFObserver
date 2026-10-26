@@ -355,6 +355,24 @@ class TestConfigApply:
         assert resp.status_code == 400
         assert original == settings.NUM_FFT_BINS  # unchanged
 
+    def test_apply_bandwidth_rejects_rates_the_receiver_cannot_do(
+        self, client_with_processor, monkeypatch, tmp_path
+    ):
+        """ "0.25" typed as MHz reaches the route as 0, which crashed the
+        receiver loop; an RTL-SDR also has a hole between 300 and 900 kHz."""
+        monkeypatch.chdir(tmp_path)
+        client, settings, processor = client_with_processor
+        original = settings.BANDWIDTH
+        resp = client.post("/config/apply", json={"bandwidth": "0"})
+        assert resp.status_code == 400 and "in Hz" in resp.json()["detail"]
+        monkeypatch.setattr(settings, "RECEIVER", "rtlsdr")
+        resp = client.post("/config/apply", json={"bandwidth": "500000"})
+        assert resp.status_code == 400 and "225001-300000" in resp.json()["detail"]
+        assert original == settings.BANDWIDTH
+        processor.reconfigure.assert_not_called()
+        resp = client.post("/config/apply", json={"bandwidth": "250000"})
+        assert resp.status_code == 200 and settings.BANDWIDTH == 250_000
+
     def test_apply_psd_backend_reconfigures(self, client_with_processor, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)  # apply persists to ./.env; keep it out of the repo
         client, settings, processor = client_with_processor

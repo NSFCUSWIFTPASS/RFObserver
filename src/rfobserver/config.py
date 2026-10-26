@@ -242,6 +242,12 @@ class AppSettings(BaseSettings):
     ISOLATION_LOOKBACK_SEC: float = 2.0
     # Longer bursts are isolated only up to this length.
     ISOLATION_MAX_BURST_SEC: float = 0.5
+    # Isolation stays off when its ring plus the worst-case working set (one
+    # ISOLATION_MAX_BURST_SEC burst) would exceed this fraction of the RAM
+    # available at start. 0.25 leaves room for a RAM-mode recording (up to
+    # RECORDING_MEM_FRACTION) and everything else; a box that measures more
+    # headroom can raise it. Read when the pipeline starts.
+    ISOLATION_RAM_FRACTION: float = 0.25
     # Gate: dB over the noise floor at the burst's peak bin, and the most bursts
     # isolated per second (strongest first).
     ISOLATION_SNR_DB: float = 13.0
@@ -269,6 +275,13 @@ class AppSettings(BaseSettings):
     # systemd's Restart=on-failure starts a fresh process (fresh USB/SDR state)
     # instead of leaving a live process with the sensor silently inactive.
     EXIT_ON_CRASH_GIVE_UP: bool = True
+
+    # Receiver hardware: "uhd" (USRP B2xx) or "rtlsdr" (RTL2832U dongle,
+    # capture/rtlsdr_receiver.py; BANDWIDTH 0.9-3.2 MS/s, 2.4 is reliable).
+    # MOCK_RECEIVER overrides both.
+    RECEIVER: Literal["uhd", "rtlsdr"] = "uhd"
+    RTLSDR_DEVICE_INDEX: int = 0
+    RTLSDR_PPM: int = 0  # tuner frequency correction, parts per million
 
     # Development
     MOCK_RECEIVER: bool = False

@@ -933,11 +933,12 @@ class StreamingProcessor:
                 SNAPSHOT_MAX_BYTES, int(s.ISOLATION_MAX_PER_SEC) * max_burst_samples * 4
             )
             avail = _mem_available_bytes()
-            if avail is not None and ring_bytes + work_bytes > 0.25 * avail:
+            frac = float(s.ISOLATION_RAM_FRACTION)
+            if avail is not None and ring_bytes + work_bytes > frac * avail:
                 self._isolation_disabled_reason = (
                     f"isolation ring of {ring_bytes / 1e6:.0f} MB plus a working set of "
-                    f"{work_bytes / 1e6:.0f} MB exceeds 25% of available "
-                    f"RAM ({avail / 1e6:.0f} MB); isolation disabled"
+                    f"{work_bytes / 1e6:.0f} MB exceeds {frac * 100:.0f}% of available "
+                    f"RAM ({avail / 1e6:.0f} MB, ISOLATION_RAM_FRACTION); isolation disabled"
                 )
                 logger.error(self._isolation_disabled_reason)
                 self._halt_isolation()
@@ -3337,8 +3338,11 @@ class StreamingProcessor:
                 if self._settings.TONE_CHECK_ENABLED:
                     await self._run_tone_check(avg, result, win_start)
 
-                # Normal-mode UI broadcast (only if no high-res subscribers)
-                if self._broadcast is not None and not self._broadcast.has_high_res_subscribers():
+                # Averaged UI broadcast, always: each client gets the frames
+                # of the mode it asked for (LiveBroadcast routes by "mode"),
+                # so one client in High Res no longer switches every other
+                # client to it. One or two frames a second, so cheap.
+                if self._broadcast is not None:
                     await self._broadcast_averaged(
                         avg, result, len(accum_powers), win_start, capture_span(result)
                     )
@@ -3364,6 +3368,7 @@ class StreamingProcessor:
                 await self._broadcast.publish(
                     {
                         "type": "psd",
+                        "mode": "high_res",
                         "center_freq_hz": result.center_freq_hz,
                         "bandwidth_hz": self._settings.BANDWIDTH,
                         "powers": result.summary_psd.powers,
@@ -3428,6 +3433,7 @@ class StreamingProcessor:
         await self._broadcast.publish(
             {
                 "type": "psd",
+                "mode": "averaged",
                 "center_freq_hz": result.center_freq_hz,
                 "bandwidth_hz": self._settings.BANDWIDTH,
                 "powers": avg_powers,

@@ -1027,6 +1027,12 @@ body {
     flex-wrap: wrap;
 }
 
+.module-audio-stats {
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+}
+
 .module-error {
     flex-basis: 100%;
     color: #ff3b30;
@@ -1043,7 +1049,7 @@ body {
 }
 
 .module-freq-input {
-    width: 70px;
+    width: 80px;
     padding: 2px 4px;
     font-size: 12px;
     border: 1px solid var(--border);

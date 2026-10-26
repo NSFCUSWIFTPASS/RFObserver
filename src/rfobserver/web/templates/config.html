@@ -387,6 +387,11 @@
             </div>
             <div class="form-row">
                 <div class="form-group">
+                    <label for="isolation-ram-fraction">RAM Limit (fraction)</label>
+                    <input type="number" id="isolation-ram-fraction" name="isolation_ram_fraction" value="{{ settings.ISOLATION_RAM_FRACTION }}" step="0.05" min="0.05" max="0.9">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Isolation stays off if its memory would exceed this share of available RAM. Applies at the next start.</span>
+                </div>
+                <div class="form-group">
                     <label for="burst-archive-max">Archive Max (GB)</label>
                     <input type="number" id="burst-archive-max" name="burst_archive_max_gb" value="{{ settings.BURST_ARCHIVE_MAX_GB }}" step="0.5" min="0">
                     <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Saved burst files are capped at this size, oldest deleted first.</span>

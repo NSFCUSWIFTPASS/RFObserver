@@ -9,8 +9,11 @@ arrays the tiles do not draw. A browser that falls behind gets each
 sensor's newest frame, never a queue.
 
 High resolution (a frame per chunk, about 27 a second, instead of one per
-averaged window) is asked of every sensor while any viewer wants it, the
-same request the sensor's own Live page makes by default.
+averaged window) is asked of every sensor while any viewer wants it, together
+with the averaged frames, and each viewer gets only the frames of the mode it
+chose: a viewer with High Res off never receives the per-chunk stream. With
+no High Res viewer the sensors send averaged frames only. Sensors that
+predate the frame "mode" label send one stream, which every viewer gets.
 
 The frequency axis is sent to a browser only when it changes for that
 sensor, as the sensor itself does, so the hub remembers each sensor's axis.
@@ -116,6 +119,7 @@ def compact_frame(sensor_id: str, data: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "psd",
         "id": sensor_id,
+        "mode": data.get("mode"),  # "high_res", "averaged", or None (older sensors)
         "t": data.get("capture_time_ms") or data.get("chunk_time_ms"),
         "dur_ms": data.get("dur_ms"),
         "powers": powers,
@@ -240,7 +244,8 @@ class _Feed:
     last_message: float = 0.0  # monotonic
     last_psd: float = 0.0  # monotonic
     last_seen: float | None = None  # wall time of the last frame
-    frame: dict[str, Any] | None = None
+    frame: dict[str, Any] | None = None  # the newest frame, any mode
+    frames: dict[Any, dict[str, Any]] = field(default_factory=dict)  # newest per mode
     frequencies: list[float] | None = None
     recording: str | None = None
     error: str | None = None
@@ -248,8 +253,8 @@ class _Feed:
     # (t, avg_power_db) and (t, kurtosis) of recent frames, oldest first.
     power: collections.deque[tuple[float, float]] = field(default_factory=collections.deque)
     kurtosis: collections.deque[tuple[float, float]] = field(default_factory=collections.deque)
-    # ``frame`` encoded, keyed by whether it carries the frequency axis.
-    encoded: dict[bool, str] = field(default_factory=dict)
+    # ``frames`` encoded, keyed by (mode, whether it carries the frequency axis).
+    encoded: dict[tuple[Any, bool], str] = field(default_factory=dict)
     overlay: _Overlay = field(default_factory=_Overlay)
 
     def add_power(self, t_ms: Any, value: Any, kurtosis: Any = None) -> None:
@@ -366,9 +371,26 @@ class LiveHub:
                         "kurtosis": list(feed.kurtosis),
                     },
                 )
-            if feed.frame is not None:
-                viewer.put((feed.sensor_id, "psd"), feed.frame)
+            frame = self._frame_for(viewer, feed)
+            if frame is not None:
+                viewer.put((feed.sensor_id, "psd"), frame)
         return viewer
+
+    @staticmethod
+    def _wants(viewer: _Viewer, frame: dict[str, Any]) -> bool:
+        mode = frame.get("mode")
+        if mode == "high_res":
+            return viewer.high_res
+        if mode == "averaged":
+            return not viewer.high_res
+        return True  # an older sensor's only stream
+
+    def _frame_for(self, viewer: _Viewer, feed: _Feed) -> dict[str, Any] | None:
+        """The newest frame of the mode this viewer takes."""
+        for frame in sorted(feed.frames.values(), key=lambda f: f.get("t") or 0, reverse=True):
+            if self._wants(viewer, frame):
+                return frame
+        return None
 
     def leave(self, viewer: _Viewer) -> None:
         self._viewers.discard(viewer)
@@ -377,7 +399,12 @@ class LiveHub:
         self._apply_mode()
 
     def set_high_res(self, viewer: _Viewer, on: bool) -> None:
-        viewer.high_res = on
+        if viewer.high_res != on:
+            viewer.high_res = on
+            # Drop queued frames of the old mode.
+            for key in [k for k in viewer.pending if k[1] == "psd"]:
+                del viewer.pending[key]
+                viewer.order.remove(key)
         self._apply_mode()
 
     def wants_high_res(self) -> bool:
@@ -395,7 +422,8 @@ class LiveHub:
             return
         feed.high_res = on
         try:
-            await sock.send(json.dumps({"type": "set_mode", "high_res": on}))
+            # In High Res, the averaged frames too: viewers with it off keep theirs.
+            await sock.send(json.dumps({"type": "set_mode", "high_res": on, "averaged": on}))
         except Exception:
             feed.high_res = not on  # retried on the next change or reconnect
             logger.debug("Fleet live: set_mode to %s failed", feed.sensor_id, exc_info=True)
@@ -424,18 +452,22 @@ class LiveHub:
         """``shape`` as JSON text. A sensor's current frame is encoded once
         and the text shared by every browser."""
         feed = self._feeds.get(msg.get("id", "")) if msg.get("type") == "psd" else None
-        if feed is None or feed.frame is not msg:
+        mode = msg.get("mode")
+        if feed is None or feed.frames.get(mode) is not msg:
             return _dumps(self.shape(viewer, msg))
         freqs = self._axis_for(viewer, msg)
-        with_axis = freqs is not None
-        text = feed.encoded.get(with_axis)
+        key = (mode, freqs is not None)
+        text = feed.encoded.get(key)
         if text is None:
-            text = _dumps({**msg, "frequencies": freqs} if with_axis else msg)
-            feed.encoded[with_axis] = text
+            text = _dumps({**msg, "frequencies": freqs} if freqs is not None else msg)
+            feed.encoded[key] = text
         return text
 
     def _publish(self, key: tuple[str, str], msg: dict[str, Any]) -> None:
+        psd = msg.get("type") == "psd"
         for viewer in list(self._viewers):
+            if psd and not self._wants(viewer, msg):
+                continue
             viewer.put(key, msg)
 
     # --- sensor feeds ---
@@ -506,12 +538,18 @@ class LiveHub:
             freqs = data.get("frequencies")
             if isinstance(freqs, list) and freqs:
                 feed.frequencies = freqs
-            feed.frame = compact_frame(feed.sensor_id, data)
-            if not data.get("chunks_averaged"):
+            frame = compact_frame(feed.sensor_id, data)
+            mode = frame["mode"]
+            if mode != "averaged" and not data.get("chunks_averaged"):
                 # High Res: averaged rows span a window, far longer than a burst.
-                feed.frame.update(feed.overlay.update(data, now))
-            feed.encoded = {}
-            feed.add_power(feed.frame["t"], data.get("avg_power_db"), data.get("kurtosis"))
+                frame.update(feed.overlay.update(data, now))
+            feed.frame = feed.frames[mode] = frame
+            for key in [k for k in feed.encoded if k[0] == mode]:
+                del feed.encoded[key]
+            # Power and kurtosis history are per chunk (the High Res plots);
+            # an averaged frame's values are its window's last chunk only.
+            if mode != "averaged":
+                feed.add_power(frame["t"], data.get("avg_power_db"), data.get("kurtosis"))
             was_standby = now - feed.last_psd >= PSD_STALE_SEC
             feed.last_psd, feed.last_seen = now, time.time()
             self._publish((feed.sensor_id, "psd"), feed.frame)

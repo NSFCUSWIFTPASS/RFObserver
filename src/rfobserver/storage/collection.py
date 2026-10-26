@@ -11,13 +11,19 @@ backfill: counting starts at the hour of the first flush
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 if TYPE_CHECKING:
+    from rfobserver.config import AppSettings
     from rfobserver.storage.database import SensorDatabase
+
+logger = logging.getLogger(__name__)
 
 HOUR = 3600
 
@@ -128,3 +134,47 @@ class CollectionStats:
         except BaseException:
             self._put_back(rows)
             raise
+
+
+# --- days in the sensor's time zone ---
+
+_warned_zones: set[str] = set()
+
+
+def whole_hour_zone(name: str) -> ZoneInfo:
+    """The IANA zone ``name``, if its UTC offset is a whole number of hours on
+    every day of this year and next (days are built from UTC hours).
+    Raises ValueError otherwise."""
+    try:
+        tz = ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"unknown time zone {name!r}") from exc
+    year = datetime.now(timezone.utc).year
+    day = datetime(year, 1, 1, 12, tzinfo=timezone.utc)
+    for _ in range(731):
+        offset = day.astimezone(tz).utcoffset()
+        if offset is not None and offset.total_seconds() % HOUR:
+            raise ValueError(f"time zone {name!r} is not a whole number of hours from UTC")
+        day += timedelta(days=1)
+    return tz
+
+
+def sensor_zone(settings: AppSettings) -> ZoneInfo:
+    """The sensor's TIMEZONE, or UTC (with a warning, once) when it is not a
+    usable zone, so a bad setting never stops the sensor."""
+    name = settings.TIMEZONE
+    try:
+        return whole_hour_zone(name)
+    except ValueError as exc:
+        if name not in _warned_zones:
+            _warned_zones.add(name)
+            logger.warning("TIMEZONE %r is not usable (%s); using UTC", name, exc)
+        return ZoneInfo("UTC")
+
+
+def local_day_bounds(day: date, tz: ZoneInfo) -> tuple[int, int]:
+    """UTC epoch seconds of ``day``'s local midnight and the next one."""
+    start = datetime(day.year, day.month, day.day, tzinfo=tz)
+    nxt = day + timedelta(days=1)
+    end = datetime(nxt.year, nxt.month, nxt.day, tzinfo=tz)
+    return int(start.timestamp()), int(end.timestamp())

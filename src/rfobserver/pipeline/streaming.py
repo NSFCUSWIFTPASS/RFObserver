@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     from rfobserver.pipeline.beacon import ProgressBeacon
     from rfobserver.pipeline.isolation import IsolationStage
     from rfobserver.processing.spectral import PSDGridResult
+    from rfobserver.storage.collection import CollectionStats
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.storage.governor import StorageGovernor
     from rfobserver.storage.local import LocalStorage
@@ -606,6 +607,7 @@ class StreamingProcessor:
         beacon: ProgressBeacon | None = None,
         storage_governor: StorageGovernor | None = None,
         replay_source: str | None = None,
+        collection: CollectionStats | None = None,
     ) -> None:
         self._receiver = receiver
         self._db = database
@@ -615,6 +617,8 @@ class StreamingProcessor:
         self._zms_monitor = zms_monitor
         self._beacon = beacon
         self._governor = storage_governor
+        # IQ recorded and live RF time, per hour (storage/collection.py).
+        self._collection = collection
         self._running = False
         # Live capture must never block the receiver thread, so chunks are
         # dropped when processing falls behind (the default). Offline replay of
@@ -1600,6 +1604,7 @@ class StreamingProcessor:
                         recv_time = time.monotonic()
                         n = self._receiver.recv_chunk(buf)
                         t_recv_done = time.monotonic()
+                        self._count_live_chunk(n)
                         capture_time = self._capture_clock.chunk_start(
                             getattr(self._receiver, "last_device_time", None),
                             n,
@@ -2577,6 +2582,16 @@ class StreamingProcessor:
             # Report and carry on: the DB insert below still records the capture.
             self._report_write_error(f"{filename} metadata .json: {describe_write_error(exc)}")
 
+        # Count the raw IQ recorded (live only): its signal seconds from the
+        # capture's start, its .sc16 bytes.
+        if self._collection is not None and not self._replay_mode:
+            self._collection.add_recorded(
+                "auto" if self._trigger_initiated else "manual",
+                start_dt.timestamp(),
+                start_dt.timestamp() + signal_duration,
+                total_samples * 4,
+            )
+
         # Record the capture's span in the DB so the Dashboard can highlight
         # where IQ is available and link straight to it. Uses the settings-
         # derived tuning (the same values avg_windows carry, which populate the
@@ -2605,6 +2620,13 @@ class StreamingProcessor:
                     )
                 )
             )
+
+    def _count_live_chunk(self, n: int) -> None:
+        """Count a chunk of ``n`` live samples as active time (not replay)."""
+        if self._collection is not None and not self._replay_mode and n > 0:
+            rate = float(self._settings.BANDWIDTH)
+            if rate > 0:
+                self._collection.add_active(n / rate, time.time())
 
     def _decide_priority(
         self, duration_sec: float, start_ts: float, stop_ts: float

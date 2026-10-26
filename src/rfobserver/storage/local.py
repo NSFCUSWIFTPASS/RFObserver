@@ -105,6 +105,10 @@ class LocalStorage:
         # Share of max_bytes priority captures may hold before they are
         # evicted ahead of ordinary ones; 0 makes eviction plain FIFO.
         self.priority_share = 0.0
+        # Told (reason, .sc16 bytes) of each capture deleted automatically:
+        # "cap" (enforce_cap) or "space" (evict_until_free). The collection
+        # statistics count these; may be called from any thread.
+        self.on_deleted: Callable[[str, int], None] | None = None
         self.set_storage_path(storage_path)
 
     def set_storage_path(self, storage_path: str | Path) -> None:
@@ -355,8 +359,9 @@ class LocalStorage:
                 total += comp.stat().st_size
         return total
 
-    def _delete_capture(self, sc16_path: Path) -> int:
+    def _delete_capture(self, sc16_path: Path, reason: str | None = None) -> int:
         """Delete a capture and all its companions. Returns bytes freed.
+        With a ``reason``, ``on_deleted`` is told it and the .sc16's bytes.
 
         Tolerant of unlink failures (e.g. a read-only-remounted or busy volume):
         a file that cannot be removed is logged and skipped rather than aborting
@@ -368,12 +373,23 @@ class LocalStorage:
         with self._lock:
             entry = self._remove_locked(sc16_path)
         freed = entry.size if entry is not None else self._size_or_zero(sc16_path)
+        sc16_bytes = 0
+        if reason is not None and self.on_deleted is not None:
+            try:
+                sc16_bytes = sc16_path.stat().st_size
+            except OSError:
+                sc16_bytes = 0
         for p in [sc16_path, *self._companion_paths(sc16_path)]:
             try:
                 p.unlink(missing_ok=True)
             except OSError:
                 logger.warning("Could not unlink %s during eviction", p)
         logger.info("Rotated old capture: %s (freed %d bytes)", sc16_path.name, freed)
+        if reason is not None and self.on_deleted is not None:
+            try:
+                self.on_deleted(reason, sc16_bytes)
+            except Exception:
+                logger.exception("on_deleted failed for %s", sc16_path.name)
         return freed
 
     def _enforce_limit(self, incoming_bytes: int) -> None:
@@ -405,7 +421,7 @@ class LocalStorage:
                 victim = self._cap_victim_locked(exclude=order[-1][1])
             if victim is None:
                 return
-            self._delete_capture(victim)
+            self._delete_capture(victim, "cap")
 
     def _priority_cap_bytes(self) -> int:
         return int(self.max_bytes * min(1.0, max(0.0, self.priority_share)))
@@ -530,7 +546,7 @@ class LocalStorage:
                 continue
             if on_evict is not None:
                 on_evict(victim.path, time.time() - victim.mtime)
-            freed += self._delete_capture(victim.path)
+            freed += self._delete_capture(victim.path, "space")
         if freed:
             logger.warning("Storage floor: evicted %.1f GB of automatic captures", freed / 1024**3)
         return freed

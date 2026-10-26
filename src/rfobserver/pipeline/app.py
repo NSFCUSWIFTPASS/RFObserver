@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from rfobserver.config import AppSettings
     from rfobserver.pipeline.beacon import ProgressBeacon
     from rfobserver.pipeline.supervisor import PipelineSupervisor
+    from rfobserver.storage.collection import CollectionStats
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.transport.rfdb import RfdbWriter
 
@@ -146,6 +147,7 @@ async def run(settings: AppSettings) -> None:
     from rfobserver.capture.receiver import ReceiverConfig
     from rfobserver.pipeline.beacon import ProgressBeacon
     from rfobserver.pipeline.supervisor import PipelineSupervisor
+    from rfobserver.storage.collection import CollectionStats
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.storage.local import LocalStorage
 
@@ -232,6 +234,13 @@ async def run(settings: AppSettings) -> None:
         logger.exception("Could not read the persisted storage degraded flag")
     retention_wake = asyncio.Event()
 
+    # Raw IQ recorded, IQ deleted automatically and live RF time per hour,
+    # flushed into collection_hours by _collection_loop.
+    collection = CollectionStats()
+    local_storage.on_deleted = lambda reason, nbytes: collection.add_deleted(
+        reason, nbytes, time.time()
+    )
+
     broadcast = LiveBroadcast()
 
     # ZMS monitor (optional). Two conditions both required:
@@ -282,6 +291,7 @@ async def run(settings: AppSettings) -> None:
                 replay_mode=replay_mode,
                 beacon=beacon,
                 storage_governor=storage_governor,
+                collection=collection,
                 # Names the replay-only outputs of isolation / attribution.
                 replay_source=(getattr(receiver, "source_name", "") or "replay")
                 if replay_mode
@@ -399,6 +409,7 @@ async def run(settings: AppSettings) -> None:
     if settings.PEAKS_ROLLUP_INTERVAL_SEC > 0:
         workers.append(asyncio.create_task(_rollup_loop(settings, db, supervisor)))
     workers.append(asyncio.create_task(_detection_hours_loop(db, read_db)))
+    workers.append(asyncio.create_task(_collection_loop(collection, db)))
     if rfdb_writer is not None:
         workers.append(asyncio.create_task(rfdb_writer.run()))
     # Serve until a stop signal. The supervisor owns the processor task
@@ -431,6 +442,10 @@ async def run(settings: AppSettings) -> None:
                 await supervisor.set_active(False)
             except Exception:
                 logger.exception("Shutdown: stopping the pipeline failed; continuing")
+            try:
+                await collection.flush(db, time.time())
+            except Exception:
+                logger.exception("Shutdown: flushing collection statistics failed; continuing")
             if zms_monitor is not None:
                 try:
                     await zms_monitor.stop()
@@ -910,6 +925,20 @@ async def _detection_hours_loop(db: SensorDatabase, read_db: SensorDatabase | No
         except Exception:
             logger.exception("Detection hours pass failed")
         await asyncio.sleep(60)
+
+
+COLLECTION_FLUSH_SEC = 15.0
+
+
+async def _collection_loop(stats: CollectionStats, db: SensorDatabase) -> None:
+    """Flush the collection statistics every COLLECTION_FLUSH_SEC. A failed
+    flush keeps its figures for the next one."""
+    while True:
+        try:
+            await stats.flush(db, time.time())
+        except Exception:
+            logger.exception("Collection statistics flush failed")
+        await asyncio.sleep(COLLECTION_FLUSH_SEC)
 
 
 async def _run_web_server(

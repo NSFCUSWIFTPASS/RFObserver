@@ -1,9 +1,20 @@
-{% extends "base.html" %}
-{% block title %}Captures - RFObs{% endblock %}
+{% extends base_template | default("base.html") %}
+{% block title %}Captures - RFObs{% if fleet_captures %} Fleet{% endif %}{% endblock %}
 {% block content %}
 <script src="/static/shared-charts.js"></script>
 <div class="page-header">
     <h1>IQ Captures</h1>
+    {% if fleet_captures %}
+    <div class="captures-fleet-bar">
+        <select id="captures-sensor" aria-label="Sensor">
+            <option value="">All sensors</option>
+            {% for s in fleet_captures.sensors %}
+            <option value="{{ s.id }}">{{ s.label }}</option>
+            {% endfor %}
+        </select>
+        <span id="captures-errors" class="captures-errors"></span>
+    </div>
+    {% endif %}
 </div>
 
 <div class="captures-layout">
@@ -20,6 +31,7 @@
     </div>
 </div>
 
+{% if not fleet_captures %}
 <div class="card" style="margin-top: 16px;">
     <div class="card-header">Replay a Raw File</div>
     <div class="card-body">
@@ -78,13 +90,29 @@
         </div>
     </div>
 </div>
+{% endif %}
 
 <script>
 (function() {
+    // Fleet mode: every sensor's captures in one list, each read through the
+    // fleet (/fleet/s/<sensor>/captures/...). No replay and no re-detect.
+    const FLEETCAP = {{ (fleet_captures or none) | tojson }};
     const listEl = document.getElementById("captures-list");
     const detailEl = document.getElementById("captures-detail");
     const viewerContainer = document.getElementById("captures-viewer-container");
     const viewerEl = document.getElementById("captures-viewer");
+
+    function esc(s) {
+        return String(s).replace(/[&<>"']/g, function(c) {
+            return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c];
+        });
+    }
+
+    // A capture's URL for one kind of read (detail, psd, detections, download).
+    function capUrl(kind, sensor, name) {
+        const tail = "/captures/" + kind + "/" + encodeURIComponent(name);
+        return FLEETCAP ? "/fleet/s/" + encodeURIComponent(sensor) + tail : tail;
+    }
 
     function formatBytes(b) {
         if (b < 1024) return b + " B";
@@ -112,7 +140,16 @@
     const LIST_PAGE = 200;
     let listShown = 0;
     let listTotal = 0;
-    let listSelected = null;
+    let listSelected = null;   // filename, plus listSensor in fleet mode
+    let listSensor = null;
+    let listCursor = "";       // fleet mode: how far into each sensor's list
+    const sensorSelect = document.getElementById("captures-sensor");
+    const errorsEl = document.getElementById("captures-errors");
+
+    function isSelected(el) {
+        return el.dataset.file === listSelected
+            && (!FLEETCAP || el.dataset.sensor === listSensor);
+    }
 
     // Why a capture is priority (the .json's "priority"). A capture promoted
     // later by a priority neighbour has the mark but no reason of its own.
@@ -133,9 +170,15 @@
             ? ' <span class="priority-badge" title="Kept longer: evicted only after ordinary captures">Priority</span>'
             : '';
 
-        let html = '<div class="capture-item" data-file="' + c.filename + '"'
+        const sensor = c.sensor
+            ? '<div class="capture-sensor"><span class="fleet-swatch" style="background:'
+                + esc(c.sensor.colour) + ';"></span>' + esc(c.sensor.label) + '</div>'
+            : '';
+        let html = '<div class="capture-item" data-file="' + esc(c.filename) + '"'
+            + (c.sensor ? ' data-sensor="' + esc(c.sensor.id) + '"' : '')
             + ' data-has-psd="' + (c.has_psd ? '1' : '0') + '">';
-        html += '<div class="capture-name">' + c.filename + ' ' + psdBadge + prioBadge + '</div>';
+        html += sensor;
+        html += '<div class="capture-name">' + esc(c.filename) + ' ' + psdBadge + prioBadge + '</div>';
         html += '<div class="capture-info">';
         html += formatBytes(c.size_bytes);
         if (dur) html += ' &middot; ' + dur;
@@ -155,14 +198,38 @@
             : "";
     }
 
-    async function loadList(more) {
+    // One page of the list: [captures, total]. Fleet mode pages by cursor.
+    async function fetchList(more, limit) {
+        if (FLEETCAP) {
+            const qs = new URLSearchParams({limit: String(limit)});
+            if (more && listCursor) qs.set("cursor", listCursor);
+            if (sensorSelect && sensorSelect.value) qs.set("sensor", sensorSelect.value);
+            const r = await fetch("/fleet/api/captures?" + qs.toString());
+            if (!r.ok) return null;
+            const body = await r.json();
+            listCursor = body.cursor || "";
+            if (errorsEl) {
+                const down = Object.keys(body.errors || {});
+                errorsEl.textContent = down.length ? "Not answering: " + down.join(", ") : "";
+            }
+            return [body.captures || [], body.total || 0];
+        }
         const offset = more ? listShown : 0;
-        const limit = more ? LIST_PAGE : Math.max(LIST_PAGE, listShown);
+        const r = await fetch("/captures/list?offset=" + offset + "&limit=" + limit);
+        if (!r.ok) return null;
+        const captures = await r.json();
+        return [captures, Number(r.headers.get("X-Total-Count")) || captures.length];
+    }
+
+    async function loadList(more) {
+        // The fleet answers at most 500 per page, so a refresh keeps that many.
+        const limit = more ? LIST_PAGE
+            : Math.min(FLEETCAP ? 500 : Infinity, Math.max(LIST_PAGE, listShown));
         try {
-            const r = await fetch("/captures/list?offset=" + offset + "&limit=" + limit);
-            if (!r.ok) return;
-            const captures = await r.json();
-            listTotal = Number(r.headers.get("X-Total-Count")) || captures.length;
+            const got = await fetchList(more, limit);
+            if (!got) return;
+            const captures = got[0];
+            listTotal = got[1];
 
             if (!more && captures.length === 0) {
                 listShown = 0;
@@ -183,7 +250,7 @@
             }
             if (listSelected) {
                 listEl.querySelectorAll(".capture-item").forEach(function(el) {
-                    el.classList.toggle("selected", el.dataset.file === listSelected);
+                    el.classList.toggle("selected", isSelected(el));
                 });
             }
         } catch (_) {
@@ -205,6 +272,7 @@
     let viewerMax = -40;
     let viewerCrosshairBin = -1;
     let viewerFilename = null;
+    let viewerSensor = null;   // fleet mode: the open capture's sensor
     // Display calibration baked into the capture: shifts stored dBFS/Hz to the
     // dBm/Hz the live view showed when recording. 0 / "dBFS" when uncalibrated.
     let viewerOffset = 0;
@@ -249,8 +317,8 @@
         files.forEach(function(f) { sizeOf[f.name] = f.size_bytes; });
         function link(name, label) {
             const size = sizeOf[name] != null ? ' <span class="dl-size">' + formatBytes(sizeOf[name]) + '</span>' : '';
-            return '<a class="dl-link" href="/captures/download/' + encodeURIComponent(name)
-                + '" download="' + name + '">' + label + '</a>' + size;
+            return '<a class="dl-link" href="' + esc(capUrl("download", listSensor, name))
+                + '" download="' + esc(name) + '">' + label + '</a>' + size;
         }
         const sc16 = files.find(function(f) { return f.name.endsWith(".sc16"); });
         let html = '<div class="dl-section"><div class="dl-title">Download</div>';
@@ -282,20 +350,26 @@
         return html + '</div>';
     }
 
-    async function showDetail(filename, hasPsd) {
+    async function showDetail(filename, hasPsd, sensor) {
         listSelected = filename;
+        listSensor = sensor || null;
         document.querySelectorAll(".capture-item").forEach(function(el) {
-            el.classList.toggle("selected", el.dataset.file === filename);
+            el.classList.toggle("selected", isSelected(el));
         });
 
         try {
-            const r = await fetch("/captures/detail/" + encodeURIComponent(filename));
+            const r = await fetch(capUrl("detail", listSensor, filename));
             if (!r.ok) return;
             const d = await r.json();
 
             const m = d.meta || {};
-            let html = '<div class="detail-header">' + d.filename + '</div>';
+            let html = '<div class="detail-header">' + esc(d.filename) + '</div>';
             html += '<table class="detail-table">';
+            if (FLEETCAP) {
+                const s = (FLEETCAP.sensors || []).find(function(x) { return x.id === listSensor; });
+                html += row("Sensor", '<span class="fleet-swatch" style="background:'
+                    + esc(s ? s.colour : "#8e8e93") + ';"></span>' + esc(s ? s.label : listSensor));
+            }
             html += row("Size", formatBytes(d.size_bytes));
             if (m.format) html += row("Format", m.format.toUpperCase());
             if (m.sample_rate_hz) html += row("Sample Rate", formatFreq(m.sample_rate_hz));
@@ -316,8 +390,8 @@
                 html += '<tr><td class="detail-label">Dropped Chunks</td>'
                     + '<td class="detail-value"' + cls + '>' + m.dropped_chunks + '</td></tr>';
             }
-            if (m.hostname) html += row("Hostname", m.hostname);
-            if (m.serial) html += row("Serial", m.serial);
+            if (m.hostname) html += row("Hostname", esc(m.hostname));
+            if (m.serial) html += row("Serial", esc(m.serial));
             html += '</table>';
             html += downloadLinks(d);
 
@@ -354,7 +428,7 @@
 
     async function fetchPageRaw(start, count) {
         try {
-            const r = await fetch("/captures/psd/" + encodeURIComponent(viewerFilename)
+            const r = await fetch(capUrl("psd", viewerSensor, viewerFilename)
                 + "?start=" + start + "&count=" + (count || PAGE) + "&max_bins=512");
             if (!r.ok) return null;
             return await r.json();
@@ -384,6 +458,7 @@
 
     async function loadPsdViewer(filename, durationSec) {
         viewerFilename = filename;
+        viewerSensor = listSensor;
         closePsdWs();
         pageCache = new Map();
         pageFill = new Map();
@@ -396,8 +471,10 @@
         // Open the binary PSD stream now, so its handshake overlaps the first
         // fetch below. Frames only arrive once a window is requested, which
         // happens after the viewer is built.
+        // The fleet reads PSD rows over HTTP only (cached, one at a time per
+        // sensor), so there is no socket in fleet mode.
         let ws = null;
-        try {
+        if (!FLEETCAP) try {
             ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://")
                 + location.host + "/captures/ws/psd/" + encodeURIComponent(filename));
             ws.binaryType = "arraybuffer";
@@ -494,6 +571,8 @@
 
             // Re-detect: re-run burst detection on this capture's stored PSD
             // grid at custom thresholds, independent of when it was recorded.
+            // Not in fleet mode: the fleet only reads from sensors.
+            {% if not fleet_captures %}
             html += '<div class="viewer-label" style="margin-top:14px;">Re-detect</div>';
             html += '<div class="redetect-panel">';
             html += '<div class="form-row">';
@@ -513,6 +592,7 @@
             html += '<span id="redetect-error" class="replay-error"></span>';
             html += '</div>';
             html += '</div>';
+            {% endif %}
 
             viewerEl.innerHTML = html;
 
@@ -954,7 +1034,7 @@
             // reusing this same load + draw path instead of duplicating it.
             async function loadDetections() {
                 try {
-                    const r = await fetch("/captures/detections/" + encodeURIComponent(filename));
+                    const r = await fetch(capUrl("detections", viewerSensor, filename));
                     if (viewerFilename !== filename) return;   // superseded
                     if (r.ok) {
                         const dd = await r.json();
@@ -975,6 +1055,7 @@
             }
             loadDetections();
 
+            {% if not fleet_captures %}
             // Re-detect: POST the panel's thresholds against this capture's
             // stored PSD grid, then reload the sidecar via loadDetections()
             // (above) so the overlay + table refresh in place without
@@ -1039,6 +1120,7 @@
                     }
                 });
             }
+            {% endif %}
 
         } catch (_) {
             if (psdWs === ws) closePsdWs();
@@ -1053,26 +1135,37 @@
     listEl.addEventListener("click", function(e) {
         if (e.target.closest(".capture-load-more")) { loadList(true); return; }
         const item = e.target.closest(".capture-item");
-        if (item) showDetail(item.dataset.file, item.dataset.hasPsd === "1");
+        if (item) showDetail(item.dataset.file, item.dataset.hasPsd === "1", item.dataset.sensor);
     });
+
+    if (sensorSelect) {
+        sensorSelect.addEventListener("change", function() {
+            listCursor = "";
+            listShown = 0;
+            loadList();
+        });
+    }
 
     // Deep link: /captures/?file=<name> (e.g. from a Dashboard IQ highlight)
     // auto-opens that capture once the list has loaded. If it is not in the
     // list (deleted by the archive cap), show a brief "no longer available".
+    // In fleet mode the link also names the sensor: ?sensor=<id>&file=<name>.
     function openFromQuery() {
-        const file = new URLSearchParams(location.search).get("file");
+        const q = new URLSearchParams(location.search);
+        const file = q.get("file");
+        const sensor = q.get("sensor");
         if (!file) return;
         let item = null;
         listEl.querySelectorAll(".capture-item").forEach(function(el) {
-            if (el.dataset.file === file) item = el;
+            if (el.dataset.file === file && (!FLEETCAP || el.dataset.sensor === sensor)) item = el;
         });
         if (item) {
             item.scrollIntoView({ block: "nearest" });
-            showDetail(item.dataset.file, item.dataset.hasPsd === "1");
-        } else if (listShown < listTotal) {
+            showDetail(item.dataset.file, item.dataset.hasPsd === "1", item.dataset.sensor);
+        } else if (listShown < listTotal && (!FLEETCAP || sensor)) {
             // Older than the pages shown: ask the server for it directly.
-            fetch("/captures/detail/" + encodeURIComponent(file)).then(function(r) {
-                if (r.ok) return r.json().then(function(d) { showDetail(file, !!d.has_psd); });
+            fetch(capUrl("detail", sensor, file)).then(function(r) {
+                if (r.ok) return r.json().then(function(d) { showDetail(file, !!d.has_psd, sensor); });
                 showGone(file);
             }).catch(function() { showGone(file); });
         } else {
@@ -1088,6 +1181,7 @@
         listEl.insertBefore(notice, listEl.firstChild);
     }
 
+    {% if not fleet_captures %}
     // --- Replay a raw file (arbitrary path outside the managed capture store) ---
     (function() {
         const pathInput = document.getElementById("replay-path");
@@ -1161,12 +1255,18 @@
             startBtn.disabled = false;
         });
     })();
+    {% endif %}
 
     loadList().then(openFromQuery);
 
+    // Fleet mode: re-list every 30 s while the page is shown.
+    if (FLEETCAP) {
+        setInterval(function() { if (!document.hidden) loadList(); }, 30000);
+    }
+
     // Re-list when capture_count ticks up on the /ws/live heartbeat — that's
     // the signal a recording finished and dropped a new file in storage.
-    (function() {
+    if (!FLEETCAP) (function() {
         let lastCount = -1;
         let ws = null;
         function connect() {

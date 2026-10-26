@@ -791,6 +791,27 @@ body {
     margin: 10px 14px;
 }
 
+.captures-fleet-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 12px;
+}
+
+.captures-errors {
+    font-size: 12px;
+    color: #ff9f0a;
+}
+
+.capture-sensor {
+    display: flex;
+    align-items: center;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-bottom: 2px;
+}
+
 .capture-name {
     font-size: 12px;
     font-weight: 600;
@@ -1809,7 +1830,8 @@ body {
     gap: 6px;
 }
 
-.avg-tuning select {
+.avg-tuning select,
+.captures-fleet-bar select {
     padding: 4px 8px;
     border: 1px solid var(--border);
     border-radius: 8px;

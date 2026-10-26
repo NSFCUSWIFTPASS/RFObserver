@@ -2060,10 +2060,11 @@
         attachDragZoom(statsCanvas, statsCanvas, renderStatsChart, function (x) {
             const b = iqBandAt(x);
             if (!b) return;
-            const url = "/captures/?file=" + encodeURIComponent(b.cap.filename);
-            // In the fleet the capture lives on the sensor: open its own page.
-            if (FLEET) window.open(FLEET.sensorUrl + url, "_blank", "noopener");
-            else window.location.href = url;
+            const file = encodeURIComponent(b.cap.filename);
+            // In the fleet, the fleet's Captures page, on that sensor's capture.
+            window.location.href = FLEET
+                ? "/captures?sensor=" + encodeURIComponent(FLEET.selected) + "&file=" + file
+                : "/captures/?file=" + file;
         });
         attachDragZoom($("avg-kurt"), $("avg-kurt"), renderKurtosisChart, null);
         setupHover(statsCanvas, $("avg-stats-tooltip"), "pwr",

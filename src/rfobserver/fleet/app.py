@@ -11,13 +11,14 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
+from starlette.background import BackgroundTask
 
 from rfobserver.__about__ import __version__
 from rfobserver.fleet.live import LiveHub
 from rfobserver.fleet.registry import Registry, parse_address
-from rfobserver.fleet.sensors import SensorHub, proxy_allowed
+from rfobserver.fleet.sensors import CACHE_CLOSED_SEC, CACHE_OPEN_SEC, SensorHub, proxy_allowed
 from rfobserver.web.app import STATIC_DIR, TEMPLATES_DIR, _RevalidatedStaticFiles
 from rfobserver.web.gzip import SafeGZipMiddleware
 from rfobserver.web.uiprefs import THEME_VALUES
@@ -31,6 +32,19 @@ if TYPE_CHECKING:
     from rfobserver.mdns import Found
 
 logger = logging.getLogger(__name__)
+
+# Request headers passed on to a sensor for a download, and answer headers
+# passed back.
+_RANGE_HEADERS = ("range", "if-range")
+_DOWNLOAD_HEADERS = (
+    "accept-ranges",
+    "content-disposition",
+    "content-length",
+    "content-range",
+    "content-type",
+    "etag",
+    "last-modified",
+)
 
 # Stats points carry only what the fleet charts draw.
 _STATS_FIELDS = ("start_time", "pwr_avg", "kurtosis")
@@ -214,6 +228,25 @@ def create_fleet_app(
             "fleet_detections.html",
             {"ui_theme": prefs.theme(), "sensors": _chart_sensors()},
         )
+
+    @app.get("/captures", response_class=HTMLResponse)
+    async def captures_page(request: Request) -> Any:
+        sensors = _chart_sensors()
+        return templates.TemplateResponse(
+            request,
+            "captures.html",
+            {
+                "ui_theme": prefs.theme(),
+                "base_template": "fleet_base.html",
+                "fleet_nav": sensors,
+                "fleet_captures": {"sensors": sensors},
+            },
+        )
+
+    @app.get("/captures/", include_in_schema=False)
+    async def captures_page_slash(request: Request) -> RedirectResponse:
+        query = f"?{request.url.query}" if request.url.query else ""
+        return RedirectResponse(f"/captures{query}", status_code=308)  # the sensor's URL
 
     @app.get("/sensors", response_class=HTMLResponse)
     async def sensors_page(request: Request) -> Any:
@@ -426,6 +459,132 @@ def create_fleet_app(
         headers = download_headers(s.id, burst_id) if download else {}
         return Response(
             content=json.dumps(doc, indent=2), media_type="application/json", headers=headers
+        )
+
+    @app.get("/fleet/api/captures")
+    async def fleet_captures(
+        limit: int = 200, cursor: str | None = None, sensor: str | None = None
+    ) -> dict[str, Any]:
+        """The next ``limit`` captures across enabled sensors (or one), newest
+        first. Pass the response's ``cursor`` back for the page after; the
+        list is read fresh each time (a new capture shows at once)."""
+        from rfobserver.fleet.captures import format_cursor, merge_page, parse_cursor
+
+        limit = max(1, min(limit, 500))
+        offsets = parse_cursor(cursor)
+        sensors = [s for s in registry.all() if s.enabled and (not sensor or s.id == sensor)]
+        errors: dict[str, str] = {}
+        totals: dict[str, int] = {}
+
+        async def one(s: Sensor) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
+            meta = {"id": s.id, "label": hub.display_label(s), "colour": s.colour}
+            off = offsets.get(s.id, 0)
+            try:
+                reply = await hub.get(
+                    s,
+                    "list",
+                    {"offset": str(off), "limit": str(limit)},
+                    root="captures",
+                    cache=False,
+                )
+                if reply.status != 200:
+                    raise ValueError(f"HTTP {reply.status}")
+                entries = json.loads(reply.body)
+            except (httpx.HTTPError, ValueError) as exc:
+                errors[s.id] = f"{type(exc).__name__}: {exc}"
+                return meta, [], off
+            if not isinstance(entries, list):
+                errors[s.id] = "not a capture list"
+                return meta, [], off
+            try:
+                totals[s.id] = int(reply.headers.get("x-total-count", ""))
+            except ValueError:
+                totals[s.id] = off + len(entries)
+            return meta, [e for e in entries if isinstance(e, dict)], off
+
+        per_sensor = await asyncio.gather(*(one(s) for s in sensors))
+        rows, new_cursor = merge_page(list(per_sensor), limit)
+        shown = sum(new_cursor.values())
+        total = sum(totals.values())
+        return {
+            "captures": rows,
+            "cursor": format_cursor(new_cursor),
+            "shown": shown,
+            "total": total,
+            "more": shown < total,
+            "sensor": sensor or None,
+            "errors": errors,
+        }
+
+    @app.api_route("/fleet/s/{sensor_id}/captures/download/{name}", methods=["GET", "HEAD"])
+    async def capture_download(sensor_id: str, name: str, request: Request) -> Response:
+        """One capture file, streamed from its sensor (Range passes through,
+        so an interrupted download resumes)."""
+        s = _sensor_or_404(sensor_id)
+        forward = {k: v for k, v in request.headers.items() if k.lower() in _RANGE_HEADERS}
+        stack = contextlib.AsyncExitStack()
+        try:
+            upstream = await stack.enter_async_context(
+                hub.download(s, f"captures/download/{name}", request.method, forward)
+            )
+        except httpx.HTTPError as exc:
+            await stack.aclose()
+            raise HTTPException(
+                status_code=502, detail=f"{s.id} did not answer: {type(exc).__name__}"
+            ) from None
+        headers = {k: v for k, v in upstream.headers.items() if k.lower() in _DOWNLOAD_HEADERS}
+        if "content-encoding" in upstream.headers:
+            headers.pop("content-length", None)  # the body is passed on decoded
+        if request.method == "HEAD" or upstream.status_code >= 300:
+            body = b"" if request.method == "HEAD" else await upstream.aread()
+            await stack.aclose()
+            if request.method == "HEAD":
+                return Response(status_code=upstream.status_code, headers=headers)
+            return Response(
+                content=body,
+                status_code=upstream.status_code,
+                media_type=upstream.headers.get("content-type"),
+            )
+
+        async def body_chunks() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in upstream.aiter_bytes():
+                    yield chunk
+            finally:
+                await stack.aclose()
+
+        return StreamingResponse(
+            body_chunks(),
+            status_code=upstream.status_code,
+            headers=headers,
+            background=BackgroundTask(stack.aclose),
+        )
+
+    @app.get("/fleet/s/{sensor_id}/captures/{kind}/{filename}")
+    async def capture_read(sensor_id: str, kind: str, filename: str, request: Request) -> Response:
+        """One capture's detail, PSD rows or detections, read through. A
+        capture's PSD never changes, so its rows are cached longer."""
+        from rfobserver.fleet.captures import READ_KINDS
+
+        s = _sensor_or_404(sensor_id)
+        if kind not in READ_KINDS:
+            raise HTTPException(status_code=404, detail="not available through the fleet")
+        psd = kind == "psd"
+        try:
+            reply = await hub.get(
+                s,
+                f"{kind}/{filename}",
+                dict(request.query_params),
+                root="captures",
+                heavy=psd,
+                ttl=CACHE_CLOSED_SEC if psd else CACHE_OPEN_SEC,
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502, detail=f"{s.id} did not answer: {type(exc).__name__}"
+            ) from None
+        return Response(
+            content=reply.body, status_code=reply.status, media_type=reply.content_type or None
         )
 
     @app.get("/fleet/s/{sensor_id}/api/{path:path}")

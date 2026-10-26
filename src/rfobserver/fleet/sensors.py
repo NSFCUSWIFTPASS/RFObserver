@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from rfobserver.fleet.registry import Registry, Sensor
 
 logger = logging.getLogger(__name__)
@@ -37,8 +39,9 @@ CACHE_MAX_BYTES = 256 * 1024**2
 # A range whose end is within this of now counts as reaching the present.
 _OPEN_RANGE_SEC = 120.0
 
-# What the fleet may read through a sensor: the Dashboard's data, never a
-# write (only GET is proxied at all) and never captures.
+# What the fleet may read through a sensor's /api: the Dashboard's data, never
+# a write (only GET is proxied at all). Captures are read through their own
+# routes (fleet/captures.py).
 PROXY_PATHS = (
     "averaged/",
     "averaged",
@@ -63,12 +66,19 @@ class Status:
     address_used: str | None = None
 
 
+# Headers kept from a sensor's answer (the capture list's total).
+_KEPT_HEADERS = ("x-total-count",)
+# Capture file downloads at a time per sensor; more wait.
+DOWNLOADS_PER_SENSOR = 2
+
+
 @dataclass
 class _Cached:
     expires: float
     status: int
     content_type: str
     body: bytes
+    headers: dict[str, str]
 
 
 @dataclass
@@ -77,12 +87,16 @@ class Reply:
     content_type: str
     body: bytes
     cached: bool = False
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
 class _Limits:
     waterfall: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
     other: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(2))
+    downloads: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(DOWNLOADS_PER_SENSOR)
+    )
 
 
 def _cache_ttl(params: dict[str, str]) -> float:
@@ -145,49 +159,93 @@ class SensorHub:
         return self._limits.setdefault(sensor_id, _Limits())
 
     async def get(
-        self, sensor: Sensor, path: str, params: dict[str, str] | None = None, *, cache: bool = True
+        self,
+        sensor: Sensor,
+        path: str,
+        params: dict[str, str] | None = None,
+        *,
+        cache: bool = True,
+        root: str = "api",
+        heavy: bool = False,
+        ttl: float | None = None,
     ) -> Reply:
-        """GET ``/api/<path>`` on a sensor, through its limits and the cache.
-        Raises httpx.HTTPError when the sensor cannot be reached."""
+        """GET ``/<root>/<path>`` on a sensor, through its limits and the
+        cache. ``heavy`` reads share the waterfall's limit and timeout;
+        ``ttl`` overrides how long the answer is cached. Raises
+        httpx.HTTPError when the sensor cannot be reached."""
         params = dict(params or {})
-        key = (sensor.id, path, str(sorted(params.items())))
+        key = (sensor.id, f"{root}/{path}", str(sorted(params.items())))
         now = time.monotonic()
         if cache:
             hit = self._cache.get(key)
             if hit is not None and hit.expires > now:
                 self._cache.move_to_end(key)
-                return Reply(hit.status, hit.content_type, hit.body, cached=True)
-        is_waterfall = path == "averaged/waterfall"
+                return Reply(hit.status, hit.content_type, hit.body, True, hit.headers)
+        heavy = heavy or (root == "api" and path == "averaged/waterfall")
         limits = self._limits_for(sensor.id)
-        sem = limits.waterfall if is_waterfall else limits.other
-        timeout = WATERFALL_TIMEOUT_SEC if is_waterfall else TIMEOUT_SEC
+        sem = limits.waterfall if heavy else limits.other
+        timeout = WATERFALL_TIMEOUT_SEC if heavy else TIMEOUT_SEC
         async with sem:
             # Another request may have filled the cache while this one waited.
             if cache:
                 hit = self._cache.get(key)
                 if hit is not None and hit.expires > time.monotonic():
-                    return Reply(hit.status, hit.content_type, hit.body, cached=True)
+                    return Reply(hit.status, hit.content_type, hit.body, True, hit.headers)
             try:
                 r = await self._client.get(
-                    f"{sensor.base_url}/api/{path}", params=params, timeout=timeout
+                    f"{sensor.base_url}/{root}/{path}", params=params, timeout=timeout
                 )
             except httpx.HTTPError as exc:
-                st = self.status(sensor.id)
-                st.online, st.error = False, f"{type(exc).__name__}: {exc}"
+                self._mark_down(sensor, exc)
                 raise
+        self._mark_up(sensor)
+        kept = {h: r.headers[h] for h in _KEPT_HEADERS if h in r.headers}
+        reply = Reply(r.status_code, r.headers.get("content-type", ""), r.content, False, kept)
+        if cache and r.status_code == 200:
+            self._store(key, reply, _cache_ttl(params) if ttl is None else ttl)
+        return reply
+
+    def _mark_down(self, sensor: Sensor, exc: Exception) -> None:
+        st = self.status(sensor.id)
+        st.online, st.error = False, f"{type(exc).__name__}: {exc}"
+
+    def _mark_up(self, sensor: Sensor) -> None:
         st = self.status(sensor.id)
         st.online, st.last_seen, st.error = True, time.time(), None
-        reply = Reply(r.status_code, r.headers.get("content-type", ""), r.content)
-        if cache and r.status_code == 200:
-            self._store(key, reply, _cache_ttl(params))
-        return reply
+
+    @contextlib.asynccontextmanager
+    async def download(
+        self, sensor: Sensor, path: str, method: str, headers: dict[str, str]
+    ) -> AsyncIterator[httpx.Response]:
+        """A streamed ``method`` request for a file at ``/<path>`` on a
+        sensor, holding one of its download slots until the caller is done.
+        Only connecting has a time limit, so a long download is not cut off."""
+        async with self._limits_for(sensor.id).downloads:
+            req = self._client.build_request(
+                method,
+                f"{sensor.base_url}/{path}",
+                headers=headers,
+                timeout=httpx.Timeout(TIMEOUT_SEC, read=None),
+            )
+            try:
+                r = await self._client.send(req, stream=True)
+            except httpx.HTTPError as exc:
+                self._mark_down(sensor, exc)
+                raise
+            self._mark_up(sensor)
+            try:
+                yield r
+            finally:
+                await r.aclose()
 
     def _store(self, key: tuple[str, str, str], reply: Reply, ttl: float) -> None:
         old = self._cache.pop(key, None)
         if old is not None:
             self._cache_bytes -= len(old.body)
         expires = time.monotonic() + ttl
-        self._cache[key] = _Cached(expires, reply.status, reply.content_type, reply.body)
+        self._cache[key] = _Cached(
+            expires, reply.status, reply.content_type, reply.body, reply.headers
+        )
         self._cache_bytes += len(reply.body)
         while self._cache and (
             len(self._cache) > CACHE_MAX_ENTRIES or self._cache_bytes > CACHE_MAX_BYTES

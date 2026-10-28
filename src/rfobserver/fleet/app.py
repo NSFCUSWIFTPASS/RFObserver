@@ -6,6 +6,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -515,6 +517,154 @@ def create_fleet_app(
             "sensor": sensor or None,
             "errors": errors,
         }
+
+    # --- scheduled captures (each sensor keeps its own; the fleet fans out) ---
+
+    def _reply_json(reply: Any) -> Any:
+        try:
+            return json.loads(reply.body)
+        except ValueError:
+            return None
+
+    def _detail(data: Any, status: int) -> str:
+        if isinstance(data, dict) and isinstance(data.get("detail"), str):
+            return str(data["detail"])
+        return f"HTTP {status}"
+
+    @app.post("/fleet/api/schedules")
+    async def fleet_schedule_create(request: Request) -> Response:
+        """Send one schedule (one id) to the chosen sensors; partial success
+        is reported per sensor."""
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="The body must be a JSON object")
+        ids = body.pop("sensors", None)
+        if not isinstance(ids, list) or not ids or not all(isinstance(i, str) for i in ids):
+            raise HTTPException(status_code=400, detail="sensors must list at least one sensor id")
+        unknown = [i for i in ids if registry.get(i) is None]
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"Unknown sensors: {', '.join(unknown)}")
+        sid = body.get("id") or uuid.uuid4().hex[:12]
+        payload = {**body, "id": sid, "source": "fleet"}
+        results: dict[str, dict[str, Any]] = {}
+        warnings: list[str] = []
+
+        async def one(s: Sensor) -> None:
+            try:
+                reply = await hub.send(s, "POST", "api/schedules", payload)
+            except httpx.HTTPError as exc:
+                results[s.id] = {
+                    "ok": False,
+                    "status": 502,
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
+                return
+            data = _reply_json(reply)
+            ok = reply.status in (200, 201)
+            results[s.id] = {
+                "ok": ok,
+                "status": reply.status,
+                "detail": None if ok else _detail(data, reply.status),
+                "schedule": data.get("schedule") if ok and isinstance(data, dict) else None,
+            }
+            if ok and isinstance(data, dict):
+                warnings.extend(f"{s.id}: {w}" for w in data.get("warnings") or [])
+
+        await asyncio.gather(*(one(registry.get(i)) for i in dict.fromkeys(ids)))  # type: ignore[arg-type]
+        if any(r["ok"] for r in results.values()):
+            status = 201
+        elif any(400 <= r["status"] < 500 for r in results.values()):
+            status = 400
+        else:
+            status = 502
+        content = {
+            "id": sid,
+            "results": {i: results[i] for i in dict.fromkeys(ids)},
+            "warnings": sorted(warnings),
+        }
+        return Response(
+            content=json.dumps(content), status_code=status, media_type="application/json"
+        )
+
+    @app.get("/fleet/api/schedules")
+    async def fleet_schedule_list() -> dict[str, Any]:
+        """Every enabled sensor's schedules, merged by id, and the newest runs."""
+        sensors = [s for s in registry.all() if s.enabled]
+        info: dict[str, dict[str, Any]] = {}
+        errors: dict[str, str] = {}
+        merged: dict[str, dict[str, Any]] = {}
+        recent: list[dict[str, Any]] = []
+
+        async def one(s: Sensor) -> tuple[Sensor, Any]:
+            try:
+                reply = await hub.get(s, "schedules", cache=False)
+            except httpx.HTTPError as exc:
+                errors[s.id] = f"{type(exc).__name__}: {exc}"
+                return s, None
+            data = _reply_json(reply)
+            if reply.status != 200 or not isinstance(data, dict):
+                errors[s.id] = _detail(data, reply.status)
+                return s, None
+            return s, data
+
+        for s, data in await asyncio.gather(*(one(s) for s in sensors)):
+            if data is None:
+                continue
+            label = hub.display_label(s)
+            info[s.id] = {"label": label, "timezone": data.get("timezone"), "colour": s.colour}
+            for item in data.get("schedules") or []:
+                sched = item.get("schedule") or {}
+                entry = merged.setdefault(
+                    str(sched.get("id")), {"id": sched.get("id"), "schedule": sched, "sensors": {}}
+                )
+                entry["sensors"][s.id] = {
+                    "label": label,
+                    "next_run": item.get("next_run"),
+                    "last_run": item.get("last_run"),
+                }
+            for run in data.get("recent") or []:
+                recent.append({**run, "sensor": s.id, "sensor_label": label})
+        recent.sort(key=lambda r: (r.get("start_ms") or 0, r.get("sensor")), reverse=True)
+        return {
+            "now_ms": int(time.time() * 1000),
+            "sensors": info,
+            "schedules": sorted(
+                merged.values(), key=lambda e: (e["schedule"].get("start_ms") or 0, str(e["id"]))
+            ),
+            "recent": recent[:20],
+            "errors": errors,
+        }
+
+    @app.delete("/fleet/api/schedules/{schedule_id}")
+    async def fleet_schedule_delete(schedule_id: str) -> Response:
+        """Delete a schedule on every enabled sensor that has it."""
+        sensors = [s for s in registry.all() if s.enabled]
+        results: dict[str, dict[str, Any]] = {}
+
+        async def one(s: Sensor) -> None:
+            try:
+                reply = await hub.send(s, "DELETE", f"api/schedules/{schedule_id}")
+            except httpx.HTTPError as exc:
+                results[s.id] = {"ok": False, "status": 502, "detail": type(exc).__name__}
+                return
+            ok = reply.status == 200
+            results[s.id] = {
+                "ok": ok,
+                "status": reply.status,
+                "detail": None if ok else _detail(_reply_json(reply), reply.status),
+            }
+
+        await asyncio.gather(*(one(s) for s in sensors))
+        found = {k: v for k, v in results.items() if v["status"] != 404}
+        status = 200 if any(v["ok"] for v in found.values()) else (502 if found else 404)
+        return Response(
+            content=json.dumps({"id": schedule_id, "results": found}),
+            status_code=status,
+            media_type="application/json",
+        )
 
     @app.api_route("/fleet/s/{sensor_id}/captures/download/{name}", methods=["GET", "HEAD"])
     async def capture_download(sensor_id: str, name: str, request: Request) -> Response:

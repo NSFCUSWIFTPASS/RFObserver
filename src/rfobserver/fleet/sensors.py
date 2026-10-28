@@ -205,6 +205,20 @@ class SensorHub:
             self._store(key, reply, _cache_ttl(params) if ttl is None else ttl)
         return reply
 
+    async def send(self, sensor: Sensor, method: str, path: str, body: Any = None) -> Reply:
+        """``method`` ``/<path>`` on a sensor with a JSON ``body``, uncached,
+        through its limits. Raises httpx.HTTPError when it cannot be reached."""
+        async with self._limits_for(sensor.id).other:
+            try:
+                r = await self._client.request(
+                    method, f"{sensor.base_url}/{path}", json=body, timeout=TIMEOUT_SEC
+                )
+            except httpx.HTTPError as exc:
+                self._mark_down(sensor, exc)
+                raise
+        self._mark_up(sensor)
+        return Reply(r.status_code, r.headers.get("content-type", ""), r.content, False, {})
+
     def _mark_down(self, sensor: Sensor, exc: Exception) -> None:
         st = self.status(sensor.id)
         st.online, st.error = False, f"{type(exc).__name__}: {exc}"

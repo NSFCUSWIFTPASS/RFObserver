@@ -71,6 +71,9 @@ if TYPE_CHECKING:
     from rfobserver.pipeline.beacon import ProgressBeacon
     from rfobserver.pipeline.isolation import IsolationStage
     from rfobserver.processing.spectral import PSDGridResult
+    from rfobserver.schedules.book import ScheduleBook
+    from rfobserver.schedules.engine import ScheduleEngine
+    from rfobserver.schedules.writer import FinishedRun, ScheduledWriter
     from rfobserver.storage.collection import CollectionStats
     from rfobserver.storage.database import SensorDatabase
     from rfobserver.storage.governor import StorageGovernor
@@ -608,6 +611,7 @@ class StreamingProcessor:
         storage_governor: StorageGovernor | None = None,
         replay_source: str | None = None,
         collection: CollectionStats | None = None,
+        schedules: ScheduleBook | None = None,
     ) -> None:
         self._receiver = receiver
         self._db = database
@@ -619,6 +623,24 @@ class StreamingProcessor:
         self._governor = storage_governor
         # IQ recorded and live RF time, per hour (storage/collection.py).
         self._collection = collection
+        # Scheduled captures (rfobserver.schedules): never during a replay.
+        self._schedules = None if replay_mode else schedules
+        self._sched_engine: ScheduleEngine | None = None
+        self._sched_errors = 0
+        self._sched_writer: ScheduledWriter | None = None
+        if self._schedules is not None:
+            from rfobserver.schedules.engine import ScheduleEngine
+            from rfobserver.schedules.writer import ScheduledWriter
+
+            self._sched_writer = ScheduledWriter(on_finished=self._scheduled_finished)
+            self._sched_engine = ScheduleEngine(
+                self._schedules,
+                self._sched_writer,
+                directory=lambda: self._storage.manual_dir,
+                refusal=self._recording_refusal,
+                capture_meta=self._scheduled_capture_meta,
+                grace_ms=int(settings.TRIGGER_PRE_SEC * 1000),
+            )
         self._running = False
         # Live capture must never block the receiver thread, so chunks are
         # dropped when processing falls behind (the default). Offline replay of
@@ -1005,6 +1027,8 @@ class StreamingProcessor:
 
         self._start_isolation()
 
+        if self._sched_writer is not None:
+            self._sched_writer.start()
         recv_thread.start()
         dispatch_thread.start()
         burst_thread.start()
@@ -1029,6 +1053,11 @@ class StreamingProcessor:
                 recv_thread.join(timeout=5)
                 dispatch_thread.join(timeout=5)
                 burst_thread.join(timeout=5)
+                if self._sched_engine is not None:
+                    # The receiver loop ended its runs; close any left.
+                    self._sched_engine.stop("stopped")
+                if self._sched_writer is not None:
+                    self._sched_writer.stop(_WRITER_JOIN_TIMEOUT_SEC)
                 # The burst thread (the stage's producer) has stopped; now the
                 # stage (its stop() joins a worker thread, so off the loop), then
                 # the attribution worker.
@@ -1563,6 +1592,8 @@ class StreamingProcessor:
                 # streamer object is replaced.
                 if self._config_generation != my_gen:
                     _ensure_stopped()
+                    if self._sched_engine is not None:
+                        self._sched_engine.stop("retuned")
                     my_gen = self._config_generation
                     self._reconfigure_receiver()
                     self._recompute_chunk_params()
@@ -1636,6 +1667,30 @@ class StreamingProcessor:
                         self._pre_trigger_buf.write(buf[:n])
                         t_ring = time.monotonic()
 
+                        # Scheduled captures cut their runs from the stream
+                        # (enqueue only; never blocks this thread).
+                        if self._sched_engine is not None:
+                            try:
+                                self._sched_engine.on_chunk(
+                                    buf[:n],
+                                    chunk_start,
+                                    capture_time,
+                                    chunk_gaps,
+                                    float(center_freq),
+                                    float(s.BANDWIDTH),
+                                    self._pre_trigger_buf,
+                                )
+                            except Exception:
+                                self._sched_errors += 1
+                                if (
+                                    self._sched_errors in (1, 100)
+                                    or self._sched_errors % 10000 == 0
+                                ):
+                                    logger.exception(
+                                        "Scheduled captures: chunk handling failed (%d)",
+                                        self._sched_errors,
+                                    )
+
                         # Feed upstream modules (GPU processing, non-blocking)
                         if self._module_manager is not None:
                             self._module_manager.feed_all(buf[:n], center_freq, s.BANDWIDTH)
@@ -1696,6 +1751,8 @@ class StreamingProcessor:
         except Exception:
             logger.exception("Receiver loop crashed")
         finally:
+            if self._sched_engine is not None:
+                self._sched_engine.stop("stopped")
             _ensure_stopped()
             logger.info("Receiver loop exiting (running=%s)", self._running)
             _signal_stop(self._chunk_queue)
@@ -2480,6 +2537,89 @@ class StreamingProcessor:
         except Exception:
             logger.exception("Detections sidecar write failed for %s", sc16_path.name)
 
+    def _scheduled_capture_meta(self) -> dict[str, Any]:
+        rx_config = getattr(self._receiver, "config", None)
+        gain = getattr(rx_config, "gain_db", None)
+        return {
+            "gain_db": float(gain if gain is not None else self._settings.GAIN),
+            "hostname": self._settings.HOSTNAME,
+            "serial": getattr(self._receiver, "serial", None),
+        }
+
+    def _scheduled_finished(self, run: FinishedRun) -> None:
+        """Writer thread: a scheduled capture's files are closed. Index it,
+        count it, record it in iq_captures and report the run's outcome."""
+        assert self._schedules is not None
+        spec, info, path = run.spec, run.info, run.path
+        status = "failed" if run.write_error is not None else str(info.get("status"))
+        rate = spec.rate_hz
+        first = info.get("first_sample_epoch")
+        start_ts = float(first) if first is not None else spec.start_ms / 1000
+        duration = run.total_samples / rate if rate > 0 else 0.0
+        if run.total_samples > 0:
+            self._storage.track(path)
+            if self._collection is not None:
+                try:
+                    self._collection.add_recorded(
+                        "scheduled", start_ts, start_ts + duration, run.total_samples * 4
+                    )
+                except Exception:
+                    logger.exception("Collection statistics: could not count %s", path.name)
+            if self._loop is not None and self._db is not None:
+                start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+                self._loop.call_soon_threadsafe(
+                    lambda: asyncio.ensure_future(
+                        self._db.insert_iq_capture(
+                            filename=path.name,
+                            origin="scheduled",
+                            start_time=start_dt,
+                            stop_time=start_dt + timedelta(seconds=duration),
+                            duration_sec=round(duration, 3),
+                            sdr_center_freq_hz=float(spec.center_freq_hz),
+                            sample_rate_hz=float(rate),
+                            gain_db=info.get("gain_db"),
+                            total_samples=run.total_samples,
+                            trigger_initiated=False,
+                            mean_power_db=None,
+                            background_db=None,
+                            priority=False,
+                        )
+                    )
+                )
+                grace = self._settings.DETECTIONS_SIDECAR_GRACE_SEC
+                self._loop.call_soon_threadsafe(
+                    lambda: asyncio.ensure_future(self._deferred_sidecar(path, grace))
+                )
+        logger.info(
+            "Scheduled capture %s run %d: %s (%s, %d samples)",
+            spec.schedule_id,
+            spec.run,
+            status,
+            path.name,
+            run.total_samples,
+        )
+        self._schedules.report_run(
+            spec.schedule_id,
+            spec.run,
+            status,
+            start_ms=spec.start_ms,
+            filename=path.name if run.total_samples > 0 else None,
+            reason=run.write_error or info.get("reason"),
+            info={
+                k: info.get(k)
+                for k in (
+                    "first_sample_time",
+                    "start_error_ns",
+                    "late_start_samples",
+                    "lost_samples",
+                    "writer_refused_samples",
+                    "clock_source",
+                    "clock_server",
+                )
+            }
+            | {"samples": run.total_samples},
+        )
+
     def _write_recording_metadata(self, filename: str, duration: float) -> None:
         """Write companion .json with capture metadata."""
         import json as _json
@@ -2974,6 +3114,14 @@ class StreamingProcessor:
                     break
                 except queue.Full:
                     continue
+
+        if self._sched_engine is not None:
+            try:
+                self._sched_engine.on_grid(
+                    cr.psd_grid, cr.chunk_start, self._slice_samples, self._settings.CAL_OFFSET_DB
+                )
+            except Exception:
+                logger.exception("Scheduled captures: PSD rows failed")
 
         # Persist PSD grids during recording. Disk mode hands rows to the
         # writer thread via the tagged queue (bounded RAM) — writing them

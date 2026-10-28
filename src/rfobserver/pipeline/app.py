@@ -241,6 +241,17 @@ async def run(settings: AppSettings) -> None:
         reason, nbytes, time.time()
     )
 
+    # Scheduled IQ captures: persisted schedules, read by the processor's
+    # receiver thread and changed through /api/schedules.
+    from rfobserver.schedules.book import ScheduleBook
+
+    schedules = ScheduleBook(db)
+    schedules.bind_loop(asyncio.get_running_loop())
+    try:
+        await schedules.load()
+    except Exception:
+        logger.exception("Could not load the capture schedules")
+
     broadcast = LiveBroadcast()
 
     # ZMS monitor (optional). Two conditions both required:
@@ -292,6 +303,7 @@ async def run(settings: AppSettings) -> None:
                 beacon=beacon,
                 storage_governor=storage_governor,
                 collection=collection,
+                schedules=schedules,
                 # Names the replay-only outputs of isolation / attribution.
                 replay_source=(getattr(receiver, "source_name", "") or "replay")
                 if replay_mode
@@ -368,6 +380,7 @@ async def run(settings: AppSettings) -> None:
                 storage_governor=storage_governor,
                 rfdb_writer=rfdb_writer,
                 local_storage=local_storage,
+                schedules=schedules,
             )
         )
         workers.append(web_task)
@@ -952,6 +965,7 @@ async def _run_web_server(
     storage_governor: Any = None,
     rfdb_writer: Any = None,
     local_storage: Any = None,
+    schedules: Any = None,
 ) -> None:
     """Run the FastAPI web server as an async task."""
     import uvicorn
@@ -966,6 +980,7 @@ async def _run_web_server(
     app.state.storage_governor = storage_governor
     app.state.rfdb_writer = rfdb_writer
     app.state.local_storage = local_storage
+    app.state.schedules = schedules
     app.state.broadcast = broadcast
     app.state.processor = supervisor.processor
 

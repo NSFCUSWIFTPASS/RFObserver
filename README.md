@@ -55,6 +55,7 @@ rfobserver web
 - [Downloading captures](docs/downloading-captures.md): Download captures as raw files or SigMF, scripted and resumable.
 - [Storage](docs/storage.md): Disk budget, free-space floor, eviction order and retention.
 - [Collection statistics API](docs/collection-api.md): IQ recorded per hour and per day, date-range totals, the 7-day average and storage now.
+- [Scheduled captures API](docs/schedules-api.md): ms-timed one-off and repeating IQ captures, cut to the sample, per sensor and through the fleet.
 - [Burst isolation and attribution](docs/burst-isolation.md): Cut bursts out of the IQ, save them as SigMF, and decode them with rtl_433.
 - [GPU PSD (Jetson)](docs/gpu-psd.md): Compute the PSD grid on the Jetson GPU.
 

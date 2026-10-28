@@ -349,3 +349,32 @@ async def test_a_run_cut_off_by_a_crash_is_partial_after_reload(book: ScheduleBo
     (run,) = await again.runs("c", 10)
     assert run["status"] == "partial" and run["reason"] == "stopped"
     assert run["filename"] == "c.sc16"
+
+
+async def test_grid_rows_arriving_out_of_order_keep_their_place(
+    book: ScheduleBook, tmp_path: Path
+) -> None:
+    # Processing workers can finish chunks out of order.
+    await book.add(sched("o", T0_MS + 100, 300))
+    rig = Rig(book, tmp_path)
+    rig.engine.on_grid(_Grid(0), 0, 10, None)
+    rig.chunks(4)
+    for cs in (300, 100, 200):
+        rig.engine.on_grid(_Grid(), cs, 10, None)
+    rig.chunks(1)  # closes the run (its rows have arrived)
+    puts = rig.writer.grids[("o", 0)]
+    assert puts[0][1]["offset_samples"] == 0
+    rows = np.concatenate([r for r, _ in puts])
+    assert rows.shape[0] == 30
+    assert np.array_equal(rows[0], _Grid().grid[0]) and np.array_equal(rows[29], _Grid().grid[9])
+
+
+async def test_runs_waiting_for_psd_rows_do_not_make_the_next_busy(
+    book: ScheduleBook, tmp_path: Path
+) -> None:
+    await book.add(sched("b", T0_MS + 100, 300, every_ms=1000, count=4))
+    rig = Rig(book, tmp_path)
+    rig.engine.on_grid(_Grid(0), 0, 10, None)  # PSD flows, but none arrives for these runs
+    rig.chunks(42)
+    assert sorted(k for _, k in rig.writer.opened) == [0, 1, 2, 3]
+    assert all(book.latest("b", k)["status"] != "missed" for k in range(4))

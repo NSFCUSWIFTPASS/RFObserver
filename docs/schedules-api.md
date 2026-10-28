@@ -284,6 +284,31 @@ curl -s "$SENSOR/api/schedules/nope"
 {"detail": "No schedule nope"}
 ```
 
+## Through the fleet
+
+A fleet (`rfobserver fleet`) sends one schedule, with one `id`, to the sensors
+you choose, so their files share `schedule.id` and `schedule.run`. Its
+Captures page has the same form with a sensor picker. These examples are not
+run by the doc test:
+
+```
+curl -s -X POST "$FLEET/fleet/api/schedules" -H "Content-Type: application/json" \
+  -d '{"start": "2026-10-28T18:30:00.250Z", "duration_ms": 2000, "sensors": ["hcro-jet-001", "hcro-jet-002"]}'
+```
+
+The answer is `201` when at least one sensor took it, with each sensor's
+result (`ok`, `status`, `detail`, `schedule`) under `results` and the
+generated `id`. A sensor that is down or refuses shows `ok: false` with the
+reason; send the same body with that `id` again to retry (sensors that already
+have it answer `200`). `400` means every sensor refused, `502` that none
+answered.
+
+- `GET /fleet/api/schedules`: every sensor's schedules merged by `id`
+  (`sensors` holds each sensor's next and last run), each sensor's time zone,
+  the newest 20 runs across sensors, and `errors` for sensors that did not
+  answer.
+- `DELETE /fleet/api/schedules/{id}`: deletes it on every sensor that has it.
+
 ## The capture files
 
 A run's file is a normal capture in `manual/`

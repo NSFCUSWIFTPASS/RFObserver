@@ -21,7 +21,7 @@ import queue
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
@@ -114,7 +114,7 @@ class ScheduledWriter:
         refused = 0
         for kind, value in ops:
             if kind == "iq":
-                data: IQ = value  # type: ignore[assignment]
+                data = cast("IQ", value)
                 nbytes = int(data.nbytes)
                 with self._lock:
                     ok = self._in_flight + nbytes <= self._budget

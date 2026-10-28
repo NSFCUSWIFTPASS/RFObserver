@@ -16,7 +16,7 @@ from __future__ import annotations
 import bisect
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias
 
 import numpy as np
 
@@ -25,8 +25,8 @@ from rfobserver.schedules.model import iso_ms
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-IQ = np.ndarray[Any, np.dtype[Any]]
-Op = tuple[Literal["iq"], IQ] | tuple[Literal["zeros"], int]
+IQ: TypeAlias = "np.ndarray[Any, np.dtype[Any]]"
+Op: TypeAlias = "tuple[Literal['iq'], IQ] | tuple[Literal['zeros'], int]"
 
 
 class RingReader(Protocol):

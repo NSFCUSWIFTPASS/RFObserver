@@ -142,13 +142,15 @@ class ScheduledWriter:
         offset_samples: int,
         slice_samples: int,
         cal_offset_db: float | None,
-    ) -> None:
+    ) -> bool:
+        """Queue PSD rows; False when they were dropped (budget full or the
+        run already closed)."""
         if key not in self._enq or rows.size == 0:
-            return
+            return False
         data = np.ascontiguousarray(rows, dtype=np.float32)
         with self._lock:
             if self._in_flight + data.nbytes > self._budget:
-                return  # companion data: drop rather than wait
+                return False  # companion data: drop rather than wait
             self._in_flight += data.nbytes
         grid_meta = {
             "freq_axis": np.asarray(freq_axis),
@@ -158,6 +160,7 @@ class ScheduledWriter:
             "cal_offset_db": cal_offset_db,
         }
         self._q.put(("grid", key, data, grid_meta))
+        return True
 
     def close(self, key: Key, info: dict[str, Any]) -> None:
         enq = self._enq.pop(key, None)
@@ -340,6 +343,7 @@ class ScheduledWriter:
                 "requested_samples": spec.n_samples,
                 "zero_filled": zero,
                 "zero_filled_samples": zero_samples,
+                "grid_rows_dropped": info.get("grid_rows_dropped", 0),
                 "clock_source": info.get("clock_source"),
                 "clock_server": info.get("clock_server"),
                 "clock_offset_ms": info.get("clock_offset_ms"),

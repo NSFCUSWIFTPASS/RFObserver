@@ -17,6 +17,74 @@
     {% endif %}
 </div>
 
+<div class="card schedule-card" id="schedule-card" data-fleet="{{ '1' if fleet_captures else '0' }}">
+    <div class="card-header">
+        <span class="card-header-label">Scheduled Captures</span>
+        <span class="card-header-detail sched-clock" id="sched-clock"></span>
+    </div>
+    <div class="card-body sched-body">
+        <form id="sched-form" class="config-form sched-form" autocomplete="off" novalidate>
+            <div class="sched-fields">
+                <div class="form-group">
+                    <label for="sched-date">Start (UTC)</label>
+                    <input type="date" id="sched-date" required>
+                </div>
+                <div class="form-group">
+                    <label for="sched-time">Time (UTC)</label>
+                    <input type="text" id="sched-time" inputmode="decimal" placeholder="18:30:00.250" required>
+                </div>
+                <div class="form-group">
+                    <label for="sched-duration">Duration (s)</label>
+                    <input type="number" id="sched-duration" min="0.001" step="0.001" value="1">
+                </div>
+            </div>
+            <div class="sched-local" id="sched-local"></div>
+            <div class="sched-fields">
+                <div class="form-group sched-toggle">
+                    <label class="toggle-label" for="sched-repeat">
+                        <input type="checkbox" id="sched-repeat">
+                        <span class="toggle-text">Repeat</span>
+                    </label>
+                </div>
+                <div class="form-group sched-repeat-field">
+                    <label for="sched-every">Every (s)</label>
+                    <input type="number" id="sched-every" min="0.002" step="0.001" value="60">
+                </div>
+                <div class="form-group sched-repeat-field">
+                    <label for="sched-count">Times</label>
+                    <input type="number" id="sched-count" min="1" step="1" value="10">
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="sched-label">Label</label>
+                <input type="text" id="sched-label" maxlength="200" placeholder="Optional">
+            </div>
+            {% if fleet_captures %}
+            <div class="form-group">
+                <label>Sensors</label>
+                <div class="sched-sensors" id="sched-sensors">
+                    {% for s in fleet_captures.sensors %}
+                    <label class="sched-sensor"><input type="checkbox" value="{{ s.id }}" checked> {{ s.label }}</label>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
+            <div class="sched-actions">
+                <span id="sched-error" class="replay-error"></span>
+                <button type="submit" id="sched-submit" class="btn-apply">Schedule</button>
+            </div>
+            <div class="sched-warnings" id="sched-warnings"></div>
+        </form>
+        <div class="sched-lists">
+            <div class="sched-list-title">Upcoming</div>
+            <div class="sched-list" id="sched-upcoming"><div class="placeholder-text">None</div></div>
+            <div class="sched-list-title">Recent runs</div>
+            <div class="sched-list" id="sched-recent"><div class="placeholder-text">None</div></div>
+        </div>
+    </div>
+</div>
+<script src="/static/schedules.js"></script>
+
 <div class="captures-layout">
     <div class="captures-list" id="captures-list">
         <div class="placeholder-text">Loading...</div>
@@ -178,7 +246,11 @@
             + (c.sensor ? ' data-sensor="' + esc(c.sensor.id) + '"' : '')
             + ' data-has-psd="' + (c.has_psd ? '1' : '0') + '">';
         html += sensor;
-        html += '<div class="capture-name">' + esc(c.filename) + ' ' + psdBadge + prioBadge + '</div>';
+        const schedBadge = c.origin === "scheduled"
+            ? ' <span class="sched-chip" title="Scheduled capture">Scheduled'
+                + (c.schedule_label ? ": " + esc(c.schedule_label) : "") + '</span>'
+            : '';
+        html += '<div class="capture-name">' + esc(c.filename) + ' ' + psdBadge + prioBadge + schedBadge + '</div>';
         html += '<div class="capture-info">';
         html += formatBytes(c.size_bytes);
         if (dur) html += ' &middot; ' + dur;
@@ -379,7 +451,24 @@
             if (m.duration_sec != null) html += row("Duration", formatDuration(m.duration_sec));
             if (m.total_samples != null) html += row("Samples", m.total_samples.toLocaleString());
             if (m.start_time) html += row("Start Time", new Date(m.start_time).toLocaleString());
-            html += row("Trigger", m.trigger_initiated ? "Power threshold" : "Manual");
+            const sch = m.schedule;
+            if (sch) {
+                html += row("Trigger", "Scheduled" + (sch.label ? ": " + esc(sch.label) : ""));
+                html += row("Schedule", esc(sch.id) + ", run " + sch.run + " (" + esc(sch.status) + ")");
+                if (sch.requested_start) html += row("Requested Start", esc(sch.requested_start));
+                if (sch.first_sample_time) html += row("First Sample", esc(sch.first_sample_time));
+                if (sch.start_error_ns != null) {
+                    html += row("Start Error", (sch.start_error_ns / 1000).toFixed(3) + " us");
+                }
+                if (sch.zero_filled_samples) {
+                    html += row("Zero-filled", sch.zero_filled_samples.toLocaleString() + " samples");
+                }
+                if (sch.clock_source) {
+                    html += row("Clock", esc(sch.clock_source) + (sch.clock_server ? " (" + esc(sch.clock_server) + ")" : ""));
+                }
+            } else {
+                html += row("Trigger", m.trigger_initiated ? "Power threshold" : "Manual");
+            }
             if (m.mean_power_db != null) html += row("Mean Power", m.mean_power_db.toFixed(1) + " dB");
             if (m.background_power_db != null) html += row("Background", m.background_power_db.toFixed(1) + " dB");
             if (d.priority) html += row("Priority", PRIORITY_REASONS[m.priority] || PRIORITY_REASONS.event);
@@ -1264,7 +1353,7 @@
         setInterval(function() { if (!document.hidden) loadList(); }, 30000);
     }
 
-    // Re-list when capture_count ticks up on the /ws/live heartbeat — that's
+    // Re-list when capture_count ticks up on the /ws/live heartbeat: that's
     // the signal a recording finished and dropped a new file in storage.
     if (!FLEETCAP) (function() {
         let lastCount = -1;

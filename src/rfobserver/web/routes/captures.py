@@ -226,6 +226,11 @@ def _describe_captures(page: list[tuple[Path, str]]) -> list[dict[str, Any]]:
                 # capture; keep the list payload small (the .json keeps it).
                 if isinstance(entry["meta"], dict):
                     entry["meta"].pop("gaps", None)
+                    # A scheduled capture lives in manual/ but says so.
+                    schedule = entry["meta"].get("schedule")
+                    if isinstance(schedule, dict):
+                        entry["origin"] = "scheduled"
+                        entry["schedule_label"] = schedule.get("label") or ""
         else:
             entry["meta"] = None
 

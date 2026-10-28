@@ -48,6 +48,7 @@ class _Active:
     closing_since: float | None = None  # monotonic, once the cutter is done
     grid_until: int | None = None  # stream position the PSD rows must reach
     grid_seen: int = 0
+    grid_dropped: int = 0
 
 
 class ScheduleEngine:
@@ -211,6 +212,7 @@ class ScheduleEngine:
             "status": "partial" if refused and cut.status == "recorded" else cut.status,
             "reason": cut.reason,
             "writer_refused_samples": refused,
+            "grid_rows_dropped": act.grid_dropped,
         }
         self._writer.close(key, info)
 
@@ -265,7 +267,7 @@ class ScheduleEngine:
                 if time_axis is not None and len(time_axis) > 1
                 else 0.0
             )
-            self._writer.put_grid(
+            ok = self._writer.put_grid(
                 key,
                 rows,
                 freq_axis=psd_grid.freq_axis,
@@ -274,3 +276,5 @@ class ScheduleEngine:
                 slice_samples=slice_samples,
                 cal_offset_db=cal_offset_db,
             )
+            if ok is False:
+                act.grid_dropped += int(rows.shape[0])

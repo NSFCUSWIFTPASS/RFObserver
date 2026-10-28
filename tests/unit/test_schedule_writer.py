@@ -147,3 +147,35 @@ def test_sigmf_carries_the_schedule_and_marks_zero_fill(tmp_path: Path) -> None:
     (ann,) = doc["annotations"]
     assert ann["core:sample_start"] == 10 and ann["core:sample_count"] == 5
     assert "zero" in ann["core:comment"]
+
+
+def test_clock_details_come_from_the_writer(tmp_path: Path, monkeypatch) -> None:
+    from rfobserver.schedules import writer as writer_mod
+
+    monkeypatch.setattr(
+        writer_mod,
+        "clock_info",
+        lambda: {"clock_source": "ntp", "clock_server": "local.ntp", "clock_offset_ms": 0.2},
+    )
+    path = tmp_path / "c-sched.sc16"
+    info = {k: v for k, v in INFO.items() if not k.startswith("clock_")}
+    done = Done()
+    w = ScheduledWriter(on_finished=done)
+    w.start()
+    w.open(("sch1", 2), path, SPEC)
+    w.put_ops(("sch1", 2), [("iq", np.arange(30, dtype=np.int32))])
+    w.close(("sch1", 2), info)
+    assert done.event.wait(5)
+    w.stop(5)
+    sch = json.loads(path.with_suffix(".json").read_text())["schedule"]
+    assert sch["clock_server"] == "local.ntp" and sch["clock_offset_ms"] == 0.2
+    assert done.runs[0].info["clock_server"] == "local.ntp"
+
+
+def test_an_existing_file_gets_a_new_name(tmp_path: Path) -> None:
+    path = tmp_path / "dup-sched.sc16"
+    path.write_bytes(b"old")
+    run, _ = run_writer(path, [("iq", np.arange(30, dtype=np.int32))])
+    assert path.read_bytes() == b"old"
+    assert run.path == tmp_path / "dup-sched-2.sc16" and run.total_samples == 30
+    assert json.loads(run.path.with_suffix(".json").read_text())["file"] == run.path.name

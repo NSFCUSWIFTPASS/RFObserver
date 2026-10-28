@@ -161,3 +161,34 @@ async def test_local_time_shows_the_date_when_it_differs(client) -> None:
         "/api/schedules", json={"start": "2026-10-29T03:00:00.000Z", "duration_ms": 10}
     )
     assert r.json()["next_runs"][0]["start_local"] == "2026-10-28 20:00:00.000 PDT"
+
+
+async def test_retry_after_the_start_passed_is_a_no_op(client, monkeypatch) -> None:
+    c = await client()
+    body = {"id": "late", "start": START, "duration_ms": 100}
+    assert (await c.post("/api/schedules", json=body)).status_code == 201
+    monkeypatch.setattr(routes, "_now", lambda: NOW + 120)  # 60 s after the start
+    again = await c.post("/api/schedules", json=body)
+    assert again.status_code == 200, again.text
+    other = await c.post("/api/schedules", json={**body, "id": "late2"})
+    assert other.status_code == 400 and "past" in other.json()["detail"]
+
+
+async def test_join_a_repeating_schedule_late(client) -> None:
+    c = await client()
+    r = await c.post(
+        "/api/schedules",
+        json={
+            "id": "rep",
+            "start": "2026-10-28T18:20:00.000Z",
+            "duration_ms": 100,
+            "every_ms": 60000,
+            "count": 30,
+        },
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["next_runs"][0] == {
+        "run": 9,
+        "start": "2026-10-28T18:29:00.000Z",
+        "start_local": "11:29:00.000 PDT",
+    }

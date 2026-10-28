@@ -18,9 +18,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+
 from rfobserver.capture.buffer import trim_grid_rows
 from rfobserver.schedules.book import RUNS_KEPT
-from rfobserver.schedules.clockinfo import clock_info
 from rfobserver.schedules.cutter import RunCutter, RunSpec
 from rfobserver.schedules.model import first_run_from, run_start_ms, runs_between
 
@@ -48,6 +49,8 @@ class _Active:
     closing_since: float | None = None  # monotonic, once the cutter is done
     grid_until: int | None = None  # stream position the PSD rows must reach
     grid_seen: int = 0
+    grid_offset: int | None = None  # file index of the first PSD row
+    grid_rows: int = 0  # PSD rows placed so far (filler included)
     grid_dropped: int = 0
 
 
@@ -96,7 +99,9 @@ class ScheduleEngine:
             self.mark_missed(int(capture_time * 1000))
         self._refresh(capture_time)
         n = len(chunk)
-        chunk_end = capture_time + (n + sum(lost for _, lost in gaps)) / rate_hz
+        # Samples lost before the chunk's first sample (offset 0) are before
+        # capture_time; the ones inside it push its end out.
+        chunk_end = capture_time + (n + sum(lost for off, lost in gaps if off > 0)) / rate_hz
         oldest_time = capture_time
         if ring is not None:
             oldest = ring.bounds()[0]
@@ -113,7 +118,7 @@ class ScheduleEngine:
                 if act.cutter.done:
                     act.closing_since = time.monotonic()
                     start = act.cutter.stream_start
-                    act.grid_until = None if start is None else start + act.cutter.written
+                    act.grid_until = None if start is None else act.cutter.stream_end()
             if act.closing_since is not None and (
                 not self._grids_flow
                 or act.grid_until is None
@@ -190,13 +195,9 @@ class ScheduleEngine:
             f"{meta.get('serial') or 'sensor'}-{meta.get('hostname') or 'host'}-"
             f"{dt:%Y%m%dT%H%M%S}{spec.start_ms % 1000:03d}-sched-{spec.schedule_id}-{spec.run}"
         )
-        directory = self._directory()
-        path = directory / f"{stem}.sc16"
-        i = 1
-        while path.exists():
-            i += 1
-            path = directory / f"{stem}-{i}.sc16"
-        return path
+        # No stat here (receiver thread): the writer picks another name if
+        # this one exists.
+        return self._directory() / f"{stem}.sc16"
 
     def _close(self, key: Key) -> None:
         with self._lock:
@@ -208,7 +209,6 @@ class ScheduleEngine:
         info: dict[str, Any] = {
             **cut.info(),
             **self._capture_meta(),
-            **clock_info(),
             "status": "partial" if refused and cut.status == "recorded" else cut.status,
             "reason": cut.reason,
             "writer_refused_samples": refused,
@@ -235,6 +235,8 @@ class ScheduleEngine:
         for s in schedules:
             last = self._book.last_run(s.id)
             t0 = s.start_ms if last is None else run_start_ms(s, last + 1)
+            # A schedule joined late has no runs before it existed.
+            t0 = max(t0, s.created_ms - self._grace_ms)
             for k in runs_between(s, t0, until, RUNS_KEPT):
                 self._book.report_run(
                     s.id, k, "missed", start_ms=run_start_ms(s, k), reason="not_running"
@@ -252,29 +254,67 @@ class ScheduleEngine:
             return
         grid = psd_grid.grid
         rows_n = int(grid.shape[0]) if grid.ndim == 2 else 0
+        time_axis = getattr(psd_grid, "time_axis", None)
+        time_res = (
+            float(time_axis[1] - time_axis[0])
+            if time_axis is not None and len(time_axis) > 1
+            else 0.0
+        )
         for key, act in active:
-            start = act.cutter.stream_start
-            if start is None:
-                continue
-            end = start + act.cutter.spec.n_samples
-            rows, first = trim_grid_rows(grid, chunk_start, slice_samples, start, end)
             act.grid_seen = max(act.grid_seen, chunk_start + rows_n * slice_samples)
-            if rows.size == 0:
+            rows, offset = self._place_rows(act, grid, chunk_start, slice_samples)
+            if rows is None:
                 continue
-            time_axis = getattr(psd_grid, "time_axis", None)
-            time_res = (
-                float(time_axis[1] - time_axis[0])
-                if time_axis is not None and len(time_axis) > 1
-                else 0.0
-            )
             ok = self._writer.put_grid(
                 key,
                 rows,
                 freq_axis=psd_grid.freq_axis,
                 time_res=time_res,
-                offset_samples=first - start,
+                offset_samples=offset,
                 slice_samples=slice_samples,
                 cal_offset_db=cal_offset_db,
             )
             if ok is False:
                 act.grid_dropped += int(rows.shape[0])
+
+    @staticmethod
+    def _place_rows(
+        act: _Active, grid: IQ, chunk_start: int, slice_samples: int
+    ) -> tuple[IQ | None, int]:
+        """This chunk's PSD rows for a run, placed by file index: the file
+        has zeros where samples were lost, the stream does not, so rows after
+        a fill are moved to their file position and the fill gets filler
+        rows (the block's minimum). Rows past the file's end are dropped.
+        Returns (rows to append, file index of the grid's first row)."""
+        cut = act.cutter
+        start = cut.stream_start
+        if start is None or slice_samples <= 0:
+            return None, 0
+        end = cut.stream_end() if cut.done else start + cut.spec.n_samples
+        if end is None:
+            return None, 0
+        rows, first = trim_grid_rows(grid, chunk_start, slice_samples, start, end)
+        if rows.size == 0:
+            return None, act.grid_offset or 0
+        if act.grid_offset is None:
+            first_index = cut.file_index(first)
+            act.grid_offset = 0 if first_index is None else first_index
+        offset = act.grid_offset
+        last_row = (cut.spec.n_samples - offset) // slice_samples  # rows that fit
+        out: list[IQ] = []
+        filler = np.full(rows.shape[1], float(rows.min()), dtype=np.float32)
+        for k in range(rows.shape[0]):
+            index = cut.file_index(first + k * slice_samples)
+            if index is None:
+                continue
+            r = round((index - offset) / slice_samples)
+            if r < act.grid_rows or r >= last_row:
+                continue  # already placed, or past the file's end
+            while act.grid_rows < r:
+                out.append(filler)
+                act.grid_rows += 1
+            out.append(rows[k])
+            act.grid_rows += 1
+        if not out:
+            return None, offset
+        return np.vstack(out).astype(np.float32, copy=False), offset

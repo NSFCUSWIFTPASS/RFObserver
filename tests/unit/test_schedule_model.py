@@ -9,6 +9,7 @@ import pytest
 
 from rfobserver.schedules.model import (
     MAX_DURATION_MS,
+    Schedule,
     ScheduleError,
     first_run_from,
     from_json,
@@ -62,7 +63,7 @@ def test_until_bounds_runs() -> None:
 
 def test_json_round_trip() -> None:
     s = parse(
-        {"id": "x-1", "start_ms": T, "duration_ms": 5, "every_ms": 10, "count": 4, "label": "a"}
+        {"id": "x-1", "start_ms": T, "duration_ms": 5, "every_ms": 1000, "count": 4, "label": "a"}
     )
     assert from_json(to_json(s)) == s
 
@@ -91,8 +92,17 @@ def test_json_round_trip() -> None:
         ({"start": "soon", "duration_ms": 1}, "start"),
         ({"id": "bad id!", "start_ms": T, "duration_ms": 1}, "id"),
         ({"start_ms": T, "duration_ms": "2"}, "duration_ms"),
-        ({"start_ms": T, "duration_ms": 1, "every_ms": 10, "count": 0}, "count"),
-        ({"start_ms": T, "duration_ms": 1, "every_ms": 10, "until": iso(T)}, "until"),
+        ({"start_ms": T, "duration_ms": 1, "every_ms": 1000, "count": 0}, "count"),
+        ({"start_ms": T, "duration_ms": 1, "every_ms": 1000, "until": iso(T)}, "until"),
+        (
+            {"start_ms": T, "duration_ms": 1, "every_ms": 999, "count": 2},
+            "every_ms must be at least",
+        ),
+        ({"start_ms": T, "duration_ms": 1, "every_ms": 1000, "count": 100_001}, "100000 runs"),
+        (
+            {"start_ms": T, "duration_ms": 1, "every_ms": 1000, "until": iso(T + 10**9)},
+            "100000 runs",
+        ),
     ],
 )
 def test_invalid_bodies(body: dict[str, Any], detail: str) -> None:
@@ -105,7 +115,8 @@ def test_start_within_grace_is_accepted() -> None:
 
 
 def test_runs_between_is_bounded_and_newest() -> None:
-    s = parse({"start_ms": T, "duration_ms": 1, "every_ms": 10, "count": 10**9})
+    # Built directly: the arithmetic must hold far past what parsing allows.
+    s = Schedule("x", T, 1, 10, 10**9, None, "", "api", NOW)
     ks = runs_between(s, T, T + 10**7, limit=500)
     assert len(ks) == 500 and ks[0] == 10**6 - 500 and ks[-1] == 10**6 - 1
     assert runs_between(s, T - 100, T + 25, limit=500) == [0, 1, 2]
@@ -116,3 +127,25 @@ def test_runs_between_is_bounded_and_newest() -> None:
 def test_schedule_bytes() -> None:
     s = parse({"start_ms": T, "duration_ms": 1000, "every_ms": 2000, "count": 3})
     assert schedule_bytes(s, 1e6) == 3 * 1_000_000 * 4
+
+
+def test_repeating_with_past_start_is_accepted_while_runs_remain() -> None:
+    s = parse({"start_ms": NOW - 600_000, "duration_ms": 500, "every_ms": 60_000, "count": 20})
+    assert first_run_from(s, NOW) == 10
+
+
+def test_repeating_with_every_run_past_is_refused() -> None:
+    with pytest.raises(ScheduleError, match="past"):
+        parse({"start_ms": NOW - 600_000, "duration_ms": 500, "every_ms": 60_000, "count": 5})
+
+
+def test_allow_past_skips_the_check() -> None:
+    s = parse_schedule(
+        {"start_ms": NOW - 600_000, "duration_ms": 1},
+        now_ms=NOW,
+        grace_ms=1000,
+        source="api",
+        new_id=lambda: "x",
+        allow_past=True,
+    )
+    assert s.start_ms == NOW - 600_000

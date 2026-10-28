@@ -132,6 +132,9 @@ async def create(request: Request) -> JSONResponse:
     now_ms = int(_now() * 1000)
     source = str(body["source"]) if body.get("source") in _SOURCES else "api"
     settings = request.app.state.settings
+    # The same schedule sent again (a retry, or a fleet resend) is a no-op
+    # even once its start has passed.
+    known = isinstance(body.get("id"), str) and book.get(body["id"]) is not None
     try:
         s = parse_schedule(
             body,
@@ -139,6 +142,7 @@ async def create(request: Request) -> JSONResponse:
             grace_ms=int(settings.TRIGGER_PRE_SEC * 1000),
             source=source,
             new_id=lambda: uuid.uuid4().hex[:12],
+            allow_past=known,
         )
     except ScheduleError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None

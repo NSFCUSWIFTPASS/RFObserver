@@ -75,6 +75,9 @@ Body fields:
 - `start` (ISO 8601 with a zone) or `start_ms` (epoch ms): required. May be up
   to `TRIGGER_PRE_SEC` (1 s by default) in the past: the sensor still holds
   that much of the stream, which covers the time a request takes to arrive.
+  A repeating schedule may start further back while runs remain: the sensor
+  joins it at the next run (so a sensor added later shares the same instants
+  and run numbers).
 - `duration_ms`: required, 1 to 600000.
 - `id`: optional, 1 to 64 letters, digits, `-` or `_`; generated if left out.
   Sending the same `id` and body again is a no-op (`200` with the stored
@@ -88,8 +91,9 @@ Body fields:
 
 Run `k` starts at `start + k x every_ms`. Counting from the schedule's start
 keeps the instants the same on every sensor, whenever each received it.
-`every_ms` must be longer than `duration_ms`. Give `count` (number of runs) or
-`until` (UTC; the last run starts before it), not both.
+`every_ms` must be at least 1000 and longer than `duration_ms`. Give `count`
+(number of runs) or `until` (UTC; the last run starts before it), not both; a
+schedule has at most 100000 runs.
 
 ```bash
 curl -s -X POST "$SENSOR/api/schedules" -H "Content-Type: application/json" \

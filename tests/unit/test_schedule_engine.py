@@ -93,12 +93,16 @@ class Rig:
         )
         self.c = 0
 
-    def chunks(self, count: int, freq: float = FREQ) -> None:
+    def chunks(
+        self, count: int, freq: float = FREQ, gaps: list[tuple[int, int]] | None = None
+    ) -> None:
         for _ in range(count):
             buf = np.arange(self.c * N, (self.c + 1) * N, dtype=np.int32)
             start = self.ring.total_written
             self.ring.write(buf)
-            self.engine.on_chunk(buf, start, T0 + self.c * N / RATE, [], freq, RATE, self.ring)
+            self.engine.on_chunk(
+                buf, start, T0 + self.c * N / RATE, gaps or [], freq, RATE, self.ring
+            )
             self.c += 1
 
 
@@ -113,15 +117,16 @@ async def test_one_off_is_cut_and_reported(book: ScheduleBook, tmp_path: Path) -
     assert path.parent == tmp_path and path.name.endswith("-sched-a-0.sc16")
     info = rig.writer.closed[key]
     assert info["status"] == "recorded" and info["gain_db"] == 40.0
-    assert "clock_source" in info
+    # Clock details are read by the writer thread, not the receiver thread.
+    assert "clock_source" not in info
     assert book.latest("a", 0)["status"] == "recording"  # final status comes from the writer
 
 
 async def test_repeating_runs_land_at_their_instants(book: ScheduleBook, tmp_path: Path) -> None:
-    await book.add(sched("r", T0_MS + 100, 50, every_ms=300, count=3))
+    await book.add(sched("r", T0_MS + 100, 50, every_ms=1000, count=3))
     rig = Rig(book, tmp_path)
-    rig.chunks(12)
-    for k, first in enumerate((100, 400, 700)):
+    rig.chunks(23)
+    for k, first in enumerate((100, 1100, 2100)):
         assert np.array_equal(rig.writer.samples(("r", k)), np.arange(first, first + 50))
     assert ("r", 3) not in rig.writer.opened
 
@@ -160,11 +165,11 @@ async def test_added_mid_stream_is_picked_up(book: ScheduleBook, tmp_path: Path)
 
 
 async def test_delete_mid_run_finishes_the_run_only(book: ScheduleBook, tmp_path: Path) -> None:
-    await book.add(sched("d", T0_MS + 100, 150, every_ms=300, count=5))
+    await book.add(sched("d", T0_MS + 100, 150, every_ms=1000, count=5))
     rig = Rig(book, tmp_path)
     rig.chunks(2)  # run 0 started
     assert await book.delete("d") is True
-    rig.chunks(10)
+    rig.chunks(25)
     assert len(rig.writer.samples(("d", 0))) == 150
     assert ("d", 1) not in rig.writer.opened
 
@@ -207,13 +212,13 @@ async def test_window_wholly_before_the_ring_is_missed(book: ScheduleBook, tmp_p
 
 
 async def test_mark_missed_after_downtime_is_bounded(book: ScheduleBook, tmp_path: Path) -> None:
-    s = sched("m", T0_MS - 1000, 1, every_ms=10, count=10**6)
+    s = sched("m", T0_MS - 1000, 1, every_ms=1000, count=100_000)
     await book.add(s)
     rig = Rig(book, tmp_path)
-    rig.engine.mark_missed(T0_MS + 10_000_000)
+    rig.engine.mark_missed(T0_MS + 10**8)
     lat = book.latest_runs("m")
     assert len(lat) == 500 and all(v["status"] == "missed" for v in lat.values())
-    assert max(lat) == (10_000_000 + 1000 - 1000) // 10 - 1
+    assert max(lat) == 99_999
 
 
 async def test_grid_rows_follow_the_run(book: ScheduleBook, tmp_path: Path) -> None:
@@ -252,3 +257,95 @@ async def test_book_reloads_from_the_database(book: ScheduleBook, tmp_path: Path
     assert again.last_run("p") == 0
     runs = await again.runs("p", 10)
     assert runs[0]["status"] == "recorded" and runs[0]["filename"] == "f.sc16"
+
+
+class _Grid:
+    def __init__(self, rows: int = 10) -> None:
+        self.grid = np.arange(rows * 4, dtype=np.float32).reshape(rows, 4) + 1.0
+        self.freq_axis = np.linspace(-1, 1, 4)
+        self.time_axis = np.arange(rows) * 0.01
+
+
+async def test_grid_rows_land_at_file_positions_across_zero_fill(
+    book: ScheduleBook, tmp_path: Path
+) -> None:
+    # Run: stream 100.. for 200 file samples. Chunk 2 loses 7 samples before
+    # its offset 30, so stream 230 is file 137 and the file ends at stream 293.
+    await book.add(sched("z", T0_MS + 100, 200))
+    rig = Rig(book, tmp_path)
+    rig.engine.on_grid(_Grid(0), 0, 10, None)  # PSD rows flow: runs wait for theirs
+    rig.chunks(2)
+    rig.chunks(1, gaps=[(30, 7)])
+    rig.chunks(1)
+    for cs in (100, 200, 300):
+        rig.engine.on_grid(_Grid(), cs, 10, None)
+    puts = rig.writer.grids[("z", 0)]
+    assert puts[0][1]["offset_samples"] == 0
+    rows = np.concatenate([r for r, _ in puts])
+    assert rows.shape[0] == 20  # rows 0..19 cover file 0..199, nothing past the end
+    # Row 13 (file 130..139) holds the zero fill: a filler row, then stream 230 at row 14.
+    assert np.array_equal(rows[12], _Grid().grid[2])
+    assert np.array_equal(rows[14], _Grid().grid[3])
+    assert float(rows[13].min()) == float(_Grid().grid.min())
+
+
+async def test_grid_offset_counts_head_zeros(book: ScheduleBook, tmp_path: Path) -> None:
+    # Start inside 20 samples lost before chunk 1: 15 zeros head the file.
+    await book.add(sched("h", T0_MS + 105, 100))
+    rig = Rig(book, tmp_path)
+    rig.engine.on_grid(_Grid(0), 0, 10, None)
+    rig.chunks(1)
+    buf = np.arange(100, 200, dtype=np.int32)
+    start = rig.ring.total_written
+    rig.ring.write(buf)
+    rig.engine.on_chunk(buf, start, T0 + 0.12, [(0, 20)], FREQ, RATE, rig.ring)
+    rig.engine.on_grid(_Grid(), 100, 10, None)
+    ((rows, kw),) = rig.writer.grids[("h", 0)]
+    assert kw["offset_samples"] == 15
+
+
+async def test_receiver_thread_runs_no_subprocess_or_stat(
+    book: ScheduleBook, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pathlib
+    import subprocess
+
+    await book.add(sched("q", T0_MS + 100, 50))
+    rig = Rig(book, tmp_path)
+    calls: list[str] = []
+    real_exists = pathlib.Path.exists
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: calls.append("subprocess.run"))
+    monkeypatch.setattr(
+        pathlib.Path, "exists", lambda self, *a, **k: calls.append("exists") or real_exists(self)
+    )
+    rig.chunks(3)
+    monkeypatch.undo()
+    assert calls == [] and ("q", 0) in rig.writer.closed
+
+
+async def test_mark_missed_starts_at_creation_for_a_late_join(
+    book: ScheduleBook, tmp_path: Path
+) -> None:
+    body = {
+        "id": "j",
+        "start_ms": T0_MS - 600_000,
+        "duration_ms": 10,
+        "every_ms": 60_000,
+        "count": 30,
+    }
+    s = parse_schedule(body, now_ms=T0_MS, grace_ms=1000, source="api", new_id=lambda: "j")
+    await book.add(s)
+    rig = Rig(book, tmp_path)
+    rig.engine.mark_missed(T0_MS + 180_000)  # restarted 3 min after joining
+    assert sorted(book.latest_runs("j")) == [10, 11, 12]
+
+
+async def test_a_run_cut_off_by_a_crash_is_partial_after_reload(book: ScheduleBook) -> None:
+    await book.add(sched("c", T0_MS + 100, 50))
+    book.report_run("c", 0, "recording", start_ms=T0_MS + 100, filename="c.sc16")
+    await asyncio.sleep(0.05)
+    again = ScheduleBook(book.db, now=lambda: T0)
+    await again.load()
+    (run,) = await again.runs("c", 10)
+    assert run["status"] == "partial" and run["reason"] == "stopped"
+    assert run["filename"] == "c.sc16"

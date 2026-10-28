@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from rfobserver.schedules.clockinfo import clock_info
 from rfobserver.storage import psd_grid
 from rfobserver.storage.governor import describe_write_error
 
@@ -224,12 +225,20 @@ class ScheduledWriter:
 
     @staticmethod
     def _open_files(path: Path, spec: RunSpec) -> _Open:
+        """Open the run's file, under a new name (``-2``, ``-3`` ...) when one
+        of that name exists: an existing capture is never overwritten."""
         st = _Open(path=path, spec=spec)
-        try:
-            st.fh = open(path, "wb")  # noqa: SIM115 (kept open across items)
-        except OSError as exc:
-            st.error = describe_write_error(exc)
-        return st
+        stem, i = path.stem, 1
+        while True:
+            try:
+                st.fh = open(st.path, "xb")  # noqa: SIM115 (kept open across items)
+                return st
+            except FileExistsError:
+                i += 1
+                st.path = path.with_name(f"{stem}-{i}{path.suffix}")
+            except OSError as exc:
+                st.error = describe_write_error(exc)
+                return st
 
     @staticmethod
     def _write(st: _Open, data: IQ) -> None:
@@ -258,6 +267,10 @@ class ScheduledWriter:
         st.grid_max = max(st.grid_max, float(rows.max()))
 
     def _finish(self, key: Key, st: _Open, info: dict[str, Any]) -> None:
+        # What disciplined the clock: read here (writer thread), never on the
+        # receiver thread, since it may run commands.
+        for k, v in clock_info().items():
+            info.setdefault(k, v)
         for fh in (st.fh, st.grid_fh):
             if fh is not None:
                 try:

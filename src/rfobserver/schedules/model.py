@@ -17,6 +17,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 MAX_DURATION_MS = 600_000
+# Repeats at most once a second, and at most this many runs: each run is a
+# file, a database row and an outcome to report.
+MIN_EVERY_MS = 1000
+MAX_RUNS = 100_000
 ID_RE = r"^[A-Za-z0-9_-]{1,64}$"
 _ID = re.compile(ID_RE)
 _LABEL_MAX = 200
@@ -84,11 +88,14 @@ def parse_schedule(
     grace_ms: int,
     source: str,
     new_id: Callable[[], str],
+    allow_past: bool = False,
 ) -> Schedule:
     """A Schedule from an API body, or ScheduleError with the reason.
 
-    ``grace_ms``: how far in the past a start may be (the sensor still holds
-    that much of the stream)."""
+    ``grace_ms``: how far in the past a run's start may be (the sensor still
+    holds that much of the stream). A repeating schedule may start in the
+    past while runs remain; it records from the next one. ``allow_past``
+    skips the check (the same schedule sent again)."""
     sid = body.get("id")
     if sid is None:
         sid = new_id()
@@ -102,11 +109,6 @@ def parse_schedule(
     else:
         raise ScheduleError("start (ISO 8601 UTC) or start_ms (epoch ms) is required")
     assert start is not None
-    if start < now_ms - grace_ms:
-        raise ScheduleError(
-            f"start is {(now_ms - start) / 1000:.3f} s in the past; "
-            f"at most {grace_ms / 1000:.3f} s is allowed"
-        )
 
     duration = _int(body, "duration_ms", minimum=1)
     if duration is None:
@@ -122,6 +124,8 @@ def parse_schedule(
         if count is not None or until is not None:
             raise ScheduleError("count and until need every_ms")
     else:
+        if every < MIN_EVERY_MS:
+            raise ScheduleError(f"every_ms must be at least {MIN_EVERY_MS}")
         if every <= duration:
             raise ScheduleError("every_ms must be longer than duration_ms")
         if (count is None) == (until is None):
@@ -132,7 +136,7 @@ def parse_schedule(
     label = body.get("label") or ""
     if not isinstance(label, str):
         raise ScheduleError("label must be text")
-    return Schedule(
+    s = Schedule(
         id=sid,
         start_ms=start,
         duration_ms=duration,
@@ -143,6 +147,16 @@ def parse_schedule(
         source=source,
         created_ms=now_ms,
     )
+    if total_runs(s) > MAX_RUNS:
+        raise ScheduleError(f"a schedule may have at most {MAX_RUNS} runs")
+    if not allow_past and first_run_from(s, now_ms - grace_ms) is None:
+        if every is None:
+            raise ScheduleError(
+                f"start is {(now_ms - start) / 1000:.3f} s in the past; "
+                f"at most {grace_ms / 1000:.3f} s is allowed"
+            )
+        raise ScheduleError("every run of this schedule is in the past")
+    return s
 
 
 def run_start_ms(s: Schedule, k: int) -> int:

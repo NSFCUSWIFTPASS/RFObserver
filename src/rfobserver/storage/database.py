@@ -2150,6 +2150,18 @@ class SensorDatabase:
         )
         await self._db.commit()
 
+    @_guarded_write
+    async def end_unfinished_runs(self) -> int:
+        """Runs still marked recording (the process ended mid-run) become
+        partial, reason stopped. Returns how many."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "UPDATE schedule_runs SET status = 'partial', reason = 'stopped' "
+            "WHERE status = 'recording'"
+        )
+        await self._db.commit()
+        return int(cursor.rowcount or 0)
+
     async def list_runs(self, schedule_id: str, limit: int = 50) -> list[dict[str, Any]]:
         """A schedule's runs, newest first."""
         assert self._db is not None

@@ -196,3 +196,56 @@ def test_exact_length(n: int) -> None:
     for c in range(3):
         ops += st.feed(cut, c)
     assert len(flatten(ops)) == n and cut.written == n
+
+
+# Receivers report samples lost between chunks as a gap at offset 0: they
+# come before the chunk's first sample, whose time capture_time is.
+
+
+def test_gap_at_offset_zero_mid_run_is_zero_filled() -> None:
+    cut = RunCutter(spec(T0 * 1000 + 50, 150))
+    st = Stream()
+    ops = st.feed(cut, 0)  # stream 50..99 -> file 0..49
+    # 20 samples lost before chunk 1, whose first sample is 20 ms later.
+    ops += st.feed(cut, 1, time=T0 + 0.1 + 0.02, gaps=[(0, 20)])
+    out = flatten(ops)
+    assert len(out) == 150
+    assert np.array_equal(out[:50], np.arange(50, 100))
+    assert np.all(out[50:70] == 0)
+    assert np.array_equal(out[70:], np.arange(100, 180))
+    assert cut.info()["gaps"] == [[50, 20]] and cut.status == "partial"
+
+
+def test_gap_at_offset_zero_before_the_start_is_not_in_the_file() -> None:
+    # Start exactly at chunk[0]; the 20 lost samples were before it.
+    cut = RunCutter(spec(T0 * 1000 + 100, 30))
+    st = Stream()
+    st.feed(RunCutter(spec(0, 1)), 0)
+    ops = st.feed(cut, 1, gaps=[(0, 20)])
+    assert np.array_equal(flatten(ops), np.arange(100, 130))
+    assert cut.info()["start_error_ns"] == 0 and cut.status == "recorded"
+
+
+def test_gap_at_offset_zero_after_a_ring_start_is_zero_filled() -> None:
+    st = Stream()
+    for c in range(2):
+        st.feed(RunCutter(spec(0, 1)), c)
+    cut = RunCutter(spec(T0 * 1000 + 150, 100))  # stream 150, in the ring
+    ops = st.feed(cut, 2, time=T0 + 0.2 + 0.01, gaps=[(0, 10)])
+    out = flatten(ops)
+    assert np.array_equal(out[:50], np.arange(150, 200))
+    assert np.all(out[50:60] == 0) and np.array_equal(out[60:], np.arange(200, 240))
+
+
+def test_file_index_maps_stream_positions_through_zero_fill() -> None:
+    cut = RunCutter(spec(T0 * 1000 + 50, 250))
+    st = Stream()
+    st.feed(cut, 0)
+    st.feed(cut, 1, gaps=[(30, 7)])
+    assert cut.file_index(50) == 0
+    assert cut.file_index(129) == 79
+    assert cut.file_index(130) == 87  # after the 7 zeros
+    assert cut.stream_end() == 200  # file holds stream 50..199 so far
+    st.feed(cut, 2)
+    st.feed(cut, 3)
+    assert cut.done and cut.stream_end() == 50 + 250 - 7

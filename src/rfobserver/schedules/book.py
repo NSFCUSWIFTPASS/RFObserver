@@ -58,6 +58,9 @@ class ScheduleBook:
         self._loop = loop
 
     async def load(self) -> None:
+        ended = await self.db.end_unfinished_runs()
+        if ended:
+            logger.warning("%d scheduled run(s) were cut off by a restart: marked partial", ended)
         schedules = await self.db.list_schedules()
         last = {s.id: await self.db.last_run(s.id) for s in schedules}
         with self._lock:

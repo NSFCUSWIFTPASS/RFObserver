@@ -13,6 +13,7 @@ Pure: no I/O, no threads; ``feed`` returns the write operations.
 
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -54,10 +55,21 @@ def _iso_ns(t: float) -> str:
     return f"{dt:%Y-%m-%dT%H:%M:%S}.{ns:09d}Z"
 
 
+def _split(gaps: Sequence[tuple[int, int]]) -> tuple[int, list[tuple[int, int]]]:
+    """(samples lost before the chunk's first sample, the gaps inside it).
+
+    A receive gap ``(off, lost)`` means ``lost`` samples are missing right
+    before ``chunk[off]``. At offset 0 they are missing between the previous
+    chunk and this one: before the first sample, whose time ``capture_time``
+    is."""
+    before = sum(lost for off, lost in gaps if off <= 0)
+    return before, sorted((off, lost) for off, lost in gaps if off > 0)
+
+
 def _place(target: int, gaps: Sequence[tuple[int, int]], n: int) -> tuple[int, int]:
     """Where time-sample ``target`` (samples after the chunk's first sample
-    in time) is in a chunk with receive ``gaps``: (offset in the chunk, zeros
-    to write first when it falls inside a gap)."""
+    in time) is in a chunk with receive ``gaps`` inside it (offsets > 0):
+    (offset in the chunk, zeros to write first when it falls inside a gap)."""
     lost_before = 0
     for off, lost in sorted(gaps):
         if target < off + lost_before:
@@ -82,6 +94,10 @@ class RunCutter:
         self._first_time: float | None = None
         self._error_ns: int | None = None
         self.stream_start: int | None = None
+        # Zero fill by stream position: (position the zeros precede, zeros
+        # written before it in total), to map stream positions to the file.
+        self._breaks: list[tuple[int, int]] = []
+        self._zeros_total = 0
 
     # --- results ---
 
@@ -109,6 +125,21 @@ class RunCutter:
             "samples": self.written,
         }
 
+    def file_index(self, stream_pos: int) -> int | None:
+        """The file index of stream sample ``stream_pos`` (None before the
+        run started)."""
+        if self.stream_start is None:
+            return None
+        i = bisect.bisect_right(self._breaks, (stream_pos, float("inf"))) - 1
+        zeros = self._breaks[i][1] if i >= 0 else 0
+        return stream_pos - self.stream_start + zeros
+
+    def stream_end(self) -> int | None:
+        """The stream position just after the file's last stream sample."""
+        if self.stream_start is None:
+            return None
+        return self.stream_start + self.written - self._zeros_total
+
     # --- feeding ---
 
     def end(self, reason: str) -> list[Op]:
@@ -134,10 +165,13 @@ class RunCutter:
             if center_freq_hz != self.spec.center_freq_hz:
                 return self.end("retuned")
             ops: list[Op] = []
+            before, inner = _split(gaps)
             if chunk_start > self._next_pos:
-                # Stream samples that never reached this cutter.
-                self._zeros(ops, chunk_start - self._next_pos)
-            self._chunk(ops, chunk, 0, gaps)
+                # Stream samples that never reached this cutter: positions
+                # skipped, so they move the file and the stream alike.
+                self._zeros(ops, chunk_start - self._next_pos, at=chunk_start, shifts=False)
+            self._zeros(ops, before, at=chunk_start)
+            self._chunk(ops, chunk, chunk_start, 0, inner)
             self._next_pos = chunk_start + n
             return ops
         return self._begin(chunk, chunk_start, capture_time, gaps, ring)
@@ -156,7 +190,8 @@ class RunCutter:
         # difference so the start error adds no rounding of its own.
         delta = self.spec.start_ms / 1000 - capture_time
         target = round(delta * rate)
-        span = n + sum(lost for _, lost in gaps)
+        before, inner = _split(gaps)
+        span = n + sum(lost for _, lost in inner)
         if target >= span:
             return []  # not due yet
         self.started = True
@@ -164,16 +199,20 @@ class RunCutter:
         self._error_ns = round((target / rate - delta) * 1e9)
         ops: list[Op] = []
         if target >= 0:
-            off, head = _place(target, gaps, n)
-            if head:
-                self._zeros(ops, head)
+            off, head = _place(target, inner, n)
             self.stream_start = chunk_start + off
-            self._chunk(ops, chunk, off, gaps)
+            self._zeros(ops, head, at=chunk_start + off)
+            self._chunk(ops, chunk, chunk_start, off, inner)
+        elif target + before >= 0:
+            # Inside the samples lost right before this chunk.
+            self.stream_start = chunk_start
+            self._zeros(ops, -target, at=chunk_start)
+            self._chunk(ops, chunk, chunk_start, 0, inner)
         else:
             # Older than this chunk: from the ring, which already holds it.
-            # Gaps logged before this chunk are not known here, so the
-            # placement counts stream samples back from the chunk.
-            p0 = chunk_start + target
+            # The samples lost right before the chunk are counted; gaps logged
+            # before earlier chunks are not known here.
+            p0 = chunk_start + target + before
             oldest = ring.bounds()[0] if ring is not None else chunk_start
             begin = max(p0, min(oldest, chunk_start))
             data = None
@@ -182,24 +221,33 @@ class RunCutter:
             if data is None:
                 begin = chunk_start
             late = begin - p0
+            self.stream_start = begin
             if late:
                 self._late = min(late, self.spec.n_samples)
-                self._zeros(ops, late)
-            self.stream_start = begin
+                self._zeros(ops, late, at=begin)
             if data is not None:
                 self._iq(ops, data)
-            self._chunk(ops, chunk, 0, gaps)
+            self._zeros(ops, before, at=chunk_start)
+            self._chunk(ops, chunk, chunk_start, 0, inner)
         self._next_pos = chunk_start + n
         return ops
 
-    def _chunk(self, ops: list[Op], chunk: IQ, start: int, gaps: Sequence[tuple[int, int]]) -> None:
-        """Samples ``chunk[start:]`` with zeros for the gaps after ``start``."""
+    def _chunk(
+        self,
+        ops: list[Op],
+        chunk: IQ,
+        chunk_start: int,
+        start: int,
+        gaps: Sequence[tuple[int, int]],
+    ) -> None:
+        """Samples ``chunk[start:]`` with zeros for the gaps (offsets > 0)
+        after ``start``; a gap at ``start`` itself lies before the run."""
         pos = start
-        for off, lost in sorted(gaps):
+        for off, lost in gaps:
             if off <= start:
                 continue
             self._iq(ops, chunk[pos:off])
-            self._zeros(ops, lost)
+            self._zeros(ops, lost, at=chunk_start + off)
             pos = off
         self._iq(ops, chunk[pos:])
 
@@ -213,9 +261,15 @@ class RunCutter:
             self.written += k
         self._check_done()
 
-    def _zeros(self, ops: list[Op], count: int) -> None:
+    def _zeros(self, ops: list[Op], count: int, *, at: int, shifts: bool = True) -> None:
+        """``count`` zeros before stream position ``at``. ``shifts``: they
+        stand for lost samples (the file moves ahead of the stream); False
+        for stream positions that were skipped."""
         k = min(count, self._room())
         if k > 0:
+            if shifts:
+                self._zeros_total += k
+                self._breaks.append((at, self._zeros_total))
             if self._gaps and self._gaps[-1][0] + self._gaps[-1][1] == self.written:
                 self._gaps[-1][1] += k  # contiguous with the previous fill
             else:

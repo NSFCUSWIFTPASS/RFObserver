@@ -43,6 +43,8 @@ from rfobserver.storage.rollup import METRICS, PEAK_TIME_COLUMN, MinuteSummary, 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping, Sequence
 
+    from rfobserver.schedules.model import Schedule
+
 logger = logging.getLogger(__name__)
 
 # A healthy write is single-digit ms; 30 s means the storage device wedged.
@@ -325,7 +327,31 @@ CREATE TABLE IF NOT EXISTS collection_hours (
     deleted_cap_bytes INTEGER NOT NULL DEFAULT 0,
     deleted_space_captures INTEGER NOT NULL DEFAULT 0,
     deleted_space_bytes INTEGER NOT NULL DEFAULT 0,
-    active_seconds REAL NOT NULL DEFAULT 0
+    active_seconds REAL NOT NULL DEFAULT 0,
+    scheduled_captures INTEGER NOT NULL DEFAULT 0,
+    scheduled_bytes INTEGER NOT NULL DEFAULT 0,
+    scheduled_seconds REAL NOT NULL DEFAULT 0
+);
+
+-- Scheduled IQ captures (schedules/model.py): the schedule as its JSON body,
+-- and one row per run with its outcome. Deleted schedules keep their row
+-- (deleted_ms set) so their runs stay readable.
+CREATE TABLE IF NOT EXISTS schedules (
+    id TEXT PRIMARY KEY,
+    body TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    deleted_ms INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS schedule_runs (
+    schedule_id TEXT NOT NULL,
+    run INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    filename TEXT,
+    reason TEXT,
+    info TEXT,
+    PRIMARY KEY (schedule_id, run)
 );
 
 CREATE INDEX IF NOT EXISTS idx_detections_time ON detections(start_time);
@@ -364,6 +390,14 @@ _DETECTION_ATTRIBUTION_COLUMNS: dict[str, str] = {
     "attribution": "TEXT",
 }
 
+
+# Scheduled-capture columns, added to collection_hours after its first
+# release; connect() adds any that are missing.
+_COLLECTION_SCHEDULED_COLUMNS: dict[str, str] = {
+    "scheduled_captures": "INTEGER NOT NULL DEFAULT 0",
+    "scheduled_bytes": "INTEGER NOT NULL DEFAULT 0",
+    "scheduled_seconds": "REAL NOT NULL DEFAULT 0",
+}
 
 # Capture-priority columns, added after the original iq_captures schema: the
 # capture's mean power, the background it was compared with, and whether it
@@ -548,6 +582,7 @@ class SensorDatabase:
         await self._db.executescript(SCHEMA)
         await self._migrate_detection_columns()
         await self._migrate_iq_capture_columns()
+        await self._migrate_collection_columns()
         await self._migrate_avg_windows_psd_nullable()
         # Created after migration: on a pre-existing DB the indexed column is
         # added by the migration above, so this can't run inside SCHEMA.
@@ -593,6 +628,19 @@ class SensorDatabase:
             if column not in existing:
                 await self._db.execute(f"ALTER TABLE iq_captures ADD COLUMN {column} {col_type}")
                 logger.info("Migrated iq_captures: added column %s", column)
+
+    async def _migrate_collection_columns(self) -> None:
+        """Add the scheduled-capture columns to an existing collection_hours
+        table (older hours read them as 0)."""
+        assert self._db is not None
+        async with self._db.execute("PRAGMA table_info(collection_hours)") as cursor:
+            existing = {row[1] for row in await cursor.fetchall()}
+        for column, col_type in _COLLECTION_SCHEDULED_COLUMNS.items():
+            if column not in existing:
+                await self._db.execute(
+                    f"ALTER TABLE collection_hours ADD COLUMN {column} {col_type}"
+                )
+                logger.info("Migrated collection_hours: added column %s", column)
 
     async def _migrate_avg_windows_psd_nullable(self) -> None:
         """Make avg_windows.psd_powers nullable on DBs created with NOT NULL.
@@ -2024,6 +2072,123 @@ class SensorDatabase:
             (since, until),
         ) as cursor:
             return [dict(zip(("hour", *FIELDS), r, strict=True)) for r in await cursor.fetchall()]
+
+    # --- scheduled captures ---
+
+    @_guarded_write
+    async def insert_schedule(self, s: Schedule) -> None:
+        from rfobserver.schedules.model import to_json
+
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT INTO schedules (id, body, created_ms) VALUES (?, ?, ?)",
+            (s.id, json.dumps(to_json(s)), s.created_ms),
+        )
+        await self._db.commit()
+
+    async def list_schedules(self, include_deleted: bool = False) -> list[Schedule]:
+        """Schedules oldest first; deleted ones only with ``include_deleted``."""
+        from rfobserver.schedules.model import from_json
+
+        assert self._db is not None
+        where = "" if include_deleted else " WHERE deleted_ms IS NULL"
+        async with self._db.execute(
+            f"SELECT body FROM schedules{where} ORDER BY created_ms, id"
+        ) as cursor:
+            return [from_json(json.loads(r[0])) for r in await cursor.fetchall()]
+
+    async def get_schedule(self, schedule_id: str) -> Schedule | None:
+        """A schedule by id, deleted or not."""
+        from rfobserver.schedules.model import from_json
+
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT body FROM schedules WHERE id = ?", (schedule_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return None if row is None else from_json(json.loads(row[0]))
+
+    @_guarded_write
+    async def delete_schedule(self, schedule_id: str, deleted_ms: int) -> bool:
+        """Mark a schedule deleted; False if there is no such live schedule."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "UPDATE schedules SET deleted_ms = ? WHERE id = ? AND deleted_ms IS NULL",
+            (deleted_ms, schedule_id),
+        )
+        await self._db.commit()
+        return bool(cursor.rowcount)
+
+    @_guarded_write
+    async def upsert_run(
+        self,
+        schedule_id: str,
+        run: int,
+        status: str,
+        *,
+        start_ms: int,
+        filename: str | None = None,
+        reason: str | None = None,
+        info: dict[str, Any] | None = None,
+    ) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT INTO schedule_runs "
+            "(schedule_id, run, status, start_ms, filename, reason, info) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(schedule_id, run) DO UPDATE SET "
+            "status = excluded.status, start_ms = excluded.start_ms, "
+            "filename = excluded.filename, reason = excluded.reason, info = excluded.info",
+            (
+                schedule_id,
+                run,
+                status,
+                start_ms,
+                filename,
+                reason,
+                None if info is None else json.dumps(info),
+            ),
+        )
+        await self._db.commit()
+
+    async def list_runs(self, schedule_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        """A schedule's runs, newest first."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT run, status, start_ms, filename, reason, info FROM schedule_runs "
+            "WHERE schedule_id = ? ORDER BY run DESC LIMIT ?",
+            (schedule_id, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            {
+                "run": int(r[0]),
+                "status": r[1],
+                "start_ms": int(r[2]),
+                "filename": r[3],
+                "reason": r[4],
+                "info": None if r[5] is None else json.loads(r[5]),
+            }
+            for r in rows
+        ]
+
+    async def last_run(self, schedule_id: str) -> int | None:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT MAX(run) FROM schedule_runs WHERE schedule_id = ?", (schedule_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return None if row is None or row[0] is None else int(row[0])
+
+    @_guarded_write
+    async def prune_runs(self, schedule_id: str, keep: int) -> None:
+        """Keep a schedule's newest ``keep`` runs."""
+        assert self._db is not None
+        await self._db.execute(
+            "DELETE FROM schedule_runs WHERE schedule_id = ? AND run NOT IN "
+            "(SELECT run FROM schedule_runs WHERE schedule_id = ? ORDER BY run DESC LIMIT ?)",
+            (schedule_id, schedule_id, keep),
+        )
+        await self._db.commit()
 
     async def detection_models(self) -> list[str]:
         """Distinct non-empty rtl_433 model names, sorted (Detections filter).

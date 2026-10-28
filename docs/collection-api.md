@@ -348,14 +348,17 @@ Figures (in days, totals, averages and hours):
 | `manual_bytes` | Raw IQ bytes recorded by manual captures |
 | `auto_seconds` | Seconds of signal recorded by triggered captures |
 | `manual_seconds` | Seconds of signal recorded by manual captures |
+| `scheduled_captures` | Scheduled captures (see [Scheduled captures API](schedules-api.md)) |
+| `scheduled_bytes` | Raw IQ bytes recorded by scheduled captures |
+| `scheduled_seconds` | Seconds of signal recorded by scheduled captures |
 | `deleted_cap_captures` | Captures deleted to stay under the storage cap |
 | `deleted_cap_bytes` | Raw IQ bytes of those captures |
 | `deleted_space_captures` | Captures deleted to keep the volume's free-space floor |
 | `deleted_space_bytes` | Raw IQ bytes of those captures |
 | `active_seconds` | Seconds of live RF received (replays are not counted) |
-| `captures` | `auto_captures + manual_captures` |
-| `bytes` | `auto_bytes + manual_bytes`: data stored |
-| `seconds` | `auto_seconds + manual_seconds` |
+| `captures` | `auto_captures + manual_captures + scheduled_captures` |
+| `bytes` | `auto_bytes + manual_bytes + scheduled_bytes`: data stored |
+| `seconds` | `auto_seconds + manual_seconds + scheduled_seconds` |
 
 Day and response fields:
 

@@ -35,6 +35,9 @@ FIELDS = (
     "manual_bytes",
     "auto_seconds",
     "manual_seconds",
+    "scheduled_captures",
+    "scheduled_bytes",
+    "scheduled_seconds",
     "deleted_cap_captures",
     "deleted_cap_bytes",
     "deleted_space_captures",
@@ -42,7 +45,7 @@ FIELDS = (
     "active_seconds",
 )
 
-_ORIGINS = ("auto", "manual")
+_ORIGINS = ("auto", "manual", "scheduled")
 _REASONS = ("cap", "space")
 
 

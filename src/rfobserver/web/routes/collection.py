@@ -89,9 +89,9 @@ def _empty() -> dict[str, float]:
 
 
 def _with_totals(fig: dict[str, Any]) -> dict[str, Any]:
-    fig["captures"] = fig["auto_captures"] + fig["manual_captures"]
-    fig["bytes"] = fig["auto_bytes"] + fig["manual_bytes"]
-    fig["seconds"] = fig["auto_seconds"] + fig["manual_seconds"]
+    fig["captures"] = fig["auto_captures"] + fig["manual_captures"] + fig["scheduled_captures"]
+    fig["bytes"] = fig["auto_bytes"] + fig["manual_bytes"] + fig["scheduled_bytes"]
+    fig["seconds"] = fig["auto_seconds"] + fig["manual_seconds"] + fig["scheduled_seconds"]
     return fig
 
 

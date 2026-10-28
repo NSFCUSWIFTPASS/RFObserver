@@ -71,4 +71,19 @@ def iq_sigmf_meta(capture: dict[str, Any]) -> dict[str, Any]:
         lost += int(n_lost)
         captures.append(segment(int(pos), lost))
 
-    return {"global": global_meta, "captures": captures, "annotations": []}
+    # A scheduled capture is contiguous in time: lost samples were written as
+    # zeros, so they are annotations rather than discontinuities.
+    annotations: list[dict[str, Any]] = []
+    schedule = capture.get("schedule")
+    if isinstance(schedule, dict):
+        global_meta["rfobs:schedule"] = schedule
+        for pos, count in schedule.get("zero_filled") or []:
+            annotations.append(
+                {
+                    "core:sample_start": int(pos),
+                    "core:sample_count": int(count),
+                    "core:comment": "zero-filled: samples lost in reception or writing",
+                }
+            )
+
+    return {"global": global_meta, "captures": captures, "annotations": annotations}

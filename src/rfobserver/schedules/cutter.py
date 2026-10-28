@@ -100,6 +100,7 @@ class RunCutter:
         return {
             "requested_start": iso_ms(self.spec.start_ms),
             "first_sample_time": None if first is None else _iso_ns(first),
+            "first_sample_epoch": first,
             "start_error_ns": self._error_ns,
             "late_start_samples": self._late,
             "gaps": [list(g) for g in self._gaps],

@@ -61,6 +61,17 @@ def test_summary_of_a_decoded_burst() -> None:
     assert s["data"] == "7a2ab5b3f7cadffe" and s["data_full"].startswith("7a2ab5b3f7cadffeea")
 
 
+def test_summary_keeps_a_decoded_rssi() -> None:
+    # rtl_433 adds its own rssi/snr/noise only with -M level, which attribution
+    # never passes, so an rssi key is the decoder's: SilverSpring-Mesh reads it
+    # from the frame (the RSSI the radio reported).
+    frame = {"time": "@0.001s", "model": "SilverSpring-Mesh", "dst_id": "001350fffe2a61c4"}
+    frame |= {"rssi": -88, "mic": "CRC"}
+    record = json.dumps({"decoded": True, "at": "x", "frames": [frame]})
+    s = attribution_summary(det(1, "t", "SilverSpring-Mesh", record))
+    assert s["fields"] == [["dst_id", "001350fffe2a61c4"], ["rssi", -88]]
+
+
 def test_summary_states_and_bad_records() -> None:
     assert attribution_summary(det(1, "t", None, TRIED))["status"] == "tried"
     assert attribution_summary(det(1, "t"))["status"] == "not_tried"

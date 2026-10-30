@@ -15,10 +15,13 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-# rtl_433 frame keys that are bookkeeping, not decoded content.
+# rtl_433 frame keys that are bookkeeping, not decoded content. rssi, snr and
+# noise are not among them: rtl_433 adds its own only with -M level, which
+# attribution never passes, so they come from the decoder (SilverSpring-Mesh
+# reports the RSSI carried in the frame).
 _FRAME_SKIP = {
     "time", "model", "count", "num_rows", "rows", "codes", "mod", "freq", "freq1", "freq2",
-    "rssi", "snr", "noise", "protocol", "mic",
+    "protocol", "mic",
 }  # fmt: skip
 _MAX_FIELDS = 4
 _DATA_PREVIEW = 16

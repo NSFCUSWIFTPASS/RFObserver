@@ -169,3 +169,20 @@ short to hold the MAC and text is no match.
   (0 errors at 908.1 and 926.5 MHz for the 917.3 MHz hop), so they will be labelled SSM, which is
   true of their content; the detection count overstates SSM transmissions about 4x. Whether the
   copies come from the TX or the RX is not known. Out of scope here.
+
+## Verified 2026-11-05
+
+- **Replay**, first 2 s of the 2025-12-12 HCRO capture, threshold 40 dB, isolation and attribution
+  on (`run_replay`, `ATTRIBUTION_RTL433_PATH=/bin/true` since rtl_433 is not installed on the
+  workstation, so only SSM labels were under test): 29 bursts isolated, 27 labelled SSM, 2 not
+  decoded. All 9 main hops: `model "SSM"`, `src_id 0200574952470001`, `preamble_errors 0`,
+  `bit_errors` 0 (one hop 1). The other 18 SSM labels are the +-9.2 MHz copies and RX images;
+  one image decoded a damaged MAC (`0200576952470001`, `bit_errors null`), as designed.
+- **Found and fixed during verification:** symbols after a cut-short hop's signal were read as
+  bits (fragments cut at 2 s showed 61 to 73 `bit_errors`); the decoder now stops where the
+  signal ends. Those fragments now show 0.
+- **CPU on nano-super** (15 W mode, numpy 1.26.4, scipy 1.13.1): the real 93 ms fixture at
+  1.6 MS/s takes 23.7 ms median (p90 25.0 ms); a synthetic 83 ms frame 18.8 ms; a noise burst of
+  the same length 24 ms. Bursts shorter than about 15 ms are rejected before any processing.
+  Over the plan's 20 ms bar; accepted by the user (runs in the attribution worker thread, only on
+  bursts of 15 ms or more, and a match saves an rtl_433 subprocess).

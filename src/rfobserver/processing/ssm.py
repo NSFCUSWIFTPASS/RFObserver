@@ -40,6 +40,10 @@ CFO_SEARCH_HZ = 15_000
 CFO_SEGMENT = 32_768
 # The frame start is searched on every DECIM-th sample, then refined.
 DECIM = 4
+# The signal has ended once this many symbols in a row are under this
+# fraction of the preamble's median symbol magnitude.
+SIGNAL_GONE_RUN = 8
+SIGNAL_GONE_FRACTION = 0.25
 
 # Frame layout, bit indices (half-open).
 PREAMBLE = (32, 160)
@@ -211,6 +215,18 @@ def decode_ssm(cs16: bytes, rate_hz: int) -> dict[str, Any] | None:
     pos = start + np.arange(n_sym) * sps
     grid = np.arange(len(y))
     sym = np.interp(pos, grid, y.real) + 1j * np.interp(pos, grid, y.imag)
+    # A hop cut short is followed by silence or noise: stop where the signal
+    # does (SIGNAL_GONE_RUN symbols in a row under SIGNAL_GONE_FRACTION of
+    # the preamble's level), so those symbols are not read as bits.
+    mag = np.abs(sym)
+    low = mag < SIGNAL_GONE_FRACTION * float(np.median(mag[PREAMBLE[0] : PREAMBLE[1]]))
+    run = np.convolve(low.astype(np.int8), np.ones(SIGNAL_GONE_RUN, dtype=np.int8), "valid")
+    gone = np.flatnonzero(run[PREAMBLE[1] :] == SIGNAL_GONE_RUN)
+    if len(gone):
+        n_sym = PREAMBLE[1] + int(gone[0])
+        if n_sym < TEXT[1]:
+            return None
+        sym = sym[:n_sym]
     bits = np.zeros(n_sym, dtype=np.uint8)
     bits[1:] = (np.real(sym[1:] * np.conj(sym[:-1])) < 0).astype(np.uint8)
 

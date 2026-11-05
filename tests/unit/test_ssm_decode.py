@@ -120,6 +120,20 @@ def test_cut_after_text_matches_and_before_mac_does_not() -> None:
     assert decode_ssm(_cs16(iq[: 200 * 16]), 1_000_000) is None
 
 
+@pytest.mark.parametrize("tail", ["zeros", "weak_noise"])
+def test_frame_cut_then_silence_counts_only_received_bits(tail: str) -> None:
+    # A hop cut short (overflow gap, end of a capture) followed by silence: the
+    # symbols after the signal ends are not received bits.
+    iq = modulate(frame_bits())[: 1000 * 16]
+    p = float(np.mean(np.abs(iq) ** 2))
+    if tail == "zeros":
+        rest = np.zeros(20_000, dtype=np.complex64)
+    else:
+        rest = _noise(20_000, p / 1000, np.random.default_rng(1))
+    f = decode_ssm(_cs16(np.concatenate([iq, rest])), 1_000_000)
+    assert f is not None and f["bit_errors"] == 0
+
+
 def test_frame_after_30ms_of_noise() -> None:
     iq = modulate(frame_bits())
     p = float(np.mean(np.abs(iq) ** 2))

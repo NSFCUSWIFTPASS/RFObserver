@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from rfobserver.processing.ssm import decode_ssm, frame_bits, modulate
+from rfobserver.processing.ssm import analysis_window, decode_ssm, frame_bits, modulate
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 
@@ -51,7 +51,7 @@ def test_frame_at_1600k_decodes() -> None:
     assert f["src_id"] == "0200574952470001" and f["bit_errors"] == 0
 
 
-@pytest.mark.parametrize("cfo", [-15_000, -4_000, 0, 3_600, 15_000])
+@pytest.mark.parametrize("cfo", [-35_000, -15_000, -4_000, 0, 3_600, 15_000, 20_000, 30_000])
 def test_offset_and_phase(cfo: int) -> None:
     iq = modulate(frame_bits())
     t = np.arange(len(iq)) / 1_000_000
@@ -149,6 +149,55 @@ def test_real_hcro_hop() -> None:
     to the 1.6 MS/s tier, gzipped."""
     data = gzip.decompress((FIXTURES / "ssm_hop_917MHz_1600k.cs16.gz").read_bytes())
     assert decode_ssm(data, 1_600_000) == KNOWN
+
+
+def _rotate(iq: np.ndarray, cfo: float, rate: int) -> np.ndarray:
+    return iq * np.exp(2j * np.pi * cfo * np.arange(len(iq)) / rate)
+
+
+@pytest.mark.parametrize(
+    "lead_ms,tail_ms,cut_bits,cfo",
+    [
+        (2, 300, None, 10_000),  # frame at the start of a long burst
+        (2, 300, None, 0),
+        (300, 2, None, -8_000),  # frame at the end of a long burst
+        (2, 200, 2500, 5_000),  # a 40 ms piece of a frame, then a long tail
+    ],
+)
+def test_frame_anywhere_in_a_long_burst(
+    lead_ms: int, tail_ms: int, cut_bits: int | None, cfo: int
+) -> None:
+    rate = 1_600_000
+    frame = modulate(frame_bits(), rate)
+    if cut_bits is not None:
+        frame = frame[: int(cut_bits * rate / 62_500)]
+    p = float(np.mean(np.abs(frame) ** 2))
+    rng = np.random.default_rng(5)
+    lead = _noise(lead_ms * rate // 1000, p / 100, rng)
+    tail = _noise(tail_ms * rate // 1000, p / 100, rng)
+    iq = _rotate(np.concatenate([lead, frame, tail]), cfo, rate)
+    f = decode_ssm(_cs16(iq), rate)
+    assert f is not None and f["src_id"] == "0200574952470001" and f["bit_errors"] == 0
+
+
+def test_long_burst_is_cut_to_a_bounded_window() -> None:
+    # Cost must not grow with burst length: a 0.5 s burst is analysed over
+    # the frame-sized window with the most energy plus a margin.
+    rate = 1_600_000
+    frame = modulate(frame_bits(), rate)
+    p = float(np.mean(np.abs(frame) ** 2))
+    rng = np.random.default_rng(6)
+    iq = np.concatenate([_noise(rate // 5, p / 100, rng), frame, _noise(rate // 5, p / 100, rng)])
+    lo, hi = analysis_window(iq, rate)
+    assert (hi - lo) / rate <= 0.130
+    assert lo <= rate // 5 and hi >= rate // 5 + len(frame)
+
+
+def test_odd_length_cs16() -> None:
+    data = _cs16(modulate(frame_bits()))
+    for trim in (1, 2, 3):
+        f = decode_ssm(data[:-trim], 1_000_000)
+        assert f is not None and f["bit_errors"] == 0
 
 
 @pytest.mark.parametrize("n", [0, 1, 400])

@@ -33,11 +33,18 @@ RATE_HZ = 1_000_000  # modulate()'s native rate
 SPS = 16  # samples per symbol at RATE_HZ
 RRC_ALPHA = 0.35
 RRC_SPAN = 8  # symbols
-# Offsets searched: +-15 kHz (the squared signal's tone sits at twice it).
-CFO_SEARCH_HZ = 15_000
-# The offset is estimated on this many samples from the middle of the burst
-# (32.8 ms: 30 Hz resolution, ample for 62.5 kbaud).
+# Offsets searched: +-40 kHz (the squared signal's tone sits at twice it).
+# Isolation centres the burst on its peak FFT cell, which can sit anywhere
+# on the SSM's +-20 kHz flat top plus half a cell (27 kHz cells at 56 MS/s).
+CFO_SEARCH_HZ = 40_000
+# The offset is estimated on the loudest span of this many samples (32.8 ms
+# at 1 MS/s: 30 Hz resolution, ample for 62.5 kbaud).
 CFO_SEGMENT = 32_768
+# Only the loudest frame-length span of a burst, plus this margin either
+# side, is analysed: bounds the cost of long bursts and keeps the offset
+# estimate on the frame when it sits at one end of a burst.
+FRAME_SEC = 0.083
+MARGIN_SEC = 0.020
 # The frame start is searched on every DECIM-th sample, then refined.
 DECIM = 4
 # The signal has ended once this many symbols in a row are under this
@@ -177,6 +184,27 @@ def _as_int(bits: IQ) -> int:
     return int("".join(str(int(b)) for b in bits), 2)
 
 
+def _loudest(power: IQ, n: int, block: int) -> int:
+    """Start index of the ``n``-sample span of ``power`` with the most energy,
+    to ``block`` samples."""
+    blocks = power[: len(power) // block * block].reshape(-1, block).sum(axis=1)
+    k = max(1, n // block)
+    if len(blocks) <= k:
+        return 0
+    c = np.concatenate([[0.0], np.cumsum(blocks)])
+    return int(np.argmax(c[k:] - c[:-k])) * block
+
+
+def analysis_window(iq: IQ, rate_hz: int) -> tuple[int, int]:
+    """(lo, hi) of the part of ``iq`` worth decoding: the loudest frame-length
+    span plus MARGIN_SEC either side."""
+    block = max(1, int(rate_hz) // 1000)
+    power = np.abs(iq) ** 2
+    start = _loudest(power, int(FRAME_SEC * rate_hz), block)
+    margin = int(MARGIN_SEC * rate_hz)
+    return max(0, start - margin), min(len(iq), start + int(FRAME_SEC * rate_hz) + margin)
+
+
 def decode_ssm(cs16: bytes, rate_hz: int) -> dict[str, Any] | None:
     """The SSM frame in ``cs16`` (<i2 I/Q at ``rate_hz``) as an rtl_433-shaped
     frame dict, or None when there is no SSM frame in it."""
@@ -186,10 +214,12 @@ def decode_ssm(cs16: bytes, rate_hz: int) -> dict[str, Any] | None:
     sps = rate / BAUD
     if len(iq) < TEXT[1] * sps:
         return None
+    lo, hi = analysis_window(iq, rate)
+    iq = iq[lo:hi]
 
     # Frequency offset: BPSK squared is a tone at twice the offset.
-    mid = max(0, (len(iq) - CFO_SEGMENT) // 2)
-    seg = iq[mid : mid + CFO_SEGMENT]
+    seg_start = _loudest(np.abs(iq) ** 2, CFO_SEGMENT, max(1, rate // 1000))
+    seg = iq[seg_start : seg_start + CFO_SEGMENT]
     n_fft = sfft.next_fast_len(len(seg))
     spec = np.abs(sfft.fft(seg * seg, n_fft))
     freqs = sfft.fftfreq(n_fft, 1.0 / rate)

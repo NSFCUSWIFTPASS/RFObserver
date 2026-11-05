@@ -237,3 +237,22 @@ def test_detection_popup_errors(fleet: Any) -> None:
     assert client.get("/fleet/api/detection", params=q).status_code == 404
     assert client.get("/fleet/api/detection", params={**q, "start_time": "x"}).status_code == 400
     assert client.get("/fleet/api/detection", params={**q, "sensor": "nope"}).status_code == 404
+
+
+def test_summary_of_an_ssm_burst() -> None:
+    frame = {
+        "model": "SSM",
+        "src_id": "0200574952470001",
+        "payload": "Hello from Boulder, CO!",
+        "preamble_errors": 0,
+        "bit_errors": 0,
+    }
+    rec = json.dumps({"decoded": True, "at": "x", "frames": [frame]})
+    s = attribution_summary(det(1, "t", "SSM", rec))
+    assert s["status"] == "decoded"
+    assert s["fields"] == [
+        ["src_id", "0200574952470001"],
+        ["payload", "Hello from Boulder, CO!"],
+        ["preamble_errors", 0],
+        ["bit_errors", 0],
+    ]

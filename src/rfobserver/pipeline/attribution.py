@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from rfobserver.processing.ssm import decode_ssm
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -246,6 +248,24 @@ class AttributionWorker:
         while not self._stop:
             item = await self.queue.get()
             now_iso = datetime.now(timezone.utc).isoformat()
+            # Our surrogate smart meters (SSM) send PSK, which rtl_433 cannot
+            # demodulate: try their decoder first; a match is final.
+            try:
+                ssm = await asyncio.to_thread(decode_ssm, item.cs16, item.target_rate_hz)
+            except Exception:
+                logger.exception("ssm decode failed for burst %s", item.burst_id)
+                ssm = None
+            if ssm is not None:
+                await self._emit(
+                    AttributionResult(
+                        item,
+                        "SSM",
+                        None,
+                        json.dumps({"decoded": True, "at": now_iso, "frames": [ssm]}),
+                        "decoded",
+                    )
+                )
+                continue
             try:
                 frames = await asyncio.to_thread(
                     decode_cs16, self._rtl, item.cs16, item.target_rate_hz, item.passes
@@ -271,12 +291,15 @@ class AttributionWorker:
                     json.dumps({"attempted": True, "decoded": False, "at": now_iso}),
                     "not_decoded",
                 )
-            self._count(result.outcome)
-            for sink in self._sinks:
-                try:
-                    await sink(result)
-                except Exception:
-                    logger.exception("attribution sink failed for burst %s", item.burst_id)
+            await self._emit(result)
+
+    async def _emit(self, result: AttributionResult) -> None:
+        self._count(result.outcome)
+        for sink in self._sinks:
+            try:
+                await sink(result)
+            except Exception:
+                logger.exception("attribution sink failed for burst %s", result.item.burst_id)
 
 
 def _protocol_id_for(model: str | None) -> int | None:

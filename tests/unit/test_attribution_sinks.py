@@ -211,3 +211,62 @@ async def test_a_decode_timeout_is_not_decoded_and_the_pass_timeout_is_5s(monkey
             break
     task.cancel()
     assert outcomes == ["not_decoded"] and got[0].outcome == "not_decoded"
+
+
+SSM_FRAME = {
+    "model": "SSM",
+    "src_id": "0200574952470001",
+    "payload": "Hello from Boulder, CO!",
+    "preamble_errors": 0,
+    "bit_errors": 0,
+}
+
+
+async def _run_one(item):
+    got, outcomes = [], []
+
+    async def sink(r):
+        got.append(r)
+
+    q = StrongestQueue(4)
+    w = AttributionWorker(None, "/bin/true", queue=q, sinks=[sink], on_outcome=outcomes.append)
+    q.put_nowait(item)
+    task = asyncio.create_task(w.run())
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if got:
+            break
+    task.cancel()
+    return got, outcomes
+
+
+async def test_ssm_match_skips_rtl433_and_is_a_normal_decoded_result(monkeypatch):
+    monkeypatch.setattr(attr, "decode_ssm", lambda cs16, rate: SSM_FRAME)
+
+    def no_rtl(*a, **k):
+        pytest.fail("rtl_433 must not run for an SSM burst")
+
+    monkeypatch.setattr(attr, "decode_cs16", no_rtl)
+    got, outcomes = await _run_one(_item())
+    r = got[0]
+    assert (r.model, r.protocol_id, r.outcome) == ("SSM", None, "decoded")
+    rec = json.loads(r.attribution)
+    assert rec["decoded"] is True and "at" in rec and rec["frames"] == [SSM_FRAME]
+    assert outcomes == ["decoded"]
+
+
+async def test_no_ssm_match_goes_to_rtl433(monkeypatch):
+    monkeypatch.setattr(attr, "decode_ssm", lambda cs16, rate: None)
+    monkeypatch.setattr(attr, "decode_cs16", lambda *a, **k: [{"model": "SilverSpring-Mesh"}])
+    got, _ = await _run_one(_item())
+    assert (got[0].model, got[0].protocol_id) == ("SilverSpring-Mesh", 383)
+
+
+async def test_ssm_decoder_crash_falls_through_to_rtl433(monkeypatch):
+    def boom(*a):
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(attr, "decode_ssm", boom)
+    monkeypatch.setattr(attr, "decode_cs16", lambda *a, **k: [])
+    got, outcomes = await _run_one(_item())
+    assert got[0].outcome == "not_decoded" and outcomes == ["not_decoded"]

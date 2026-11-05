@@ -143,3 +143,30 @@ The CRC check fails on every hop, including the clean reference file (see below)
 - `..._ssm_freq_sweep_OVF.dat` (same folder) was not analysed.
 - Whether the t = 13.557 s hop was cut by a USB overflow gap (79 ms, 513-bit lag): likely, not
   verified.
+
+## CORRECTION 2026-11-05 (later the same day): "83 hops" counts only the strongest signal
+
+The hop finder in `tools/ssm_analyze.py` follows the single strongest bin each millisecond, so
+the "83 hops in 20 s" above counts one signal per instant, not every SSM burst in the capture.
+The earlier statement that the capture contains 83 SSM bursts is withdrawn; 83 is the number of
+main hops, and 82 of them decoding with 0 errors still stands.
+
+Replaying the first 2 s through RFObserver's own detector (`run_replay`, thresholds 20, 30 and
+40 dB) gave 9, 32 and 29 detections. Besides the main hops (83.1 ms, peak within 3.6 kHz of the
+decoded centre) there are many 81.7 ms bursts at other frequencies. Decoding the ones at
+t = 53 ms (main hop 917.30 MHz):
+
+```
+ 908.1064 t=53 ms dur 82 snr~33 dB  rho 0.956 core err 0 mac 0200574952470001 text b'Hello from Boulder, CO!'
+ 926.5020 t=53 ms dur 82 snr~32 dB  rho 0.956 core err 0 mac 0200574952470001 text b'Hello from Boulder, CO!'
+```
+
+So each hop also appears 9.2 MHz either side at the same time, and the detector also reports its
+image across the 915 MHz RX centre (912.70 MHz for 917.30 MHz). Whether the +-9.2 MHz copies are
+made by the transmitter or the receiver is open.
+
+Detector bandwidths for the main hops were 1 to 26 MHz at every threshold, so RFObserver hands
+them to attribution on the 1.6 MS/s tier, not the 1.0 MS/s tier the SSM's own rate suggests.
+
+Trap: a strongest-bin hop finder hides simultaneous copies; count bursts with the detector the
+product uses.

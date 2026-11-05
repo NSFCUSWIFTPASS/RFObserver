@@ -715,7 +715,7 @@ def test_stop_waits_for_an_in_flight_submit_before_setting_the_stop_event(tmp_pa
             st.stop()
 
 
-async def test_attribution_without_rtl433_keeps_isolation(tmp_path, monkeypatch):
+async def test_attribution_without_rtl433_keeps_isolation_and_ssm(tmp_path, monkeypatch):
     monkeypatch.setattr("rfobserver.pipeline.isolation.find_rtl433", lambda override=None: None)
     s = _settings(ISOLATION_ENABLED=False, ATTRIBUTION_ENABLED=True, STORAGE_PATH=str(tmp_path))
     stage, worker, rtl = build_isolation(
@@ -728,8 +728,29 @@ async def test_attribution_without_rtl433_keeps_isolation(tmp_path, monkeypatch)
         replay_source=None,
         on_label=None,
     )
-    assert stage is not None and worker is None
-    assert "not found" in rtl
+    # The SSM decoder needs no rtl_433, so the worker still runs.
+    assert stage is not None and worker is not None and worker._rtl is None
+    assert "not found" in rtl and "SSM only" in rtl
+
+
+async def test_the_worker_reads_the_decoder_switches_from_settings(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "rfobserver.pipeline.isolation.find_rtl433", lambda override=None: "/bin/true"
+    )
+    s = _settings(ATTRIBUTION_ENABLED=True, ATTRIBUTION_DECODERS="ssm,rtl433")
+    _, worker, _ = build_isolation(
+        s,
+        database=object(),
+        storage_path=str(tmp_path),
+        loop=asyncio.get_running_loop(),
+        module_feed=None,
+        refuse_saving=lambda: False,
+        replay_source=None,
+        on_label=None,
+    )
+    assert worker._decoders() == {"ssm", "rtl433"}
+    object.__setattr__(s, "ATTRIBUTION_DECODERS", "ssnmesh")
+    assert worker._decoders() == {"ssnmesh"}
 
 
 async def test_nothing_is_built_when_both_switches_are_off(tmp_path):

@@ -12,7 +12,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -25,6 +25,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _KNOWN_BUILD = os.path.expanduser("~/rtl_433_build/build/src/rtl_433")
+
+# Decoders that can be switched on and off one at a time (ATTRIBUTION_DECODERS):
+# our SSM decoder, rtl_433's SilverSpring-Mesh protocol (-R 383), the
+# ssnmesh-like flex decoder (-X), and rtl_433's default set run on narrow bursts.
+ALL_DECODERS = ("ssm", "silverspring", "ssnmesh", "rtl433")
+
+
+def parse_decoders(value: str) -> frozenset[str]:
+    """The enabled decoders in a comma-separated list; unknown names are ignored."""
+    names = (part.strip().lower() for part in value.split(","))
+    return frozenset(n for n in names if n in ALL_DECODERS)
+
+
+def _pass_decoder(extra: list[str]) -> str:
+    """Which decoder an rtl_433 pass (its argument list) belongs to."""
+    if "-X" in extra:
+        return "ssnmesh"
+    if "-R" in extra:
+        return "silverspring"
+    return "rtl433"
+
+
+def _model_decoder(model: str | None) -> str:
+    """Which decoder a decoded model name belongs to."""
+    return {"SSM": "ssm", "SilverSpring-Mesh": "silverspring", "ssnmesh-like": "ssnmesh"}.get(
+        model or "", "rtl433"
+    )
+
+
+def _enabled_frames(frames: Iterable[dict], enabled: frozenset[str]) -> list[dict]:
+    return [f for f in frames if _model_decoder(f.get("model")) in enabled]
 
 
 def find_rtl433(override: str | None = None) -> str | None:
@@ -206,18 +237,25 @@ class StrongestQueue:
 
 class AttributionWorker:
     """Drains the queue, decodes each burst off the event loop, and merges the
-    result onto its detections row (three-state: decoded / attempted-not-decoded)."""
+    result onto its detections row (three-state: decoded / attempted-not-decoded).
+
+    ``decoders`` returns the enabled decoders; it is read for every burst, so a
+    change on the Config page applies to the next one. A burst that no enabled
+    decoder applies to is counted as skipped and its row is left alone. Without
+    rtl_433 (``rtl_path`` None) only the SSM decoder runs."""
 
     def __init__(
         self,
         database: Any,
-        rtl_path: str,
+        rtl_path: str | None,
         queue: StrongestQueue | None = None,
         sinks: list[Sink] | None = None,
         on_outcome: Callable[[str], None] | None = None,
+        decoders: Callable[[], frozenset[str]] | None = None,
     ) -> None:
         self._db = database
         self._rtl = rtl_path
+        self._decoders = decoders or (lambda: frozenset(ALL_DECODERS))
         self.queue = queue if queue is not None else StrongestQueue(maxsize=64)
         self._sinks = sinks if sinks is not None else [db_sink(database)]
         self._on_outcome = on_outcome
@@ -248,31 +286,47 @@ class AttributionWorker:
         while not self._stop:
             item = await self.queue.get()
             now_iso = datetime.now(timezone.utc).isoformat()
+            enabled = self._decoders()
+            attempted = False
             # Our surrogate smart meters (SSM) send PSK, which rtl_433 cannot
             # demodulate: try their decoder first; a match is final.
-            try:
-                ssm = await asyncio.to_thread(decode_ssm, item.cs16, item.target_rate_hz)
-            except Exception:
-                logger.exception("ssm decode failed for burst %s", item.burst_id)
-                ssm = None
-            if ssm is not None:
-                await self._emit(
-                    AttributionResult(
-                        item,
-                        "SSM",
-                        None,
-                        json.dumps({"decoded": True, "at": now_iso, "frames": [ssm]}),
-                        "decoded",
+            if "ssm" in enabled:
+                attempted = True
+                try:
+                    ssm = await asyncio.to_thread(decode_ssm, item.cs16, item.target_rate_hz)
+                except Exception:
+                    logger.exception("ssm decode failed for burst %s", item.burst_id)
+                    ssm = None
+                if ssm is not None:
+                    await self._emit(
+                        AttributionResult(
+                            item,
+                            "SSM",
+                            None,
+                            json.dumps({"decoded": True, "at": now_iso, "frames": [ssm]}),
+                            "decoded",
+                        )
                     )
-                )
-                continue
-            try:
-                frames = await asyncio.to_thread(
-                    decode_cs16, self._rtl, item.cs16, item.target_rate_hz, item.passes
-                )
-            except Exception:
-                logger.exception("rtl_433 decode failed for burst %s", item.burst_id)
-                self._count("failed")
+                    continue
+            rtl = self._rtl
+            passes = (
+                [p for p in item.passes if _pass_decoder(p) in enabled] if rtl is not None else []
+            )
+            frames: list[dict] = []
+            if rtl is not None and passes:
+                attempted = True
+                try:
+                    frames = await asyncio.to_thread(
+                        decode_cs16, rtl, item.cs16, item.target_rate_hz, passes
+                    )
+                except Exception:
+                    logger.exception("rtl_433 decode failed for burst %s", item.burst_id)
+                    self._count("failed")
+                    continue
+                # rtl_433's default set can also decode a model switched off here.
+                frames = _enabled_frames(frames, enabled)
+            if not attempted:
+                self._count("skipped")
                 continue
             if frames:
                 model = frames[0].get("model")

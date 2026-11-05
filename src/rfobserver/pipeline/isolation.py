@@ -29,6 +29,7 @@ from rfobserver.pipeline.attribution import (
     StrongestQueue,
     db_sink,
     find_rtl433,
+    parse_decoders,
 )
 from rfobserver.processing.isolate import (
     BurstRange,
@@ -567,7 +568,7 @@ def build_isolation(
     replay_source: str | None,
     on_label: Callable[[AttributionResult], None] | None,
 ) -> tuple[IsolationStage | None, AttributionWorker | None, str | None]:
-    """Build the stage (and the rtl_433 worker when attribution is on).
+    """Build the stage (and the attribution worker when attribution is on).
 
     Attribution forces isolation on. In replay, burst files go to
     ``bursts/replay-<stem>/`` and results to its ``attribution.jsonl``, never
@@ -589,18 +590,19 @@ def build_isolation(
     if settings.ATTRIBUTION_ENABLED:
         rtl = find_rtl433(settings.ATTRIBUTION_RTL433_PATH or None)
         if rtl is None:
-            rtl_status = "rtl_433 not found; attribution unavailable"
+            # The SSM decoder needs no rtl_433, so attribution still runs.
+            rtl_status = "rtl_433 not found; SSM only"
             logger.warning("ATTRIBUTION_ENABLED but %s", rtl_status)
         else:
             rtl_status = rtl
-            if subdir is not None:
-                sinks.append(ReplayFileSink(archive.root / subdir / "attribution.jsonl"))
-            else:
-                sinks.append(db_sink(database))
-            if on_label is not None:
-                sinks.append(_make_label_sink(on_label))
-            q = StrongestQueue(maxsize=max(1, settings.ISOLATION_QUEUE_MAX))
-            handoff = _make_attribution_handoff(q, loop)
+        if subdir is not None:
+            sinks.append(ReplayFileSink(archive.root / subdir / "attribution.jsonl"))
+        else:
+            sinks.append(db_sink(database))
+        if on_label is not None:
+            sinks.append(_make_label_sink(on_label))
+        q = StrongestQueue(maxsize=max(1, settings.ISOLATION_QUEUE_MAX))
+        handoff = _make_attribution_handoff(q, loop)
 
     stage = IsolationStage(
         settings,
@@ -612,12 +614,13 @@ def build_isolation(
     )
 
     worker: AttributionWorker | None = None
-    if q is not None and rtl is not None:
+    if q is not None:
         worker = AttributionWorker(
             database,
             rtl,
             queue=q,
             sinks=sinks,
             on_outcome=lambda outcome: stage.stats.count(f"attr_{outcome}"),
+            decoders=lambda: parse_decoders(settings.ATTRIBUTION_DECODERS),
         )
     return stage, worker, rtl_status

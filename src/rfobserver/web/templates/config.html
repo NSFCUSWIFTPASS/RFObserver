@@ -358,7 +358,34 @@
                         <span class="toggle-text">Attribution</span>
                     </label>
                     <span style="font-size: 10px; color: var(--text-secondary); margin-top: 2px; display: block;">Applies at next start (turn Sensor Active off and on).</span>
-                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Decode isolated bursts with rtl_433 and label the detection (turns isolation on).</span>
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Decode isolated bursts (our SSM decoder, then rtl_433) and label the detection (turns isolation on).</span>
+                </div>
+            </div>
+            {% set enabled_decoders = settings.ATTRIBUTION_DECODERS.replace(' ', '').lower().split(',') %}
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Decoders</label>
+                    <input type="hidden" id="attribution-decoders" name="attribution_decoders" value="{{ settings.ATTRIBUTION_DECODERS }}">
+                    <ul class="check-list" id="decoder-list">
+                        {% for key, title, detail in [
+                            ('ssm', 'SSM', 'Surrogate smart meters (DBPSK), matched on their MAC and text'),
+                            ('silverspring', 'SilverSpring-Mesh', 'rtl_433 protocol 383 on wide bursts'),
+                            ('ssnmesh', 'ssnmesh-like', 'rtl_433 flex decoder for SSN mesh framing'),
+                            ('rtl433', 'Other rtl_433 devices', 'rtl_433 default protocols on narrow bursts'),
+                        ] %}
+                        <li>
+                            <label class="check-row">
+                                <input type="checkbox" data-decoder="{{ key }}"{% if key in enabled_decoders %} checked{% endif %}>
+                                <span class="check-row-text">
+                                    <span class="check-row-title">{{ title }}</span>
+                                    <span class="check-row-detail">{{ detail }}</span>
+                                </span>
+                                <svg class="check-row-mark" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5l3 3 6-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            </label>
+                        </li>
+                        {% endfor %}
+                    </ul>
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 4px; display: block;">Unchecked decoders are not run. Applies to the next burst; labels already stored stay.</span>
                 </div>
             </div>
             <div class="form-row">
@@ -513,6 +540,17 @@
         });
     }
     snapshotChecks();
+
+    // The decoder checklist is sent as one comma-separated value through its
+    // hidden input, so the FormData comparison below sees every change.
+    const decoderInput = document.getElementById('attribution-decoders');
+    document.querySelectorAll('#decoder-list input[data-decoder]').forEach(el => {
+        el.addEventListener('change', () => {
+            decoderInput.value = Array.from(document.querySelectorAll('#decoder-list input[data-decoder]'))
+                .filter(c => c.checked).map(c => c.dataset.decoder).join(',');
+            refreshDirty();
+        });
+    });
 
     function hasChanges() {
         for (const id of boolIds) {
@@ -1047,6 +1085,7 @@ const ISOLATION_COUNT_LABELS = [
     ['module_error', 'Module errors'], ['handoff_error', 'Handoff errors'],
     ['attr_decoded', 'Decoded'], ['attr_not_decoded', 'Not decoded'],
     ['attr_failed', 'Decode failed'], ['attr_dropped', 'Dropped (attribution)'],
+    ['attr_skipped', 'Skipped (decoders off)'],
 ];
 function renderIsolation(iso) {
     const state = document.getElementById('isolation-state');

@@ -10,15 +10,31 @@ default:
   `RFOBS_ISOLATION_MAX_PER_SEC` (20) are taken per second, strongest first, and
   only the first `RFOBS_ISOLATION_MAX_BURST_SEC` (0.5) of a longer burst is kept.
 - **Attribution** (`RFOBS_ATTRIBUTION_ENABLED`): isolated bursts are decoded
-  with rtl_433 and the `model`, `protocol_id` and `attribution` are written
-  onto the detection. The live waterfall labels decoded bursts with the model.
-  Turning attribution on turns isolation on.
+  (our SSM decoder first, then rtl_433) and the `model`, `protocol_id` and
+  `attribution` are written onto the detection. The live waterfall labels
+  decoded bursts with the model. Turning attribution on turns isolation on.
+
+Each decoder can be switched off on its own in the **Decoders** checklist
+under Attribution (`RFOBS_ATTRIBUTION_DECODERS`, comma-separated, all four by
+default). A switched-off decoder is not run, and the change applies to the next
+burst without a restart:
+
+| Name | Decoder |
+|---|---|
+| `ssm` | our surrogate smart meter (DBPSK) decoder, model `SSM` |
+| `silverspring` | rtl_433 SilverSpring-Mesh (`-R 383`) on wide bursts |
+| `ssnmesh` | rtl_433 `ssnmesh-like` flex decoder on wide bursts |
+| `rtl433` | rtl_433's default protocols on narrow bursts |
+
+A model from a switched-off decoder is never written as a label, even when
+rtl_433's default set decodes it. A burst no enabled decoder applies to is
+counted as "Skipped (decoders off)" and its detection gets no attribution.
 
 Attribution needs rtl_433 built from master (the SilverSpring-Mesh decoder is
 protocol 383, not in a release yet). The sensor looks for
 `RFOBS_ATTRIBUTION_RTL433_PATH`, then `$RTL433`, then
 `~/rtl_433_build/build/src/rtl_433`, then `rtl_433` on `PATH`. If none is
-found, attribution stays off with a warning and isolation still runs.
+found, only the SSM decoder runs (with a warning) and isolation still runs.
 
 To install it, run `sudo ./deploy/install_rtl433.sh` from the repo root
 (`deploy/install.sh` runs it too; set `RFOBS_SKIP_RTL433=1` to skip). It builds

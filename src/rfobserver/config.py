@@ -241,6 +241,11 @@ class AppSettings(BaseSettings):
     # detection). Turning it on forces isolation on. Off by default.
     ATTRIBUTION_ENABLED: bool = False
     ATTRIBUTION_RTL433_PATH: str = ""  # "" -> auto-discover via find_rtl433
+    # Decoders tried on each isolated burst, comma-separated; any left out is
+    # not run: ssm (our surrogate smart meters), silverspring (rtl_433
+    # SilverSpring-Mesh), ssnmesh (the ssnmesh-like flex decoder), rtl433
+    # (rtl_433's default set, on narrow bursts). Read for every burst.
+    ATTRIBUTION_DECODERS: str = "ssm,silverspring,ssnmesh,rtl433"
     # While isolation is on, the IQ ring keeps at least this many seconds so a
     # burst's samples are still there when detection completes. Live bursts
     # reach isolation 0.5-1.3 s after they start (the rolling detector emits a

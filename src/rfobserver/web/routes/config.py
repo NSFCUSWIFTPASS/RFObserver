@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import SecretStr
 
 from rfobserver.capture.rtlsdr_receiver import valid_rate as rtlsdr_valid_rate
+from rfobserver.pipeline.attribution import ALL_DECODERS
 from rfobserver.processing import psd_cuda
 from rfobserver.processing.spectral import PSD_BACKENDS
 from rfobserver.web.uiprefs import ui_theme
@@ -142,6 +143,8 @@ async def apply_config(request: Request) -> dict[str, Any]:
         # Burst isolation and attribution
         "isolation_enabled": ("ISOLATION_ENABLED", _to_bool),
         "attribution_enabled": ("ATTRIBUTION_ENABLED", _to_bool),
+        # Read by the attribution worker for every burst, so no reconfigure.
+        "attribution_decoders": ("ATTRIBUTION_DECODERS", str),
         "isolation_snr_db": ("ISOLATION_SNR_DB", float),
         "isolation_max_per_sec": ("ISOLATION_MAX_PER_SEC", int),
         "isolation_lookback_sec": ("ISOLATION_LOOKBACK_SEC", float),
@@ -246,6 +249,17 @@ async def apply_config(request: Request) -> dict[str, Any]:
                     status_code=400,
                     detail=f"Bandwidth is in Hz: {new_val} Hz is too low (e.g. 250e3, 56e6)",
                 )
+
+        if attr == "ATTRIBUTION_DECODERS" and isinstance(new_val, str):
+            names = [n.strip().lower() for n in new_val.split(",") if n.strip()]
+            unknown = [n for n in names if n not in ALL_DECODERS]
+            if unknown:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown attribution decoder: {', '.join(unknown)} "
+                    f"(known: {', '.join(ALL_DECODERS)})",
+                )
+            new_val = ",".join(d for d in ALL_DECODERS if d in names)
 
         # Validate FFT bins: must be a power of 2 in [256, 8192]
         if attr == "NUM_FFT_BINS":

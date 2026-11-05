@@ -348,6 +348,43 @@ class TestConfigApply:
             assert resp.status_code == 200
             assert bins == settings.NUM_FFT_BINS
 
+    def test_apply_attribution_decoders_is_live_and_normalized(
+        self, client_with_processor, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)  # the apply writes .env in the working directory
+        client, settings, processor = client_with_processor
+        resp = client.post("/config/apply", json={"attribution_decoders": " SSM,rtl433 "})
+        assert resp.status_code == 200
+        assert settings.ATTRIBUTION_DECODERS == "ssm,rtl433"
+        processor.reconfigure.assert_not_called()  # the worker reads it per burst
+
+    def test_apply_attribution_decoders_all_off(self, client_with_processor, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)  # the apply writes .env in the working directory
+        client, settings, _ = client_with_processor
+        resp = client.post("/config/apply", json={"attribution_decoders": ""})
+        assert resp.status_code == 200
+        assert settings.ATTRIBUTION_DECODERS == ""
+
+    def test_apply_attribution_decoders_rejects_unknown_names(
+        self, client_with_processor, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)  # the apply writes .env in the working directory
+        client, settings, _ = client_with_processor
+        before = settings.ATTRIBUTION_DECODERS
+        resp = client.post("/config/apply", json={"attribution_decoders": "ssm,bogus"})
+        assert resp.status_code == 400
+        assert "bogus" in resp.json()["detail"]
+        assert before == settings.ATTRIBUTION_DECODERS
+
+    def test_config_page_lists_the_decoders_with_their_state(self, client_with_processor):
+        client, settings, _ = client_with_processor
+        object.__setattr__(settings, "ATTRIBUTION_DECODERS", "ssm,silverspring")
+        html = client.get("/config").text
+        for name in ("ssm", "silverspring", "ssnmesh", "rtl433"):
+            assert f'data-decoder="{name}"' in html
+        assert 'data-decoder="ssm" checked' in html
+        assert 'data-decoder="ssnmesh" checked' not in html
+
     def test_apply_num_fft_bins_invalid(self, client_with_processor):
         client, settings, _ = client_with_processor
         original = settings.NUM_FFT_BINS

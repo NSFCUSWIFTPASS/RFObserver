@@ -36,6 +36,7 @@ def psd_kwargs():
         hostname="jetson-test",
         monitor_id="mon-1",
         monitor_name="Test Monitor",
+        metric_id="9ef90ba1-0307-4d5d-9734-42f80d094839",
     )
 
 
@@ -72,6 +73,12 @@ class TestCreateSigMFMetadata:
         assert values[0]["tags"]["name"] == "Zone 0"
         assert values[0]["fields"]["mean"] == -110.0
         assert values[0]["fields"]["max"] == -100.0
+        assert values[0]["metric_id"] == "9ef90ba1-0307-4d5d-9734-42f80d094839"
+
+    def test_empty_metric_id_is_refused(self, psd_kwargs):
+        # DST parses metric_id as a UUID: "" rejects the whole observation.
+        with pytest.raises(ValueError):
+            create_sigmf_metadata(**{**psd_kwargs, "metric_id": ""})
 
     def test_zones_add_extra_values(self, psd_kwargs):
         zones = [

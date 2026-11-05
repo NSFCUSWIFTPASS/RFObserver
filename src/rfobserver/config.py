@@ -16,10 +16,12 @@ class ZmsSettingsGroup:
     identity_http: str
     token: str
     monitor_id: str
+    # DST metric the per-zone values are filed under. Required: DST rejects
+    # an observation whose values carry no metric id.
+    metric_id: str
     monitor_name: str = "RFObserver"
     dst_http: str | None = None
     monitor_schema_path: str | None = None
-    metric_id: str | None = None
 
     @property
     def dst_or_zmc(self) -> str:
@@ -335,11 +337,30 @@ class AppSettings(BaseSettings):
             object.__setattr__(self, "DB_RETENTION_DAYS", self.HISTORY_DAYS)
         return self
 
+    @property
+    def zms_missing(self) -> list[str]:
+        """The required ZMS env vars that are unset, in the order they are
+        listed on the Config page."""
+        required = (
+            ("RFOBS_ZMS_ZMC_HTTP", self.ZMS_ZMC_HTTP),
+            ("RFOBS_ZMS_IDENTITY_HTTP", self.ZMS_IDENTITY_HTTP),
+            ("RFOBS_ZMS_TOKEN", self.ZMS_TOKEN),
+            ("RFOBS_ZMS_MONITOR_ID", self.ZMS_MONITOR_ID),
+            ("RFOBS_ZMS_METRIC_ID", self.ZMS_METRIC_ID),
+        )
+        return [name for name, value in required if not value]
+
     @computed_field  # type: ignore[prop-decorator]
     @property
     def zms(self) -> ZmsSettingsGroup | None:
         """Constructs ZMS settings if all required env vars are set."""
-        if self.ZMS_ZMC_HTTP and self.ZMS_IDENTITY_HTTP and self.ZMS_TOKEN and self.ZMS_MONITOR_ID:
+        if (
+            self.ZMS_ZMC_HTTP
+            and self.ZMS_IDENTITY_HTTP
+            and self.ZMS_TOKEN
+            and self.ZMS_MONITOR_ID
+            and self.ZMS_METRIC_ID
+        ):
             return ZmsSettingsGroup(
                 zmc_http=self.ZMS_ZMC_HTTP,
                 dst_http=self.ZMS_DST_HTTP,

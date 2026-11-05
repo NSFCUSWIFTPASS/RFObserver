@@ -870,6 +870,11 @@ class TestZmsAPI:
         assert data["enabled"] is False
         assert "connected" in data
 
+    def test_zms_status_lists_missing_fields(self, client):
+        # The Config page shows why ZMS cannot be enabled.
+        data = client.get("/api/zms/status").json()
+        assert "RFOBS_ZMS_METRIC_ID" in data["missing"]
+
     def test_zms_status_with_processor(self, client_with_processor):
         client, _, processor = client_with_processor
         processor._zms_monitor = None
@@ -881,8 +886,9 @@ class TestZmsAPI:
         client, settings, _ = client_with_processor
         resp = client.post("/api/zms/enable")
         assert resp.status_code == 200
-        # Settings incomplete (no ZMS fields set), should error
+        # Settings incomplete (no ZMS fields set), should error and say what
         assert resp.json()["status"] == "error"
+        assert "RFOBS_ZMS_METRIC_ID" in resp.json()["detail"]
 
     def test_zms_disable(self, client_with_processor):
         client, _, processor = client_with_processor
@@ -897,6 +903,7 @@ class TestZmsAPI:
         assert "OpenZMS" in resp.text
         assert "zms-toggle" in resp.text
         assert "zms-zmc" in resp.text
+        assert 'name="zms_metric_id"' in resp.text
 
     def test_apply_zms_fields(self, client_with_processor):
         client, settings, _ = client_with_processor
@@ -905,12 +912,14 @@ class TestZmsAPI:
             json={
                 "zms_zmc_http": "http://zmc.test",
                 "zms_monitor_id": "mon-1",
+                "zms_metric_id": "met-1",
             },
         )
         assert resp.status_code == 200
         changed = resp.json()["changed"]
         assert "ZMS_ZMC_HTTP" in changed
         assert "ZMS_MONITOR_ID" in changed
+        assert "ZMS_METRIC_ID" in changed
 
 
 # -- Detections fragment (SDR capture-context filtering) --

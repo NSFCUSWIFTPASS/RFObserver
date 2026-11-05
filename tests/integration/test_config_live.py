@@ -138,6 +138,7 @@ _CONFIG_FIELDS: list[tuple[str, Any, str]] = [
     ("zms_dst_http", "http://localhost:9220/v1", "ZMS_DST_HTTP"),
     ("zms_identity_http", "http://localhost:9200/v1", "ZMS_IDENTITY_HTTP"),
     ("zms_monitor_id", "00000000-0000-0000-0000-000000000001", "ZMS_MONITOR_ID"),
+    ("zms_metric_id", "00000000-0000-0000-0000-000000000002", "ZMS_METRIC_ID"),
     ("zms_monitor_name", "test-monitor", "ZMS_MONITOR_NAME"),
 ]
 
@@ -243,6 +244,7 @@ async def test_zms_enable_disable_status_round_trip(
     object.__setattr__(settings, "ZMS_IDENTITY_HTTP", "http://test/v1")
     object.__setattr__(settings, "ZMS_TOKEN", SecretStr("t"))
     object.__setattr__(settings, "ZMS_MONITOR_ID", "00000000-0000-0000-0000-000000000001")
+    object.__setattr__(settings, "ZMS_METRIC_ID", "00000000-0000-0000-0000-000000000002")
 
     async def noop_async(*_a: Any, **_kw: Any) -> None:
         return None

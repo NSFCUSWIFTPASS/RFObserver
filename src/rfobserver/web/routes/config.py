@@ -161,6 +161,7 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "zms_dst_http": ("ZMS_DST_HTTP", str),
         "zms_identity_http": ("ZMS_IDENTITY_HTTP", str),
         "zms_monitor_id": ("ZMS_MONITOR_ID", str),
+        "zms_metric_id": ("ZMS_METRIC_ID", str),
         "zms_monitor_name": ("ZMS_MONITOR_NAME", str),
     }
 

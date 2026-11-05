@@ -115,9 +115,11 @@ def test_zms_constructed_when_complete():
         ZMS_IDENTITY_HTTP="http://id.test",
         ZMS_TOKEN="secret-token",
         ZMS_MONITOR_ID="mon-1",
+        ZMS_METRIC_ID="met-1",
         _env_file=None,
     )
     assert settings.zms is not None
+    assert settings.zms.metric_id == "met-1"
     assert settings.zms.monitor_id == "mon-1"
     assert settings.zms.token == "secret-token"
     assert settings.zms.dst_or_zmc == "http://zmc.test"
@@ -130,9 +132,35 @@ def test_zms_with_dst_http():
         ZMS_IDENTITY_HTTP="http://id.test",
         ZMS_TOKEN="tok",
         ZMS_MONITOR_ID="m1",
+        ZMS_METRIC_ID="met-1",
         _env_file=None,
     )
+    assert settings.zms is not None
     assert settings.zms.dst_or_zmc == "http://dst.test"
+
+
+def test_zms_requires_metric_id():
+    # DST rejects every observation whose values carry no metric id, so ZMS
+    # is not configured without one.
+    settings = AppSettings(
+        ZMS_ZMC_HTTP="http://zmc.test",
+        ZMS_IDENTITY_HTTP="http://id.test",
+        ZMS_TOKEN="tok",
+        ZMS_MONITOR_ID="m1",
+        _env_file=None,
+    )
+    assert settings.zms is None
+    assert settings.zms_missing == ["RFOBS_ZMS_METRIC_ID"]
+
+
+def test_zms_missing_lists_every_unset_field():
+    assert AppSettings(_env_file=None).zms_missing == [
+        "RFOBS_ZMS_ZMC_HTTP",
+        "RFOBS_ZMS_IDENTITY_HTTP",
+        "RFOBS_ZMS_TOKEN",
+        "RFOBS_ZMS_MONITOR_ID",
+        "RFOBS_ZMS_METRIC_ID",
+    ]
 
 
 def test_rfdb_none_when_incomplete():

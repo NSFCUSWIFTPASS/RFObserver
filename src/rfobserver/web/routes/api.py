@@ -667,6 +667,7 @@ def build_zms_status_payload(settings: Any, proc: Any) -> dict[str, Any]:
             "message_count": 0,
             "last_sent": None,
             "monitor_id": settings.ZMS_MONITOR_ID,
+            "missing": settings.zms_missing,
         }
     return {
         "enabled": enabled,
@@ -674,6 +675,7 @@ def build_zms_status_payload(settings: Any, proc: Any) -> dict[str, Any]:
         "message_count": zms.message_count,
         "last_sent": f"{zms.message_count} observations sent",
         "monitor_id": settings.ZMS_MONITOR_ID,
+        "missing": settings.zms_missing,
         "op_status": getattr(zms, "_op_status", "unknown"),
     }
 
@@ -696,7 +698,8 @@ async def zms_enable(request: Request) -> dict[str, Any]:
         return {"status": "error", "detail": "Pipeline not running"}
 
     if settings.zms is None:
-        return {"status": "error", "detail": "ZMS settings incomplete"}
+        missing = ", ".join(settings.zms_missing)
+        return {"status": "error", "detail": f"ZMS settings incomplete: missing {missing}"}
 
     if getattr(proc, "_zms_monitor", None) is None:
         from rfobserver.zms.monitor import ZmsMonitor

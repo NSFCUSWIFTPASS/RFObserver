@@ -264,6 +264,8 @@ async def run(settings: AppSettings) -> None:
         zms_monitor = ZmsMonitor(settings.zms)
         await zms_monitor.start()
         logger.info("ZMS monitor enabled (id=%s)", settings.zms.monitor_id)
+    elif settings.ZMS_ENABLED:
+        logger.warning("ZMS enabled but not started: missing %s", ", ".join(settings.zms_missing))
 
     # The receiver and processor are built lazily by the supervisor when the
     # sensor is activated, so a Standby start never claims the SDR.

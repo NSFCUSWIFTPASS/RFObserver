@@ -25,6 +25,7 @@ def zms_settings():
         identity_http="http://identity.test",
         token="tok-123",
         monitor_id="mon-1",
+        metric_id="met-1",
         monitor_name="Test Monitor",
         dst_http="http://dst.test",
     )
@@ -177,5 +178,6 @@ class TestZmsMonitor:
             identity_http="http://id.test",
             token="tok",
             monitor_id="m1",
+            metric_id="met-1",
         )
         assert s.dst_or_zmc == "http://zmc.test"

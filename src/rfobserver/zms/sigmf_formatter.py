@@ -30,7 +30,7 @@ def create_sigmf_metadata(
     hostname: str,
     monitor_id: str,
     monitor_name: str,
-    metric_id: str | None = None,
+    metric_id: str,
     time_kurtosis: float = 0.0,
     pwr_avg: float = 0.0,
     pwr_max: float = 0.0,
@@ -40,6 +40,9 @@ def create_sigmf_metadata(
     zones: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a SigMF metadata dictionary for a PSD observation."""
+    if not metric_id:
+        # DST parses metric_id as a UUID; an empty one rejects the observation.
+        raise ValueError("metric_id is required for OpenZMS values")
     num_bins = len(psd_powers)
     min_freq_hz = int(min(psd_frequencies))
     max_freq_hz = int(max(psd_frequencies))
@@ -143,7 +146,7 @@ def create_sigmf_metadata(
 
     values: list[dict[str, Any]] = [
         {
-            "metric_id": metric_id or "",
+            "metric_id": metric_id,
             "monitor_id": monitor_id,
             "fields": {
                 "kurtosis": time_kurtosis,
@@ -165,7 +168,7 @@ def create_sigmf_metadata(
             actual_min, actual_max = zone_bin_ranges[i]
             values.append(
                 {
-                    "metric_id": metric_id or "",
+                    "metric_id": metric_id,
                     "monitor_id": monitor_id,
                     "fields": {"kurtosis": time_kurtosis},
                     "tags": {
@@ -234,7 +237,7 @@ def create_sigmf_archive(
     hostname: str,
     monitor_id: str,
     monitor_name: str,
-    metric_id: str | None = None,
+    metric_id: str,
     time_kurtosis: float = 0.0,
     pwr_avg: float = 0.0,
     pwr_max: float = 0.0,

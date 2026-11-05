@@ -437,6 +437,10 @@
                     <label for="zms-monitor-id">Monitor ID</label>
                     <input type="text" id="zms-monitor-id" name="zms_monitor_id" value="{{ settings.ZMS_MONITOR_ID or '' }}">
                 </div>
+                <div class="form-group">
+                    <label for="zms-metric-id" title="DST metric the per-zone values are filed under (required)">Metric ID</label>
+                    <input type="text" id="zms-metric-id" name="zms_metric_id" value="{{ settings.ZMS_METRIC_ID or '' }}">
+                </div>
             </div>
             <div class="form-row">
                 <div class="form-group">
@@ -681,6 +685,11 @@
         if (d.enabled) {
             el.textContent = d.last_sent || 'enabled';
             el.style.color = d.connected ? '#34c759' : '#ff9f0a';
+        } else if (d.missing && d.missing.length) {
+            // Required fields unset: ZMS cannot be enabled until they are.
+            const names = d.missing.map(n => n.replace('RFOBS_ZMS_', '').replace(/_/g, ' ').toLowerCase());
+            el.textContent = 'Missing: ' + names.join(', ');
+            el.style.color = '#ff9f0a';
         } else {
             el.textContent = 'disabled';
             el.style.color = '';
@@ -721,7 +730,14 @@
     const zmsToggle = document.getElementById('zms-toggle');
     zmsToggle.addEventListener('change', async function() {
         const endpoint = this.checked ? '/api/zms/enable' : '/api/zms/disable';
-        await fetch(endpoint, {method: 'POST'});
+        const r = await fetch(endpoint, {method: 'POST'});
+        const d = await r.json().catch(() => ({}));
+        if (d.status === 'error') {
+            // Enabling refused (e.g. a required field is missing): say why.
+            this.checked = false;
+            document.getElementById('zms-status').textContent = d.detail || 'Could not enable';
+            return;
+        }
         pollStatus();
     });
 

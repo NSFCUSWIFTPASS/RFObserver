@@ -3,10 +3,15 @@ isolation tiers, with offset, noise, cuts, and signals that are not SSM."""
 
 from __future__ import annotations
 
+import gzip
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from rfobserver.processing.ssm import decode_ssm, frame_bits, modulate
+
+FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 
 KNOWN = {
     "model": "SSM",
@@ -121,6 +126,15 @@ def test_frame_after_30ms_of_noise() -> None:
     lead = _noise(30_000, p / 100, np.random.default_rng(3))
     f = decode_ssm(_cs16(np.concatenate([lead, iq])), 1_000_000)
     assert f is not None and f["bit_errors"] == 0
+
+
+def test_real_hcro_hop() -> None:
+    """One hop from iq_capture_hcro-rpi-002_2025-12-12T19-33-52.92Z_915MHz_26.0Msps_
+    20.0s_35dB_ssm_fhss_OVF.dat (ci16, 26 MS/s at 915 MHz): samples from 47 ms to
+    140 ms, through channelize_to_cs16 at the detector's peak_freq_hz 917.2979 MHz
+    to the 1.6 MS/s tier, gzipped."""
+    data = gzip.decompress((FIXTURES / "ssm_hop_917MHz_1600k.cs16.gz").read_bytes())
+    assert decode_ssm(data, 1_600_000) == KNOWN
 
 
 @pytest.mark.parametrize("n", [0, 1, 400])

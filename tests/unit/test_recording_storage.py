@@ -832,12 +832,13 @@ def test_an_abandoned_writer_flags_its_capture_and_warns_when_it_exits(
     assert writer is not None and writer.is_alive()
 
     meta = json.loads(sc16.with_suffix(".json").read_text())
-    expected = (
-        "writer timeout: the file writer did not finish within 0.3 s; the .sc16 may "
-        "be incomplete or keep growing after this metadata was written"
-    )
     assert meta["write_failed"] is True
-    assert meta["write_error"] == expected
+    assert meta["write_error"].startswith(
+        "writer timeout: the file writer made no progress for 0.3 s (blocked in write for "
+    )
+    assert meta["write_error"].endswith(
+        "the .sc16 may be incomplete or keep growing after this metadata was written"
+    )
     assert meta["stopped_reason"] == "manual"
     err = gov.state.last_write_error
     assert err is not None and sc16.name in err["error"] and "writer timeout" in err["error"]
@@ -855,14 +856,182 @@ def test_an_abandoned_writer_flags_its_capture_and_warns_when_it_exits(
     assert str(size) in warned[0].message
 
 
-def test_abandoned_writer_default_message_names_the_shipped_timeout():
+def test_abandoned_writer_default_message_names_the_shipped_limits():
     from rfobserver.pipeline import streaming
 
     assert streaming._WRITER_JOIN_TIMEOUT_SEC == 10.0
-    assert streaming._writer_timeout_error() == (
-        "writer timeout: the file writer did not finish within 10 s; the .sc16 may "
-        "be incomplete or keep growing after this metadata was written"
+    assert streaming._WRITER_MAX_WAIT_SEC == 60.0
+    assert streaming._writer_timeout_error("made no progress for 10 s", "write", 12.34) == (
+        "writer timeout: the file writer made no progress for 10 s (blocked in write for "
+        "12.3 s); the .sc16 may be incomplete or keep growing after this metadata was written"
     )
+
+
+# --- 2026-11-06, hcro-jet-001: a slow writer is waited for, a late one fixed up ---
+
+
+class _PacedFile:
+    """A .sc16 whose every write takes ``delay`` seconds: a slow volume that
+    still makes progress."""
+
+    def __init__(self, real, delay) -> None:
+        self.real, self.delay = real, delay
+
+    def write(self, data) -> int:
+        time.sleep(self.delay)
+        return self.real.write(data)
+
+    def close(self) -> None:
+        self.real.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+def _patch_sc16(monkeypatch, wrap):
+    import builtins
+
+    real_open = builtins.open
+
+    def fake_open(path, mode="r", *a, **k):
+        f = real_open(path, mode, *a, **k)
+        if str(path).endswith(".sc16") and "w" in mode:
+            return wrap(f)
+        return f
+
+    monkeypatch.setattr("rfobserver.pipeline.streaming.open", fake_open, raising=False)
+
+
+def _record_chunks(proc, chunks: int) -> Path:
+    proc.start_recording()
+    pos = proc._pre_trigger_buf.total_written
+    for _ in range(chunks):
+        proc._check_trigger_and_record(np.ones(1000, dtype=np.int32), (), pos)
+        pos += 1000
+    return proc._recording_dir / proc._recording_file
+
+
+def test_a_slow_writer_that_keeps_writing_is_waited_for(tmp_path, monkeypatch):
+    """Each write is slow (0.15 s), the whole queue takes over a second, but
+    no single write stalls past the 0.3 s limit: finalize waits, and the
+    capture closes clean with metadata that matches the file."""
+    from rfobserver.pipeline import streaming
+
+    monkeypatch.setattr(streaming, "_WRITER_JOIN_TIMEOUT_SEC", 0.3)
+    _patch_sc16(monkeypatch, lambda f: _PacedFile(f, 0.15))
+    gov = _governor_at(0)
+    proc = _proc(tmp_path, gov, RECORDING_RAM_BUFFER=False)
+    proc._await_tail_grids = lambda: None
+    sc16 = _record_chunks(proc, 8)
+    writer = proc._writer_thread
+    proc.stop_recording()
+
+    assert writer is not None and not writer.is_alive()
+    meta = json.loads(sc16.with_suffix(".json").read_text())
+    assert meta["write_failed"] is False
+    assert "write_error" not in meta
+    assert meta["total_bytes"] == sc16.stat().st_size == 8 * 1000 * 4
+    assert gov.state.last_write_error is None
+
+
+def test_a_writer_past_the_total_cap_is_abandoned(tmp_path, monkeypatch):
+    from rfobserver.pipeline import streaming
+
+    monkeypatch.setattr(streaming, "_WRITER_JOIN_TIMEOUT_SEC", 5.0)
+    monkeypatch.setattr(streaming, "_WRITER_MAX_WAIT_SEC", 0.4)
+    _patch_sc16(monkeypatch, lambda f: _PacedFile(f, 0.15))
+    proc = _proc(tmp_path, None, RECORDING_RAM_BUFFER=False)
+    proc._await_tail_grids = lambda: None
+    sc16 = _record_chunks(proc, 12)
+    writer = proc._writer_thread
+    proc.stop_recording()
+    assert writer is not None and writer.is_alive()
+    meta = json.loads(sc16.with_suffix(".json").read_text())
+    assert meta["write_error"].startswith(
+        "writer timeout: the file writer did not finish within 0.4 s"
+    )
+    writer.join(timeout=10)
+
+
+def test_an_abandoned_writer_that_finishes_fixes_up_its_capture(tmp_path, monkeypatch):
+    """The .31 capture: metadata said 10.4 MB, the file grew to 14.5 MB after.
+    When the abandoned writer exits cleanly the .json, the archive index and
+    the database row are rewritten from the file, and the capture is no longer
+    marked failed (finished_late records what happened)."""
+    import threading
+    from unittest.mock import MagicMock
+
+    from rfobserver.pipeline import streaming
+
+    monkeypatch.setattr(streaming, "_WRITER_JOIN_TIMEOUT_SEC", 0.3)
+    release = threading.Event()
+    _patch_sc16(monkeypatch, lambda f: _SlowFile(f, release))
+    proc = _proc(tmp_path, _governor_at(0), RECORDING_RAM_BUFFER=False)
+    proc._await_tail_grids = lambda: None
+    sc16 = _record_chunks(proc, 4)
+    writer = proc._writer_thread
+    proc.stop_recording()
+    assert writer is not None and writer.is_alive()
+    before = json.loads(sc16.with_suffix(".json").read_text())
+    assert before["write_failed"] is True and before["total_bytes"] < 4 * 1000 * 4
+
+    proc._loop = MagicMock()  # the database update is scheduled on the loop
+    proc._db = MagicMock()
+    release.set()
+    writer.join(timeout=5)
+    assert not writer.is_alive()
+
+    after = json.loads(sc16.with_suffix(".json").read_text())
+    size = sc16.stat().st_size
+    assert size == 4 * 1000 * 4
+    assert after["total_bytes"] == size and after["total_samples"] == size // 4
+    assert after["duration_sec"] == pytest.approx(size / 4 / 1_000_000, abs=1e-3)
+    assert after["write_failed"] is False and "write_error" not in after
+    late = after["finished_late"]
+    assert late["bytes_after_metadata"] == size - before["total_bytes"]
+    assert late["error"] == before["write_error"]
+    entry = next(e for e in proc._storage.captures_newest_first() if e.path == sc16)
+    assert entry.size >= size
+    proc._loop.call_soon_threadsafe.assert_called_once()
+
+
+def test_an_abandoned_writer_that_fails_keeps_its_capture_failed(tmp_path, monkeypatch):
+    import threading
+
+    from rfobserver.pipeline import streaming
+
+    monkeypatch.setattr(streaming, "_WRITER_JOIN_TIMEOUT_SEC", 0.3)
+    release = threading.Event()
+    _patch_sc16(monkeypatch, lambda f: _StuckFile(f, release))
+    proc = _proc(tmp_path, None, RECORDING_RAM_BUFFER=False)
+    proc._await_tail_grids = lambda: None
+    sc16 = _record_chunks(proc, 2)
+    writer = proc._writer_thread
+    proc.stop_recording()
+    release.set()
+    writer.join(timeout=5)
+    after = json.loads(sc16.with_suffix(".json").read_text())
+    assert after["write_failed"] is True
+    assert "finished_late" not in after
+
+
+def test_a_blocked_write_is_logged_with_how_long_it_took(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from rfobserver.pipeline import streaming
+
+    monkeypatch.setattr(streaming, "_WRITER_SLOW_OP_SEC", 0.1)
+    _patch_sc16(monkeypatch, lambda f: _PacedFile(f, 0.2))
+    proc = _proc(tmp_path, None, RECORDING_RAM_BUFFER=False)
+    proc._await_tail_grids = lambda: None
+    with caplog.at_level(logging.WARNING, logger="rfobserver.pipeline.streaming"):
+        _record_chunks(proc, 1)
+        proc.stop_recording()
+    slow = [r.message for r in caplog.records if "Recording writer: write of" in r.message]
+    assert slow and "blocked" in slow[0] and "4000 bytes" in slow[0]
 
 
 # --- final review M2: a RAM-mode flush failure holds new starts ---------------

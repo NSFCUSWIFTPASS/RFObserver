@@ -1131,6 +1131,20 @@ class SensorDatabase:
         await self._db.commit()
 
     @_guarded_write
+    async def update_iq_capture_span(
+        self, filename: str, *, stop_time: datetime, duration_sec: float, total_samples: int
+    ) -> None:
+        """Bring a capture's row up to its file when its writer finished after
+        finalize had written the row (an abandoned writer that exited later)."""
+        assert self._db is not None
+        await self._db.execute(
+            "UPDATE iq_captures SET stop_time = ?, duration_sec = ?, total_samples = ? "
+            "WHERE filename = ?",
+            (stop_time.isoformat(), duration_sec, total_samples, filename),
+        )
+        await self._db.commit()
+
+    @_guarded_write
     async def mark_iq_captures_priority(self, filenames: list[str]) -> None:
         """Set the priority flag on captures promoted after their insert (ones
         recorded just before a priority capture)."""

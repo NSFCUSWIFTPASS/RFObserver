@@ -1200,6 +1200,36 @@ async def test_insert_and_query_iq_capture(db):
     assert r["trigger_initiated"] is False
 
 
+async def test_update_iq_capture_span_corrects_a_late_finished_capture(db):
+    """A capture whose writer finished after finalize: its row is brought up to
+    the file (2026-11-06, hcro-jet-001)."""
+    start = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    await db.insert_iq_capture(
+        filename="late.sc16",
+        origin="auto",
+        start_time=start,
+        stop_time=start + timedelta(seconds=0.1),
+        duration_sec=0.1,
+        sdr_center_freq_hz=915e6,
+        sample_rate_hz=26e6,
+        gain_db=35.0,
+        total_samples=2_600_000,
+        trigger_initiated=True,
+    )
+    await db.update_iq_capture_span(
+        "late.sc16",
+        stop_time=start + timedelta(seconds=0.139),
+        duration_sec=0.139,
+        total_samples=3_624_000,
+    )
+    (row,) = await db.query_iq_captures(
+        since=start - timedelta(seconds=1), until=start + timedelta(seconds=1)
+    )
+    assert row["duration_sec"] == 0.139
+    assert row["total_samples"] == 3_624_000
+    assert row["stop_time"].startswith("2026-01-01T12:00:00.139")
+
+
 async def test_iq_capture_range_overlap(db):
     base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
     # inside the window

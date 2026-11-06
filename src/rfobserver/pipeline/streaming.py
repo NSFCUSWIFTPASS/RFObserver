@@ -129,19 +129,61 @@ _GRID_TAIL_DRAIN_FLOOR_SEC = 3.0
 _RESULT_POLL_SEC = 0.005
 _GRID_TAIL_DRAIN_CEILING_SEC = 10.0
 
-# How long finalize waits to hand the disk writer its stop sentinel and then
-# for the writer to exit. A writer still blocked after that is abandoned (a
-# hung volume): the recording finalizes without it.
+# Finalize waits for the disk writer to drain its queue and exit for as long
+# as it keeps making progress. It gives up (abandons the writer, a hung
+# volume) when one write or close has been blocked this long, or after
+# _WRITER_MAX_WAIT_SEC in all. A slow volume used to be abandoned after a
+# fixed 10 s even while it was still writing (hcro-jet-001, 2026-11-06: the
+# metadata said 10.4 MB, the file reached 14.5 MB after it).
 _WRITER_JOIN_TIMEOUT_SEC = 10.0
+_WRITER_MAX_WAIT_SEC = 60.0
+# A single write or close blocked this long is logged, so a stall names its
+# step (a write, or the close that flushes the buffered tail).
+_WRITER_SLOW_OP_SEC = 1.0
 
 
-def _writer_timeout_error() -> str:
+def _writer_timeout_error(reason: str, op: str, blocked_sec: float) -> str:
     """The write_error recorded for a capture whose writer finalize abandoned."""
     return (
-        "writer timeout: the file writer did not finish within "
-        f"{_WRITER_JOIN_TIMEOUT_SEC:g} s; the .sc16 may be incomplete or keep "
-        "growing after this metadata was written"
+        f"writer timeout: the file writer {reason} (blocked in {op} for "
+        f"{blocked_sec:.1f} s); the .sc16 may be incomplete or keep growing after "
+        "this metadata was written"
     )
+
+
+class _WriterProgress:
+    """What one recording's writer thread is doing, read by finalize: the
+    operation it is in ("write", "close", or "idle" while it waits on its
+    queue) and since when."""
+
+    def __init__(self) -> None:
+        self.op = "idle"
+        self.since = time.monotonic()
+
+    def begin(self, op: str) -> None:
+        self.since = time.monotonic()
+        self.op = op
+
+    def end(self) -> float:
+        """Back to idle; returns how long the operation took."""
+        took = time.monotonic() - self.since
+        self.op = "idle"
+        self.since = time.monotonic()
+        return took
+
+    def blocked_sec(self) -> float:
+        """How long the current write or close has been blocked (0 when idle)."""
+        return 0.0 if self.op == "idle" else time.monotonic() - self.since
+
+
+class _AbandonedCapture:
+    """A capture whose writer finalize gave up on, for the fix-up when that
+    writer exits: where the capture is, and what its metadata said."""
+
+    def __init__(self, path: Path, at: float, error: str | None) -> None:
+        self.path = path
+        self.at = at
+        self.error = error
 
 
 # How often a writer waiting on an empty queue checks whether a newer
@@ -789,7 +831,9 @@ class StreamingProcessor:
         # Abandoned writers by generation, with the capture path finalize
         # reported; each logs its bytes on disk when it finally exits.
         # Guarded by _writer_gen_lock.
-        self._abandoned_paths: dict[int, Path] = {}
+        self._abandoned_paths: dict[int, _AbandonedCapture] = {}
+        # The current recording's writer progress (finalize reads it).
+        self._writer_progress: _WriterProgress | None = None
 
         # Recording-control thread: runs the blocking finalization work
         # (writer drain, file close, metadata, disk-cap eviction) so the
@@ -2162,6 +2206,7 @@ class StreamingProcessor:
                     except queue.Full:
                         self._grid_dropped += int(g.shape[0])
 
+            self._writer_progress = _WriterProgress()
             self._writer_thread = threading.Thread(
                 target=self._file_writer_loop,
                 args=(
@@ -2169,6 +2214,7 @@ class StreamingProcessor:
                     self._writer_gen,
                     self._recording_dir / self._recording_file,
                     self._grid_raw_path,
+                    self._writer_progress,
                 ),
                 name="writer",
                 daemon=True,
@@ -2200,6 +2246,98 @@ class StreamingProcessor:
         rate = float(getattr(rx_config, "bandwidth_hz", None) or self._settings.BANDWIDTH)
         span = (pre_len + self._recording_lost) / rate if rate > 0 else 0.0
         self._recording_wall_start = t_read - span
+
+    def _finish_late_capture(self, rec: _AbandonedCapture, size: int, clean: bool) -> None:
+        """Writer thread, after an abandoned writer exits: rewrite the capture's
+        metadata from its files (it was written at finalize from a short file).
+
+        Updates the .json (bytes, samples, duration, time span), the .psd
+        sidecar's row count, the archive index and the database row. When the
+        writer exited cleanly every queued sample reached disk, so the capture
+        is no longer marked failed; ``finished_late`` keeps what happened and
+        the original error. The collection statistics keep the bytes counted
+        at finalize."""
+        import json as _json
+
+        from rfobserver.storage import psd_grid
+
+        path = rec.path
+        json_path = path.with_suffix(".json")
+        try:
+            meta: Any = _json.loads(json_path.read_text())
+        except (OSError, ValueError):
+            meta = None
+        samples = size // 4
+        if isinstance(meta, dict):
+            rate = float(meta.get("sample_rate_hz") or self._settings.BANDWIDTH) or 1.0
+            old_samples = int(meta.get("total_samples") or 0)
+            old_bytes = int(meta.get("total_bytes") or 0)
+            meta["total_bytes"] = size
+            meta["total_samples"] = samples
+            meta["duration_sec"] = round(samples / rate, 3)
+            if isinstance(meta.get("time_span_sec"), (int, float)):
+                meta["time_span_sec"] = round(
+                    meta["time_span_sec"] + (samples - old_samples) / rate, 3
+                )
+            if clean:
+                meta["write_failed"] = False
+                meta.pop("write_error", None)
+                meta["finished_late"] = {
+                    "after_sec": round(time.monotonic() - rec.at, 1),
+                    "bytes_after_metadata": size - old_bytes,
+                    "error": rec.error,
+                }
+            psd_grid.write_text_atomic(json_path, _json.dumps(meta, indent=2))
+
+        # The writer also finished the streamed .psd after its row count was taken.
+        raw_path, grid_meta_path = psd_grid.grid_paths(path)
+        try:
+            grid_meta = _json.loads(grid_meta_path.read_text())
+            row_bytes = 4 * int(grid_meta["num_bins"])
+            grid_size = raw_path.stat().st_size
+            rows = grid_size // row_bytes
+            if grid_size % row_bytes:
+                os.truncate(raw_path, rows * row_bytes)
+            if rows != grid_meta.get("rows"):
+                grid_meta["rows"] = rows
+                psd_grid.write_text_atomic(grid_meta_path, _json.dumps(grid_meta))
+        except (OSError, ValueError, KeyError, TypeError, ZeroDivisionError):
+            pass  # no grid for this capture, or it is gone
+
+        self._storage.track(path)
+
+        if (
+            isinstance(meta, dict)
+            and not self._replay_mode
+            and self._loop is not None
+            and self._db is not None
+        ):
+            try:
+                start = datetime.fromisoformat(str(meta["start_time"]))
+            except (KeyError, ValueError):
+                return
+            span = meta.get("time_span_sec") or meta["duration_sec"]
+            db = self._db
+            update = functools.partial(
+                db.update_iq_capture_span,
+                path.name,
+                stop_time=start + timedelta(seconds=float(span)),
+                duration_sec=meta["duration_sec"],
+                total_samples=samples,
+            )
+            self._loop.call_soon_threadsafe(lambda: asyncio.ensure_future(update()))
+
+    def _writer_stalled(self, waited_from: float) -> tuple[str, str, float] | None:
+        """Why finalize should give up on the current writer, or None to keep
+        waiting: (reason, operation, seconds it has been blocked)."""
+        prog = self._writer_progress
+        op = prog.op if prog is not None else "write"
+        blocked = prog.blocked_sec() if prog is not None else 0.0
+        if blocked >= _WRITER_JOIN_TIMEOUT_SEC:
+            return f"made no progress for {_WRITER_JOIN_TIMEOUT_SEC:g} s", op, blocked
+        if time.monotonic() - waited_from >= _WRITER_MAX_WAIT_SEC:
+            return f"did not finish within {_WRITER_MAX_WAIT_SEC:g} s", op, blocked
+        return None
 
     def _end_recording(self) -> None:
         """Finalize the recording (runs on the recording-control thread).
@@ -2286,32 +2424,55 @@ class StreamingProcessor:
             self._recording_buf = None
             self._recording_buf_pos = 0
         else:
-            # Disk mode: stop writer thread. Bounded put: if the writer already
-            # died (disk full / EROFS), the queue may be full and no consumer
-            # will ever drain it, so a plain blocking put would wedge recctl in
-            # "finalizing" forever. Time-bounded, then proceed regardless.
-            # The sentinel goes to this recording's own queue.
-            try:
-                self._recording_queue.put(None, timeout=_WRITER_JOIN_TIMEOUT_SEC)
-            except queue.Full:
-                logger.error("Recording writer not draining; abandoning writer thread")
+            # Disk mode: stop the writer thread, waiting while it makes
+            # progress (see _writer_stalled). Bounded put: if the writer
+            # already died (disk full / EROFS), the queue may be full and no
+            # consumer will ever drain it, so a plain blocking put would wedge
+            # recctl in "finalizing" forever. The sentinel goes to this
+            # recording's own queue.
+            waited_from = time.monotonic()
+            stall: tuple[str, str, float] | None = None
+            while True:
+                try:
+                    self._recording_queue.put(None, timeout=0.2)
+                    break
+                except queue.Full:
+                    stall = self._writer_stalled(waited_from)
+                    if stall is not None:
+                        logger.error("Recording writer not draining; abandoning writer thread")
+                        break
             if self._writer_thread is not None:
-                self._writer_thread.join(timeout=_WRITER_JOIN_TIMEOUT_SEC)
+                while self._writer_thread.is_alive():
+                    self._writer_thread.join(timeout=0.2)
+                    if self._writer_thread.is_alive():
+                        stall = stall or self._writer_stalled(waited_from)
+                        if stall is not None:
+                            break
                 if self._writer_thread.is_alive():
-                    logger.error("Recording writer did not exit; abandoning writer thread")
+                    reason, op, blocked = stall or ("did not exit", "write", 0.0)
+                    logger.error(
+                        "Recording writer %s (blocked in %s for %.1f s); abandoning writer thread",
+                        reason,
+                        op,
+                        blocked,
+                    )
                     self._abandoned_writer = self._writer_thread
                     # The capture is not complete as far as this metadata can
                     # tell: flag it rather than record a clean short file. This
                     # generation is still current (the next start bumps it), so
                     # the flag is this recording's. A writer error already set
-                    # is more specific and is kept.
+                    # is more specific and is kept. When the writer does exit,
+                    # _finish_late_capture brings the metadata up to the file.
                     with self._writer_gen_lock:
                         if self._writer_error is None:
-                            self._writer_error = _writer_timeout_error()
-                        self._abandoned_paths[self._writer_gen] = self._recording_dir / base_name
+                            self._writer_error = _writer_timeout_error(reason, op, blocked)
+                        self._abandoned_paths[self._writer_gen] = _AbandonedCapture(
+                            self._recording_dir / base_name, time.monotonic(), self._writer_error
+                        )
                     if not self._writer_thread.is_alive():
                         # It exited before the entry above existed; whichever
-                        # side pops the entry logs it.
+                        # side pops the entry handles it. Too late to tell
+                        # whether it failed, so the capture stays flagged.
                         self._note_abandoned_writer_exit(self._writer_gen)
                 self._writer_thread = None
 
@@ -2832,6 +2993,7 @@ class StreamingProcessor:
         gen: int,
         filepath: Path,
         grid_path: Path,
+        progress: _WriterProgress | None = None,
     ) -> None:
         """Dedicated thread: drains one recording's queue ``q`` and writes it
         to disk.
@@ -2864,31 +3026,53 @@ class StreamingProcessor:
                     if gen != self._writer_gen:
                         return None  # superseded and drained
 
+        prog = progress if progress is not None else _WriterProgress()
+
+        def timed(op: str, nbytes: int, fn: Any, *args: Any) -> None:
+            prog.begin(op)
+            try:
+                fn(*args)
+            finally:
+                took = prog.end()
+                if took >= _WRITER_SLOW_OP_SEC:
+                    what = f"write of {nbytes} bytes" if op == "write" else "close (flush)"
+                    logger.warning(
+                        "Recording writer: %s blocked %.1f s (%s)", what, took, filepath.name
+                    )
+
         rate = float(self._settings.BANDWIDTH) or 1.0
         check_every = max(1, int(rate * 4))  # about one second of IQ
         since_check = 0
         stopped = False
+        clean = False
         try:
-            with (
-                open(filepath, "wb", buffering=8 * 1024 * 1024) as f,
-                open(grid_path, "wb") as gf,
-            ):
-                while True:
-                    item = next_item()
-                    if item is None:
-                        stopped = True
-                        break
-                    kind, data = item
-                    if kind == "iq":
-                        f.write(data)
-                        since_check += memoryview(data).nbytes
-                        if since_check >= check_every:
-                            since_check = 0
-                            self._check_disk_floor(gen)
-                    else:
-                        gf.write(data)
-                    # No flush: let the OS buffer writes for throughput. The
-                    # close at loop exit flushes, and can itself fail (ENOSPC).
+            # Closed explicitly (not a with) so the close, which flushes the
+            # buffered tail and can block or fail (ENOSPC), is timed too.
+            f = open(filepath, "wb", buffering=8 * 1024 * 1024)  # noqa: SIM115 (timed close)
+            try:
+                gf = open(grid_path, "wb")  # noqa: SIM115 (timed close)
+                try:
+                    while True:
+                        item = next_item()
+                        if item is None:
+                            stopped = True
+                            break
+                        kind, data = item
+                        nbytes = memoryview(data).nbytes
+                        if kind == "iq":
+                            timed("write", nbytes, f.write, data)
+                            since_check += nbytes
+                            if since_check >= check_every:
+                                since_check = 0
+                                self._check_disk_floor(gen)
+                        else:
+                            timed("write", nbytes, gf.write, data)
+                        # No flush: let the OS buffer writes for throughput.
+                finally:
+                    timed("close", 0, gf.close)
+            finally:
+                timed("close", 0, f.close)
+            clean = True
         except Exception as exc:
             error = describe_write_error(exc)
             with self._writer_gen_lock:
@@ -2908,26 +3092,33 @@ class StreamingProcessor:
                 while next_item() is not None:
                     pass
         finally:
-            self._note_abandoned_writer_exit(gen)
+            self._note_abandoned_writer_exit(gen, clean)
 
-    def _note_abandoned_writer_exit(self, gen: int) -> None:
+    def _note_abandoned_writer_exit(self, gen: int, clean: bool = False) -> None:
         """Writer thread, at exit: if finalize abandoned this writer, say how
-        much it left on disk. The capture's metadata was written at finalize
-        and is not rewritten from here."""
+        much it left on disk and bring the capture's metadata up to it (it was
+        written at finalize, from the file as it was then)."""
         with self._writer_gen_lock:
-            path = self._abandoned_paths.pop(gen, None)
-        if path is None:
+            rec = self._abandoned_paths.pop(gen, None)
+        if rec is None:
             return
+        path = rec.path
         try:
             size: int | str = path.stat().st_size
         except OSError:
             size = "unknown"
         logger.warning(
-            "Abandoned recording writer for %s exited; %s bytes on disk. Its metadata "
-            "was written at finalize and is not updated",
+            "Abandoned recording writer for %s exited %.1f s after finalize; %s bytes on disk%s",
             path.name,
+            time.monotonic() - rec.at,
             size,
+            "" if clean else " (it failed; the capture stays marked failed)",
         )
+        if isinstance(size, int):
+            try:
+                self._finish_late_capture(rec, size, clean)
+            except Exception:
+                logger.exception("Could not update the metadata of %s", path.name)
 
     # -- Dispatch thread --
 

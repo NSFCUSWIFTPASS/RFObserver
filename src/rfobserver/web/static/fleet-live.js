@@ -680,9 +680,18 @@
         lo -= pad; hi += pad;
         const X = function (t) { return ((t - t0) / mode.windowMs) * W; };
         const Y = function (v) { return H - 14 - ((v - lo) / (hi - lo)) * (H - 26); };
+        // Points (the default) or a line, at the plot thickness (plot-style.js).
+        const style = window.RFObsPlot ? window.RFObsPlot.get() : { points: false, size: 2 };
         for (const v of vis) {
+            if (style.points) {
+                ctx.fillStyle = v.s.colour;
+                for (const p of v.pts) {
+                    if (p[0] >= t0) window.RFObsPlot.dot(ctx, X(p[0]), Y(p[1]));
+                }
+                continue;
+            }
             ctx.strokeStyle = v.s.colour;
-            ctx.lineWidth = highResBox.checked ? 1.5 : 2;
+            ctx.lineWidth = style.size;
             ctx.lineJoin = "round";
             ctx.beginPath();
             let started = false, prevT = null;
@@ -773,6 +782,8 @@
 
     let ws = null;
     let lastMessage = 0;
+
+    if (window.RFObsPlot) window.RFObsPlot.onChange(function () { powerDirty = true; });
 
     // High Res and Bursts are on unless this browser turned them off.
     try { highResBox.checked = localStorage.getItem(HIGHRES_KEY) !== "0"; } catch (_) {}

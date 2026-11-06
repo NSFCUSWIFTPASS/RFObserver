@@ -1606,11 +1606,44 @@ def _validate_theme(raw: Any) -> str:
     return raw
 
 
+# How the power and kurtosis plots draw: points (the default) or a line, and
+# the dot size / line width in px.
+PLOT_DEFAULT: dict[str, Any] = {"points": True, "size": 2.0}
+PLOT_SIZE_RANGE = (1.0, 8.0)
+
+
+def _validate_plot(raw: Any, current: Any) -> dict[str, Any]:
+    """Merge a partial ``plot`` update ({"points": bool, "size": px}) into the
+    stored one, so the chart switch and the thickness setting change only
+    their own key."""
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=400, detail="'plot' must be an object")
+    unknown = sorted(set(raw) - set(PLOT_DEFAULT))
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown plot keys: {', '.join(unknown)}")
+    out = {**PLOT_DEFAULT, **(current if isinstance(current, dict) else {})}
+    if "points" in raw:
+        if not isinstance(raw["points"], bool):
+            raise HTTPException(status_code=400, detail="'plot.points' must be true or false")
+        out["points"] = raw["points"]
+    if "size" in raw:
+        size = raw["size"]
+        lo, hi = PLOT_SIZE_RANGE
+        if isinstance(size, bool) or not isinstance(size, (int, float)) or not lo <= size <= hi:
+            raise HTTPException(
+                status_code=400, detail=f"'plot.size' must be a number from {lo:g} to {hi:g}"
+            )
+        out["size"] = float(size)
+    return out
+
+
 def _normalize_prefs(doc: Any) -> dict[str, Any]:
     """Shape a stored ui_prefs document into its full form with defaults."""
     out: dict[str, Any] = doc if isinstance(doc, dict) else {}
     out.setdefault("scale", {})
     out.setdefault("theme", "auto")
+    plot = out.get("plot")
+    out["plot"] = {**PLOT_DEFAULT, **(plot if isinstance(plot, dict) else {})}
     return out
 
 
@@ -1635,6 +1668,7 @@ async def put_ui_prefs(request: Request) -> dict[str, Any]:
     theme change keeps the stored scale. Scale values are per-chart low/high
     bounds (dBFS for waterfall/PSD, dB for power, unitless for kurtosis); null
     or omitted means auto-scale from the data. Theme is auto/light/dark.
+    Plot is how the power and kurtosis plots draw ({"points", "size"}).
 
     The read and the write both go through the writer: merging a document read
     from the reader (possibly an older snapshot) and writing it back would
@@ -1659,6 +1693,8 @@ async def put_ui_prefs(request: Request) -> dict[str, Any]:
         doc["scale"] = _validate_scale(body["scale"])
     if "theme" in body:
         doc["theme"] = _validate_theme(body["theme"])
+    if "plot" in body:
+        doc["plot"] = _validate_plot(body["plot"], doc.get("plot"))
     doc = _normalize_prefs(doc)
     await db.set_config(UI_PREFS_KEY, json.dumps(doc))
     return doc

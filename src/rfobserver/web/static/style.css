@@ -670,6 +670,11 @@ body {
     z-index: 1;
 }
 
+/* The Points switch sits in the Live trace's legend. */
+#ts-legend {
+    align-items: center;
+}
+
 .legend-item {
     font-size: 10px;
     font-weight: 500;
@@ -2373,6 +2378,19 @@ body {
     color: var(--text-primary);
 }
 
+.fleet-add input#plot-size {
+    flex: 0 0 90px;
+}
+
+.fleet-plot-card {
+    margin-top: 16px;
+}
+
+.fleet-plot-label {
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
 .fleet-add input:focus {
     outline: none;
     border-color: var(--accent);
@@ -2521,7 +2539,8 @@ body {
     }
 }
 
-.fleet-live-power .toggle-label {
+.fleet-live-power .toggle-label,
+.fleet-live-kurtosis .toggle-label {
     margin-left: 0;
 }
 
@@ -3105,7 +3124,8 @@ body {
     white-space: nowrap;
 }
 
-.fleet-live-power .card-header .fleet-live-toggles {
+.fleet-live-power .card-header .fleet-live-toggles,
+.fleet-live-kurtosis .card-header .fleet-live-toggles {
     margin-left: auto;
     white-space: nowrap;
 }

@@ -1434,7 +1434,41 @@ def test_ui_prefs_put_merges_into_the_writers_current_document(settings):
     assert json.loads(writer.stored[UI_PREFS_KEY]) == {
         "scale": {"wf_lo": -100.0, "wf_hi": -20.0},
         "theme": "dark",
+        "plot": {"points": True, "size": 2.0},
     }
+
+
+def _prefs_app(settings, stored: dict[str, str] | None = None):
+    app = create_app(settings)
+    store = _ConfigStore(stored or {})
+    app.state.database = store
+    app.state.write_database = store
+    return TestClient(app)
+
+
+def test_ui_prefs_plot_defaults_to_points(settings):
+    assert _prefs_app(settings).get("/api/ui-prefs").json()["plot"] == {
+        "points": True,
+        "size": 2.0,
+    }
+
+
+def test_ui_prefs_plot_merges_points_and_size_separately(settings):
+    client = _prefs_app(settings)
+    assert client.put("/api/ui-prefs", json={"plot": {"size": 4}}).status_code == 200
+    r = client.put("/api/ui-prefs", json={"plot": {"points": False}})
+    assert r.json()["plot"] == {"points": False, "size": 4.0}
+    # A theme change keeps the plot style.
+    assert client.put("/api/ui-prefs", json={"theme": "dark"}).json()["plot"]["size"] == 4.0
+
+
+@pytest.mark.parametrize(
+    "plot",
+    [{"size": 0}, {"size": 9}, {"size": "2"}, {"points": "yes"}, {"bogus": 1}, [1]],
+)
+def test_ui_prefs_plot_rejects_bad_values(settings, plot):
+    r = _prefs_app(settings).put("/api/ui-prefs", json={"plot": plot})
+    assert r.status_code == 400
 
 
 def test_ui_prefs_put_503_without_a_database(settings):

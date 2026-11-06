@@ -138,6 +138,10 @@
                 <input type="number" id="avg-scale-pwr-lo" placeholder="auto" step="1" aria-label="Power scale low">
                 <input type="number" id="avg-scale-pwr-hi" placeholder="auto" step="1" aria-label="Power scale high">
             </span>
+            <label class="toggle-label" title="Draw each value as a point instead of a line">
+                <input type="checkbox" data-plot-points checked>
+                <span class="toggle-text">Points</span>
+            </label>
             <label class="toggle-label" title="Show where IQ was recorded">
                 <input type="checkbox" id="avg-iq-toggle" checked>
                 <span class="toggle-text">IQ</span>
@@ -213,6 +217,10 @@
                 <input type="number" id="avg-scale-kurt-lo" placeholder="auto" step="0.1" aria-label="Kurtosis scale low">
                 <input type="number" id="avg-scale-kurt-hi" placeholder="auto" step="0.1" aria-label="Kurtosis scale high">
             </span>
+            <label class="toggle-label" title="Draw each value as a point instead of a line">
+                <input type="checkbox" data-plot-points checked>
+                <span class="toggle-text">Points</span>
+            </label>
         </div>
         <div class="card-body">
             <div class="avg-chart-hold">
@@ -248,5 +256,6 @@
 
 <script type="application/json" id="avg-boot">{{ boot | tojson }}</script>
 {% if fleet %}<script>window.RFOBS_FLEET = {{ fleet | tojson }};</script>{% endif %}
+<script src="/static/plot-style.js"></script>
 <script src="/static/averaged.js"></script>
 {% endblock %}

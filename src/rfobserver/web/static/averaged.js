@@ -1615,9 +1615,19 @@
         return { lo: lo, hi: hi };
     }
 
-    // Line plus point markers; markers only where they stay legible.
+    // Points (the default) or a line plus point markers, markers only where
+    // they stay legible; the thickness is the plot preference (plot-style.js).
     function drawSeries(ctx, s, X, Y, W) {
         const times = pointTimes(s.points);
+        const style = window.RFObsPlot ? window.RFObsPlot.get() : { points: false, size: 2 };
+        if (style.points) {
+            ctx.fillStyle = s.colour;
+            for (let i = 0; i < s.points.length; i++) {
+                const v = s.getVal(s.points[i]);
+                if (v != null) window.RFObsPlot.dot(ctx, X(times[i]), Y(v));
+            }
+            return;
+        }
         ctx.beginPath();
         let started = false;
         for (let i = 0; i < s.points.length; i++) {
@@ -1628,7 +1638,7 @@
             else { ctx.lineTo(x, Y(v)); }
         }
         ctx.strokeStyle = s.colour;
-        ctx.lineWidth = FLEET ? 2 : 1.5;
+        ctx.lineWidth = style.size;
         ctx.stroke();
         if (!FLEET || s.points.length > W / 3) return;
         ctx.fillStyle = s.colour;
@@ -2437,6 +2447,9 @@
         setupFleetLegends();
         setupSensorButtons();
         setupIqToggle();
+        if (window.RFObsPlot) {
+            window.RFObsPlot.onChange(function () { renderStatsChart(); renderKurtosisChart(); });
+        }
         fitCanvases();
         let resizeTimer = null;
         window.addEventListener("resize", function () {

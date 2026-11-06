@@ -23,7 +23,7 @@ import numpy as np
 from rfobserver.capture.buffer import trim_grid_rows
 from rfobserver.schedules.book import RUNS_KEPT
 from rfobserver.schedules.cutter import RunCutter, RunSpec
-from rfobserver.schedules.model import first_run_from, run_start_ms, runs_between
+from rfobserver.schedules.model import first_run_from, run_start_ms, runs_between, total_runs
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -149,7 +149,9 @@ class ScheduleEngine:
             k = first_run_from(s, now_ms - self._grace_ms)
             last = self._book.last_run(s.id)
             if k is not None and last is not None and k <= last:
-                k = first_run_from(s, run_start_ms(s, last + 1))
+                # Not run last again: a one-shot's "run last + 1" starts at the
+                # same instant as run 0.
+                k = last + 1 if last + 1 < total_runs(s) else None
             fresh[s.id] = (s, k)
         self._next = fresh
 
@@ -245,6 +247,11 @@ class ScheduleEngine:
         until = now_ms - self._grace_ms
         for s in schedules:
             last = self._book.last_run(s.id)
+            if last is not None and last + 1 >= total_runs(s):
+                # Every run already has an outcome. run_start_ms(s, last + 1)
+                # of a one-shot is run 0's start again, which re-marked a
+                # recorded run missed (HCRO, 2026-11-06).
+                continue
             t0 = s.start_ms if last is None else run_start_ms(s, last + 1)
             # A schedule joined late has no runs before it existed.
             t0 = max(t0, s.created_ms - self._grace_ms)

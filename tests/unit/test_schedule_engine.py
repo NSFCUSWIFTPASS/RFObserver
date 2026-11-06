@@ -378,3 +378,54 @@ async def test_runs_waiting_for_psd_rows_do_not_make_the_next_busy(
     rig.chunks(42)
     assert sorted(k for _, k in rig.writer.opened) == [0, 1, 2, 3]
     assert all(book.latest("b", k)["status"] != "missed" for k in range(4))
+
+
+# --- 2026-11-06, HCRO: a recorded one-shot run was re-marked missed on restart ---
+#
+# mark_missed looked from run last + 1, whose start for a one-shot schedule
+# (no every_ms) is the same instant as run 0, so run 0 was reported again as
+# missed/not_running and overwrote its "recorded" outcome. The capture file
+# and its .json were fine; only the schedule's run record was wrong.
+
+
+async def test_a_recorded_one_shot_stays_recorded_when_the_pipeline_restarts(
+    book: ScheduleBook, tmp_path: Path
+) -> None:
+    await book.add(sched("o", T0_MS + 250, 120))
+    rig = Rig(book, tmp_path)
+    rig.chunks(5)
+    book.report_run("o", 0, "recorded", start_ms=T0_MS + 250, filename="o.sc16")
+    # A new pipeline in the same process (reconfigure, Standby, supervisor restart).
+    again = Rig(book, tmp_path)
+    again.engine.mark_missed(T0_MS + 600_000)
+    assert book.latest("o", 0)["status"] == "recorded"
+
+
+async def test_a_recorded_one_shot_stays_recorded_after_a_process_restart(
+    book: ScheduleBook, tmp_path: Path
+) -> None:
+    await book.add(sched("p", T0_MS + 250, 120))
+    book.report_run("p", 0, "recorded", start_ms=T0_MS + 250, filename="p.sc16")
+    await asyncio.sleep(0.05)
+    reloaded = ScheduleBook(book.db, now=lambda: T0)
+    reloaded.bind_loop(asyncio.get_running_loop())
+    await reloaded.load()
+    rig = Rig(reloaded, tmp_path)
+    rig.engine.mark_missed(T0_MS + 600_000)
+    (run,) = await reloaded.runs("p", 10)
+    assert run["status"] == "recorded"
+
+
+async def test_a_repeating_schedule_still_marks_the_runs_after_its_last(
+    book: ScheduleBook, tmp_path: Path
+) -> None:
+    await book.add(sched("e", T0_MS + 100, 10, every_ms=1000, count=5))
+    book.report_run("e", 1, "recorded", start_ms=T0_MS + 1100, filename="e.sc16")
+    rig = Rig(book, tmp_path)
+    rig.engine.mark_missed(T0_MS + 10_000)
+    assert book.latest("e", 1)["status"] == "recorded"
+    assert [k for k, v in sorted(book.latest_runs("e").items()) if v["status"] == "missed"] == [
+        2,
+        3,
+        4,
+    ]

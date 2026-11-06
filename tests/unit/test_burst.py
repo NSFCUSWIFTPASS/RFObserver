@@ -105,7 +105,7 @@ def test_two_separate_bursts():
 
 
 def test_many_separated_bursts_all_extracted():
-    """Guards the find_objects-based extraction: many labels, each isolated in
+    """Guards the per-region extraction: many labels, each isolated in
     its own bbox, must all be found with the correct per-region time/freq/peak
     (a regression guard for the O(bursts x grid) -> bbox rewrite)."""
     grid = _make_grid(n_rows=600, n_bins=64, noise_db=-60.0)
@@ -279,3 +279,93 @@ def test_default_threshold_does_not_turn_noise_into_bursts() -> None:
         grid, config=config, center_freq_hz=915e6, capture_time=datetime.now(timezone.utc)
     )
     assert len(result.bursts) < 5, f"{len(result.bursts)} bursts detected in pure noise"
+
+
+def _reference_fingerprints(result_grid, config, center_freq_hz, capture_time):
+    """The per-label extraction as it was before vectorizing: one region at a
+    time, peak = first maximum in row-major order. Kept here as the oracle."""
+    from datetime import timedelta
+
+    from scipy import ndimage
+
+    grid = result_grid.grid
+    nf = compute_noise_floor(grid, config.noise_floor_percentile)
+    labeled, _ = ndimage.label(
+        grid > nf + config.threshold_low_db, structure=ndimage.generate_binary_structure(2, 2)
+    )
+    valid = np.unique(labeled[grid > nf + config.threshold_high_db])
+    out = []
+    for label_id in valid[valid > 0]:
+        rows, cols = np.where(labeled == label_id)
+        t_start = float(result_grid.time_axis[rows.min()])
+        t_end = float(result_grid.time_axis[min(rows.max() + 1, len(result_grid.time_axis) - 1)])
+        if t_end - t_start < config.min_duration_sec:
+            continue
+        f_min = float(result_grid.freq_axis[cols.min()])
+        f_max = float(result_grid.freq_axis[cols.max()])
+        powers = grid[rows, cols]
+        k = int(np.argmax(powers))
+        out.append(
+            (
+                capture_time + timedelta(seconds=t_start),
+                capture_time + timedelta(seconds=t_end),
+                center_freq_hz + (f_min + f_max) / 2,
+                center_freq_hz + float(result_grid.freq_axis[cols[k]]),
+                max(f_max - f_min, 0.0),
+                float(powers[k]),
+                (t_end - t_start) * 1000.0,
+            )
+        )
+    out.sort(key=lambda b: b[0])
+    return out
+
+
+def test_fingerprints_match_reference_on_busy_grids():
+    """Many components of random shape, power ties, regions touching the last
+    row, and regions shorter than min_duration: the extraction matches the
+    per-label oracle exactly (merging off so every raw region is compared)."""
+    rng = np.random.default_rng(7)
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for _ in range(5):
+        g = _make_grid(n_rows=400, n_bins=128, noise_db=-60.0)
+        g.grid += rng.normal(0.0, 2.0, g.grid.shape).astype(np.float32)
+        for _ in range(60):
+            r, c = int(rng.integers(0, 400)), int(rng.integers(0, 128))
+            h, w = int(rng.integers(1, 12)), int(rng.integers(1, 8))
+            g.grid[r : r + h, c : c + w] = float(rng.choice([-45.0, -40.0, -30.0]))
+        config = BurstDetectionConfig(
+            threshold_high_db=12.0, min_duration_sec=0.003, merge_freq_bins=0, merge_time_sec=-1.0
+        )
+        got = detect_bursts(g, config, center_freq_hz=915e6, capture_time=t0)
+        want = _reference_fingerprints(g, config, 915e6, t0)
+        assert len(want) > 20
+        assert [
+            (
+                b.start_time,
+                b.stop_time,
+                b.center_freq_hz,
+                b.peak_freq_hz,
+                b.bandwidth_hz,
+                b.peak_power_db,
+                b.duration_ms,
+            )
+            for b in got.bursts
+        ] == want
+
+
+def test_extraction_does_not_use_find_objects(monkeypatch):
+    """ndimage.find_objects is one C call over the whole grid that holds the GIL
+    throughout (68 ms on an Orin Nano with a 4096x2048 window), long enough to
+    make the receiver thread overflow under heavy burst load. See
+    docs/debugging/2026-11-06_overflows-under-burst-load.md."""
+    from rfobserver.processing import burst
+
+    def refuse(*_a, **_k):
+        raise AssertionError("find_objects called")
+
+    monkeypatch.setattr(burst.ndimage, "find_objects", refuse)
+    grid = _make_grid(n_rows=200, n_bins=64, noise_db=-60.0)
+    _inject_burst(grid, 20, 40, 10, 14, -30.0)
+    config = BurstDetectionConfig(threshold_high_db=10.0, min_duration_sec=0.0)
+    result = detect_bursts(grid, config, capture_time=datetime(2026, 1, 1))
+    assert len(result.bursts) == 1

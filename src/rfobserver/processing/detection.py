@@ -10,6 +10,13 @@ from collections import deque
 import numpy as np
 
 
+def interference_flag(pwr_avg: float, threshold_db: float | None) -> bool | None:
+    """True when ``pwr_avg`` is above ``threshold_db``; None when there is no threshold."""
+    if threshold_db is None:
+        return None
+    return pwr_avg > threshold_db
+
+
 class PSDDetector:
     """Detect power violations in PSD bins using rolling baseline + hysteresis."""
 

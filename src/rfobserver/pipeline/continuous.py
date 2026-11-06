@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from rfobserver.processing.burst import BurstDetectionConfig, detect_bursts
+from rfobserver.processing.detection import interference_flag
 from rfobserver.processing.iq_utils import calculate_iq_statistics, convert_bytes_to_complex
 from rfobserver.processing.spectral import PSDGridConfig, compute_psd_grid, compute_summary_psd
 
@@ -354,7 +355,10 @@ class ContinuousProcessor:
         """Submit the processed envelope to ZMS (HTTP)."""
         if self._zms_monitor is not None:
             try:
-                ok = await self._zms_monitor.submit_observation(envelope)
+                flag = interference_flag(
+                    envelope.statistics.average, self._settings.ZMS_INTERFERENCE_THRESHOLD_DB
+                )
+                ok = await self._zms_monitor.submit_observation(envelope, interference=bool(flag))
                 if ok:
                     logger.debug("ZMS observation submitted (capture #%d)", capture_num)
             except Exception:

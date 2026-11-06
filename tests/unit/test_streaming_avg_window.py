@@ -926,3 +926,42 @@ async def test_averaged_frames_continue_while_a_client_is_in_high_res(tmp_path, 
 
     modes = [p["mode"] for p in published]
     assert modes.count("high_res") == 12 and modes.count("averaged") >= 1
+
+
+# --- interference flag: pwr_avg above ZMS_INTERFERENCE_THRESHOLD_DB (2026-11-06) ---
+
+
+async def _publish_with_threshold(tmp_path, threshold):
+    proc, db = _proc(tmp_path)
+    proc._settings.ZMS_INTERFERENCE_THRESHOLD_DB = threshold
+    proc._build_envelope = MagicMock(return_value="envelope")
+    proc._zms_monitor.submit_observation = AsyncMock(return_value=True)
+    await proc._publish_processed(
+        [-80.0, -70.0, -60.0, -50.0], _result(), _stats(), start_time=_T0, duration_sec=0.5
+    )
+    await _drain(proc)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    return proc, db
+
+
+@pytest.mark.asyncio
+async def test_window_above_interference_threshold_is_flagged(tmp_path):
+    proc, db = await _publish_with_threshold(tmp_path, -75.0)  # pwr_avg is -70
+    assert db.insert_avg_window.call_args.kwargs["interference"] is True
+    proc._zms_monitor.submit_observation.assert_awaited_once_with("envelope", interference=True)
+
+
+@pytest.mark.asyncio
+async def test_window_at_or_below_interference_threshold_is_not_flagged(tmp_path):
+    proc, db = await _publish_with_threshold(tmp_path, -70.0)  # equal is not above
+    assert db.insert_avg_window.call_args.kwargs["interference"] is False
+    proc._zms_monitor.submit_observation.assert_awaited_once_with("envelope", interference=False)
+
+
+@pytest.mark.asyncio
+async def test_no_interference_threshold_leaves_the_flag_unset(tmp_path):
+    proc, db = await _publish_with_threshold(tmp_path, None)
+    # NULL in the DB means "not evaluated"; ZMS still gets an explicit false.
+    assert db.insert_avg_window.call_args.kwargs["interference"] is None
+    proc._zms_monitor.submit_observation.assert_awaited_once_with("envelope", interference=False)

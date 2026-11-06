@@ -478,6 +478,11 @@
                     <label for="zms-name">Monitor Name</label>
                     <input type="text" id="zms-name" name="zms_monitor_name" value="{{ settings.ZMS_MONITOR_NAME or '' }}" placeholder="RFObs - {{ settings.HOSTNAME }}">
                 </div>
+                <div class="form-group">
+                    <label for="zms-interference" title="An observation whose average power is above this is flagged as interference">Interference Threshold (dB)</label>
+                    <input type="number" id="zms-interference" name="zms_interference_threshold_db" value="{{ settings.ZMS_INTERFERENCE_THRESHOLD_DB if settings.ZMS_INTERFERENCE_THRESHOLD_DB is not none else '' }}" step="1" placeholder="Off">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Average power above this marks the observation as interference. Empty turns it off.</span>
+                </div>
             </div>
         </div>
     </div>

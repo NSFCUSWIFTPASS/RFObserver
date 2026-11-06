@@ -478,6 +478,8 @@ class SensorDatabase:
         self._db: aiosqlite.Connection | None = None
         self._write_timeout = _DB_WRITE_TIMEOUT_SEC
         self._reconnect_lock = asyncio.Lock()
+        # Background closes of abandoned connections (kept so they are not GC'd).
+        self._corpse_closes: set[asyncio.Task[None]] = set()
         # (start_time, rowid) up to which every avg_windows blob is known to be
         # pruned, so each hourly pass resumes instead of rescanning history.
         self._blob_prune_mark: tuple[str, int] = ("", 0)
@@ -493,21 +495,43 @@ class SensorDatabase:
     async def _reconnect(self, expect: aiosqlite.Connection | None) -> None:
         """Abandon a connection whose write stuck, and open a fresh one.
 
-        The corpse is leaked deliberately: closing it awaits its worker
-        thread, which is the thing that is stuck. WAL locks are tracked
-        per-process via the shared wal-index, so the corpse cannot corrupt
-        the fresh connection — a write attempted while the corpse still
-        holds the WAL write lock fails fast (busy_timeout) instead of
-        hanging. Serialized so concurrent stuck writers reconnect once.
+        The corpse is not awaited: closing it waits for its worker thread,
+        which is the thing that is stuck. WAL locks are tracked per-process
+        via the shared wal-index, so the corpse cannot corrupt the fresh
+        connection; a write attempted while the corpse still holds the WAL
+        write lock fails fast (busy_timeout) instead of hanging. Serialized
+        so concurrent stuck writers reconnect once.
+
+        Its close is still queued, in the background: the timed-out write
+        stays queued on the corpse and runs once the stall clears, opening a
+        transaction nobody commits. Without the close that held the write
+        lock for good and every later write failed with "database is
+        locked" (W230, 2026-11-05;
+        docs/debugging/2026-11-06_w230-db-locked-after-stuck-write.md).
+        The close runs after it and rolls it back; the retry on the fresh
+        connection already wrote that row.
         """
         async with self._reconnect_lock:
             if self._db is not expect:
                 return  # another coroutine already reconnected
             self._db = None
+            if expect is not None:
+                task = asyncio.ensure_future(self._close_corpse(expect))
+                self._corpse_closes.add(task)
+                task.add_done_callback(self._corpse_closes.discard)
             conn = await aiosqlite.connect(self._db_path)
             await self._configure_writer(conn)
             self._db = conn
             logger.error("Database reconnected after stuck write")
+
+    @staticmethod
+    async def _close_corpse(corpse: aiosqlite.Connection) -> None:
+        try:
+            await corpse.close()
+        except Exception:
+            logger.exception("Closing an abandoned database connection failed")
+        else:
+            logger.warning("Abandoned database connection closed; its write lock is released")
 
     async def _configure_writer(self, conn: aiosqlite.Connection) -> None:
         """Journal/sync pragmas for a writer connection (connect and reconnect)."""

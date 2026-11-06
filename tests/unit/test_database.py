@@ -1087,6 +1087,32 @@ async def test_concurrent_stuck_writes_reconnect_once(db):
     await corpse.close()
 
 
+async def test_abandoned_connection_does_not_keep_the_write_lock(db):
+    """W230, 2026-11-05: a write queued behind something slow timed out and the
+    connection was abandoned. The corpse then ran that queued INSERT (an implicit
+    BEGIN nobody commits) and held the WAL write lock for good: every later write
+    failed with "database is locked" for 22 h. See
+    docs/debugging/2026-11-06_w230-db-locked-after-stuck-write.md."""
+    import time
+
+    corpse = db._db
+    assert corpse is not None
+    db._write_timeout = 0.5
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # Something slow occupies the writer's worker thread past the write timeout.
+    slow = asyncio.ensure_future(corpse._execute(time.sleep, 1.5))
+    await asyncio.sleep(0.05)
+    await db.insert_avg_window(start_time=base, **_avg_common())
+    assert db._db is not corpse
+    await slow
+    await asyncio.sleep(0.3)  # the corpse reaches the INSERT queued behind the sleep
+
+    db._write_timeout = 5.0
+    await db.insert_avg_window(start_time=base + timedelta(seconds=1), **_avg_common())
+    rows = await db.query_avg_windows(since=base - timedelta(seconds=1), limit=10)
+    assert len(rows) == 2, "the retried row and the next one; the corpse's copy rolled back"
+
+
 async def _journal_pragmas(db: SensorDatabase) -> tuple[str, int]:
     assert db._db is not None
     async with db._db.execute("PRAGMA journal_mode") as cur:

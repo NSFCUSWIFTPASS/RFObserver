@@ -459,7 +459,11 @@ async def test_ui_prefs_roundtrip(app_with_db):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         r = await c.get("/api/ui-prefs")
         assert r.status_code == 200
-        assert r.json() == {"scale": {}, "theme": "auto"}
+        assert r.json() == {
+            "scale": {},
+            "theme": "auto",
+            "plot": {"points": True, "size": 2.0},
+        }
 
         doc = {
             "scale": {
@@ -491,7 +495,11 @@ async def test_ui_prefs_roundtrip(app_with_db):
         # and a scale update keeps the stored theme
         r = await c.put("/api/ui-prefs", json={"scale": {}})
         assert r.status_code == 200
-        assert (await c.get("/api/ui-prefs")).json() == {"scale": {}, "theme": "dark"}
+        assert (await c.get("/api/ui-prefs")).json() == {
+            "scale": {},
+            "theme": "dark",
+            "plot": {"points": True, "size": 2.0},
+        }
 
 
 @pytest.mark.asyncio
@@ -522,7 +530,11 @@ async def test_ui_prefs_rejects_bad_values(app_with_db):
         r = await c.put("/api/ui-prefs", json={"theme": 42})
         assert r.status_code == 400
         # nothing was stored
-        assert (await c.get("/api/ui-prefs")).json() == {"scale": {}, "theme": "auto"}
+        assert (await c.get("/api/ui-prefs")).json() == {
+            "scale": {},
+            "theme": "auto",
+            "plot": {"points": True, "size": 2.0},
+        }
 
 
 @pytest.mark.asyncio

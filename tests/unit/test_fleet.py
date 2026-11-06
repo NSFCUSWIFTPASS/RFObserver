@@ -499,6 +499,13 @@ def test_fleet_ui_prefs(fleet_client: TestClient, tmp_path: Path) -> None:
     assert fleet_client.put("/api/ui-prefs", content=b"[1]").status_code == 400
 
 
+def test_fleet_ui_prefs_plot(fleet_client: TestClient) -> None:
+    assert fleet_client.get("/api/ui-prefs").json()["plot"] == {"points": True, "size": 2.0}
+    r = fleet_client.put("/api/ui-prefs", json={"plot": {"points": False, "size": 3}})
+    assert r.status_code == 200 and r.json()["plot"] == {"points": False, "size": 3.0}
+    assert fleet_client.put("/api/ui-prefs", json={"plot": {"size": 20}}).status_code == 400
+
+
 def test_fleet_health(fleet_client: TestClient) -> None:
     assert fleet_client.get("/api/health").json()["mode"] == "fleet"
 

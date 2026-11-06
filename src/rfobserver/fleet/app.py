@@ -774,7 +774,12 @@ def create_fleet_app(
 
     @app.put("/api/ui-prefs")
     async def put_prefs(request: Request) -> dict[str, Any]:
-        from rfobserver.web.routes.api import _normalize_prefs, _validate_scale, _validate_theme
+        from rfobserver.web.routes.api import (
+            _normalize_prefs,
+            _validate_plot,
+            _validate_scale,
+            _validate_theme,
+        )
 
         try:
             body = await request.json()
@@ -787,6 +792,8 @@ def create_fleet_app(
             doc["scale"] = _validate_scale(body["scale"])
         if "theme" in body:
             doc["theme"] = _validate_theme(body["theme"])
+        if "plot" in body:
+            doc["plot"] = _validate_plot(body["plot"], doc.get("plot"))
         doc = _normalize_prefs(doc)
         prefs.write(doc)
         return doc

@@ -9,6 +9,10 @@
             <div class="card-header">
                 <span id="fleet-live-power-title">Power</span>
                 <span class="fleet-live-toggles">
+                    <label class="toggle-label" title="Draw each value as a point instead of a line">
+                        <input type="checkbox" data-plot-points checked>
+                        <span class="toggle-text">Points</span>
+                    </label>
                     <label class="toggle-label" id="fleet-live-bursts-label" title="Show detected bursts and their rtl_433 labels on the waterfalls (High Res only)">
                         <input type="checkbox" id="fleet-live-bursts" checked>
                         <span class="toggle-text">Bursts</span>
@@ -35,6 +39,12 @@
         <div class="card fleet-live-kurtosis fleet-live-chart">
             <div class="card-header">
                 <span id="fleet-live-kurtosis-title">Kurtosis</span>
+                <span class="fleet-live-toggles">
+                    <label class="toggle-label" title="Draw each value as a point instead of a line">
+                        <input type="checkbox" data-plot-points checked>
+                        <span class="toggle-text">Points</span>
+                    </label>
+                </span>
             </div>
             <div class="card-body">
                 <div class="fleet-live-chart-hold">
@@ -51,5 +61,6 @@
     </p>
 </div>
 
+<script src="/static/plot-style.js"></script>
 <script src="/static/fleet-live.js"></script>
 {% endblock %}

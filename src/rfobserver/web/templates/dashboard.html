@@ -2,6 +2,7 @@
 {% block title %}Live - RFObs{% endblock %}
 {% block content %}
 <script src="/static/shared-charts.js"></script>
+<script src="/static/plot-style.js"></script>
 <div id="storage-banner" class="storage-banner" role="status" style="display: none;">
     <span class="storage-banner-label">Storage</span>
     <span id="storage-banner-text" class="storage-banner-text"></span>
@@ -37,6 +38,10 @@
             <div style="position: relative;">
                 <canvas id="timeseries-canvas" width="920" height="160" style="width: 100%; height: 160px;"></canvas>
                 <div class="graph-legend" id="ts-legend">
+                    <label class="toggle-label" title="Draw each value as a point instead of a line">
+                        <input type="checkbox" data-plot-points checked>
+                        <span class="toggle-text">Points</span>
+                    </label>
                     <span class="legend-item active" data-trace="power" style="--color: #0071e3;">Power</span>
                     <span class="legend-item" data-trace="kurtosis" style="--color: #ff9f0a;">Kurtosis</span>
                 </div>
@@ -323,6 +328,32 @@
         drawTimeSeries();
     });
 
+    // One trace as points (the default) or a line, at the plot thickness
+    // (plot-style.js).
+    function drawTrace(values, lo, hi, colour, N, W, H) {
+        const style = window.RFObsPlot ? window.RFObsPlot.get() : { points: false, size: 1.5 };
+        const xy = function (i) {
+            return [(i / (TS_MAX_POINTS - 1)) * W, H - ((values[i] - lo) / (hi - lo)) * H];
+        };
+        if (style.points) {
+            tsCtx.fillStyle = colour;
+            for (let i = 0; i < N; i++) {
+                const p = xy(i);
+                window.RFObsPlot.dot(tsCtx, p[0], p[1]);
+            }
+            return;
+        }
+        tsCtx.beginPath();
+        for (let i = 0; i < N; i++) {
+            const p = xy(i);
+            if (i === 0) tsCtx.moveTo(p[0], p[1]); else tsCtx.lineTo(p[0], p[1]);
+        }
+        tsCtx.strokeStyle = colour;
+        tsCtx.lineWidth = style.size;
+        tsCtx.stroke();
+    }
+    if (window.RFObsPlot) window.RFObsPlot.onChange(function () { drawTimeSeries(); });
+
     function drawTimeSeries() {
         const W = tsCanvas.width;
         const H = tsCanvas.height;
@@ -359,15 +390,7 @@
 
         // Power trace
         if (traceVisible.power) {
-            tsCtx.beginPath();
-            for (let i = 0; i < N; i++) {
-                const x = (i / (TS_MAX_POINTS - 1)) * W;
-                const y = H - ((tsAvgPower[i] - pMin) / (pMax - pMin)) * H;
-                if (i === 0) tsCtx.moveTo(x, y); else tsCtx.lineTo(x, y);
-            }
-            tsCtx.strokeStyle = "#0071e3";
-            tsCtx.lineWidth = 1.5;
-            tsCtx.stroke();
+            drawTrace(tsAvgPower, pMin, pMax, "#0071e3", N, W, H);
 
             tsCtx.font = "10px -apple-system, sans-serif";
             tsCtx.fillStyle = "#0071e3";
@@ -411,15 +434,7 @@
             const kPad = Math.max((kMax - kMin) * 0.1, 0.5);
             kMin -= kPad; kMax += kPad;
 
-            tsCtx.beginPath();
-            for (let i = 0; i < N; i++) {
-                const x = (i / (TS_MAX_POINTS - 1)) * W;
-                const y = H - ((tsKurtosis[i] - kMin) / (kMax - kMin)) * H;
-                if (i === 0) tsCtx.moveTo(x, y); else tsCtx.lineTo(x, y);
-            }
-            tsCtx.strokeStyle = "#ff9f0a";
-            tsCtx.lineWidth = 1.5;
-            tsCtx.stroke();
+            drawTrace(tsKurtosis, kMin, kMax, "#ff9f0a", N, W, H);
 
             tsCtx.font = "10px -apple-system, sans-serif";
             tsCtx.fillStyle = "#ff9f0a";

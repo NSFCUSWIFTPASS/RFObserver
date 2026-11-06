@@ -19,6 +19,16 @@ if ! id rfobserver &>/dev/null; then
     useradd --system --shell /usr/sbin/nologin --create-home rfobserver
 fi
 
+# GPU access for RFOBS_PSD_BACKEND=cuda: on a Jetson the GPU device nodes
+# (/dev/nvmap, /dev/nvhost-*, /dev/nvgpu/*) belong to group video, the DRM
+# ones to render. Without them the service reports "no CUDA device" even with
+# the library built (hcro-jet-001, 2026-11-06). Only groups that exist.
+for grp in video render; do
+    if getent group "$grp" >/dev/null; then
+        usermod -aG "$grp" rfobserver
+    fi
+done
+
 # Create directories. chown -R so a DB/.env left root-owned by an earlier root
 # run becomes writable by the service user (else SQLite hits "readonly database").
 mkdir -p /var/lib/rfobserver

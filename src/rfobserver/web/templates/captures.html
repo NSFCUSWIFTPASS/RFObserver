@@ -64,7 +64,7 @@
                 <label>Sensors</label>
                 <div class="sched-sensors" id="sched-sensors">
                     {% for s in fleet_captures.sensors %}
-                    <label class="sched-sensor"><input type="checkbox" value="{{ s.id }}" checked> {{ s.label }}</label>
+                    <label class="sched-sensor"><input type="checkbox" value="{{ s.id }}" data-label="{{ s.label }}" checked> {{ s.label }}</label>
                     {% endfor %}
                 </div>
             </div>

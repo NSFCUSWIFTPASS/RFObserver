@@ -66,3 +66,12 @@ def test_schedules_script_uses_the_api_and_no_em_dash() -> None:
     assert "/api/schedules" in js
     assert "visibilitychange" in js
     assert "—" not in js
+
+
+def test_fleet_failures_name_the_sensor_and_its_host() -> None:
+    # "Not scheduled on: W230 (hcro-jet-003): HTTP 500", not the bare host id.
+    js = (STATIC / "schedules.js").read_text()
+    assert "function sensorName(id)" in js
+    assert "sensorName(e[0])" in js
+    tpl = (STATIC.parent / "templates" / "captures.html").read_text()
+    assert 'data-label="{{ s.label }}"' in tpl

@@ -115,6 +115,14 @@
             .map((el) => el.value);
     }
 
+    // "W230 (hcro-jet-003)": the sensor's name, then the id the fleet knows it by.
+    function sensorName(id) {
+        const el = Array.from(document.querySelectorAll("#sched-sensors input"))
+            .find((i) => i.value === id);
+        const label = el ? el.dataset.label : "";
+        return label && label !== id ? label + " (" + id + ")" : id;
+    }
+
     async function submit(ev) {
         ev.preventDefault();
         errorEl.textContent = "";
@@ -157,7 +165,7 @@
                 const failed = Object.entries(data.results || {}).filter((e) => !e[1].ok);
                 if (failed.length) {
                     errorEl.textContent = "Not scheduled on: " + failed.map(
-                        (e) => e[0] + " (" + (e[1].detail || e[1].status) + ")").join(", ");
+                        (e) => sensorName(e[0]) + ": " + (e[1].detail || e[1].status)).join("; ");
                 }
             }
             warnEl.textContent = (data.warnings || []).join(" ");

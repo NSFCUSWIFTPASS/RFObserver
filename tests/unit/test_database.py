@@ -1036,6 +1036,14 @@ async def test_avg_window_configs_distinct_and_latest(db):
 # -- Stuck-write resilience (device hiccup wedge) --
 
 
+async def _corpses_closed(db: SensorDatabase, corpse) -> None:
+    """The database closes an abandoned connection itself, in the background.
+    Wait for that rather than closing it again: two concurrent aiosqlite
+    closes can queue work behind the worker's stop and hang for good."""
+    await asyncio.gather(*list(db._corpse_closes))
+    assert corpse._connection is None, "the abandoned connection was closed"
+
+
 def _sabotage_execute_hang(conn, hang: asyncio.Event) -> None:
     """Replace a connection's execute with one that never returns — simulates
     a storage-device hiccup wedging the aiosqlite worker thread mid-write."""
@@ -1055,7 +1063,7 @@ async def test_stuck_write_abandons_connection_and_retries(db):
     complete on a fresh one — the device hiccup then costs one timeout
     instead of the whole avg_windows history."""
     corpse = db._db
-    db._write_timeout = 0.05
+    db._write_timeout = 0.5  # the hang never ends; the retry needs real margin
     _sabotage_execute_hang(corpse, asyncio.Event())
 
     base = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -1064,14 +1072,14 @@ async def test_stuck_write_abandons_connection_and_retries(db):
     assert db._db is not corpse, "stuck connection must be abandoned"
     rows = await db.query_avg_windows(since=base - timedelta(seconds=1), limit=10)
     assert len(rows) == 1, "retried insert lands on the fresh connection"
-    await corpse.close()  # sabotage bypassed aiosqlite internals; close is clean
+    await _corpses_closed(db, corpse)
 
 
 async def test_concurrent_stuck_writes_reconnect_once(db):
     """Two writers timing out on the same corpse must share one reconnect —
     the second sees the fresh connection and retries on it directly."""
     corpse = db._db
-    db._write_timeout = 0.05
+    db._write_timeout = 0.5  # the hang never ends; the retry needs real margin
     _sabotage_execute_hang(corpse, asyncio.Event())
 
     base = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -1084,7 +1092,7 @@ async def test_concurrent_stuck_writes_reconnect_once(db):
     # Both retries landed on the same fresh connection.
     rows = await db.query_avg_windows(since=base - timedelta(seconds=1), limit=10)
     assert len(rows) == 1
-    await corpse.close()
+    await _corpses_closed(db, corpse)
 
 
 async def test_abandoned_connection_does_not_keep_the_write_lock(db):
@@ -1137,7 +1145,7 @@ async def test_writer_reconnect_caps_wal_and_is_in_wal_mode(db):
         assert db._db is not corpse
         assert await _journal_pragmas(db) == ("wal", 67108864)
     finally:
-        await corpse.close()
+        await _corpses_closed(db, corpse)
 
 
 async def test_writer_logs_error_when_wal_is_unavailable(tmp_path, monkeypatch, caplog):
@@ -1535,7 +1543,7 @@ async def test_writer_disables_secure_delete_on_connect_and_reconnect(db):
         await db._reconnect(expect=corpse)
         assert await _secure_delete(db._db) == 0
     finally:
-        await corpse.close()
+        await _corpses_closed(db, corpse)
 
 
 _WINDOW = dict(

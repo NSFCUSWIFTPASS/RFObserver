@@ -40,6 +40,7 @@ from rfobserver.capture.buffer import CircularBuffer, GridPreBuffer, trim_grid_r
 from rfobserver.capture.clock import CaptureClock
 from rfobserver.processing import psd_cuda
 from rfobserver.processing.burst import BurstDetectionConfig
+from rfobserver.processing.detection import interference_flag
 from rfobserver.processing.iq_utils import (
     IQMoments,
     convert_sc16_to_complex,
@@ -3734,11 +3735,12 @@ class StreamingProcessor:
         *,
         start_time: datetime,
         duration_sec: float,
+        interference: bool | None = None,
     ) -> None:
         """Store the averaged window locally. Runs for every live window,
-        independent of whether ZMS is attached. Flags (interference /
-        violations) are not computed in the streaming path yet, so they are left
-        NULL until the PSDProcessor gap is closed.
+        independent of whether ZMS is attached. ``interference`` is the
+        ZMS_INTERFERENCE_THRESHOLD_DB check (None when it is off); per-bin
+        violations are not computed in the streaming path yet and stay NULL.
 
         ``start_time`` / ``duration_sec`` are the window's real span, measured by
         the caller (see ``_AvgWindowClock``), not the persist time and the
@@ -3762,6 +3764,7 @@ class StreamingProcessor:
                 pwr_median=iq_stats.median,
                 pwr_std=iq_stats.std,
                 kurtosis=iq_stats.kurtosis,
+                interference=interference,
                 powers=(
                     None
                     if self._governor is not None and self._governor.state.skip_psd_blobs
@@ -3795,6 +3798,9 @@ class StreamingProcessor:
             return
         # The background a capture's power is compared with (capture priority).
         self._background.add(iq_stats.average)
+        interference = interference_flag(
+            iq_stats.average, self._settings.ZMS_INTERFERENCE_THRESHOLD_DB
+        )
         self._db_writer.submit(
             functools.partial(
                 self._persist_avg_window,
@@ -3803,6 +3809,7 @@ class StreamingProcessor:
                 iq_stats,
                 start_time=start_time,
                 duration_sec=duration_sec,
+                interference=interference,
             ),
             window_start=start_time,
         )
@@ -3815,13 +3822,19 @@ class StreamingProcessor:
             return
 
         if self._zms_monitor is not None:
-            asyncio.create_task(self._zms_submit_async(envelope, result.capture_num))
+            asyncio.create_task(
+                self._zms_submit_async(envelope, result.capture_num, bool(interference))
+            )
 
-    async def _zms_submit_async(self, envelope: ProcessedDataEnvelope, chunk_num: int) -> None:
+    async def _zms_submit_async(
+        self, envelope: ProcessedDataEnvelope, chunk_num: int, interference: bool = False
+    ) -> None:
         timeout = max(15.0, 5.0 * self._settings.DURATION_SEC)
         try:
             ok = await asyncio.wait_for(
-                self._zms_monitor.submit_observation(envelope),  # type: ignore[union-attr]
+                self._zms_monitor.submit_observation(  # type: ignore[union-attr]
+                    envelope, interference=interference
+                ),
                 timeout=timeout,
             )
             if ok:

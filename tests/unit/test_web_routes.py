@@ -376,6 +376,25 @@ class TestConfigApply:
         assert "bogus" in resp.json()["detail"]
         assert before == settings.ATTRIBUTION_DECODERS
 
+    def test_apply_interference_threshold_is_live_and_clearable(
+        self, client_with_processor, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)  # the apply writes .env in the working directory
+        client, settings, processor = client_with_processor
+        resp = client.post("/config/apply", json={"zms_interference_threshold_db": "-55"})
+        assert resp.status_code == 200
+        assert settings.ZMS_INTERFERENCE_THRESHOLD_DB == -55.0
+        processor.reconfigure.assert_not_called()  # read for every window
+        resp = client.post("/config/apply", json={"zms_interference_threshold_db": ""})
+        assert resp.status_code == 200
+        assert settings.ZMS_INTERFERENCE_THRESHOLD_DB is None
+
+    def test_config_page_shows_the_interference_threshold(self, client_with_processor):
+        client, settings, _ = client_with_processor
+        object.__setattr__(settings, "ZMS_INTERFERENCE_THRESHOLD_DB", -55.0)
+        html = client.get("/config").text
+        assert 'name="zms_interference_threshold_db" value="-55.0"' in html
+
     def test_config_page_lists_the_decoders_with_their_state(self, client_with_processor):
         client, settings, _ = client_with_processor
         object.__setattr__(settings, "ATTRIBUTION_DECODERS", "ssm,silverspring")

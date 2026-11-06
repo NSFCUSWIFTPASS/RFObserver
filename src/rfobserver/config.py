@@ -316,6 +316,10 @@ class AppSettings(BaseSettings):
     ZMS_MONITOR_NAME: str | None = None
     ZMS_MONITOR_SCHEMA_PATH: str | None = None
     ZMS_METRIC_ID: str | None = None
+    # An observation whose pwr_avg is above this (same dB scale as pwr_avg and
+    # TRIGGER_THRESHOLD_DB) goes out with interference=true and the flag is
+    # stored on its averaged window. None turns the check off.
+    ZMS_INTERFERENCE_THRESHOLD_DB: float | None = None
 
     # rf-db (optional): every averaged window's stats go to the Grafana
     # Postgres on node1.

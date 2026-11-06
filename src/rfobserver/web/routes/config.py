@@ -166,6 +166,8 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "zms_monitor_id": ("ZMS_MONITOR_ID", str),
         "zms_metric_id": ("ZMS_METRIC_ID", str),
         "zms_monitor_name": ("ZMS_MONITOR_NAME", str),
+        # Read for every averaged window, so no reconfigure.
+        "zms_interference_threshold_db": ("ZMS_INTERFERENCE_THRESHOLD_DB", float),
     }
 
     # Tokens are SecretStr and use a "(unchanged)" placeholder in the UI;
@@ -184,6 +186,7 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "CAL_OFFSET_DB",
         "PSD_SCALE_MIN_DB",
         "PSD_SCALE_MAX_DB",
+        "ZMS_INTERFERENCE_THRESHOLD_DB",
     }
 
     # Reject an inverted display scale (Min >= Max) up front, before any

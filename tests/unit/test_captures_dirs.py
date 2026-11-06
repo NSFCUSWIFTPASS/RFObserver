@@ -85,3 +85,30 @@ async def test_list_and_detail_report_the_priority_mark(app, settings):
     assert by_name["plain-cap.sc16"]["priority"] is False
     r = await _get(app, "/captures/detail/event-cap.sc16")
     assert r.json()["priority"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("indexed", [False, True])
+async def test_list_filters_by_origin(app, settings, indexed):
+    from rfobserver.storage.local import LocalStorage
+
+    _seed(settings, "auto", "trig-cap")
+    _seed(settings, "manual", "man-cap")
+    _seed(settings, "manual", "s-20261105T200000000-sched-8a6d821a1b7d-0")
+    if indexed:  # the running sensor lists from its capture index
+        app.state.local_storage = LocalStorage(settings.STORAGE_PATH, max_gb=1.0)
+
+    r = await _get(app, "/captures/list?origin=scheduled")
+    assert r.status_code == 200
+    assert [e["filename"] for e in r.json()] == ["s-20261105T200000000-sched-8a6d821a1b7d-0.sc16"]
+    assert r.headers["X-Total-Count"] == "1"
+    r = await _get(app, "/captures/list?origin=auto,manual")
+    assert sorted(e["filename"] for e in r.json()) == ["man-cap.sc16", "trig-cap.sc16"]
+    assert r.headers["X-Total-Count"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_list_rejects_an_unknown_origin(app, settings):
+    r = await _get(app, "/captures/list?origin=bogus")
+    assert r.status_code == 400
+    assert "bogus" in r.json()["detail"]

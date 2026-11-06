@@ -75,3 +75,14 @@ def test_fleet_failures_name_the_sensor_and_its_host() -> None:
     assert "sensorName(e[0])" in js
     tpl = (STATIC.parent / "templates" / "captures.html").read_text()
     assert 'data-label="{{ s.label }}"' in tpl
+
+
+def test_captures_page_has_the_origin_filter(tmp_path: Path, monkeypatch) -> None:
+    with _app(tmp_path, monkeypatch) as c:
+        html = c.get("/captures/").text
+    assert 'id="captures-origin"' in html
+    buttons = (("", "All"), ("auto", "Auto"), ("manual", "Manual"), ("scheduled", "Scheduled"))
+    for value, label in buttons:
+        assert f'data-origin="{value}"' in html and f">{label}</button>" in html
+    assert 'qs.set("origin"' in html  # the fleet list passes it on
+    assert "&origin=" in html  # the sensor list asks for it

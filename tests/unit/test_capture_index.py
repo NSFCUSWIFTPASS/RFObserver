@@ -152,3 +152,33 @@ def test_enforce_cap_and_evict_never_double_delete(tmp_path):
     assert ls._delete_capture(first) == 100
     assert ls._delete_capture(first) == 0  # already claimed and gone
     assert ls.get_usage_bytes() == 300
+
+
+def test_newest_first_and_count_filter_by_origin(tmp_path):
+    """auto/ holds auto captures; manual/ holds manual and scheduled ones, and a
+    scheduled capture is named ...-sched-<id>-<run>."""
+    root = tmp_path / "s"
+    (root / "auto").mkdir(parents=True)
+    (root / "manual").mkdir()
+    _write(root / "auto", "a-old", 4, 100.0)
+    _write(root / "manual", "m-1", 4, 200.0)
+    _write(root / "manual", "x-20261105T200000000-sched-8a6d821a1b7d-0", 4, 300.0)
+    _write(root / "auto", "a-new", 4, 400.0)
+    ls = LocalStorage(str(root), max_gb=1.0)
+
+    def names(**kw):
+        return [e.path.stem for e in ls.captures_newest_first(**kw)]
+
+    assert [e.origin for e in ls.captures_newest_first()] == [
+        "auto",
+        "scheduled",
+        "manual",
+        "auto",
+    ]
+    assert names(origins={"auto"}) == ["a-new", "a-old"]
+    assert names(origins={"manual"}) == ["m-1"]
+    assert names(origins={"scheduled"}) == ["x-20261105T200000000-sched-8a6d821a1b7d-0"]
+    assert names(origins={"auto", "manual"}, offset=1, limit=1) == ["m-1"]
+    assert ls.capture_count(origins={"auto"}) == 2
+    assert ls.capture_count(origins={"scheduled"}) == 1
+    assert ls.capture_count() == 4

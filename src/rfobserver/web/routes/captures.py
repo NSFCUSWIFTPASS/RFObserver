@@ -15,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from rfobserver.storage import psd_grid
+from rfobserver.storage.local import CAPTURE_ORIGINS, capture_origin
 from rfobserver.storage.priority import PRIORITY_SUFFIX
 from rfobserver.storage.sigmf_export import iq_sigmf_meta
 from rfobserver.web.uiprefs import ui_theme
@@ -153,6 +154,21 @@ def _page_param(raw: str | None, default: int | None, name: str) -> int | None:
     return value
 
 
+def _origin_param(raw: str | None) -> frozenset[str] | None:
+    """The ``origin`` filter as a set, or None for every capture."""
+    if raw is None or not raw.strip():
+        return None
+    names = {n.strip().lower() for n in raw.split(",") if n.strip()}
+    unknown = sorted(names - set(CAPTURE_ORIGINS))
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown capture origin: {', '.join(unknown)} "
+            f"(known: {', '.join(CAPTURE_ORIGINS)})",
+        )
+    return frozenset(names)
+
+
 def _scan_captures(storage: Path) -> list[tuple[Path, str]]:
     """Newest-first (path, origin) by listing the capture directories. Only
     for a web-only process, which has no capture index (and no receiver)."""
@@ -160,7 +176,7 @@ def _scan_captures(storage: Path) -> list[tuple[Path, str]]:
     for d in _capture_dirs(storage):
         if d.exists():
             origin = d.name if d != storage else "manual"
-            found.extend((sc16, origin) for sc16 in d.glob("*.sc16"))
+            found.extend((sc16, capture_origin(sc16, origin)) for sc16 in d.glob("*.sc16"))
     return sorted(found, key=lambda t: t[0].stat().st_mtime, reverse=True)
 
 
@@ -170,27 +186,33 @@ async def captures_list(
     response: Response,
     offset: str | None = None,
     limit: str | None = None,
+    origin: str | None = None,
 ) -> list[dict[str, Any]]:
     """List .sc16 captures with metadata, newest first.
 
     ``offset``/``limit`` page the list (the page asks for 200 at a time;
-    without ``limit`` every capture is returned, as before). The total is in
-    the ``X-Total-Count`` header. With the pipeline running, the capture
-    index supplies the order, so only the requested page touches the disk.
+    without ``limit`` every capture is returned, as before). ``origin`` keeps
+    only captures of the listed origins (comma separated: auto, manual,
+    scheduled). The total, after the filter, is in the ``X-Total-Count``
+    header. With the pipeline running, the capture index supplies the order,
+    so only the requested page touches the disk.
     """
     storage = _get_storage(request)
     off = _page_param(offset, 0, "offset") or 0
     lim = _page_param(limit, None, "limit")
+    origins = _origin_param(origin)
     if not storage.exists():
         response.headers["X-Total-Count"] = "0"
         return []
 
     local = getattr(request.app.state, "local_storage", None)
     if local is not None:
-        total = local.capture_count()
-        page = [(e.path, e.origin) for e in local.captures_newest_first(off, lim)]
+        total = local.capture_count(origins)
+        page = [(e.path, e.origin) for e in local.captures_newest_first(off, lim, origins)]
     else:
         found = await asyncio.to_thread(_scan_captures, storage)
+        if origins is not None:
+            found = [f for f in found if f[1] in origins]
         total = len(found)
         page = found[off : None if lim is None else off + lim]
     response.headers["X-Total-Count"] = str(total)

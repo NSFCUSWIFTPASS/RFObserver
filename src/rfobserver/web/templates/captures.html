@@ -4,17 +4,25 @@
 <script src="/static/shared-charts.js"></script>
 <div class="page-header">
     <h1>IQ Captures</h1>
-    {% if fleet_captures %}
     <div class="captures-fleet-bar">
+        {% if fleet_captures %}
         <select id="captures-sensor" aria-label="Sensor">
             <option value="">All sensors</option>
             {% for s in fleet_captures.sensors %}
             <option value="{{ s.id }}">{{ s.label }}</option>
             {% endfor %}
         </select>
+        {% endif %}
+        <span class="captures-origin" id="captures-origin" role="group" aria-label="Capture origin">
+            <button type="button" class="btn-preset active" data-origin="">All</button>
+            <button type="button" class="btn-preset" data-origin="auto">Auto</button>
+            <button type="button" class="btn-preset" data-origin="manual">Manual</button>
+            <button type="button" class="btn-preset" data-origin="scheduled">Scheduled</button>
+        </span>
+        {% if fleet_captures %}
         <span id="captures-errors" class="captures-errors"></span>
+        {% endif %}
     </div>
-    {% endif %}
 </div>
 
 <div class="card schedule-card" id="schedule-card" data-fleet="{{ '1' if fleet_captures else '0' }}">
@@ -211,6 +219,7 @@
     let listSelected = null;   // filename, plus listSensor in fleet mode
     let listSensor = null;
     let listCursor = "";       // fleet mode: how far into each sensor's list
+    let listOrigin = "";       // "", or one of auto / manual / scheduled
     const sensorSelect = document.getElementById("captures-sensor");
     const errorsEl = document.getElementById("captures-errors");
 
@@ -276,6 +285,7 @@
             const qs = new URLSearchParams({limit: String(limit)});
             if (more && listCursor) qs.set("cursor", listCursor);
             if (sensorSelect && sensorSelect.value) qs.set("sensor", sensorSelect.value);
+            if (listOrigin) qs.set("origin", listOrigin);
             const r = await fetch("/fleet/api/captures?" + qs.toString());
             if (!r.ok) return null;
             const body = await r.json();
@@ -287,7 +297,8 @@
             return [body.captures || [], body.total || 0];
         }
         const offset = more ? listShown : 0;
-        const r = await fetch("/captures/list?offset=" + offset + "&limit=" + limit);
+        const r = await fetch("/captures/list?offset=" + offset + "&limit=" + limit
+            + (listOrigin ? "&origin=" + encodeURIComponent(listOrigin) : ""));
         if (!r.ok) return null;
         const captures = await r.json();
         return [captures, Number(r.headers.get("X-Total-Count")) || captures.length];
@@ -305,7 +316,8 @@
 
             if (!more && captures.length === 0) {
                 listShown = 0;
-                listEl.innerHTML = '<div class="placeholder-text">No captures yet</div>';
+                listEl.innerHTML = '<div class="placeholder-text">'
+                    + (listOrigin ? "No " + listOrigin + " captures" : "No captures yet") + '</div>';
                 return;
             }
 
@@ -1225,6 +1237,19 @@
         if (e.target.closest(".capture-load-more")) { loadList(true); return; }
         const item = e.target.closest(".capture-item");
         if (item) showDetail(item.dataset.file, item.dataset.hasPsd === "1", item.dataset.sensor);
+    });
+
+    const originGroup = document.getElementById("captures-origin");
+    originGroup.addEventListener("click", function(e) {
+        const btn = e.target.closest("button[data-origin]");
+        if (!btn || btn.dataset.origin === listOrigin) return;
+        listOrigin = btn.dataset.origin;
+        originGroup.querySelectorAll("button").forEach(function(b) {
+            b.classList.toggle("active", b === btn);
+        });
+        listCursor = "";
+        listShown = 0;
+        loadList();
     });
 
     if (sensorSelect) {

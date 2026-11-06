@@ -66,3 +66,14 @@ def test_schedules_script_uses_the_api_and_no_em_dash() -> None:
     assert "/api/schedules" in js
     assert "visibilitychange" in js
     assert "—" not in js
+
+
+def test_captures_page_has_the_origin_filter(tmp_path: Path, monkeypatch) -> None:
+    with _app(tmp_path, monkeypatch) as c:
+        html = c.get("/captures/").text
+    assert 'id="captures-origin"' in html
+    buttons = (("", "All"), ("auto", "Auto"), ("manual", "Manual"), ("scheduled", "Scheduled"))
+    for value, label in buttons:
+        assert f'data-origin="{value}"' in html and f">{label}</button>" in html
+    assert 'qs.set("origin"' in html  # the fleet list passes it on
+    assert "&origin=" in html  # the sensor list asks for it

@@ -465,11 +465,16 @@ def create_fleet_app(
 
     @app.get("/fleet/api/captures")
     async def fleet_captures(
-        limit: int = 200, cursor: str | None = None, sensor: str | None = None
+        limit: int = 200,
+        cursor: str | None = None,
+        sensor: str | None = None,
+        origin: str | None = None,
     ) -> dict[str, Any]:
         """The next ``limit`` captures across enabled sensors (or one), newest
         first. Pass the response's ``cursor`` back for the page after; the
-        list is read fresh each time (a new capture shows at once)."""
+        list is read fresh each time (a new capture shows at once).
+        ``origin`` (auto, manual, scheduled; comma separated) is passed to
+        each sensor, which filters its own list."""
         from rfobserver.fleet.captures import format_cursor, merge_page, parse_cursor
 
         limit = max(1, min(limit, 500))
@@ -481,11 +486,14 @@ def create_fleet_app(
         async def one(s: Sensor) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
             meta = {"id": s.id, "label": hub.display_label(s), "colour": s.colour}
             off = offsets.get(s.id, 0)
+            params = {"offset": str(off), "limit": str(limit)}
+            if origin:
+                params["origin"] = origin
             try:
                 reply = await hub.get(
                     s,
                     "list",
-                    {"offset": str(off), "limit": str(limit)},
+                    params,
                     root="captures",
                     cache=False,
                 )

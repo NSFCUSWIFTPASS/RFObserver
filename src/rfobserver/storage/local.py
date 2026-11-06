@@ -34,7 +34,7 @@ from rfobserver.storage.governor import StorageSample, VolumeSample
 from rfobserver.storage.priority import PRIORITY_SUFFIX
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection
+    from collections.abc import Callable, Collection, Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,17 @@ class CaptureEntry:
 
     @property
     def origin(self) -> str:
-        return self.path.parent.name
+        return capture_origin(self.path, self.path.parent.name)
+
+
+# A capture's origin: "auto" (auto/), "manual" (manual/), or "scheduled"
+# (written to manual/ and named ...-sched-<schedule id>-<run>).
+CAPTURE_ORIGINS = ("auto", "manual", "scheduled")
+
+
+def capture_origin(sc16: Path, dir_origin: str) -> str:
+    """``dir_origin`` (the capture directory's origin) unless the capture is scheduled."""
+    return "scheduled" if "-sched-" in sc16.stem else dir_origin
 
 
 def _capture_base(name: str) -> str | None:
@@ -303,14 +313,21 @@ class LocalStorage:
         with self._lock:
             self._remove_locked(Path(sc16_path))
 
-    def capture_count(self) -> int:
+    def capture_count(self, origins: Collection[str] | None = None) -> int:
+        """Tracked captures, or only those whose origin is in ``origins``."""
         with self._lock:
-            return len(self._entries)
+            if origins is None:
+                return len(self._entries)
+            return sum(1 for e in self._entries.values() if e.origin in origins)
 
     def captures_newest_first(
-        self, offset: int = 0, limit: int | None = None
+        self,
+        offset: int = 0,
+        limit: int | None = None,
+        origins: Collection[str] | None = None,
     ) -> list[CaptureEntry]:
-        """Tracked captures across auto/ and manual/, newest first."""
+        """Tracked captures across auto/ and manual/, newest first; with
+        ``origins``, only those whose origin is in it."""
         with self._lock:
             # Both lists are sorted, so merging them newest first touches only
             # offset + limit items, not every capture.
@@ -319,8 +336,11 @@ class LocalStorage:
                 reversed(self._order[self.manual_dir]),
                 reverse=True,
             )
+            entries: Iterable[CaptureEntry] = (self._entries[Path(p)] for _, p in merged)
+            if origins is not None:
+                entries = (e for e in entries if e.origin in origins)
             stop = None if limit is None else offset + limit
-            return [self._entries[Path(p)] for _, p in itertools.islice(merged, offset, stop)]
+            return list(itertools.islice(entries, offset, stop))
 
     def migrate_flat_captures_to_manual(self) -> None:
         """Move any legacy root-level captures into manual/ (one-time, at startup).

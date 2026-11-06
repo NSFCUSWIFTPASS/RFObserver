@@ -197,6 +197,20 @@ def test_list_one_sensor_and_a_sensor_down(fleet: Any) -> None:
     assert "b" in body["errors"]
 
 
+def test_list_passes_the_origin_filter_to_each_sensor(fleet: Any) -> None:
+    client, sensors = fleet
+    client.get("/fleet/api/captures", params={"origin": "scheduled"})
+    asked = [r.url.params.get("origin") for r in sensors.seen if r.url.path == "/captures/list"]
+    assert asked and set(asked) == {"scheduled"}
+
+
+def test_list_without_a_filter_asks_for_everything(fleet: Any) -> None:
+    client, sensors = fleet
+    client.get("/fleet/api/captures")
+    asked = [r for r in sensors.seen if r.url.path == "/captures/list"]
+    assert asked and all("origin" not in r.url.params for r in asked)
+
+
 def test_list_is_not_served_stale_after_a_new_capture(fleet: Any) -> None:
     client, sensors = fleet
     client.get("/fleet/api/captures")

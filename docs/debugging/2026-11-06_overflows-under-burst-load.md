@@ -102,8 +102,41 @@ neither past 45 ms. The workstation has headroom; the Orin does not.
 ## Open, not yet answered
 
 - No GIL profile on an HCRO sensor itself (needs py-spy and sudo on the sensor).
-- Which fix: cheaper `_extract_fingerprints` (per-label numpy calls), a cap on bursts handled
-  per chunk, a shorter `sys.setswitchinterval`, or burst detection in a separate process. None
-  measured yet.
+- Whether the fix below is enough on HCRO under a real SSM run (measured on nano-super only).
 - Why .34 detects about 2x more bursts than .36 and 20x more than .33 (distance to the
   transmitter is the likely reason, unconfirmed).
+
+## Fix: fingerprint extraction without find_objects (2026-11-06)
+
+Per step of `detect_bursts` on one 4096x2048 window of the SSM capture, nano-super. A second
+thread sleeping 1 ms at a time measures the longest single GIL hold ("rx late max"):
+
+```
+percentile      304.0 ms/call  rx late max   12.4 ms   (releases the GIL)
+masks            21.7 ms/call  rx late max    5.6 ms
+label            62.8 ms/call  rx late max   10.9 ms
+unique            5.6 ms/call  rx late max   12.2 ms
+find_objects     59.5 ms/call  rx late max   68.4 ms   <- one C call, GIL held throughout
+extract_fp       81.8 ms/call  rx late max   55.5 ms   <- per-label loop
+```
+
+The window had 7,294 to 11,242 labels, of which 53 to 88 were valid. `find_objects` walks
+the whole grid and builds a slice for every label, noise included. `_extract_fingerprints` now
+takes the low-threshold mask, gathers only the cells of valid labels (`flatnonzero` of the
+mask, 5.8 ms, against 35 ms for the label image), and measures every region at once with
+`reduceat` (bounds, peak, first peak cell in row-major order). Output is identical to the old
+code on the three SSM windows and on random busy grids (`test_fingerprints_match_reference_on_
+busy_grids`); its longest GIL hold is 16 to 19 ms.
+
+Replay on nano-super, 90 s, recv stalls over 100 ms:
+
+```
+                      stall lines  recv>125ms  max recv   pattern
+control (no bursts)        12           0       116.7 ms  100-117 ms, spread out
+SSM, before               38          12       243.8 ms  195-244 ms every ~5 s (each loop of the capture)
+SSM, fix, run 1           33           4       133.5 ms  100-134 ms
+SSM, fix, run 2           30           3       165.4 ms  100-165 ms, no 200 ms class
+```
+
+The 200 ms class tied to the bursts is gone. What remains is the same 100-130 ms band the
+control shows on this box (15 W, two other RFObserver instances running).

@@ -91,6 +91,7 @@ def detect_bursts(
 
     raw_bursts = _extract_fingerprints(
         labeled,
+        mask_low,
         valid_labels,
         grid,
         time_axis,
@@ -119,6 +120,7 @@ def detect_bursts(
 
 def _extract_fingerprints(
     labeled: np.ndarray,
+    labeled_mask: np.ndarray,
     valid_labels: np.ndarray,
     grid: np.ndarray,
     time_axis: np.ndarray,
@@ -127,50 +129,65 @@ def _extract_fingerprints(
     capture_time: datetime,
     min_duration_sec: float,
 ) -> list[BurstFingerprint]:
-    """Extract five-parameter fingerprints from labeled regions."""
+    """Extract five-parameter fingerprints from labeled regions.
+
+    ``labeled_mask`` is the mask ``labeled`` was labeled from (nonzero cells).
+    Every region is measured at once from the cells of the valid labels only,
+    with numpy reductions. ``ndimage.find_objects`` (one C call over the whole
+    grid, building a slice per label, noise labels included) and a per-label
+    loop held the GIL for 55 to 68 ms at a time on an Orin Nano and made the
+    receiver overflow under heavy burst load; see
+    docs/debugging/2026-11-06_overflows-under-burst-load.md.
+    """
+    flat = labeled.ravel()
+    cells = np.flatnonzero(labeled_mask)
+    cell_labels = flat[cells]
+    lut = np.zeros(int(valid_labels.max()) + 1, dtype=bool)
+    lut[valid_labels] = True
+    keep = lut[np.minimum(cell_labels, len(lut) - 1)] & (cell_labels < len(lut))
+    # Group the cells by label; the stable sort keeps each region's cells in
+    # row-major order, so its first maximum is the same peak cell as before.
+    order = np.argsort(cell_labels[keep], kind="stable")
+    idx = cells[keep][order]
+    lbl = cell_labels[keep][order]
+    starts = np.flatnonzero(np.r_[True, lbl[1:] != lbl[:-1]])
+
+    n_cols = labeled.shape[1]
+    rows = idx // n_cols
+    cols = idx % n_cols
+    row_min = np.minimum.reduceat(rows, starts)
+    row_max = np.maximum.reduceat(rows, starts)
+    col_min = np.minimum.reduceat(cols, starts)
+    col_max = np.maximum.reduceat(cols, starts)
+    powers = grid.ravel()[idx]
+    peak = np.maximum.reduceat(powers, starts)
+    group = np.repeat(np.arange(len(starts)), np.diff(np.r_[starts, len(idx)]))
+    at_peak = np.flatnonzero(powers == peak[group])
+    first_peak = at_peak[np.r_[True, group[at_peak][1:] != group[at_peak][:-1]]]
+
     bursts: list[BurstFingerprint] = []
-
-    # Bounding box for every label in ONE pass. Extracting each region within
-    # its own (small) bbox avoids an O(num_labels * grid_size) full-grid
-    # `np.where(labeled == label_id)` scan per label, which made re-detection on
-    # large grids (e.g. a 25 s / 2048-bin capture) take minutes.
-    objects = ndimage.find_objects(labeled)
-
-    for label_id in valid_labels:
-        sl = objects[label_id - 1]
-        if sl is None:
-            continue
-        region_mask = labeled[sl] == label_id
-        rows_local, cols_local = np.where(region_mask)
-        if len(rows_local) == 0:
-            continue
-        rows = rows_local + sl[0].start
-        cols = cols_local + sl[1].start
-
+    last_row = len(time_axis) - 1
+    for k in range(len(starts)):
         # Time bounds
-        start_row, end_row = int(rows.min()), int(rows.max())
-        t_start = float(time_axis[start_row])
-        t_end = float(time_axis[min(end_row + 1, len(time_axis) - 1)])
+        t_start = float(time_axis[row_min[k]])
+        t_end = float(time_axis[min(int(row_max[k]) + 1, last_row)])
 
         duration_sec = t_end - t_start
         if duration_sec < min_duration_sec:
             continue
 
         # Frequency bounds
-        min_col, max_col = int(cols.min()), int(cols.max())
-        f_min = float(freq_axis[min_col])
-        f_max = float(freq_axis[max_col])
+        f_min = float(freq_axis[col_min[k]])
+        f_max = float(freq_axis[col_max[k]])
         bandwidth = f_max - f_min
 
         # Peak power; center frequency = geometric middle of (f_min, f_max).
         # The peak's exact bin location is intentionally NOT used for
-        # center_freq_hz — visualizations and span queries assume it sits
+        # center_freq_hz: visualizations and span queries assume it sits
         # at the geometric center so that center +/- bandwidth/2 reproduces
         # the actual occupied range.
-        region_powers = grid[sl][region_mask]
-        peak_idx = int(np.argmax(region_powers))
-        peak_power = float(region_powers[peak_idx])
-        peak_freq_hz = center_freq_hz + float(freq_axis[cols[peak_idx]])
+        peak_power = float(peak[k])
+        peak_freq_hz = center_freq_hz + float(freq_axis[cols[first_peak[k]]])
 
         burst_center_freq = center_freq_hz + (f_min + f_max) / 2
 

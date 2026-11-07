@@ -364,7 +364,7 @@
                         <span class="toggle-text">Attribution</span>
                     </label>
                     <span style="font-size: 10px; color: var(--text-secondary); margin-top: 2px; display: block;">Applies at next start (turn Sensor Active off and on).</span>
-                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Decode isolated bursts (our SSM decoder, then rtl_433) and label the detection (turns isolation on).</span>
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Decode isolated bursts (our SSM decoder and RFID reader check, then rtl_433) and label the detection (turns isolation on).</span>
                 </div>
             </div>
             {% set enabled_decoders = settings.ATTRIBUTION_DECODERS.replace(' ', '').lower().split(',') %}
@@ -375,6 +375,7 @@
                     <ul class="check-list" id="decoder-list">
                         {% for key, title, detail in [
                             ('ssm', 'SSM', 'Surrogate smart meters (DBPSK), matched on their MAC and text'),
+                            ('rfid', 'RFID reader', 'UHF RFID (EPC Gen2) readers: a carrier with PIE pulses'),
                             ('silverspring', 'SilverSpring-Mesh', 'rtl_433 protocol 383 on wide bursts'),
                             ('ssnmesh', 'ssnmesh-like', 'rtl_433 flex decoder for SSN mesh framing'),
                             ('rtl433', 'Other rtl_433 devices', 'rtl_433 default protocols on narrow bursts'),

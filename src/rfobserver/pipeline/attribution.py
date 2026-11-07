@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from rfobserver.processing.rfid import classify_rfid_reader
 from rfobserver.processing.ssm import decode_ssm
 
 if TYPE_CHECKING:
@@ -27,9 +28,10 @@ logger = logging.getLogger(__name__)
 _KNOWN_BUILD = os.path.expanduser("~/rtl_433_build/build/src/rtl_433")
 
 # Decoders that can be switched on and off one at a time (ATTRIBUTION_DECODERS):
-# our SSM decoder, rtl_433's SilverSpring-Mesh protocol (-R 383), the
-# ssnmesh-like flex decoder (-X), and rtl_433's default set run on narrow bursts.
-ALL_DECODERS = ("ssm", "silverspring", "ssnmesh", "rtl433")
+# our SSM decoder, the UHF RFID reader classifier, rtl_433's SilverSpring-Mesh
+# protocol (-R 383), the ssnmesh-like flex decoder (-X), and rtl_433's default
+# set run on narrow bursts.
+ALL_DECODERS = ("ssm", "rfid", "silverspring", "ssnmesh", "rtl433")
 
 
 def parse_decoders(value: str) -> frozenset[str]:
@@ -49,9 +51,12 @@ def _pass_decoder(extra: list[str]) -> str:
 
 def _model_decoder(model: str | None) -> str:
     """Which decoder a decoded model name belongs to."""
-    return {"SSM": "ssm", "SilverSpring-Mesh": "silverspring", "ssnmesh-like": "ssnmesh"}.get(
-        model or "", "rtl433"
-    )
+    return {
+        "SSM": "ssm",
+        "RFID-Reader": "rfid",
+        "SilverSpring-Mesh": "silverspring",
+        "ssnmesh-like": "ssnmesh",
+    }.get(model or "", "rtl433")
 
 
 def _enabled_frames(frames: Iterable[dict], enabled: frozenset[str]) -> list[dict]:
@@ -103,7 +108,8 @@ class AttributionItem:
     passes: list[list[str]]
     power_db: float
     # Burst context carried through to a sink (e.g. freq_hz, start_time_ms,
-    # stop_time_ms, freq_low_hz, freq_high_hz, snr_db). Not used for decoding.
+    # stop_time_ms, freq_low_hz, freq_high_hz, snr_db). Decoding uses only
+    # freq_hz (the RFID classifier's carrier frequency and channel).
     meta: dict[str, Any] = field(default_factory=dict)
 
 
@@ -304,6 +310,31 @@ class AttributionWorker:
                             "SSM",
                             None,
                             json.dumps({"decoded": True, "at": now_iso, "frames": [ssm]}),
+                            "decoded",
+                        )
+                    )
+                    continue
+            # A UHF RFID reader (a carrier with PIE dips) is not something
+            # rtl_433 decodes: recognize it next; a match is final.
+            if "rfid" in enabled:
+                attempted = True
+                try:
+                    rfid = await asyncio.to_thread(
+                        classify_rfid_reader,
+                        item.cs16,
+                        item.target_rate_hz,
+                        item.meta.get("freq_hz"),
+                    )
+                except Exception:
+                    logger.exception("rfid classify failed for burst %s", item.burst_id)
+                    rfid = None
+                if rfid is not None:
+                    await self._emit(
+                        AttributionResult(
+                            item,
+                            rfid["model"],
+                            None,
+                            json.dumps({"decoded": True, "at": now_iso, "frames": [rfid]}),
                             "decoded",
                         )
                     )

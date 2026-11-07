@@ -171,3 +171,42 @@ async def test_the_switches_are_read_for_every_burst(monkeypatch):
     task.cancel()
     assert outcomes == ["decoded", "skipped"]
     assert json.loads(got[0].attribution)["frames"] == [SSM_FRAME]
+
+
+RFID = {"model": "RFID-Reader", "protocol": "EPC Gen2", "channel_mhz": 914.75}
+
+
+async def test_rfid_reader_is_labelled_before_rtl433(monkeypatch):
+    monkeypatch.setattr(attr, "decode_ssm", lambda *a: None)
+    monkeypatch.setattr(attr, "classify_rfid_reader", lambda *a, **k: RFID)
+
+    def no_rtl(*a, **k):
+        pytest.fail("a reader match is final")
+
+    monkeypatch.setattr(attr, "decode_cs16", no_rtl)
+    got, _ = await _run(_item(NARROW), set(ALL_DECODERS))
+    assert got[0].model == "RFID-Reader" and got[0].outcome == "decoded"
+    assert json.loads(got[0].attribution)["frames"] == [RFID]
+
+
+async def test_rfid_off_does_not_run_the_classifier(monkeypatch):
+    def no_rfid(*a, **k):
+        pytest.fail("RFID classifier is switched off")
+
+    monkeypatch.setattr(attr, "classify_rfid_reader", no_rfid)
+    monkeypatch.setattr(attr, "decode_cs16", lambda *a, **k: [])
+    got, _ = await _run(_item(NARROW), {"rtl433"})
+    assert got[0].outcome == "not_decoded"
+
+
+async def test_rfid_gets_the_burst_frequency(monkeypatch):
+    seen = []
+
+    def spy(cs16, rate, freq_hz=None):
+        seen.append(freq_hz)
+        return None
+
+    monkeypatch.setattr(attr, "classify_rfid_reader", spy)
+    item = AttributionItem("b1", b"\0\0" * 10, 1_000_000, NARROW, -30.0, {"freq_hz": 914.75e6})
+    await _run(item, {"rfid"})
+    assert seen == [914.75e6]

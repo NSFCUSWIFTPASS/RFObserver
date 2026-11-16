@@ -1121,6 +1121,93 @@ async def test_abandoned_connection_does_not_keep_the_write_lock(db):
     assert len(rows) == 2, "the retried row and the next one; the corpse's copy rolled back"
 
 
+async def test_failed_retry_does_not_leave_the_writer_in_a_stale_transaction(db):
+    """The retry after a stuck write fails with "database is locked" while the
+    abandoned connection still holds the write lock. sqlite3 has already sent
+    its implicit BEGIN, so the fresh connection was left mid-transaction and
+    the next read pinned a snapshot; once the abandoned connection committed,
+    every later write failed with "database is locked" for good. See
+    docs/debugging/2026-11-16_web-read-backlog-wal-pin.md."""
+    corpse = db._db
+    assert corpse is not None
+    # As in production, the write timeout outlasts the 2 s busy_timeout, so the
+    # retry fails on the lock rather than timing out.
+    db._write_timeout = 3.0
+
+    def hold_and_commit() -> None:
+        raw = corpse._connection
+        raw.execute("BEGIN IMMEDIATE")
+        raw.execute("INSERT INTO config(key, value) VALUES('held', '1')")
+        time.sleep(6.0)  # past the first attempt's timeout and the retry's busy_timeout
+        raw.commit()
+
+    held = asyncio.ensure_future(corpse._execute(hold_and_commit))
+    await asyncio.sleep(0.1)
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        await db.set_config("a", "1")
+    assert db._db is not corpse
+    await db.get_config("a")  # a read on the fresh connection
+    await held
+    await _corpses_closed(db, corpse)
+
+    db._write_timeout = 5.0
+    await db.set_config("b", "2")
+    assert await db.get_config("b") == "2"
+
+
+async def test_read_only_cursor_does_not_pin_the_wal(tmp_path):
+    """A web read holds no open statement between its calls. Under load the
+    reader's queue is long, and a cursor left open between execute and fetch
+    kept the reader's snapshot for good: the WAL could not be checkpointed and
+    grew to 14 GB on W230 (docs/debugging/2026-11-16_web-read-backlog-wal-pin.md)."""
+    path = str(tmp_path / "pin.db")
+    writer = SensorDatabase(path)
+    await writer.connect()
+    reader = SensorDatabase(path, read_only=True)
+    await reader.connect()
+    try:
+        for i in range(20):
+            await writer.set_config(f"k{i}", "v")
+        assert reader._db is not None
+        cur = await reader._db.execute("SELECT key FROM config")
+        assert await cur.fetchone() is not None  # one row read, more remain
+        for i in range(20):
+            await writer.set_config(f"j{i}", "w")
+        probe = sqlite3.connect(path)
+        try:
+            busy, _log, _done = probe.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        finally:
+            probe.close()
+        assert busy == 0, "an open read cursor must not block the checkpoint"
+        await cur.close()
+    finally:
+        await reader.close()
+        await writer.close()
+
+
+async def test_time_bounded_detection_query_walks_the_time_index(db):
+    """Every detection on a sensor shares its one tuning config, so the
+    sdr_center index matches the whole table: the fleet's 15-minute
+    detections.json read every row and sorted them (1.8 s on 2.5 M rows, far
+    longer on 11 M), past the hub's 5 s timeout on every poll."""
+    since = datetime(2026, 11, 16, 18, 0, tzinfo=timezone.utc)
+    conditions, params = db._detection_conditions(
+        since=since,
+        until=since + timedelta(minutes=15),
+        sdr_center_freq=915e6,
+        sample_rate=26e6,
+        gain=35.0,
+    )
+    async with db._db.execute(
+        "EXPLAIN QUERY PLAN SELECT * FROM detections WHERE "
+        + " AND ".join(conditions)
+        + " ORDER BY start_time DESC, id DESC LIMIT 200",
+        params,
+    ) as cur:
+        plan = " ".join(str(r[3]) for r in await cur.fetchall())
+    assert "idx_detections_time" in plan, plan
+
+
 async def _journal_pragmas(db: SensorDatabase) -> tuple[str, int]:
     assert db._db is not None
     async with db._db.execute("PRAGMA journal_mode") as cur:

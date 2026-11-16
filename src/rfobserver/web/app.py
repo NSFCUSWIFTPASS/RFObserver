@@ -81,6 +81,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     # the two above; it still gets its own gate so a burst of panel opens cannot
     # queue behind a waterfall or starve the pipeline.
     app.state.peaks_sem = asyncio.Semaphore(1)
+    # The detections and IQ capture lists the fleet's Live page polls with the
+    # two above. Gated too, so a request its client gave up on while it queued
+    # is dropped instead of run: abandoned polls once backed a sensor's reader
+    # up by hours (docs/debugging/2026-11-16_web-read-backlog-wal-pin.md).
+    app.state.lists_sem = asyncio.Semaphore(1)
 
     if STATIC_DIR.exists():
         app.mount("/static", _RevalidatedStaticFiles(directory=str(STATIC_DIR)), name="static")

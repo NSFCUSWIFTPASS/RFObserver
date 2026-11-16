@@ -79,8 +79,27 @@ class _RecordingDB:
         self.calls.append("query_avg_stats")
         raise AssertionError("aggregation ran for a disconnected client")
 
+    async def query_detections(self, **_: Any) -> list[dict[str, Any]]:
+        self.calls.append("query_detections")
+        raise AssertionError("query ran for a disconnected client")
 
-@pytest.mark.parametrize("path", ["/api/averaged/waterfall", "/api/averaged/stats"])
+    async def query_iq_captures(self, **_: Any) -> list[dict[str, Any]]:
+        self.calls.append("query_iq_captures")
+        raise AssertionError("query ran for a disconnected client")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/averaged/waterfall",
+        "/api/averaged/stats",
+        # The fleet Live page polls these two with the averaged pair; abandoned
+        # ones backed up a sensor's reader for hours
+        # (docs/debugging/2026-11-16_web-read-backlog-wal-pin.md).
+        "/api/detections.json",
+        "/api/iq-captures",
+    ],
+)
 @pytest.mark.asyncio
 async def test_disconnected_client_gets_499_without_running_the_aggregation(path: str) -> None:
     """A request whose client already left (e.g. the Dashboard moved on while it

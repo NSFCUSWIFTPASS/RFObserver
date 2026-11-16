@@ -23,9 +23,10 @@ import json
 import logging
 import math
 import os
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import aiosqlite
 import numpy as np
@@ -460,6 +461,104 @@ class WindowStatsRow(NamedTuple):
     kurtosis: float | None
 
 
+def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
+class _FetchedCursor:
+    """A cursor whose rows were all read in the call that ran the statement."""
+
+    def __init__(self, rows: list[Any], description: Any) -> None:
+        self._rows = rows
+        self._next = 0
+        self.description = description
+
+    async def fetchone(self) -> Any:
+        if self._next >= len(self._rows):
+            return None
+        row = self._rows[self._next]
+        self._next += 1
+        return row
+
+    async def fetchmany(self, size: int = 1) -> list[Any]:
+        rows = self._rows[self._next : self._next + size]
+        self._next += len(rows)
+        return rows
+
+    async def fetchall(self) -> list[Any]:
+        rows = self._rows[self._next :]
+        self._next = len(self._rows)
+        return rows
+
+    async def close(self) -> None:
+        return None
+
+    async def __aenter__(self) -> _FetchedCursor:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+class _FetchedResult:
+    """What ``execute`` returns: awaitable, or ``async with`` for the cursor."""
+
+    def __init__(self, run: Any) -> None:
+        self._run = run
+
+    def __await__(self) -> Any:
+        return self._run().__await__()
+
+    async def __aenter__(self) -> _FetchedCursor:
+        cursor: _FetchedCursor = await self._run()
+        return cursor
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+class _ReadConnection:
+    """The web reader's connection: each ``execute`` runs the statement and
+    reads every row in one worker call, so no statement stays open between
+    calls. A cursor left open between execute and fetch keeps the reader's
+    read transaction, and its WAL snapshot, until that fetch reaches the
+    front of the reader's queue; with a backlog of Dashboard and fleet reads
+    there was always one open, the WAL could not be checkpointed past it and
+    grew to 14 GB (docs/debugging/2026-11-16_web-read-backlog-wal-pin.md).
+    Every read path fetches its whole result, so nothing streams."""
+
+    def __init__(self, conn: aiosqlite.Connection) -> None:
+        self._inner = conn
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    @property
+    def row_factory(self) -> Any:
+        return self._inner.row_factory
+
+    @row_factory.setter
+    def row_factory(self, factory: Any) -> None:
+        self._inner.row_factory = factory
+
+    def execute(self, sql: str, parameters: Any = None) -> _FetchedResult:
+        inner = self._inner
+
+        def run() -> tuple[list[Any], Any]:
+            cursor = inner._conn.execute(sql, parameters if parameters is not None else ())
+            try:
+                return cursor.fetchall(), cursor.description
+            finally:
+                cursor.close()
+
+        async def fetched() -> _FetchedCursor:
+            rows, description = await inner._execute(run)  # type: ignore[no-untyped-call,unused-ignore]
+            return _FetchedCursor(rows, description)
+
+        return _FetchedResult(fetched)
+
+
 class SensorDatabase:
     """Async SQLite database for local sensor state."""
 
@@ -567,16 +666,34 @@ class SensorDatabase:
         hiccup persists it fails fast via busy_timeout and the exception
         propagates to the caller (which logs and continues), so the pipeline
         keeps running and recovers on its own.
+
+        A write that fails on a lock is rolled back: sqlite3 sent its implicit
+        BEGIN before the statement, and a connection left in that transaction
+        pins its first read's snapshot. Once another connection commits, every
+        later write on it fails with "database is locked" for good
+        (docs/debugging/2026-11-16_web-read-backlog-wal-pin.md). A lock error
+        means this connection holds no write lock, so no other caller's
+        uncommitted rows are in that transaction.
         """
 
-        @functools.wraps(fn)
-        async def wrapper(self: SensorDatabase, *args: Any, **kwargs: Any) -> Any:
+        async def attempt(self: SensorDatabase, *args: Any, **kwargs: Any) -> Any:
             conn = self._db
             try:
                 # wait_for (not asyncio.timeout): the Jetson runs Python 3.10.
                 return await asyncio.wait_for(
                     fn(self, *args, **kwargs), timeout=self._write_timeout
                 )
+            except sqlite3.OperationalError as exc:
+                if conn is not None and _is_lock_error(exc):
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(conn.rollback(), timeout=self._write_timeout)
+                raise
+
+        @functools.wraps(fn)
+        async def wrapper(self: SensorDatabase, *args: Any, **kwargs: Any) -> Any:
+            conn = self._db
+            try:
+                return await attempt(self, *args, **kwargs)
             except asyncio.TimeoutError:  # noqa: UP041 — NOT the builtin on 3.10
                 logger.error(
                     "DB write %s stuck >%.0fs — abandoning connection",
@@ -584,7 +701,7 @@ class SensorDatabase:
                     self._write_timeout,
                 )
             await asyncio.wait_for(self._reconnect(expect=conn), timeout=self._write_timeout)
-            return await asyncio.wait_for(fn(self, *args, **kwargs), timeout=self._write_timeout)
+            return await attempt(self, *args, **kwargs)
 
         return wrapper
 
@@ -596,9 +713,11 @@ class SensorDatabase:
             # (set by the writer) gives concurrent read/write. query_only makes
             # any accidental write fail instead of contending with the pipeline.
             # The writer must connect first: it owns schema and migrations.
-            self._db = await aiosqlite.connect(self._db_path)
-            await self._db.execute("PRAGMA busy_timeout=2000")
-            await self._db.execute("PRAGMA query_only=ON")
+            conn = await aiosqlite.connect(self._db_path)
+            await conn.execute("PRAGMA busy_timeout=2000")
+            await conn.execute("PRAGMA query_only=ON")
+            # Typed as the aiosqlite connection it forwards to.
+            self._db = cast("aiosqlite.Connection", _ReadConnection(conn))
             logger.info("Database connected read-only: %s", self._db_path)
             return
         self._db = await aiosqlite.connect(self._db_path)
@@ -1923,6 +2042,14 @@ class SensorDatabase:
             params.append(_utc_iso(until))
         # Exact-match SDR capture-context filters (categorize by tuning config).
         sdr_conditions, sdr_params = cls._sdr_conditions(sdr_center_freq, sample_rate, gain)
+        if since is not None or until is not None:
+            # A sensor's detections nearly all share one tuning config, so the
+            # sdr_center index matches the whole table; with no stats SQLite
+            # still prefers it to the time range. The unary + keeps the planner
+            # on idx_detections_time (docs/debugging/2026-11-16_web-read-backlog-wal-pin.md).
+            sdr_conditions = [
+                "+" + c if c.startswith("sdr_center_freq_hz") else c for c in sdr_conditions
+            ]
         conditions.extend(sdr_conditions)
         params.extend(sdr_params)
         # Half-open [min, max) duration range -- matches the histogram buckets so a

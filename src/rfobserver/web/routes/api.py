@@ -1109,7 +1109,7 @@ async def detections_csv(
     )
 
 
-@router.get("/detections.json")
+@router.get("/detections.json", response_model=None)
 async def detections_json(
     request: Request,
     limit: int = 200,
@@ -1119,7 +1119,7 @@ async def detections_json(
     until: str | None = None,
     attributed: str | None = None,
     model: str | None = None,
-) -> dict[str, list[dict[str, Any]]]:
+) -> dict[str, list[dict[str, Any]]] | Response:
     """JSON detections for external tooling (e.g. the OTA burst validator) and
     the fleet's Detections page.
 
@@ -1134,19 +1134,22 @@ async def detections_json(
     db = _get_db(request)
     if db is None:
         return {"detections": []}
-    try:
-        rows = await db.query_detections(
-            limit=limit,
-            sdr_center_freq=_opt_float(sdr_center),
-            sample_rate=_opt_float(sample_rate),
-            since=_opt_dt(since),
-            until=_opt_dt(until),
-            attributed=_opt_bool(attributed),
-            model=_opt_str(model),
-        )
-    except Exception:
-        logger.exception("detections.json query failed")
-        return {"detections": []}
+    async with request.app.state.lists_sem:
+        if await request.is_disconnected():
+            return Response(status_code=499)
+        try:
+            rows = await db.query_detections(
+                limit=limit,
+                sdr_center_freq=_opt_float(sdr_center),
+                sample_rate=_opt_float(sample_rate),
+                since=_opt_dt(since),
+                until=_opt_dt(until),
+                attributed=_opt_bool(attributed),
+                model=_opt_str(model),
+            )
+        except Exception:
+            logger.exception("detections.json query failed")
+            return {"detections": []}
     return {"detections": [dict(r) for r in rows]}
 
 
@@ -1520,7 +1523,7 @@ async def averaged_peaks(
     return payload
 
 
-@router.get("/iq-captures")
+@router.get("/iq-captures", response_model=None)
 async def iq_captures(
     request: Request,
     since: str,
@@ -1528,20 +1531,23 @@ async def iq_captures(
     sdr_center: str | None = None,
     sample_rate: str | None = None,
     gain: str | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | Response:
     """IQ capture spans overlapping a range, for the Dashboard's availability
     highlights. Filtered by tuning to match the stats/detections on the plot."""
     db = _get_db(request)
     if db is None:
         return {"captures": []}
     since_dt, until_dt = _parse_range(since, until)
-    captures = await db.query_iq_captures(
-        since=since_dt,
-        until=until_dt,
-        sdr_center_freq=_opt_float(sdr_center),
-        sample_rate=_opt_float(sample_rate),
-        gain=_opt_float(gain),
-    )
+    async with request.app.state.lists_sem:
+        if await request.is_disconnected():
+            return Response(status_code=499)
+        captures = await db.query_iq_captures(
+            since=since_dt,
+            until=until_dt,
+            sdr_center_freq=_opt_float(sdr_center),
+            sample_rate=_opt_float(sample_rate),
+            gain=_opt_float(gain),
+        )
     return {"captures": captures}
 
 

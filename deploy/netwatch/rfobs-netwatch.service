@@ -1,0 +1,9 @@
+[Unit]
+Description=RFObserver NIC watchdog (recover a link that passes no traffic)
+Documentation=file:///usr/local/share/doc/rfobs-netwatch/README.md
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/rfobs-netwatch
+ExecStart=/usr/local/sbin/rfobs-netwatch

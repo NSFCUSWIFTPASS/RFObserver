@@ -71,6 +71,14 @@ period was resent from the bookmark).
   the outage (all queried 2026-11-16).
 - **Link down / cable unplugged**: NetworkManager never logged a carrier change; the device stayed
   in its connection cycle with the link up.
+- **Lost DHCP lease as the cause**: the lease was lost, but 16.5 h after traffic stopped; .34 was
+  already unreachable on 2026-11-16 at 11:24 MST with its lease still valid until 14:04.
+- **IP address conflict**: no conflict or duplicate-address message in the log (NetworkManager's
+  IPv4 DAD is off, `ipv4.dad-timeout -1`, so a conflict would not have been logged either). Against
+  it: .31 got no ARP reply at all for 10.1.42.34 on 2026-11-16 (a device holding the address would
+  have answered), and after the lease expired 658 DHCP discovers, which are broadcasts that do not
+  depend on the IP, got no offer in 22 h. A brief conflict at 21:33 that triggered the wedge cannot
+  be excluded.
 
 ## Measurement traps
 
@@ -82,11 +90,15 @@ period was resent from the bookmark).
 ## Open, not yet answered
 
 - NIC (r8168 / its PCIe link) or switch port: not distinguishable from the sensor's logs, and the
-  interface counters were reset by the power cycle. If it recurs, before power-cycling: read
+  interface counters were reset by the power cycle. The router's DHCP log (10.1.42.1) would tell:
+  .34's discovers arriving there means .34 could send but not receive. .34 runs
+  prometheus-node-exporter, so a site Prometheus may hold its interface counters up to 21:33. If it recurs, before power-cycling: read
   `ip -s link show enP8p1s0` (do RX and TX counters move?), `ethtool -S enP8p1s0`, and try
   `ip link set enP8p1s0 down/up` from the console; ask whether the switch shows the port's MAC.
 - Whether this is related to the NVMe completion-polled timeouts (missed interrupts on the same
   PCIe complex).
 - Whether .34 had shorter episodes before (a full-syslog search for missed lease renewals was not
   run, to avoid evicting the DB from the page cache).
-- No automatic recovery exists: a wedged NIC stays wedged until someone power-cycles the sensor.
+- No automatic recovery was installed at the time. `deploy/netwatch/` (rfobs-netwatch) now does
+  it when installed: saves the counters after 5 min with the link up and no traffic, then bounces
+  the interface, reloads r8168, and as a last step reboots at most once per 6 h.

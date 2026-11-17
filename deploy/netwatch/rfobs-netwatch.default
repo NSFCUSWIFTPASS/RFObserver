@@ -1,0 +1,20 @@
+# /etc/default/rfobs-netwatch: settings for rfobs-netwatch (all optional).
+
+# Interface and its driver.
+NETWATCH_IFACE=enP8p1s0
+NETWATCH_DRIVER=r8168
+
+# Healthy while the default gateway or any of these answers ping. The sensor's
+# own address is skipped, so one list serves every sensor at a site.
+NETWATCH_PEERS="10.1.42.31 10.1.42.32 10.1.42.33 10.1.42.34 10.1.42.35 10.1.42.36"
+
+# Minutes of no traffic with the link up before each step.
+NETWATCH_EVIDENCE_MIN=5
+NETWATCH_BOUNCE_MIN=10
+NETWATCH_RELOAD_MIN=20
+NETWATCH_REBOOT_MIN=40
+
+# The last step; at most one reboot per cooldown, so an outage upstream
+# cannot reboot the sensor in a loop. "no" stops at the driver reload.
+NETWATCH_REBOOT=yes
+NETWATCH_REBOOT_COOLDOWN_H=6

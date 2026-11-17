@@ -1063,7 +1063,9 @@ async def test_stuck_write_abandons_connection_and_retries(db):
     complete on a fresh one — the device hiccup then costs one timeout
     instead of the whole avg_windows history."""
     corpse = db._db
-    db._write_timeout = 0.5  # the hang never ends; the retry needs real margin
+    # The hang never ends, so this only bounds the test; the retry on the fresh
+    # connection needs real margin (0.5 s timed it out on a slow CI runner).
+    db._write_timeout = 2.0
     _sabotage_execute_hang(corpse, asyncio.Event())
 
     base = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -1079,7 +1081,9 @@ async def test_concurrent_stuck_writes_reconnect_once(db):
     """Two writers timing out on the same corpse must share one reconnect —
     the second sees the fresh connection and retries on it directly."""
     corpse = db._db
-    db._write_timeout = 0.5  # the hang never ends; the retry needs real margin
+    # The hang never ends, so this only bounds the test; the retry on the fresh
+    # connection needs real margin (0.5 s timed it out on a slow CI runner).
+    db._write_timeout = 2.0
     _sabotage_execute_hang(corpse, asyncio.Event())
 
     base = datetime(2026, 1, 1, tzinfo=timezone.utc)

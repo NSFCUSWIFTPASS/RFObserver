@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from rfobserver.processing.rfid import classify_rfid_reader
 from rfobserver.processing.ssm import decode_ssm
+from rfobserver.processing.tone import classify_tone
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -28,16 +29,26 @@ logger = logging.getLogger(__name__)
 _KNOWN_BUILD = os.path.expanduser("~/rtl_433_build/build/src/rtl_433")
 
 # Decoders that can be switched on and off one at a time (ATTRIBUTION_DECODERS):
-# our SSM decoder, the UHF RFID reader classifier, rtl_433's SilverSpring-Mesh
+# our SSM decoder, the UHF RFID reader and tone classifiers, rtl_433's SilverSpring-Mesh
 # protocol (-R 383), the ssnmesh-like flex decoder (-X), and rtl_433's default
 # set run on narrow bursts.
-ALL_DECODERS = ("ssm", "rfid", "silverspring", "ssnmesh", "rtl433")
+ALL_DECODERS = ("ssm", "rfid", "tone", "silverspring", "ssnmesh", "rtl433")
 
 
 def parse_decoders(value: str) -> frozenset[str]:
     """The enabled decoders in a comma-separated list; unknown names are ignored."""
     names = (part.strip().lower() for part in value.split(","))
     return frozenset(n for n in names if n in ALL_DECODERS)
+
+
+def enabled_decoders(settings: Any) -> frozenset[str]:
+    """The decoders attribution runs: ATTRIBUTION_DECODERS, less the tone check
+    while the tone detector is on (it finds and labels tones itself, and the
+    per-burst check almost never matches)."""
+    names = parse_decoders(settings.ATTRIBUTION_DECODERS)
+    if getattr(settings, "TONE_DETECTOR_ENABLED", False):
+        names -= {"tone"}
+    return names
 
 
 def _pass_decoder(extra: list[str]) -> str:
@@ -54,6 +65,7 @@ def _model_decoder(model: str | None) -> str:
     return {
         "SSM": "ssm",
         "RFID-Reader": "rfid",
+        "Tone": "tone",
         "SilverSpring-Mesh": "silverspring",
         "ssnmesh-like": "ssnmesh",
     }.get(model or "", "rtl433")
@@ -335,6 +347,31 @@ class AttributionWorker:
                             rfid["model"],
                             None,
                             json.dumps({"decoded": True, "at": now_iso, "frames": [rfid]}),
+                            "decoded",
+                        )
+                    )
+                    continue
+            # An unmodulated carrier (a test tone, a stuck transmitter): after the
+            # reader, which is a carrier too; a match is final.
+            if "tone" in enabled:
+                attempted = True
+                try:
+                    tone = await asyncio.to_thread(
+                        classify_tone,
+                        item.cs16,
+                        item.target_rate_hz,
+                        item.meta.get("freq_hz"),
+                    )
+                except Exception:
+                    logger.exception("tone classify failed for burst %s", item.burst_id)
+                    tone = None
+                if tone is not None:
+                    await self._emit(
+                        AttributionResult(
+                            item,
+                            tone["model"],
+                            None,
+                            json.dumps({"decoded": True, "at": now_iso, "frames": [tone]}),
                             "decoded",
                         )
                     )

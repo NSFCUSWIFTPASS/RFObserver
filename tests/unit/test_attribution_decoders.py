@@ -210,3 +210,86 @@ async def test_rfid_gets_the_burst_frequency(monkeypatch):
     item = AttributionItem("b1", b"\0\0" * 10, 1_000_000, NARROW, -30.0, {"freq_hz": 914.75e6})
     await _run(item, {"rfid"})
     assert seen == [914.75e6]
+
+
+TONE = {"model": "Tone", "protocol": "CW", "tone_hz": 915_003_000.0}
+
+
+async def test_tone_is_labelled_before_rtl433(monkeypatch):
+    monkeypatch.setattr(attr, "decode_ssm", lambda *a: None)
+    monkeypatch.setattr(attr, "classify_rfid_reader", lambda *a, **k: None)
+    monkeypatch.setattr(attr, "classify_tone", lambda *a, **k: TONE)
+
+    def no_rtl(*a, **k):
+        pytest.fail("a tone match is final")
+
+    monkeypatch.setattr(attr, "decode_cs16", no_rtl)
+    got, _ = await _run(_item(NARROW), set(ALL_DECODERS))
+    assert got[0].model == "Tone" and got[0].outcome == "decoded"
+    assert json.loads(got[0].attribution)["frames"] == [TONE]
+
+
+async def test_rfid_is_tried_before_tone(monkeypatch):
+    """A reader is a carrier too; when it is one, it is labelled a reader."""
+    monkeypatch.setattr(attr, "decode_ssm", lambda *a: None)
+    monkeypatch.setattr(attr, "classify_rfid_reader", lambda *a, **k: RFID)
+
+    def no_tone(*a, **k):
+        pytest.fail("a reader match is final")
+
+    monkeypatch.setattr(attr, "classify_tone", no_tone)
+    got, _ = await _run(_item(NARROW), set(ALL_DECODERS))
+    assert got[0].model == "RFID-Reader"
+
+
+async def test_tone_off_does_not_run_the_classifier(monkeypatch):
+    def no_tone(*a, **k):
+        pytest.fail("tone classifier is switched off")
+
+    monkeypatch.setattr(attr, "classify_tone", no_tone)
+    monkeypatch.setattr(attr, "decode_cs16", lambda *a, **k: [])
+    got, _ = await _run(_item(NARROW), {"rtl433"})
+    assert got[0].outcome == "not_decoded"
+
+
+async def test_tone_gets_the_burst_frequency(monkeypatch):
+    seen = []
+
+    def spy(cs16, rate, freq_hz=None):
+        seen.append(freq_hz)
+        return None
+
+    monkeypatch.setattr(attr, "classify_tone", spy)
+    item = AttributionItem("b1", b"\0\0" * 10, 1_000_000, NARROW, -30.0, {"freq_hz": 915.0e6})
+    await _run(item, {"tone"})
+    assert seen == [915.0e6]
+
+
+def test_tone_is_available_but_off_by_default():
+    """The tone detector finds the linearity check's tones; the per-burst
+    check is kept for anyone who wants it, but off by default."""
+    from rfobserver.config import AppSettings
+
+    assert "tone" in ALL_DECODERS
+    assert "tone" not in AppSettings(_env_file=None).ATTRIBUTION_DECODERS.split(",")
+
+
+def test_tone_detector_on_takes_tone_out_of_attribution():
+    """With the tone detector on, tones are found and labelled there, so the
+    per-burst tone check (which almost never matches) does not run."""
+    from types import SimpleNamespace
+
+    from rfobserver.pipeline.attribution import enabled_decoders
+
+    on = SimpleNamespace(ATTRIBUTION_DECODERS="ssm,rfid,tone,rtl433", TONE_DETECTOR_ENABLED=True)
+    off = SimpleNamespace(ATTRIBUTION_DECODERS="ssm,rfid,tone,rtl433", TONE_DETECTOR_ENABLED=False)
+    assert enabled_decoders(on) == frozenset({"ssm", "rfid", "rtl433"})
+    assert enabled_decoders(off) == frozenset({"ssm", "rfid", "tone", "rtl433"})
+
+
+def test_tone_detector_is_off_by_default():
+    from rfobserver.config import AppSettings
+
+    s = AppSettings(_env_file=None)
+    assert s.TONE_DETECTOR_ENABLED is False
+    assert s.TONE_DETECTOR_THRESHOLD_DB > 0

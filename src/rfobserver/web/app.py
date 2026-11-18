@@ -154,6 +154,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 body["status"] = "degraded"
             if proc is not None and hasattr(proc, "isolation_status"):
                 body["isolation"] = proc.isolation_status()
+            if proc is not None and hasattr(proc, "tone_detector_status"):
+                body["tone_detector"] = proc.tone_detector_status()
         gov = getattr(app.state, "storage_governor", None)
         if gov is not None:
             st = gov.state

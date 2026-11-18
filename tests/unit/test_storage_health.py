@@ -272,5 +272,47 @@ def test_dashboard_places_bursts_on_the_capture_clock():
 
 def test_config_page_marks_the_isolation_switches_as_next_start():
     html = _client(None).get("/config").text
-    assert html.count("Applies at next start") == 2
+    assert html.count("Applies at next start") == 3  # and the tone detector
     assert 'class="sb-seg sb-bursts"' in html
+
+
+def test_health_reports_the_tone_detector():
+    from types import SimpleNamespace
+
+    app = create_app(AppSettings(_env_file=None))
+    status = {
+        "enabled": True,
+        "disabled_reason": None,
+        "freqs": {"915100000": "tracking"},
+        "counts": {"inserted": 2},
+    }
+    proc = SimpleNamespace(tone_detector_status=lambda: status)
+    app.state.supervisor = SimpleNamespace(
+        processor=proc, active=True, gave_up=False, consecutive_crashes=0
+    )
+    assert TestClient(app).get("/api/health").json()["tone_detector"] == status
+
+
+def test_config_page_has_the_tone_detector_fields():
+    html = _client(None).get("/config").text
+    assert 'name="tone_detector_enabled"' in html
+    assert 'name="tone_detector_threshold_db"' in html
+    assert 'name="tone_detector_freqs"' in html
+    assert "'tone-detector-enabled'" in html  # tracked as a checkbox
+
+
+def test_the_tone_detector_settings_apply(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    app = create_app(AppSettings(_env_file=None))
+    r = TestClient(app).post(
+        "/config/apply",
+        json={
+            "tone_detector_enabled": True,
+            "tone_detector_threshold_db": "4",
+            "tone_detector_freqs": "915100000",
+        },
+    )
+    assert r.status_code == 200, r.text
+    s = app.state.settings
+    assert s.TONE_DETECTOR_ENABLED is True and s.TONE_DETECTOR_THRESHOLD_DB == 4.0
+    assert s.TONE_DETECTOR_FREQS == "915100000"

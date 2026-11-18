@@ -151,6 +151,10 @@ async def apply_config(request: Request) -> dict[str, Any]:
         "isolation_max_burst_sec": ("ISOLATION_MAX_BURST_SEC", float),
         "isolation_ram_fraction": ("ISOLATION_RAM_FRACTION", float),
         "burst_archive_max_gb": ("BURST_ARCHIVE_MAX_GB", float),
+        # Tone detector (read when the pipeline starts)
+        "tone_detector_enabled": ("TONE_DETECTOR_ENABLED", _to_bool),
+        "tone_detector_threshold_db": ("TONE_DETECTOR_THRESHOLD_DB", float),
+        "tone_detector_freqs": ("TONE_DETECTOR_FREQS", str),
         # Sensor identity + location (all optional — empty input clears)
         "sensor_name": ("SENSOR_NAME", str),
         "latitude": ("LATITUDE", float),

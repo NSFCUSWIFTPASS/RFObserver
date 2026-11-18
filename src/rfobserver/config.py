@@ -224,6 +224,18 @@ class AppSettings(BaseSettings):
     TONE_CHECK_FREQ_HZ: float = 0.0
     TONE_CHECK_THRESHOLD_DB: float = 10.0
 
+    # Tone detector: records CW tones at TONE_DETECTOR_FREQS (comma-separated
+    # Hz; the daily RF-chain linearity check's tones) down to a few dB over
+    # their PSD bin's floor, too weak for the burst detector, as Tone
+    # detections (or labels the burst rows that already cover them). Watches
+    # only those bins of the PSD grid, apart from burst detection and
+    # isolation; while on, attribution skips its per-burst tone check.
+    # TONE_DETECTOR_THRESHOLD_DB: how far a 1 ms block of the bin must be over
+    # the bin's floor to count as on. Read when the pipeline starts.
+    TONE_DETECTOR_ENABLED: bool = False
+    TONE_DETECTOR_FREQS: str = "914850000,915100000"
+    TONE_DETECTOR_THRESHOLD_DB: float = 3.0
+
     # Recording
     RECORDING_MAX_SEC: float = 30.0  # auto-stop after this duration (0 = no limit)
     RECORDING_RAM_BUFFER: bool = False  # buffer entire capture in RAM, flush on stop
@@ -243,9 +255,10 @@ class AppSettings(BaseSettings):
     ATTRIBUTION_RTL433_PATH: str = ""  # "" -> auto-discover via find_rtl433
     # Decoders tried on each isolated burst, comma-separated; any left out is
     # not run: ssm (our surrogate smart meters), rfid (UHF RFID readers),
-    # silverspring (rtl_433 SilverSpring-Mesh), ssnmesh (the ssnmesh-like flex
-    # decoder), rtl433 (rtl_433's default set, on narrow bursts). Read for every
-    # burst.
+    # tone (unmodulated carriers; off by default, the tone detector below finds
+    # the tones that matter), silverspring (rtl_433 SilverSpring-Mesh),
+    # ssnmesh (the ssnmesh-like flex decoder), rtl433 (rtl_433's default set, on
+    # narrow bursts). Read for every burst.
     ATTRIBUTION_DECODERS: str = "ssm,rfid,silverspring,ssnmesh,rtl433"
     # While isolation is on, the IQ ring keeps at least this many seconds so a
     # burst's samples are still there when detection completes. Live bursts

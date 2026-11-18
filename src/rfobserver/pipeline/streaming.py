@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     from rfobserver.pipeline.attribution import AttributionResult, AttributionWorker
     from rfobserver.pipeline.beacon import ProgressBeacon
     from rfobserver.pipeline.isolation import IsolationStage
+    from rfobserver.pipeline.tone_detector import ToneDetector
     from rfobserver.processing.spectral import PSDGridResult
     from rfobserver.schedules.book import ScheduleBook
     from rfobserver.schedules.engine import ScheduleEngine
@@ -291,6 +292,7 @@ class _StreamResult:
         "process_ms",
         "latency_ms",
         "capture_time",
+        "chunk_start",
     )
 
     def __init__(
@@ -305,10 +307,13 @@ class _StreamResult:
         latency_ms: float,
         iq_moments: IQMoments,
         capture_time: float | None = None,
+        chunk_start: int | None = None,
     ) -> None:
         self.summary_psd = summary_psd
         # Host-clock time (epoch s) of the chunk's first sample (capture/clock.py).
         self.capture_time = capture_time
+        # The chunk's first stream sample (the ring's total_written before it).
+        self.chunk_start = chunk_start
         self.iq_stats = iq_stats
         self.iq_moments = iq_moments
         self.bursts = bursts
@@ -636,6 +641,8 @@ _ISOLATION_LOG_INTERVAL_SEC = 60.0
 # was 1.4 copies (the complex64 IQ plus its FFT blocks) over the int32 read.
 _ISOLATION_WORKING_SET_FACTOR = 3
 
+_TONE_STOP_TIMEOUT_SEC = 15.0
+
 
 class StreamingProcessor:
     """Streaming pipeline: continuous recv → parallel PSD → rolling burst detection."""
@@ -717,6 +724,10 @@ class StreamingProcessor:
         # the switches mid-run changes nothing until the next start.
         self._isolation_on = self._isolation_wanted()
         self._isolation_disabled_reason: str | None = None
+        # The tone detector, likewise a snapshot per run.
+        self._tone_on = self._tone_wanted()
+        self._tone_disabled_reason: str | None = None
+        self._tone_detector: ToneDetector | None = None
 
         # Compute chunk sizing from current settings
         self._recompute_chunk_params()
@@ -937,6 +948,9 @@ class StreamingProcessor:
         s = self._settings
         return bool(s.ISOLATION_ENABLED or s.ATTRIBUTION_ENABLED)
 
+    def _tone_wanted(self) -> bool:
+        return bool(self._settings.TONE_DETECTOR_ENABLED) and not self._replay_mode
+
     def _halt_isolation(self) -> None:
         """A running stage whose ring no longer fits (a mid-run reconfigure):
         stop it (on the calling thread; it joins the worker) and keep it off
@@ -1058,6 +1072,7 @@ class StreamingProcessor:
         if want != self._isolation_on:
             self._isolation_on = want
             self._recompute_chunk_params()
+        self._tone_on = self._tone_wanted()
 
         recv_thread = threading.Thread(target=self._receiver_loop, name="recv", daemon=True)
         dispatch_thread = threading.Thread(target=self._dispatch_loop, name="dispatch", daemon=True)
@@ -1071,6 +1086,7 @@ class StreamingProcessor:
         self._burst_thread = burst_thread
 
         self._start_isolation()
+        self._start_tone_detector()
 
         if self._sched_writer is not None:
             self._sched_writer.start()
@@ -1107,6 +1123,7 @@ class StreamingProcessor:
                 # stage (its stop() joins a worker thread, so off the loop), then
                 # the attribution worker.
                 await self._stop_isolation()
+                await self._stop_tone_detector()
                 self._recctl_queue.put(None)
                 recctl_thread.join(timeout=5)
                 self._recctl_thread = None
@@ -1340,6 +1357,67 @@ class StreamingProcessor:
             "ring_sec": self._ring_sec,
             "disabled_reason": self._isolation_disabled_reason,
             "counts": self._isolation_counts(),
+        }
+
+    # -- Tone detector --
+
+    def _start_tone_detector(self) -> None:
+        self._tone_detector = None
+        self._tone_disabled_reason = None
+        if not self._tone_on:
+            return
+        from rfobserver.pipeline.tone_detector import ToneDetector
+        from rfobserver.processing.tone_detect import parse_tone_freqs
+
+        s = self._settings
+        try:
+            freqs = parse_tone_freqs(s.TONE_DETECTOR_FREQS)
+        except ValueError:
+            freqs = []
+            self._tone_disabled_reason = (
+                f"TONE_DETECTOR_FREQS is not a list of Hz: {s.TONE_DETECTOR_FREQS!r}"
+            )
+        if not freqs:
+            self._tone_disabled_reason = self._tone_disabled_reason or "no frequencies set"
+            logger.error("Tone detector off: %s", self._tone_disabled_reason)
+            return
+        self._tone_detector = ToneDetector(
+            self._db,
+            freqs=freqs,
+            threshold_db=float(s.TONE_DETECTOR_THRESHOLD_DB),
+            meta=self._tone_meta,
+        )
+        logger.info("Tone detector watching %s Hz", ", ".join(f"{f:.0f}" for f in freqs))
+
+    async def _stop_tone_detector(self) -> None:
+        """Write the tones still open."""
+        det = self._tone_detector
+        if det is None:
+            return
+        try:
+            await asyncio.wait_for(det.stop(), timeout=_TONE_STOP_TIMEOUT_SEC)
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
+            logger.warning("Tone detector did not finish writing in time")
+        except Exception:
+            logger.exception("Tone detector stop failed")
+
+    def _tone_meta(self) -> dict[str, Any]:
+        rx_config = getattr(self._receiver, "config", None)
+        return {
+            "sample_rate_hz": float(
+                getattr(rx_config, "bandwidth_hz", None) or self._settings.BANDWIDTH
+            ),
+            "gain_db": float(getattr(rx_config, "gain_db", None) or self._settings.GAIN),
+            "device_serial": getattr(self._receiver, "serial", None),
+        }
+
+    def tone_detector_status(self) -> dict[str, Any]:
+        det = self._tone_detector
+        return {
+            "enabled": det is not None,
+            "disabled_reason": self._tone_disabled_reason,
+            "freqs": {f"{f:.0f}": st for f, st in det.status_freqs().items()} if det else None,
+            "counts": dict(det.stats) if det is not None else None,
         }
 
     def _maybe_log_isolation(self) -> None:
@@ -3402,6 +3480,7 @@ class StreamingProcessor:
             latency_ms=latency_ms,
             iq_moments=cr.iq_moments,
             capture_time=cr.capture_time,
+            chunk_start=cr.chunk_start,
         )
 
         if self._loop is not None:
@@ -3679,6 +3758,10 @@ class StreamingProcessor:
                 # DURATION_SEC, so dropping would lose every window.
                 await flush_pending()
             window_clock.mark_result(waited)
+            if self._tone_detector is not None:
+                self._tone_detector.on_result(
+                    result, self._slice_samples / self._settings.BANDWIDTH
+                )
             if not accum_powers:
                 first_capture = result.capture_time
             accum_powers.append(new_powers)

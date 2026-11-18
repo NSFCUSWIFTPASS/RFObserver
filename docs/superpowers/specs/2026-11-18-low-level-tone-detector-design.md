@@ -98,3 +98,31 @@ The burst-path tone classifier stays; when both label the same burst they agree.
 
 The exact threshold and N, the channel width, how candidates are capped per window, and
 where stage B runs (a worker thread like isolation's).
+
+## CORRECTION 2026-11-18 (after the first over-the-air run): stage B on the PSD grid, listed frequencies only
+
+The IQ-ring design above is withdrawn. On nano-super at 26 MS/s, stage B on IQ took
+1.3 s per flagged window plus 1.15 s per extra candidate (the FFT channelizer; a
+cheaper CIC + FIR decimator measured 1.7 s, numpy over 26 MS/s being the floor on that
+CPU). With 1.7 candidates per window from the lab's own narrowband signals, 69 windows
+had left the 2.5 s ring before they were read and none of 60 weak pulses was recorded;
+ten real 150 ms narrowband signals at 904 to 915 MHz were recorded as Tone.
+
+Decided with the owner:
+
+- **Required frequency list.** `TONE_DETECTOR_FREQS` (comma-separated Hz). The detector
+  does nothing until it is set; only the PSD bin holding each listed frequency is
+  watched. This is a daily RF-chain linearity check with known tones, not a survey.
+- **Measured from the PSD grid the pipeline already computes** (12.7 kHz x 0.2 ms cells
+  at 26 MS/s), not from IQ: per chunk, the listed bins' columns, averaged into 1 ms
+  blocks, against a rolling floor of that bin's off blocks. A block is on when it is
+  `TONE_DETECTOR_THRESHOLD_DB` (default 3 dB) over the floor; gaps up to 6 ms are
+  bridged (the B200's 3.4 ms step); a tone lasts at least 20 ms. The tracker streams
+  across chunks, so a tone of a few seconds is one detection; stage A and the ring
+  margin are gone.
+- **Reported:** the listed frequency (not measured within the bin), start and stop to
+  about 1 ms, level as the median over the on time with the floor taken out (in the
+  grid's dB units, like a burst's peak power), and SNR in the bin.
+- **Lost against the IQ design:** the single-line check (narrow modulation inside a
+  12.7 kHz bin at a listed frequency would count) and a measured tone frequency.
+- Duplicates with the burst path, the 3 s hold, and the Config toggle are unchanged.

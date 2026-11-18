@@ -61,3 +61,51 @@ def test_burst_threshold_follows_the_run(tmp_path):
     proc.high_sensitivity.end_now("expired")
     assert proc._hs_burst_config(on).threshold_high_db == 30.0
     assert proc._hs_run_id() is None
+
+
+class _FakeDB:
+    def __init__(self) -> None:
+        self.saved: list[dict] = []
+        self.closed: list[tuple[str, float]] = []
+
+    async def hs_run_save(self, run):
+        self.saved.append(dict(run))
+
+    async def hs_run_counts(self, run_id):
+        return {"detections": 3, "ssm": {"0200574952470001": 2}, "tones": []}
+
+    async def hs_run_close_open(self, reason, ended):
+        self.closed.append((reason, ended))
+        return 1
+
+
+async def test_summary_has_counter_deltas_and_counts(tmp_path, monkeypatch):
+    import rfobserver.pipeline.streaming as st
+
+    monkeypatch.setattr(st, "_HS_SUMMARY_DELAY_SEC", 0.0)
+    proc = _proc(tmp_path)
+    proc._loop = asyncio.get_running_loop()
+    db = _FakeDB()
+    proc._db = db
+    rx = proc._receiver
+    rx.overflow_events, rx.overflow_lost_samples = 5, 100
+    run = proc.high_sensitivity.start(30, run_id="r1")
+    await _settle()
+    assert db.saved[0]["id"] == "r1" and db.saved[0]["ended"] is None
+    rx.overflow_events, rx.overflow_lost_samples = 7, 160
+    proc.high_sensitivity.stop("r1")
+    for _ in range(20):
+        await asyncio.sleep(0)
+    s = db.saved[-1]["summary"]
+    assert db.saved[-1]["end_reason"] == "deleted"
+    assert s["overflow_events"] == 2 and s["overflow_lost_samples"] == 60
+    assert s["detections"] == 3 and s["ssm"] == {"0200574952470001": 2}
+    assert s["threshold_db"] == run.threshold_db
+
+
+async def test_startup_closes_a_run_left_open_by_a_restart(tmp_path):
+    proc = _proc(tmp_path)
+    db = _FakeDB()
+    proc._db = db
+    await proc._hs_close_left_open()
+    assert db.closed and db.closed[0][0] == "restart"

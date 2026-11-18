@@ -634,6 +634,10 @@ def peak_bin_snr(
     return float(burst.peak_power_db - float(np.asarray(noise_per_bin)[idx]))
 
 
+# Wait after a high-sensitivity run ends before its summary, so its last
+# bursts and tones are in the database.
+_HS_SUMMARY_DELAY_SEC = 3.0
+
 # How often the isolation counters are logged (only when they changed).
 _ISOLATION_LOG_INTERVAL_SEC = 60.0
 # Complex64 copies of one ISOLATION_MAX_BURST_SEC burst the RAM guard budgets
@@ -737,6 +741,8 @@ class StreamingProcessor:
         self.high_sensitivity = HighSensitivity(settings)
         self.high_sensitivity.listeners.append(self._on_hs_event)
         self._hs_tone_started = False
+        # Counters at the run's start, for its summary.
+        self._hs_snap: dict[str, Any] = {}
 
         # Compute chunk sizing from current settings
         self._recompute_chunk_params()
@@ -1074,6 +1080,7 @@ class StreamingProcessor:
         """Start the streaming pipeline."""
         self._running = True
         self._loop = asyncio.get_running_loop()
+        await self._hs_close_left_open()
         if self._beacon is not None:
             self._beacon.mark()
         # Snapshot the isolation switches for this run (see __init__).
@@ -1399,6 +1406,7 @@ class StreamingProcessor:
             freqs=freqs,
             threshold_db=float(s.TONE_DETECTOR_THRESHOLD_DB),
             meta=self._tone_meta,
+            hs_run=self._hs_run_id,
         )
         logger.info("Tone detector watching %s Hz", ", ".join(f"{f:.0f}" for f in freqs))
 
@@ -1436,8 +1444,88 @@ class StreamingProcessor:
             return
         if event == "start":
             loop.call_soon_threadsafe(self._hs_tone_start)
+            loop.call_soon_threadsafe(self._hs_on_start, run)
         elif event == "end":
             loop.call_soon_threadsafe(lambda: loop.create_task(self._hs_tone_end()))
+            loop.call_soon_threadsafe(lambda: loop.create_task(self._hs_on_end(run)))
+
+    def _hs_counters(self) -> dict[str, Any]:
+        rx = self._receiver
+        iso = self._isolation
+        return {
+            "overflow_events": int(getattr(rx, "overflow_events", 0) or 0),
+            "overflow_lost_samples": int(getattr(rx, "overflow_lost_samples", 0) or 0),
+            "recv_stalls": int(self._recv_stalls),
+            "isolation": iso.stats.snapshot() if iso is not None else {},
+        }
+
+    def _hs_on_start(self, run: Any) -> None:
+        self._hs_snap = self._hs_counters()
+        assert self._loop is not None
+        self._loop.create_task(self._hs_save(run, None))
+
+    async def _hs_on_end(self, run: Any) -> None:
+        # Late rows (the burst thread's last batches, tones still being
+        # written) land first.
+        await asyncio.sleep(_HS_SUMMARY_DELAY_SEC)
+        try:
+            summary = await self.hs_summary(run)
+        except Exception:
+            logger.exception("High-sensitivity summary for %s failed", run.id)
+            summary = None
+        await self._hs_save(run, summary)
+
+    async def hs_summary(self, run: Any) -> dict[str, Any]:
+        """The run's counts and the counter changes since it started."""
+        now = self._hs_counters()
+        before = self._hs_snap or now
+        counts = await self._db.hs_run_counts(run.id)
+        iso_keys = ("received", "picked", "gated_out", "copies")
+        return {
+            "id": run.id,
+            "source": run.source,
+            "start": run.start,
+            "end": run.end,
+            "ended": run.ended,
+            "end_reason": run.end_reason,
+            "threshold_db": run.threshold_db,
+            **counts,
+            "overflow_events": now["overflow_events"] - before["overflow_events"],
+            "overflow_lost_samples": (
+                now["overflow_lost_samples"] - before["overflow_lost_samples"]
+            ),
+            "recv_stalls": now["recv_stalls"] - before["recv_stalls"],
+            "isolation": {
+                k: now["isolation"].get(k, 0) - before["isolation"].get(k, 0) for k in iso_keys
+            },
+        }
+
+    async def _hs_save(self, run: Any, summary: dict[str, Any] | None) -> None:
+        try:
+            await self._db.hs_run_save(
+                {
+                    "id": run.id,
+                    "source": run.source,
+                    "start": run.start,
+                    "end": run.end,
+                    "ended": run.ended,
+                    "end_reason": run.end_reason,
+                    "threshold_db": run.threshold_db,
+                    "summary": summary,
+                }
+            )
+        except Exception:
+            logger.exception("Saving high-sensitivity run %s failed", run.id)
+
+    async def _hs_close_left_open(self) -> None:
+        """A run is never resumed: close any a restart left open."""
+        try:
+            n = await self._db.hs_run_close_open("restart", time.time())
+        except Exception:
+            logger.exception("Closing high-sensitivity runs left open failed")
+            return
+        if n:
+            logger.info("Closed %d high-sensitivity run(s) left open by a restart", n)
 
     def _hs_tone_start(self) -> None:
         if self._tone_detector is not None or self.high_sensitivity.current() is None:
@@ -4230,6 +4318,7 @@ class StreamingProcessor:
                         "gain_db": gain_db,
                         "antenna": "RX2",
                         "device_serial": device_serial,
+                        "hs_run": hs_run_id,
                     }
                 )
 

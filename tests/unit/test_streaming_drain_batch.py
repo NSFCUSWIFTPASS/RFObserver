@@ -71,3 +71,13 @@ async def test_drain_with_nothing_queued_writes_nothing() -> None:
     db = _BatchDB()
     await _proc(db)._drain_burst_results()
     assert db.batches == []
+
+
+@pytest.mark.asyncio
+async def test_rows_made_under_a_high_sensitivity_run_carry_its_id() -> None:
+    db = _BatchDB()
+    proc = _proc(db)
+    await proc._burst_result_queue.put(([_burst()], 915e6, "r1"))
+    await proc._burst_result_queue.put(([_burst()], 915e6, None))
+    await proc._drain_burst_results()
+    assert [r["hs_run"] for r in db.batches[0]] == ["r1", None]

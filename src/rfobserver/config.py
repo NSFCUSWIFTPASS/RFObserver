@@ -96,6 +96,11 @@ class AppSettings(BaseSettings):
     BURST_MERGE_FREQ_BINS: int = 5
     BURST_MERGE_TIME_MS: float = 3.0
     BURST_NOISE_FLOOR_PERCENTILE: float = 50.0
+    # A burst's extent counts only cells within this many dB of its own peak
+    # (0: off). Near a transmitter its skirt rides over the low threshold for
+    # MHz either side, and the burst is reported that wide; this matters more
+    # the lower BURST_THRESHOLD_HIGH_DB is.
+    BURST_GROW_DEPTH_DB: float = 25.0
 
     # Identity
     #
@@ -278,6 +283,11 @@ class AppSettings(BaseSettings):
     # isolated per second (strongest first).
     ISOLATION_SNR_DB: float = 13.0
     ISOLATION_MAX_PER_SEC: int = 20
+    # Skip a candidate this many dB (or more) under another in the same batch
+    # that starts within 5 ms and is as long within 20 %: near a transmitter
+    # each burst also shows up as spurs and the RX image, which would use up
+    # ISOLATION_MAX_PER_SEC. 0: off.
+    ISOLATION_COPY_DB: float = 15.0
     # Bounded queues into the isolation worker and the rtl_433 worker.
     ISOLATION_QUEUE_MAX: int = 64
     # Cap on saved isolated-burst files (oldest deleted first).

@@ -100,3 +100,20 @@ def test_slow_keying_is_not_a_reader() -> None:
 def test_too_short_is_not_classified() -> None:
     iq = _reader(1_000_000, 20.0, 0.002)
     assert classify_rfid_reader(_cs16(iq), 1_000_000) is None
+
+
+# Real snippets from an over-the-air tone test on 2026-11-18 (B200mini at
+# 26 MS/s); see tests/unit/test_tone_classify.py.
+
+
+def test_weak_tone_fragment_is_not_a_reader() -> None:
+    """A carrier near the detection threshold: noise dips it about halfway,
+    never to the near-zero of PIE pulses."""
+    cs16 = gzip.decompress((FIXTURES / "tone_weak_fragment_1000k.cs16.gz").read_bytes())
+    assert classify_rfid_reader(cs16, 1_000_000, freq_hz=915_495_117.2) is None
+
+
+def test_receiver_ghost_line_is_not_a_reader() -> None:
+    """A 3.5 ms ghost line: readers dwell 80 to 390 ms per channel."""
+    cs16 = gzip.decompress((FIXTURES / "b200_ghost_line_1000k.cs16.gz").read_bytes())
+    assert classify_rfid_reader(cs16, 1_000_000, freq_hz=912_499_023.4) is None

@@ -22,7 +22,9 @@ IQ: TypeAlias = "np.ndarray[Any, np.dtype[Any]]"
 MODEL = "RFID-Reader"
 PROTOCOL = "EPC Gen2"
 
-MIN_SEC = 0.005
+# Readers dwell 80 to 390 ms per channel (HCRO); 20 ms of carrier leaves out
+# a B200mini receiver's 3.5 ms ghost lines (2026-11-18 tone test).
+MIN_SEC = 0.020
 # The carrier is searched within this offset of DC (isolation centres the burst
 # on its peak cell, a cell or two from the carrier).
 CARRIER_SEARCH_HZ = 50_000
@@ -33,6 +35,10 @@ BAND_HZ = 150_000
 MIN_CARRIER_FRACTION = 0.3
 # A dip is the envelope under this fraction of the carrier level.
 DIP_LEVEL = 0.5
+# PIE pulses dip the carrier nearly to zero: the median dip bottoms out at 0.04
+# of the level in the HCRO reader hop. Noise on a carrier near the detection
+# threshold dips it about halfway (0.42 in the 2026-11-18 tone test).
+MAX_DIP_FLOOR = 0.25
 # Gen2 pulse widths are 0.265 to 0.525 Tari: 1.6 to 13 us over the Tari range.
 PULSE_US = (1.5, 15.0)
 # Pulse-to-pulse spacing of PIE symbols (6.25 us to 2 x 25 us, with margin);
@@ -63,9 +69,10 @@ def _us_channel_mhz(carrier_hz: float) -> float | None:
     return round(channel, 3)
 
 
-def _dips(env: IQ, rate_hz: int) -> tuple[IQ, IQ]:
+def _dips(env: IQ, rate_hz: int) -> tuple[IQ, IQ, IQ]:
     """Start and width (us) of each dip under DIP_LEVEL of the carrier level,
-    with dips split by under 1 us of carrier merged into one."""
+    with dips split by under 1 us of carrier merged into one, and the lowest
+    envelope in each as a fraction of the level."""
     us = 1e6 / rate_hz
     level = float(np.median(env[env > 0.3 * np.percentile(env, 90)]))
     low = (env < DIP_LEVEL * level).astype(np.int8)
@@ -73,12 +80,14 @@ def _dips(env: IQ, rate_hz: int) -> tuple[IQ, IQ]:
     starts = np.flatnonzero(edges == 1)
     ends = np.flatnonzero(edges == -1)
     if len(starts) == 0:
-        return starts.astype(float), starts.astype(float)
+        empty = starts.astype(float)
+        return empty, empty, empty
     joined = (starts[1:] - ends[:-1]) * us < 1.0
     keep_start = np.r_[True, ~joined]
     keep_end = np.r_[~joined, True]
     starts, ends = starts[keep_start], ends[keep_end]
-    return starts * us, (ends - starts) * us
+    floors = np.array([env[a:b].min() for a, b in zip(starts, ends, strict=True)]) / level
+    return starts * us, (ends - starts) * us, floors
 
 
 def classify_rfid_reader(
@@ -106,9 +115,11 @@ def classify_rfid_reader(
 
     smooth = max(1, round(rate_hz / 1e6))  # about 1 us
     env = np.convolve(np.abs(x), np.ones(smooth) / smooth, mode="same")
-    starts, widths = _dips(env, rate_hz)
+    starts, widths, floors = _dips(env, rate_hz)
     pulse = (widths >= PULSE_US[0]) & (widths <= PULSE_US[1])
     if pulse.sum() < MIN_PULSES_PER_SEC * n / rate_hz:
+        return None
+    if float(np.median(floors[pulse])) > MAX_DIP_FLOOR:
         return None
     spacing = np.diff(starts[pulse])
     spacing = spacing[spacing < GAP_US]

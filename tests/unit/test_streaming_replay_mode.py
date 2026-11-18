@@ -47,7 +47,7 @@ def _proc(replay_mode: bool, tmp_path):
 async def test_replay_mode_skips_insert(tmp_path):
     proc, db, _zms = _proc(True, tmp_path)
     # queue one burst result and drain
-    proc._burst_result_queue.put_nowait(([_fake_burst()], 915e6))
+    proc._burst_result_queue.put_nowait(([_fake_burst()], 915e6, None))
     proc._burst_result_queue.put_nowait(None)
     await proc._drain_burst_results()
     db.insert_detections.assert_not_called()
@@ -56,7 +56,7 @@ async def test_replay_mode_skips_insert(tmp_path):
 @pytest.mark.asyncio
 async def test_normal_mode_inserts(tmp_path):
     proc, db, _zms = _proc(False, tmp_path)
-    proc._burst_result_queue.put_nowait(([_fake_burst()], 915e6))
+    proc._burst_result_queue.put_nowait(([_fake_burst()], 915e6, None))
     proc._burst_result_queue.put_nowait(None)
     await proc._drain_burst_results()
     db.insert_detections.assert_called()

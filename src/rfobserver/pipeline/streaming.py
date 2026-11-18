@@ -31,6 +31,7 @@ import shutil
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -728,6 +729,14 @@ class StreamingProcessor:
         self._tone_on = self._tone_wanted()
         self._tone_disabled_reason: str | None = None
         self._tone_detector: ToneDetector | None = None
+        # High-sensitivity mode (pipeline/high_sensitivity.py): an in-memory
+        # overlay on the burst threshold and isolation budget, with a tone
+        # detector of its own when the routine one is off.
+        from rfobserver.pipeline.high_sensitivity import HighSensitivity
+
+        self.high_sensitivity = HighSensitivity(settings)
+        self.high_sensitivity.listeners.append(self._on_hs_event)
+        self._hs_tone_started = False
 
         # Compute chunk sizing from current settings
         self._recompute_chunk_params()
@@ -896,9 +905,9 @@ class StreamingProcessor:
         # Burst results from burst thread -> event loop. Payload is
         # (completed_bursts, sdr_center_freq_hz) so each detection can be
         # stamped with the actual tuned center, correct even mid-sweep.
-        self._burst_result_queue: asyncio.Queue[tuple[list[BurstFingerprint], int] | None] = (
-            asyncio.Queue(maxsize=32)
-        )
+        self._burst_result_queue: asyncio.Queue[
+            tuple[list[BurstFingerprint], int, str | None] | None
+        ] = asyncio.Queue(maxsize=32)
         self._burst_handoff = _LoopHandoff(self._burst_result_queue)
 
         # Module manager — attached externally by pipeline/app.py (optional)
@@ -1123,6 +1132,7 @@ class StreamingProcessor:
                 # stage (its stop() joins a worker thread, so off the loop), then
                 # the attribution worker.
                 await self._stop_isolation()
+                self.high_sensitivity.end_now("stopped")
                 await self._stop_tone_detector()
                 self._recctl_queue.put(None)
                 recctl_thread.join(timeout=5)
@@ -1193,6 +1203,7 @@ class StreamingProcessor:
                 ),
                 replay_source=replay_source,
                 on_label=self._add_label,
+                max_per_sec=self.high_sensitivity.isolation_max_per_sec,
             )
         except Exception as exc:
             # Isolation is an add-on: the pipeline runs without it. Say why in
@@ -1361,10 +1372,12 @@ class StreamingProcessor:
 
     # -- Tone detector --
 
-    def _start_tone_detector(self) -> None:
+    def _start_tone_detector(self, *, force: bool = False) -> None:
+        """Start the tone detector when it is switched on (or ``force``d, for a
+        high-sensitivity run)."""
         self._tone_detector = None
         self._tone_disabled_reason = None
-        if not self._tone_on:
+        if not (self._tone_on or force):
             return
         from rfobserver.pipeline.tone_detector import ToneDetector
         from rfobserver.processing.tone_detect import parse_tone_freqs
@@ -1400,6 +1413,45 @@ class StreamingProcessor:
             logger.warning("Tone detector did not finish writing in time")
         except Exception:
             logger.exception("Tone detector stop failed")
+
+    # -- High-sensitivity mode --
+
+    def _hs_burst_config(self, config: BurstDetectionConfig) -> BurstDetectionConfig:
+        """``config`` with the threshold now in force (the same object when it
+        already has it). Called by the burst thread once per grid."""
+        threshold = self.high_sensitivity.burst_threshold_db()
+        if config.threshold_high_db == threshold:
+            return config
+        return replace(config, threshold_high_db=threshold)
+
+    def _hs_run_id(self) -> str | None:
+        run = self.high_sensitivity.current()
+        return run.id if run is not None else None
+
+    def _on_hs_event(self, event: str, run: Any) -> None:
+        """Controller listener (any thread): hand the tone detector's start
+        or stop to the event loop."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        if event == "start":
+            loop.call_soon_threadsafe(self._hs_tone_start)
+        elif event == "end":
+            loop.call_soon_threadsafe(lambda: loop.create_task(self._hs_tone_end()))
+
+    def _hs_tone_start(self) -> None:
+        if self._tone_detector is not None or self.high_sensitivity.current() is None:
+            return
+        self._start_tone_detector(force=True)
+        self._hs_tone_started = self._tone_detector is not None
+
+    async def _hs_tone_end(self) -> None:
+        """Stop the tone detector the run started (a routine one stays)."""
+        if not self._hs_tone_started:
+            return
+        self._hs_tone_started = False
+        await self._stop_tone_detector()
+        self._tone_detector = None
 
     def _tone_meta(self) -> dict[str, Any]:
         rx_config = getattr(self._receiver, "config", None)
@@ -1443,6 +1495,7 @@ class StreamingProcessor:
         """
         self._config_generation += 1
         logger.info("Reconfiguration requested (gen=%d)", self._config_generation)
+        self.high_sensitivity.end_now("retune")
 
     def set_replay_recording(self, on: bool) -> None:
         """Opt in/out of recording during replay (manual record only)."""
@@ -3557,10 +3610,16 @@ class StreamingProcessor:
                 # every chunk wedged the burst-detection thread (see fix in
                 # this commit), so we piggy-back on the detector's existing
                 # work and only refresh when it actually evaluates.
+                hs_config = self._hs_burst_config(burst_config)
+                if hs_config is not burst_config:
+                    burst_config = hs_config
+                    rolling_detector.set_config(burst_config)
                 prev_rows_since_eval = rolling_detector._rows_since_eval
                 completed_bursts = rolling_detector.feed(
                     psd_grid, chunk_start=chunk_start, slice_samples=self._slice_samples
                 )
+                # The run in force when these bursts were made (None: routine).
+                hs_run_id = self._hs_run_id()
                 if rolling_detector._rows_since_eval < prev_rows_since_eval:
                     last_det = rolling_detector._last_detection
                     if last_det is not None and last_det.noise_floor_per_bin is not None:
@@ -3579,7 +3638,9 @@ class StreamingProcessor:
                 self._publish_burst_done(my_gen, done_end)
 
                 if completed_bursts and self._loop is not None:
-                    self._burst_handoff.submit(self._loop, (completed_bursts, int(freq_hz)))
+                    self._burst_handoff.submit(
+                        self._loop, (completed_bursts, int(freq_hz), hs_run_id)
+                    )
 
                 # Build active burst overlay data for WebSocket.
                 # Each burst carries absolute frequency bounds plus real
@@ -3760,6 +3821,9 @@ class StreamingProcessor:
                 # DURATION_SEC, so dropping would lose every window.
                 await flush_pending()
             window_clock.mark_result(waited)
+            if last_result is not None and last_result.center_freq_hz != result.center_freq_hz:
+                self.high_sensitivity.end_now("retune")
+            self.high_sensitivity.current()  # expires a run that is due
             if self._tone_detector is not None:
                 self._tone_detector.on_result(
                     result, self._slice_samples / self._settings.BANDWIDTH
@@ -4131,7 +4195,7 @@ class StreamingProcessor:
             if item is None:
                 break
 
-            bursts, sdr_center_freq_hz = item
+            bursts, sdr_center_freq_hz, hs_run_id = item
 
             # SDR capture context, recorded on every detection so they can be
             # categorized by tuning (center / sample rate / gain). Center comes

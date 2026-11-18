@@ -914,3 +914,25 @@ def test_long_bursts_share_the_budget_when_theirs_is_zero(tmp_path):
     long_ = [_no_pos(_cand(7, 20, 50_000, 50_000 + 80 * ms))]
     long_[0].burst.duration_ms = 80.0
     assert st.process_batch(IsolationBatch(long_, 915e6, FS, ring)) == []
+
+
+def test_gate_reads_the_cap_through_the_callable(tmp_path):
+    """High-sensitivity mode raises the per-second budget while it runs."""
+    cap = {"n": 2}
+    handed = []
+    st = IsolationStage(
+        _settings(ISOLATION_MAX_PER_SEC=99),
+        archive=None,
+        module_feed=None,
+        attribution_handoff=lambda item: handed.append(item.burst_id),
+        clock=_Clock(),
+        max_per_sec=lambda: cap["n"],
+    )
+    ring = RingSource(_ring())
+    out = st.process_batch(
+        IsolationBatch([_no_pos(_cand(i, 30 + i)) for i in range(4)], 915e6, FS, ring)
+    )
+    assert len(out) == 2
+    cap["n"] = 3  # same window: one more fits
+    out = st.process_batch(IsolationBatch([_no_pos(_cand(9, 40))], 915e6, FS, ring))
+    assert len(out) == 1

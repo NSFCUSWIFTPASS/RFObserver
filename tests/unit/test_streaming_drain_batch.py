@@ -49,7 +49,7 @@ async def test_drain_writes_all_pending_bursts_in_one_batch() -> None:
     db = _BatchDB()
     proc = _proc(db)
     for n in (3, 1, 4):
-        await proc._burst_result_queue.put(([_burst() for _ in range(n)], 915e6))
+        await proc._burst_result_queue.put(([_burst() for _ in range(n)], 915e6, None))
     await proc._drain_burst_results()
     assert len(db.batches) == 1, "one DB write per drain, not per burst"
     assert len(db.batches[0]) == 8
@@ -61,7 +61,7 @@ async def test_drain_writes_all_pending_bursts_in_one_batch() -> None:
 async def test_drain_in_replay_mode_writes_nothing() -> None:
     db = _BatchDB()
     proc = _proc(db, replay=True)
-    await proc._burst_result_queue.put(([_burst()], 915e6))
+    await proc._burst_result_queue.put(([_burst()], 915e6, None))
     await proc._drain_burst_results()
     assert db.batches == []
 

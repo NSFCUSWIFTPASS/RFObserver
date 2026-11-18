@@ -44,7 +44,7 @@ async def test_drain_burst_results_survives_db_error():
         peak_power_db=-40.0,
         duration_ms=10.0,
     )
-    await proc._burst_result_queue.put(([burst], 915e6))
+    await proc._burst_result_queue.put(([burst], 915e6, None))
     # Must NOT raise despite the DB blowing up.
     await proc._drain_burst_results()
     assert proc._db.calls == 1

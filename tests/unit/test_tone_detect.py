@@ -213,3 +213,26 @@ def test_two_pulses_are_two_segments() -> None:
 def test_a_short_blip_is_not_a_tone() -> None:
     x = _channel(pulses=((0.5, 0.008),), bin_snr_db=20.0, seed=9)
     assert confirm_tones(x, CH_RATE, bin_hz=BIN_HZ) == []
+
+
+def test_a_weak_tone_through_the_channelizer_at_either_window_edge() -> None:
+    """The channelizer's filter rolls off toward the channel's edges, so noise
+    near the line is about 10 % above a whole-channel median; the line test
+    must measure noise beside the line. A tone crossing a window boundary
+    (at the window's end or start) is the case that exposed it."""
+    from rfobserver.processing.channelize import channelize
+
+    wide, step = 1_300_000, 1_300_000 / 128
+    for on, edge in (((0.7, 1.0), "end"), ((0.0, 0.3), "start")):
+        for seed in range(6):
+            rng = np.random.default_rng(400 + seed)
+            n = wide
+            x = np.sqrt(0.5e-6) * (rng.normal(size=n) + 1j * rng.normal(size=n))
+            amp = np.sqrt(1e-6 * step / wide * 10**0.5)
+            t = np.arange(n) / wide
+            m = (t >= on[0]) & (t < on[1])
+            x[m] += amp * np.exp(2j * np.pi * 1_581.0 * t[m])
+            ch = channelize(x.astype(np.complex64), wide, 0.0, CH_RATE)
+            segs = confirm_tones(ch, CH_RATE, bin_hz=step)
+            assert len(segs) == 1, (edge, seed)
+            assert segs[0].touches_end if edge == "end" else segs[0].touches_start

@@ -164,16 +164,20 @@ def confirm_tones(
     w = np.hanning(n).astype(np.float32)
     spec = np.abs(np.fft.fft(x * w)) ** 2
     f = np.fft.fftfreq(n, 1.0 / rate)
-    # Noise per FFT bin: the median of an exponential is ln 2 of its mean.
-    noise = float(np.median(spec)) / np.log(2.0)
-    if noise <= 0:
-        return []
     near = np.flatnonzero(np.abs(f) <= search)
     k = int(near[np.argmax(spec[near])])
-    if spec[k] < noise * 10 ** (MIN_LINE_DB / 10):
-        return []
     band = np.abs(f - f[k]) <= bin_hz / 2
     line = np.abs(f - f[k]) <= LINE_HZ
+    # Noise per FFT bin, measured beside the line (the median of an
+    # exponential is ln 2 of its mean): the channelizer's filter rolls off
+    # toward the channel's edges, where a whole-channel median would sit
+    # about 10 % under the noise at the line.
+    beside = band & (np.abs(f - f[k]) > 2 * LINE_HZ)
+    noise = float(np.median(spec[beside])) / np.log(2.0) if beside.any() else 0.0
+    if noise <= 0:
+        return []
+    if spec[k] < noise * 10 ** (MIN_LINE_DB / 10):
+        return []
     excess_band = float(spec[band].sum()) - noise * int(band.sum())
     excess_line = float(spec[line].sum()) - noise * int(line.sum())
     if excess_band <= 0 or excess_line / excess_band < MIN_LINE_FRACTION:

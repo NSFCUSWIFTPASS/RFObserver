@@ -107,8 +107,8 @@ _INSERT_DETECTION_SQL = """INSERT OR IGNORE INTO detections
    (burst_id, start_time, stop_time, center_freq_hz, bandwidth_hz,
     peak_power_db, duration_ms, detection_timestamp,
     sdr_center_freq_hz, sample_rate_hz, lo_offset_hz, analog_bw_hz,
-    gain_db, antenna, device_serial, peak_freq_hz)
-   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+    gain_db, antenna, device_serial, peak_freq_hz, hs_run)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
 
 _UPSERT_AVG_MINUTE_SQL = """INSERT OR REPLACE INTO avg_minutes
     (minute_start, sdr_center_freq_hz, n, sample_rate_hz, gain_db,
@@ -133,6 +133,7 @@ def _detection_row(
     antenna: str | None = None,
     device_serial: str | None = None,
     peak_freq_hz: float = 0.0,
+    hs_run: str | None = None,
 ) -> tuple[Any, ...]:
     return (
         burst_id,
@@ -151,6 +152,7 @@ def _detection_row(
         antenna,
         device_serial,
         peak_freq_hz,
+        hs_run,
     )
 
 
@@ -177,6 +179,19 @@ CREATE TABLE IF NOT EXISTS detections (
     antenna TEXT,
     device_serial TEXT,
     created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- High-sensitivity runs (pipeline/high_sensitivity.py): the newest 50, each
+-- with its summary as JSON. Detections made in a run carry its id (hs_run).
+CREATE TABLE IF NOT EXISTS hs_runs (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    start REAL NOT NULL,
+    "end" REAL NOT NULL,
+    ended REAL,
+    end_reason TEXT,
+    threshold_db REAL NOT NULL,
+    summary TEXT
 );
 
 CREATE TABLE IF NOT EXISTS config (
@@ -390,6 +405,12 @@ _DETECTION_ATTRIBUTION_COLUMNS: dict[str, str] = {
     "protocol_id": "INTEGER",
     "attribution": "TEXT",
 }
+
+# The high-sensitivity run a detection was made in (NULL: routine).
+_DETECTION_HS_COLUMNS: dict[str, str] = {"hs_run": "TEXT"}
+
+# High-sensitivity run summaries kept.
+HS_RUNS_KEPT = 50
 
 
 # Scheduled-capture columns, added to collection_hours after its first
@@ -732,6 +753,10 @@ class SensorDatabase:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_detections_sdr_center ON detections(sdr_center_freq_hz)"
         )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_detections_hs_run ON detections(hs_run) "
+            "WHERE hs_run IS NOT NULL"
+        )
         # Partial: only decoded rows, so the Detections page's model dropdown
         # (SELECT DISTINCT model) reads a small index instead of the table.
         await self._db.execute(
@@ -756,6 +781,7 @@ class SensorDatabase:
         for column, col_type in {
             **_DETECTION_SDR_COLUMNS,
             **_DETECTION_ATTRIBUTION_COLUMNS,
+            **_DETECTION_HS_COLUMNS,
         }.items():
             if column not in existing:
                 await self._db.execute(f"ALTER TABLE detections ADD COLUMN {column} {col_type}")
@@ -2017,6 +2043,7 @@ class SensorDatabase:
         attributed: bool | None = None,
         model: str | None = None,
         status: str | None = None,
+        hs_run: str | None = None,
     ) -> tuple[list[str], list[Any]]:
         """WHERE fragments shared by the detections table, histogram and CSV.
 
@@ -2028,6 +2055,12 @@ class SensorDatabase:
         """
         conditions: list[str] = []
         params: list[Any] = []
+        # A high-sensitivity run's rows ("any": every run's).
+        if hs_run == "any":
+            conditions.append("hs_run IS NOT NULL")
+        elif hs_run is not None:
+            conditions.append("hs_run = ?")
+            params.append(hs_run)
         if min_freq is not None:
             conditions.append("center_freq_hz >= ?")
             params.append(min_freq)
@@ -2102,6 +2135,7 @@ class SensorDatabase:
         model: str | None = None,
         before: tuple[str, int] | None = None,
         status: str | None = None,
+        hs_run: str | None = None,
     ) -> list[dict[str, Any]]:
         """Detections newest first (start_time DESC, id DESC as the tiebreak).
 
@@ -2123,6 +2157,7 @@ class SensorDatabase:
             attributed=attributed,
             model=model,
             status=status,
+            hs_run=hs_run,
         )
         if before is not None:
             # Row-value form: SQLite walks idx_detections_time (rowid is the
@@ -2171,10 +2206,104 @@ class SensorDatabase:
             "COALESCE(model, '') AS m, "
             "CASE WHEN attribution IS NOT NULL THEN 1 ELSE 0 END AS tried, "
             "COUNT(*) FROM detections WHERE start_time >= ? AND start_time < ? "
+            "AND hs_run IS NULL "
             "GROUP BY hour, m, tried"
         )
         async with self._db.execute(query, bounds) as cursor:
             return [(int(r[0]), str(r[1]), int(r[2]), int(r[3])) for r in await cursor.fetchall()]
+
+    # -- High-sensitivity runs --
+
+    @_guarded_write
+    async def hs_run_save(self, run: Mapping[str, Any]) -> None:
+        """Insert or replace one run (``summary`` a dict or None), keeping the
+        newest HS_RUNS_KEPT by start."""
+        assert self._db is not None
+        summary = run.get("summary")
+        await self._db.execute(
+            'INSERT OR REPLACE INTO hs_runs (id, source, start, "end", ended, end_reason, '
+            "threshold_db, summary) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run["id"],
+                run["source"],
+                float(run["start"]),
+                float(run["end"]),
+                run.get("ended"),
+                run.get("end_reason"),
+                float(run["threshold_db"]),
+                None if summary is None else json.dumps(summary),
+            ),
+        )
+        await self._db.execute(
+            "DELETE FROM hs_runs WHERE id NOT IN "
+            "(SELECT id FROM hs_runs ORDER BY start DESC LIMIT ?)",
+            (HS_RUNS_KEPT,),
+        )
+        await self._db.commit()
+
+    @_guarded_write
+    async def hs_run_close_open(self, reason: str, ended: float) -> int:
+        """Close the runs a restart left open; returns how many."""
+        assert self._db is not None
+        cur = await self._db.execute(
+            "UPDATE hs_runs SET ended = ?, end_reason = ? WHERE ended IS NULL", (ended, reason)
+        )
+        await self._db.commit()
+        return int(cur.rowcount or 0)
+
+    async def hs_runs(self, limit: int = HS_RUNS_KEPT) -> list[dict[str, Any]]:
+        assert self._db is not None
+        async with self._db.execute(
+            'SELECT id, source, start, "end", ended, end_reason, threshold_db, summary '
+            "FROM hs_runs ORDER BY start DESC LIMIT ?",
+            (limit,),
+        ) as cursor:
+            return [_hs_run_dict(r) for r in await cursor.fetchall()]
+
+    async def hs_run_get(self, run_id: str) -> dict[str, Any] | None:
+        assert self._db is not None
+        async with self._db.execute(
+            'SELECT id, source, start, "end", ended, end_reason, threshold_db, summary '
+            "FROM hs_runs WHERE id = ?",
+            (run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return None if row is None else _hs_run_dict(row)
+
+    async def hs_run_counts(self, run_id: str) -> dict[str, Any]:
+        """A run's detections, SSM labels by source id, and tones."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT COUNT(*) FROM detections WHERE hs_run = ?", (run_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        n = int(row[0]) if row else 0
+        async with self._db.execute(
+            "SELECT json_extract(attribution, '$.frames[0].src_id'), COUNT(*) FROM detections "
+            "WHERE hs_run = ? AND model = 'SSM' GROUP BY 1",
+            (run_id,),
+        ) as cursor:
+            ssm = {str(r[0]): int(r[1]) for r in await cursor.fetchall()}
+        tones = []
+        async with self._db.execute(
+            "SELECT attribution FROM detections WHERE hs_run = ? AND model = 'Tone' "
+            "ORDER BY start_time",
+            (run_id,),
+        ) as cursor:
+            for (raw,) in await cursor.fetchall():
+                try:
+                    f = json.loads(raw)["frames"][0]
+                except (TypeError, ValueError, KeyError, IndexError):
+                    continue
+                tones.append(
+                    {
+                        "freq_hz": f.get("tone_hz"),
+                        "level_db": f.get("level_db"),
+                        "snr_db": f.get("snr_db"),
+                        "duration_ms": f.get("duration_ms"),
+                    }
+                )
+        return {"detections": n, "ssm": ssm, "tones": tones}
 
     @_guarded_write
     async def store_detection_hours(
@@ -2671,3 +2800,16 @@ class SensorDatabase:
             with contextlib.suppress(OSError):
                 size += os.stat(self._db_path + suffix).st_size
         return size, page_size * free_pages
+
+
+def _hs_run_dict(r: Any) -> dict[str, Any]:
+    return {
+        "id": r[0],
+        "source": r[1],
+        "start": r[2],
+        "end": r[3],
+        "ended": r[4],
+        "end_reason": r[5],
+        "threshold_db": r[6],
+        "summary": json.loads(r[7]) if r[7] else None,
+    }

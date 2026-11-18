@@ -1,6 +1,7 @@
 """Tests for rfobserver.storage.database."""
 
 import asyncio
+import json
 import math
 import sqlite3
 import time
@@ -1724,3 +1725,102 @@ async def test_avg_windows_after_works_on_a_read_only_connection(db, tmp_path):
         assert [r.id for r in await reader.avg_windows_after(0, 10)] == [1]
     finally:
         await reader.close()
+
+
+# -- High-sensitivity runs --
+
+
+def _hs_det(i: int, run: str | None = None, **kw: Any) -> dict[str, Any]:
+    d = {**_det_kwargs(i), "start_time": datetime(2026, 1, 1, 0, 0, i, tzinfo=timezone.utc)}
+    d["stop_time"] = d["start_time"] + timedelta(seconds=1)
+    if run is not None:
+        d["hs_run"] = run
+    return {**d, **kw}
+
+
+async def test_hourly_counts_leave_out_high_sensitivity_rows(db):
+    await db.insert_detections([_hs_det(1), _hs_det(2, "r1")])
+    t0 = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
+    rows = await db.count_detections_by_hour(t0, t0 + 3600)
+    assert sum(r[3] for r in rows) == 1
+
+
+async def test_detections_filter_by_hs_run(db):
+    await db.insert_detections([_hs_det(1), _hs_det(2, "r1"), _hs_det(3, "r2")])
+    assert [r["burst_id"] for r in await db.query_detections(hs_run="r1")] == ["burst-2"]
+    got = sorted(r["burst_id"] for r in await db.query_detections(hs_run="any"))
+    assert got == ["burst-2", "burst-3"]
+    assert len(await db.query_detections()) == 3
+
+
+async def test_hs_run_counts_ssm_and_tones(db):
+    await db.insert_detections([_hs_det(1, "r1"), _hs_det(2, "r1"), _hs_det(3, "r1"), _hs_det(4)])
+    ssm = {"decoded": True, "frames": [{"model": "SSM", "src_id": "0200574952470001"}]}
+    tone = {
+        "decoded": True,
+        "frames": [
+            {
+                "model": "Tone",
+                "tone_hz": 914.85e6,
+                "level_db": -80.5,
+                "snr_db": 12.0,
+                "duration_ms": 2000.0,
+            }
+        ],
+    }
+    await db.update_detection_attribution(
+        burst_id="burst-1", model="SSM", protocol_id=None, attribution=json.dumps(ssm)
+    )
+    await db.update_detection_attribution(
+        burst_id="burst-2", model="Tone", protocol_id=None, attribution=json.dumps(tone)
+    )
+    c = await db.hs_run_counts("r1")
+    assert c["detections"] == 3
+    assert c["ssm"] == {"0200574952470001": 1}
+    assert c["tones"] == [
+        {"freq_hz": 914.85e6, "level_db": -80.5, "snr_db": 12.0, "duration_ms": 2000.0}
+    ]
+
+
+async def test_hs_runs_keep_the_newest_50_and_close_open_ones(db):
+    for k in range(55):
+        await db.hs_run_save(
+            {
+                "id": f"r{k}",
+                "source": "api",
+                "start": float(k),
+                "end": k + 60.0,
+                "ended": None if k == 54 else k + 60.0,
+                "end_reason": None,
+                "threshold_db": 15.0,
+                "summary": {"detections": k},
+            }
+        )
+    runs = await db.hs_runs()
+    assert len(runs) == 50
+    assert runs[0]["id"] == "r54" and runs[0]["summary"] == {"detections": 54}
+    assert await db.hs_run_get("r0") is None
+    assert await db.hs_run_close_open("restart", ended=99.0) == 1
+    r = await db.hs_run_get("r54")
+    assert r["end_reason"] == "restart" and r["ended"] == 99.0
+
+
+async def test_existing_db_gains_hs_run_column(tmp_path):
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE TABLE detections (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " burst_id TEXT UNIQUE NOT NULL, start_time TEXT NOT NULL,"
+        " stop_time TEXT NOT NULL, center_freq_hz REAL NOT NULL,"
+        " bandwidth_hz REAL NOT NULL, peak_power_db REAL NOT NULL,"
+        " duration_ms REAL NOT NULL, detection_timestamp TEXT NOT NULL)"
+    )
+    con.commit()
+    con.close()
+    db = SensorDatabase(str(path))
+    await db.connect()
+    try:
+        await db.insert_detections([_hs_det(1, "r1")])
+        assert len(await db.query_detections(hs_run="r1")) == 1
+    finally:
+        await db.close()

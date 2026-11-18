@@ -153,3 +153,30 @@ Decoder in isolation: every hop decoded `0200574952470001` with 0 bit errors at 
   investigated.
 - `ISOLATION_COPY_DB` compares bursts only within one isolation batch; a copy that completes in a
   different evaluation than its hop is not caught. Not measured.
+
+## ADDENDUM 2026-11-18: a budget of their own for long bursts (the 15 dB open item)
+
+Two ways to keep 15 dB's short candidates from using up `ISOLATION_MAX_PER_SEC`, scored the same way
+(both fixes above on; all 390 hop-sensor pairs):
+
+```
+F   15 dB cap 20, long (>= 20 ms) bursts ordered first      labelled  48  SSM labels on no hop  5
+F2  15 dB cap 20, long bursts get 10/s of their own        labelled 104                       12
+H2  30 dB cap 20, long bursts get 10/s of their own        labelled  59                       11
+E   15 dB uncapped (ceiling)                               labelled 108                       21
+```
+
+F2 per sensor (hops labelled): N1000 17/21, 20/20, 18/19; NbE540 6/7 and 17/19; N830 5/5 and 17/19;
+W230 3/4. At 30 dB the same sensors outside N1000 label none.
+
+**Measured and REJECTED (do not retry): ordering long bursts first.** The 1 s budget spans many
+isolation batches and the ordering acts within one batch, so the short bursts of earlier batches in
+the second have spent it before the batch holding the hop arrives (.36 SSM1_neg12: 7/21 with and
+without the ordering).
+
+What was done: `ISOLATION_LONG_MS` (20) and `ISOLATION_LONG_MAX_PER_SEC` (10). Bursts that long are
+charged to their own per-second budget first, then to the general one. 0 turns it off.
+
+Open: the cost. Up to 10 more isolations and decodes a second of 20-500 ms bursts per sensor (an SSM
+decode of a long burst was about 27 ms on nano-super, 2026-11-05). Not measured on the HCRO Jetsons
+at 15 dB.

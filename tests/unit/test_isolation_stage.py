@@ -871,3 +871,46 @@ def test_copy_gate_off_at_zero(tmp_path):
     cands = [_cand(0, 50), _cand(1, 30)]
     out = st.process_batch(IsolationBatch(cands, 915e6, FS, RingSource(_ring())))
     assert sorted(bid for bid, _ in out) == ["b0", "b1"]
+
+
+def test_long_bursts_have_their_own_budget(tmp_path):
+    """At a low burst threshold a busy sensor yields hundreds of 1-5 ms
+    candidates a second, which use up ISOLATION_MAX_PER_SEC before a frame as
+    long as an SSM hop (82 ms) arrives; long bursts get a budget of their own."""
+    clock = _Clock()
+    st, *_ = _stage(
+        tmp_path,
+        clock,
+        ISOLATION_MAX_PER_SEC=2,
+        ISOLATION_LONG_MS=20.0,
+        ISOLATION_LONG_MAX_PER_SEC=1,
+    )
+    ms = int(FS) // 1000
+    ring = RingSource(_ring(1_000_000))
+    short = [_no_pos(_cand(i, 50 - i, 10_000, 10_000 + 2 * ms)) for i in range(3)]
+    assert [b for b, _ in st.process_batch(IsolationBatch(short, 915e6, FS, ring))] == ["b0", "b1"]
+    long_ = [
+        _no_pos(_cand(7, 20, 50_000, 50_000 + 80 * ms)),
+        _no_pos(_cand(8, 19, 50_000, 50_000 + 80 * ms)),
+    ]
+    long_[0].burst.duration_ms = long_[1].burst.duration_ms = 80.0
+    # b7 fits the long budget though the general one is spent; b8 does not.
+    assert [b for b, _ in st.process_batch(IsolationBatch(long_, 915e6, FS, ring))] == ["b7"]
+
+
+def test_long_bursts_share_the_budget_when_theirs_is_zero(tmp_path):
+    clock = _Clock()
+    st, *_ = _stage(
+        tmp_path,
+        clock,
+        ISOLATION_MAX_PER_SEC=2,
+        ISOLATION_LONG_MS=20.0,
+        ISOLATION_LONG_MAX_PER_SEC=0,
+    )
+    ms = int(FS) // 1000
+    ring = RingSource(_ring(1_000_000))
+    short = [_no_pos(_cand(i, 50 - i, 10_000, 10_000 + 2 * ms)) for i in range(2)]
+    st.process_batch(IsolationBatch(short, 915e6, FS, ring))
+    long_ = [_no_pos(_cand(7, 20, 50_000, 50_000 + 80 * ms))]
+    long_[0].burst.duration_ms = 80.0
+    assert st.process_batch(IsolationBatch(long_, 915e6, FS, ring)) == []

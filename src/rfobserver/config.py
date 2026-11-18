@@ -288,6 +288,14 @@ class AppSettings(BaseSettings):
     # each burst also shows up as spurs and the RX image, which would use up
     # ISOLATION_MAX_PER_SEC. 0: off.
     ISOLATION_COPY_DB: float = 15.0
+    # Bursts of ISOLATION_LONG_MS or longer get ISOLATION_LONG_MAX_PER_SEC
+    # picks a second of their own before sharing ISOLATION_MAX_PER_SEC. At a low
+    # BURST_THRESHOLD_HIGH_DB a busy sensor yields hundreds of 1-5 ms candidates
+    # a second, which use up the general budget before a frame such as an
+    # 82 ms SSM hop arrives (one transmitter sends about 4 a second). 0: no
+    # budget of their own. See docs/debugging/2026-11-18_ssm-coverage-hcro.md.
+    ISOLATION_LONG_MS: float = 20.0
+    ISOLATION_LONG_MAX_PER_SEC: int = 10
     # Bounded queues into the isolation worker and the rtl_433 worker.
     ISOLATION_QUEUE_MAX: int = 64
     # Cap on saved isolated-burst files (oldest deleted first).

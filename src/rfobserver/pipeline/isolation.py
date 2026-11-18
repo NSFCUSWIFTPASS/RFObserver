@@ -175,6 +175,7 @@ class IsolationStage:
         self._whole_pending = 0
         self._window_start = -1e18
         self._window_count = 0
+        self._window_long = 0  # picks charged to ISOLATION_LONG_MAX_PER_SEC
         self.stats = IsolationStats()
 
     # -- producer side (burst thread / sweep loop): never blocks --
@@ -298,7 +299,9 @@ class IsolationStage:
             self.stats.count("queue_full", len(batch.candidates))
 
     def _gate(self, cands: list[BurstCandidate], sample_rate_hz: float) -> list[BurstCandidate]:
-        """SNR gate, then cap to ISOLATION_MAX_PER_SEC, strongest first.
+        """SNR gate, then cap to ISOLATION_MAX_PER_SEC, strongest first. Bursts
+        of ISOLATION_LONG_MS or longer are charged to ISOLATION_LONG_MAX_PER_SEC
+        first (and to the general budget once theirs is spent).
 
         The per-second budget is a fixed 1 s window measured from the first
         candidate seen after the previous window expired (not aligned to
@@ -320,10 +323,20 @@ class IsolationStage:
         stops = [c.burst.stop_sample for c in cands if c.burst.stop_sample is not None]
         now = max(stops) / float(sample_rate_hz) if stops and sample_rate_hz > 0 else self._clock()
         if now < self._window_start or now - self._window_start >= 1.0:
-            self._window_start, self._window_count = now, 0
+            self._window_start, self._window_count, self._window_long = now, 0, 0
         room = max(0, int(s.ISOLATION_MAX_PER_SEC) - self._window_count)
-        picked = passed[:room]
-        self._window_count += len(picked)
+        long_room = max(0, int(s.ISOLATION_LONG_MAX_PER_SEC) - self._window_long)
+        long_sec = float(s.ISOLATION_LONG_MS) / 1000.0
+        picked = []
+        for c in passed:
+            if long_room and _length_sec(c, sample_rate_hz) >= long_sec:
+                long_room -= 1
+                self._window_long += 1
+                picked.append(c)
+            elif room:
+                room -= 1
+                self._window_count += 1
+                picked.append(c)
         if picked:
             self.stats.count("picked", len(picked))
         gated_out = len(cands) - len(picked)
@@ -666,3 +679,10 @@ def _copies(cands: list[BurstCandidate], min_db: float, sample_rate_hz: float) -
                 out.add(id(c))
                 break
     return out
+
+
+def _length_sec(c: BurstCandidate, sample_rate_hz: float) -> float:
+    b = c.burst
+    if b.start_sample is not None and b.stop_sample is not None and sample_rate_hz > 0:
+        return (b.stop_sample - b.start_sample) / sample_rate_hz
+    return b.duration_ms / 1000.0

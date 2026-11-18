@@ -8,6 +8,7 @@ ISO 8601 with ms and ``Z``. See docs/high-sensitivity-api.md.
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -16,6 +17,9 @@ from rfobserver.pipeline.high_sensitivity import HighSensitivity, HSError, HSRun
 from rfobserver.schedules.model import iso_ms
 
 router = APIRouter()
+
+# Run ids go in URL paths (and the fleet's rollback): plain characters only.
+RUN_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
 def processor(app: Any) -> Any:
@@ -70,8 +74,19 @@ async def start(request: Request) -> dict[str, Any]:
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="The body must be a JSON object")
     run_id = body.get("id")
-    if run_id is not None and (not isinstance(run_id, str) or not 1 <= len(run_id) <= 64):
-        raise HTTPException(status_code=400, detail="id must be 1 to 64 characters")
+    if run_id is not None and (not isinstance(run_id, str) or not RUN_ID.match(run_id)):
+        raise HTTPException(
+            status_code=400, detail="id must be 1 to 64 letters, digits, '.', '-' or '_'"
+        )
+    cur = hs.current()
+    db = getattr(request.app.state, "database", None)
+    if (
+        run_id is not None
+        and (cur is None or cur.id != run_id)
+        and db is not None
+        and await db.hs_run_get(run_id) is not None
+    ):
+        raise HTTPException(status_code=409, detail=f"run id {run_id} was used before")
     try:
         run = hs.start(
             body.get("seconds"),

@@ -38,10 +38,11 @@ class ToneDetector:
         freqs: list[float],
         threshold_db: float,
         meta: Callable[[], dict[str, Any]],
-        hs_run: Callable[[], str | None] = lambda: None,
+        hs_run: Callable[[float], str | None] = lambda t: None,
     ) -> None:
         self._db = db
-        # The high-sensitivity run in force (its id goes on the rows).
+        # The high-sensitivity run a time fell in (a tone carries the run it
+        # started in, even when it is written after the run ended).
         self._hs_run = hs_run
         self._freqs = list(dict.fromkeys(float(f) for f in freqs))
         self._threshold = float(threshold_db)
@@ -136,7 +137,7 @@ class ToneDetector:
     def _finalize(self, f: float, bin_hz: float, center: float, m: ToneMeasure) -> None:
         self.stats["tones"] += 1
         task = asyncio.get_running_loop().create_task(
-            self._write(f, bin_hz, center, m, self._hs_run())
+            self._write(f, bin_hz, center, m, self._hs_run(m.start))
         )
         self._finals.add(task)
         task.add_done_callback(self._finals.discard)

@@ -37,7 +37,7 @@ curl -s -X POST "$SENSOR/api/high-sensitivity" -H "Content-Type: application/jso
 ```
 
 - `seconds`: required, 1 to 300.
-- `id`: optional, 1 to 64 characters; generated if left out. Sending the same
+- `id`: optional, 1 to 64 letters, digits, `.`, `-` or `_`; generated if left out; never reused (see Run ids). Sending the same
   `id` again while it runs extends it, never past its start + 300 s.
 - `threshold_db`: optional, 10 to 30.
 
@@ -72,8 +72,10 @@ compromise them.
 Add `"high_sensitivity": true` (and optionally `"hs_threshold_db"`) to a
 schedule (docs/schedules-api.md). Each run turns the mode on `HS_LEAD_SEC`
 (2 s, so the tone detector's floor settles) before the capture and off when it
-ends; lead plus duration may be at most 300 s. The run id is
-`<schedule id>-<run>`, and every scheduled capture's `.json` records the run in
+ends, plus the same lead after it (the pipeline processes the capture a
+little behind the radio); lead, duration and tail may be at most 300 s, so
+`duration_ms` at most 296000. The run id is `<schedule id>-<run>-<start ms>`,
+and every scheduled capture's `.json` records the run in
 force as it started (`hs_run`). If another run is already on, the schedule's
 run is skipped (logged) and the capture records the other run's id.
 
@@ -116,3 +118,9 @@ States: `entered`, `offline`, `failed` (with `detail`), `rolled_back`, and
 - `DELETE /fleet/api/high-sensitivity/{id}`: ends it on every enabled sensor
   (`200` if any had it).
 - `GET /fleet/api/high-sensitivity/{id}`: each sensor's summary, or its error.
+
+## Run ids
+
+An `id` is 1 to 64 letters, digits, `.`, `-` or `_` (it goes in URLs). An id
+already used by a stored run is refused (`409`), except to extend the run that
+is on, so each run keeps its own summary.

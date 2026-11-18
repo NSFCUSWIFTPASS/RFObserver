@@ -740,9 +740,11 @@ class StreamingProcessor:
         # detector of its own when the routine one is off.
         self.high_sensitivity = HighSensitivity(settings)
         self.high_sensitivity.listeners.append(self._on_hs_event)
-        self._hs_tone_started = False
-        # Counters at the run's start, for its summary.
-        self._hs_snap: dict[str, Any] = {}
+        # The run whose tone detector is running (None: none, or the routine one).
+        self._hs_tone_owner: str | None = None
+        self._hs_tone_lock: asyncio.Lock | None = None
+        # Counters at each run's start, for its summary.
+        self._hs_snap: dict[str, dict[str, Any]] = {}
         # Flagged schedule runs already handled (run id -> end, epoch s).
         self._hs_sched_seen: dict[str, float] = {}
 
@@ -1411,7 +1413,7 @@ class StreamingProcessor:
             freqs=freqs,
             threshold_db=float(s.TONE_DETECTOR_THRESHOLD_DB),
             meta=self._tone_meta,
-            hs_run=self._hs_run_id,
+            hs_run=self.high_sensitivity.run_at,
         )
         logger.info("Tone detector watching %s Hz", ", ".join(f"{f:.0f}" for f in freqs))
 
@@ -1447,12 +1449,14 @@ class StreamingProcessor:
         loop = self._loop
         if loop is None or loop.is_closed():
             return
+        # Counters are read here, as the run starts or ends, not when the
+        # loop gets to it (the next run may already have started).
+        counters = self._hs_counters()
         if event == "start":
-            loop.call_soon_threadsafe(self._hs_tone_start)
-            loop.call_soon_threadsafe(self._hs_on_start, run)
+            loop.call_soon_threadsafe(self._hs_on_start, run, counters)
         elif event == "end":
-            loop.call_soon_threadsafe(lambda: loop.create_task(self._hs_tone_end()))
-            loop.call_soon_threadsafe(lambda: loop.create_task(self._hs_on_end(run)))
+            loop.call_soon_threadsafe(self._hs_on_end, run, counters)
+        loop.call_soon_threadsafe(lambda: loop.create_task(self._hs_tone_apply()))
 
     def _hs_schedule_tick(self, now: float) -> None:
         """Start high-sensitivity mode for a flagged schedule's run that is
@@ -1468,10 +1472,13 @@ class StreamingProcessor:
         for s in book.snapshot()[1]:
             if not s.high_sensitivity:
                 continue
-            for k in runs_between(s, now_ms - s.duration_ms + 1, now_ms + lead_ms + 1, 2):
+            for k in runs_between(s, now_ms - s.duration_ms - lead_ms + 1, now_ms + lead_ms + 1, 2):
                 start_ms = run_start_ms(s, k)
-                end = (start_ms + s.duration_ms) / 1000
-                run_id = f"{s.id}-{k}"
+                # On past the capture's end by the lead too: the pipeline
+                # processes it behind the radio.
+                end = (start_ms + s.duration_ms + lead_ms) / 1000
+                # Unique even when a schedule is deleted and made again.
+                run_id = f"{s.id}-{k}-{start_ms}"
                 if run_id in self._hs_sched_seen or not start_ms - lead_ms <= now_ms < end * 1000:
                     continue
                 self._hs_sched_seen[run_id] = end
@@ -1495,26 +1502,33 @@ class StreamingProcessor:
             "isolation": iso.stats.snapshot() if iso is not None else {},
         }
 
-    def _hs_on_start(self, run: Any) -> None:
-        self._hs_snap = self._hs_counters()
+    def _hs_on_start(self, run: Any, counters: dict[str, Any]) -> None:
+        self._hs_snap[run.id] = counters
         assert self._loop is not None
         self._loop.create_task(self._hs_save(run, None))
 
-    async def _hs_on_end(self, run: Any) -> None:
+    def _hs_on_end(self, run: Any, counters: dict[str, Any]) -> None:
+        """The summary follows once the run's late rows are in."""
+        assert self._loop is not None
+        self._loop.create_task(self._hs_finish(run, counters))
+
+    async def _hs_finish(self, run: Any, end: dict[str, Any]) -> None:
         # Late rows (the burst thread's last batches, tones still being
         # written) land first.
         await asyncio.sleep(_HS_SUMMARY_DELAY_SEC)
         try:
-            summary = await self.hs_summary(run)
+            summary = await self.hs_summary(run, end)
         except Exception:
             logger.exception("High-sensitivity summary for %s failed", run.id)
             summary = None
         await self._hs_save(run, summary)
+        self._hs_snap.pop(run.id, None)
 
-    async def hs_summary(self, run: Any) -> dict[str, Any]:
-        """The run's counts and the counter changes since it started."""
-        now = self._hs_counters()
-        before = self._hs_snap or now
+    async def hs_summary(self, run: Any, end: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The run's counts and the counter changes from its start to ``end``
+        (the counters as it ended; now when not given)."""
+        now = end if end is not None else self._hs_counters()
+        before = self._hs_snap.get(run.id) or now
         counts = await self._db.hs_run_counts(run.id)
         iso_keys = ("received", "picked", "gated_out", "copies")
         return {
@@ -1566,19 +1580,27 @@ class StreamingProcessor:
         if n:
             logger.info("Closed %d high-sensitivity run(s) left open by a restart", n)
 
-    def _hs_tone_start(self) -> None:
-        if self._tone_detector is not None or self.high_sensitivity.current() is None:
-            return
-        self._start_tone_detector(force=True)
-        self._hs_tone_started = self._tone_detector is not None
-
-    async def _hs_tone_end(self) -> None:
-        """Stop the tone detector the run started (a routine one stays)."""
-        if not self._hs_tone_started:
-            return
-        self._hs_tone_started = False
-        await self._stop_tone_detector()
-        self._tone_detector = None
+    async def _hs_tone_apply(self) -> None:
+        """Bring the tone detector in line with the run now on: one is
+        running while a run is (the routine one, or one a run started), and
+        one a run started stops when no run is on. Serialised, and it reads
+        the state when it runs, so runs ending and starting back to back keep
+        their detector."""
+        if self._hs_tone_lock is None:
+            self._hs_tone_lock = asyncio.Lock()
+        async with self._hs_tone_lock:
+            run = self.high_sensitivity.current()
+            if run is not None:
+                if self._tone_detector is None:
+                    self._start_tone_detector(force=True)
+                    if self._tone_detector is not None:
+                        self._hs_tone_owner = run.id
+                elif self._hs_tone_owner is not None:
+                    self._hs_tone_owner = run.id  # the next run carries it on
+            elif self._hs_tone_owner is not None:
+                self._hs_tone_owner = None
+                await self._stop_tone_detector()
+                self._tone_detector = None
 
     def _tone_meta(self) -> dict[str, Any]:
         rx_config = getattr(self._receiver, "config", None)

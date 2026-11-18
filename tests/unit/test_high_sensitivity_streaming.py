@@ -146,9 +146,10 @@ def test_flagged_run_starts_hs_lead_seconds_early_and_ends_with_the_capture(tmp_
     proc.high_sensitivity._clock = lambda: t0 / 1000 - 1.9
     proc._hs_schedule_tick(t0 / 1000 - 1.9)
     run = proc.high_sensitivity.current()
-    assert run is not None and run.id == "daily-0" and run.source == "schedule"
+    assert run is not None and run.id == f"daily-0-{t0}" and run.source == "schedule"
     assert run.threshold_db == 12.0
-    assert abs(run.end - (t0 / 1000 + 60.0)) < 1e-6
+    # the capture's end plus HS_LEAD_SEC for the processing lag
+    assert abs(run.end - (t0 / 1000 + 60.0 + 2.0)) < 1e-6
     proc._hs_schedule_tick(t0 / 1000 - 1.8)  # the same run is not started twice
     assert proc.high_sensitivity.current() is run
 
@@ -168,3 +169,45 @@ def test_scheduled_capture_meta_names_the_run_in_force(tmp_path):
     assert proc._scheduled_capture_meta()["hs_run"] is None
     proc.high_sensitivity.start(30, run_id="daily-0")
     assert proc._scheduled_capture_meta()["hs_run"] == "daily-0"
+
+
+async def test_back_to_back_runs_keep_a_tone_detector(tmp_path):
+    """Run A expires and run B starts in one synchronous block (two flagged
+    captures close together): B must still have a tone detector."""
+    proc = _proc(tmp_path)
+    proc._loop = asyncio.get_running_loop()
+    proc.high_sensitivity.start(30, run_id="A")
+    for _ in range(20):
+        await asyncio.sleep(0)
+    proc.high_sensitivity.end_now("expired")
+    proc.high_sensitivity.start(30, run_id="B")
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert proc.high_sensitivity.current().id == "B"
+    assert proc.tone_detector_status()["enabled"] is True
+    proc.high_sensitivity.end_now("deleted")
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert proc.tone_detector_status()["enabled"] is False
+
+
+async def test_each_run_summary_uses_its_own_counters(tmp_path, monkeypatch):
+    import rfobserver.pipeline.streaming as st
+
+    monkeypatch.setattr(st, "_HS_SUMMARY_DELAY_SEC", 0.0)
+    proc = _proc(tmp_path)
+    proc._loop = asyncio.get_running_loop()
+    db = _FakeDB()
+    proc._db = db
+    rx = proc._receiver
+    rx.overflow_events, rx.overflow_lost_samples = 0, 0
+    proc.high_sensitivity.start(30, run_id="A")
+    await _settle()
+    rx.overflow_events = 2
+    proc.high_sensitivity.end_now("expired")
+    proc.high_sensitivity.start(30, run_id="B")
+    rx.overflow_events = 9  # after A ended: not A's
+    for _ in range(30):
+        await asyncio.sleep(0)
+    a = [r for r in db.saved if r["id"] == "A" and r["summary"]][-1]["summary"]
+    assert a["overflow_events"] == 2

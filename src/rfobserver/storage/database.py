@@ -2250,7 +2250,8 @@ class SensorDatabase:
         assert self._db is not None
         cutoff = float("inf") if started_before is None else float(started_before)
         cur = await self._db.execute(
-            "UPDATE hs_runs SET ended = ?, end_reason = ? WHERE ended IS NULL AND start < ?",
+            'UPDATE hs_runs SET ended = MIN("end", ?), end_reason = ? '
+            "WHERE ended IS NULL AND start < ?",
             (ended, reason, cutoff),
         )
         await self._db.commit()

@@ -6,10 +6,12 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -55,6 +57,7 @@ _STATS_FIELDS = ("start_time", "pwr_avg", "kurtosis")
 # sensors, and each start or rollback call.
 _HS_PROBE_TIMEOUT_SEC = 3.0
 _HS_START_TIMEOUT_SEC = 5.0
+_HS_RUN_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
 class _Prefs:
@@ -639,6 +642,10 @@ def create_fleet_app(
             raise HTTPException(status_code=400, detail="min_sensors must be a whole number >= 1")
         targets = _hs_targets(body.get("sensors"))
         rid = body.get("id") or uuid.uuid4().hex[:12]
+        if not isinstance(rid, str) or not _HS_RUN_ID.match(rid):
+            raise HTTPException(
+                status_code=400, detail="id must be 1 to 64 letters, digits, '.', '-' or '_'"
+            )
         payload: dict[str, Any] = {"seconds": seconds, "id": rid, "source": "fleet"}
         if body.get("threshold_db") is not None:
             payload["threshold_db"] = body["threshold_db"]
@@ -690,7 +697,7 @@ def create_fleet_app(
                 r = results[s.id]
                 try:
                     reply = await asyncio.wait_for(
-                        hub.send(s, "DELETE", f"api/high-sensitivity/{rid}"),
+                        hub.send(s, "DELETE", f"api/high-sensitivity/{quote(rid, safe='')}"),
                         _HS_START_TIMEOUT_SEC,
                     )
                 except (httpx.HTTPError, asyncio.TimeoutError) as exc:

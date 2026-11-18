@@ -161,10 +161,11 @@ def parse_schedule(
             raise ScheduleError(
                 f"hs_threshold_db must be {HS_MIN_THRESHOLD_DB:.0f} to {HS_MAX_THRESHOLD_DB:.0f}"
             )
-    if hs and hs_lead_ms + duration > HS_MAX_MS:
+    if hs and 2 * hs_lead_ms + duration > HS_MAX_MS:
         raise ScheduleError(
             f"a high_sensitivity run lasts at most {HS_MAX_MS // 1000} s including its "
-            f"{hs_lead_ms / 1000:g} s lead: duration_ms must be at most {HS_MAX_MS - hs_lead_ms}"
+            f"{hs_lead_ms / 1000:g} s lead and tail: duration_ms must be at most "
+            f"{HS_MAX_MS - 2 * hs_lead_ms}"
         )
     s = Schedule(
         id=sid,

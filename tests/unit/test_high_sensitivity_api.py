@@ -113,3 +113,29 @@ async def test_health_reports_the_mode(client) -> None:
     h = (await c.get("/api/health")).json()
     assert h["high_sensitivity"]["active"] is True
     assert h["high_sensitivity"]["run"]["id"] == "h"
+
+
+async def test_ids_are_plain_and_not_reused(client) -> None:
+    c, proc, clock = await client()
+    for bad in ("daily/0dB", "a?b", "x#y", "has space"):
+        r = await c.post("/api/high-sensitivity", json={"seconds": 10, "id": bad})
+        assert r.status_code == 400, bad
+    assert (
+        await c.post("/api/high-sensitivity", json={"seconds": 10, "id": "d.1"})
+    ).status_code == 200
+    await c.delete("/api/high-sensitivity/d.1")
+    db = c._transport.app.state.database  # type: ignore[attr-defined]
+    await db.hs_run_save(
+        {
+            "id": "d.1",
+            "source": "api",
+            "start": NOW,
+            "end": NOW + 10,
+            "ended": NOW,
+            "end_reason": "deleted",
+            "threshold_db": 15.0,
+            "summary": None,
+        }
+    )
+    r = await c.post("/api/high-sensitivity", json={"seconds": 10, "id": "d.1"})
+    assert r.status_code == 409

@@ -166,10 +166,10 @@ def test_high_sensitivity_flag_round_trips() -> None:
 
 
 def test_flagged_schedule_longer_than_the_hs_limit_is_refused() -> None:
-    # 2 s lead + 299 s > 300 s
+    # 2 s lead + 297 s + 2 s tail > 300 s
     with pytest.raises(ScheduleError, match="high_sensitivity"):
-        parse({"start": iso(T), "duration_ms": 299_000, "high_sensitivity": True})
-    parse({"start": iso(T), "duration_ms": 298_000, "high_sensitivity": True})
+        parse({"start": iso(T), "duration_ms": 297_000, "high_sensitivity": True})
+    parse({"start": iso(T), "duration_ms": 296_000, "high_sensitivity": True})
     parse({"start": iso(T), "duration_ms": 299_000})  # unflagged: no limit
 
 

@@ -155,3 +155,9 @@ def test_fleet_schedule_passes_the_flag_through(fleet: Any) -> None:
     }
     assert client.post("/fleet/api/schedules", json=body).status_code == 201
     assert seen and seen[0]["high_sensitivity"] is True
+
+
+def test_fleet_refuses_ids_that_are_not_plain(fleet: Any) -> None:
+    client, sensors = fleet
+    r = client.post("/fleet/api/high-sensitivity", json={"seconds": 10, "id": "daily/0dB"})
+    assert r.status_code == 400 and sensors.posted == []

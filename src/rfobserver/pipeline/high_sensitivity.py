@@ -14,6 +14,7 @@ import logging
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -54,6 +55,8 @@ class HighSensitivity:
         self._clock = clock
         self._lock = threading.Lock()
         self._run: HSRun | None = None
+        # Recently ended runs, for run_at (tones are tagged by their start).
+        self._recent: deque[HSRun] = deque(maxlen=20)
         self.listeners: list[Callable[[str, HSRun], None]] = []
 
     def start(
@@ -116,6 +119,7 @@ class HighSensitivity:
             self._run = None
             run.ended = min(self._clock(), run.end)
             run.end_reason = reason
+            self._recent.append(run)
         self._tell("end", run)
         return run
 
@@ -123,6 +127,17 @@ class HighSensitivity:
         self._expire()
         with self._lock:
             return self._run
+
+    def run_at(self, t: float) -> str | None:
+        """The id of the run whose window held time ``t`` (epoch s), or None."""
+        self._expire()
+        with self._lock:
+            runs = ([self._run] if self._run is not None else []) + list(self._recent)
+        for run in runs:
+            end = run.end if run.ended is None else run.ended
+            if run.start <= t < end:
+                return run.id
+        return None
 
     def now(self) -> float:
         return self._clock()

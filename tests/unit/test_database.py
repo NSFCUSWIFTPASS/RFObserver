@@ -1843,3 +1843,20 @@ async def test_close_open_spares_runs_started_after_the_cutoff(db):
     assert await db.hs_run_close_open("restart", ended=40.0, started_before=40.0) == 1
     assert (await db.hs_run_get("old"))["end_reason"] == "restart"
     assert (await db.hs_run_get("new"))["ended"] is None
+
+
+async def test_close_open_keeps_the_planned_end_when_it_is_earlier(db):
+    await db.hs_run_save(
+        {
+            "id": "r",
+            "source": "api",
+            "start": 10.0,
+            "end": 70.0,
+            "ended": None,
+            "end_reason": None,
+            "threshold_db": 15.0,
+            "summary": None,
+        }
+    )
+    await db.hs_run_close_open("restart", ended=5000.0, started_before=5000.0)
+    assert (await db.hs_run_get("r"))["ended"] == 70.0

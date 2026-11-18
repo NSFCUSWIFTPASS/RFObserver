@@ -98,3 +98,15 @@ def test_a_failing_listener_does_not_break_the_run():
     hs.listeners.append(boom)
     hs.start(10)
     assert hs.current() is not None
+
+
+def test_run_at_names_the_run_a_time_fell_in():
+    clk = Clock(100.0)
+    hs = HighSensitivity(_settings(), clock=clk)
+    hs.start(10, run_id="a")
+    clk.t = 120.0
+    hs.current()  # expires a
+    hs.start(10, run_id="b")
+    assert hs.run_at(105.0) == "a"
+    assert hs.run_at(125.0) == "b"
+    assert hs.run_at(115.0) is None

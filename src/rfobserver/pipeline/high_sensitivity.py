@@ -122,6 +122,9 @@ class HighSensitivity:
         with self._lock:
             return self._run
 
+    def now(self) -> float:
+        return self._clock()
+
     def burst_threshold_db(self) -> float:
         run = self.current()
         return run.threshold_db if run is not None else float(self._s.BURST_THRESHOLD_HIGH_DB)

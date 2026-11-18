@@ -472,6 +472,10 @@
                 <div id="tone-detector-state" style="font-size: 12px; color: var(--text-primary);">--</div>
                 <div id="tone-detector-counts" style="display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 4px; font-size: 11px; color: var(--text-secondary);"></div>
             </div>
+            <div class="form-group">
+                <label>High Sensitivity</label>
+                <div id="hs-state" style="font-size: 12px; color: var(--text-primary);">--</div>
+            </div>
         </div>
     </div>
 </div>
@@ -1095,6 +1099,7 @@ async function refreshStorageBar() {
         s = body.storage;
         renderIsolation(body.isolation);
         renderToneDetector(body.tone_detector);
+        renderHighSensitivity(body.high_sensitivity);
     } catch (e) { return; }
     const bar = document.getElementById('storage-bar');
     const legend = document.getElementById('storage-legend');
@@ -1171,6 +1176,17 @@ const TONE_COUNT_LABELS = [
     ['tones', 'Tones'], ['inserted', 'Recorded'],
     ['out_of_band', 'Out of band'], ['skipped', 'Chunks skipped'], ['errors', 'Errors'],
 ];
+// High-sensitivity run (set by API, a schedule or the fleet; see
+// docs/high-sensitivity-api.md): when it ends and at what threshold.
+function renderHighSensitivity(hs) {
+    const el = document.getElementById('hs-state');
+    if (!el) return;
+    if (!hs) { el.textContent = 'No pipeline running'; return; }
+    if (!hs.active || !hs.run) { el.textContent = 'Off'; return; }
+    const until = new Date(hs.run.end).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+    el.textContent = `On until ${until} (${hs.run.threshold_db} dB burst threshold, ${hs.run.source})`;
+}
+
 function renderToneDetector(td) {
     const state = document.getElementById('tone-detector-state');
     const counts = document.getElementById('tone-detector-counts');

@@ -58,7 +58,7 @@ class HighSensitivity:
 
     def start(
         self,
-        seconds: float,
+        seconds: Any,
         *,
         run_id: str | None = None,
         threshold_db: float | None = None,

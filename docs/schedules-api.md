@@ -373,6 +373,8 @@ PPS into the radios).
 | `label` | Free text |
 | `source` | Who created it: `api`, `ui` (Captures page) or `fleet` |
 | `created_ms` | When it was created, epoch ms |
+| `high_sensitivity` | Whether high-sensitivity mode runs around each capture: on `HS_LEAD_SEC` (2 s) before it, off when it ends; at most 300 s including the lead (docs/high-sensitivity-api.md) |
+| `hs_threshold_db` | The burst threshold for those runs (10 to 30), or null for `HS_BURST_THRESHOLD_DB` |
 | `next_runs` | The next five runs not yet started |
 | `next_run` | The next run not yet started, or null |
 | `run` | A run's number, from 0 |

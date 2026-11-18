@@ -12,7 +12,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from rfobserver.pipeline.high_sensitivity import HSError, HSRun
+from rfobserver.pipeline.high_sensitivity import HighSensitivity, HSError, HSRun
 from rfobserver.schedules.model import iso_ms
 
 router = APIRouter()
@@ -25,9 +25,14 @@ def processor(app: Any) -> Any:
     return proc if proc is not None else getattr(app.state, "processor", None)
 
 
-def _hs(request: Request) -> Any:
-    proc = processor(request.app)
-    hs = getattr(proc, "high_sensitivity", None)
+def controller(app: Any) -> HighSensitivity | None:
+    """The running pipeline's high-sensitivity controller, or None."""
+    hs = getattr(processor(app), "high_sensitivity", None)
+    return hs if isinstance(hs, HighSensitivity) else None
+
+
+def _hs(request: Request) -> HighSensitivity:
+    hs = controller(request.app)
     if hs is None:
         raise HTTPException(status_code=503, detail="pipeline not running")
     return hs
@@ -48,7 +53,7 @@ def run_json(run: HSRun, now: float) -> dict[str, Any]:
 
 def status(app: Any) -> dict[str, Any] | None:
     """The health block: whether a run is on, and which."""
-    hs = getattr(processor(app), "high_sensitivity", None)
+    hs = controller(app)
     if hs is None:
         return None
     run = hs.current()
@@ -72,7 +77,7 @@ async def start(request: Request) -> dict[str, Any]:
             body.get("seconds"),
             run_id=run_id,
             threshold_db=body.get("threshold_db"),
-            source=body.get("source") if body.get("source") in ("api", "fleet") else "api",
+            source="fleet" if body.get("source") == "fleet" else "api",
         )
     except HSError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from None
@@ -91,7 +96,7 @@ async def stop(request: Request, run_id: str) -> dict[str, Any]:
 
 @router.get("")
 async def current(request: Request) -> dict[str, Any]:
-    hs = getattr(processor(request.app), "high_sensitivity", None)
+    hs = controller(request.app)
     run = hs.current() if hs is not None else None
     db = getattr(request.app.state, "database", None)
     runs = await db.hs_runs() if db is not None else []

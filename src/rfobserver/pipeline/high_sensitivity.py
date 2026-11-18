@@ -17,14 +17,16 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from rfobserver.schedules.model import HS_MAX_MS, HS_MAX_THRESHOLD_DB, HS_MIN_THRESHOLD_DB
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
-HS_MAX_SEC = 300.0
-MIN_THRESHOLD_DB = 10.0
-MAX_THRESHOLD_DB = 30.0
+HS_MAX_SEC = HS_MAX_MS / 1000
+MIN_THRESHOLD_DB = HS_MIN_THRESHOLD_DB
+MAX_THRESHOLD_DB = HS_MAX_THRESHOLD_DB
 
 
 class HSError(ValueError):

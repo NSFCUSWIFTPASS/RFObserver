@@ -143,6 +143,7 @@ async def create(request: Request) -> JSONResponse:
             source=source,
             new_id=lambda: uuid.uuid4().hex[:12],
             allow_past=known,
+            hs_lead_ms=round(settings.HS_LEAD_SEC * 1000),
         )
     except ScheduleError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None

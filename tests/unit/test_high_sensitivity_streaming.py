@@ -109,3 +109,62 @@ async def test_startup_closes_a_run_left_open_by_a_restart(tmp_path):
     proc._db = db
     await proc._hs_close_left_open()
     assert db.closed and db.closed[0][0] == "restart"
+
+
+class _Book:
+    def __init__(self, schedules) -> None:
+        self._s = schedules
+
+    def snapshot(self):
+        return 1, list(self._s)
+
+
+def _flagged(start_ms: int, duration_ms: int = 60_000, **kw):
+    from rfobserver.schedules.model import Schedule
+
+    return Schedule(
+        id="daily",
+        start_ms=start_ms,
+        duration_ms=duration_ms,
+        every_ms=None,
+        count=None,
+        until_ms=None,
+        label="",
+        source="api",
+        created_ms=0,
+        high_sensitivity=True,
+        **kw,
+    )
+
+
+def test_flagged_run_starts_hs_lead_seconds_early_and_ends_with_the_capture(tmp_path):
+    proc = _proc(tmp_path)
+    t0 = 1_795_000_000_000
+    proc._schedules = _Book([_flagged(t0, hs_threshold_db=12.0)])
+    proc._hs_schedule_tick(t0 / 1000 - 2.5)
+    assert proc.high_sensitivity.current() is None
+    proc.high_sensitivity._clock = lambda: t0 / 1000 - 1.9
+    proc._hs_schedule_tick(t0 / 1000 - 1.9)
+    run = proc.high_sensitivity.current()
+    assert run is not None and run.id == "daily-0" and run.source == "schedule"
+    assert run.threshold_db == 12.0
+    assert abs(run.end - (t0 / 1000 + 60.0)) < 1e-6
+    proc._hs_schedule_tick(t0 / 1000 - 1.8)  # the same run is not started twice
+    assert proc.high_sensitivity.current() is run
+
+
+def test_flagged_run_while_another_hs_run_is_on_is_skipped(tmp_path):
+    proc = _proc(tmp_path)
+    t0 = 1_795_000_000_000
+    proc.high_sensitivity._clock = lambda: t0 / 1000 - 1.0
+    other = proc.high_sensitivity.start(120, run_id="manual")
+    proc._schedules = _Book([_flagged(t0)])
+    proc._hs_schedule_tick(t0 / 1000 - 1.0)
+    assert proc.high_sensitivity.current() is other
+
+
+def test_scheduled_capture_meta_names_the_run_in_force(tmp_path):
+    proc = _proc(tmp_path)
+    assert proc._scheduled_capture_meta()["hs_run"] is None
+    proc.high_sensitivity.start(30, run_id="daily-0")
+    assert proc._scheduled_capture_meta()["hs_run"] == "daily-0"

@@ -39,6 +39,7 @@ import numpy as np
 
 from rfobserver.capture.buffer import CircularBuffer, GridPreBuffer, trim_grid_rows
 from rfobserver.capture.clock import CaptureClock
+from rfobserver.pipeline.high_sensitivity import HighSensitivity, HSError
 from rfobserver.processing import psd_cuda
 from rfobserver.processing.burst import BurstDetectionConfig
 from rfobserver.processing.detection import interference_flag
@@ -54,6 +55,7 @@ from rfobserver.processing.spectral import (
     compute_psd_grid,
     compute_summary_psd,
 )
+from rfobserver.schedules.model import run_start_ms, runs_between
 from rfobserver.storage.governor import (
     HARD_FLOOR_FRACTION,
     describe_write_error,
@@ -736,13 +738,13 @@ class StreamingProcessor:
         # High-sensitivity mode (pipeline/high_sensitivity.py): an in-memory
         # overlay on the burst threshold and isolation budget, with a tone
         # detector of its own when the routine one is off.
-        from rfobserver.pipeline.high_sensitivity import HighSensitivity
-
         self.high_sensitivity = HighSensitivity(settings)
         self.high_sensitivity.listeners.append(self._on_hs_event)
         self._hs_tone_started = False
         # Counters at the run's start, for its summary.
         self._hs_snap: dict[str, Any] = {}
+        # Flagged schedule runs already handled (run id -> end, epoch s).
+        self._hs_sched_seen: dict[str, float] = {}
 
         # Compute chunk sizing from current settings
         self._recompute_chunk_params()
@@ -1448,6 +1450,37 @@ class StreamingProcessor:
         elif event == "end":
             loop.call_soon_threadsafe(lambda: loop.create_task(self._hs_tone_end()))
             loop.call_soon_threadsafe(lambda: loop.create_task(self._hs_on_end(run)))
+
+    def _hs_schedule_tick(self, now: float) -> None:
+        """Start high-sensitivity mode for a flagged schedule's run that is
+        due within HS_LEAD_SEC; it ends with the capture. A run that finds
+        another one on is skipped (logged; the capture records the run in
+        force). Called on the event loop once per result."""
+        book = self._schedules
+        if book is None:
+            return
+        lead_ms = round(self._settings.HS_LEAD_SEC * 1000)
+        now_ms = round(now * 1000)
+        self._hs_sched_seen = {k: e for k, e in self._hs_sched_seen.items() if e > now}
+        for s in book.snapshot()[1]:
+            if not s.high_sensitivity:
+                continue
+            for k in runs_between(s, now_ms - s.duration_ms + 1, now_ms + lead_ms + 1, 2):
+                start_ms = run_start_ms(s, k)
+                end = (start_ms + s.duration_ms) / 1000
+                run_id = f"{s.id}-{k}"
+                if run_id in self._hs_sched_seen or not start_ms - lead_ms <= now_ms < end * 1000:
+                    continue
+                self._hs_sched_seen[run_id] = end
+                try:
+                    self.high_sensitivity.start(
+                        end - now,
+                        run_id=run_id,
+                        threshold_db=s.hs_threshold_db,
+                        source="schedule",
+                    )
+                except HSError as exc:
+                    logger.warning("High sensitivity for schedule run %s skipped: %s", run_id, exc)
 
     def _hs_counters(self) -> dict[str, Any]:
         rx = self._receiver
@@ -2926,6 +2959,9 @@ class StreamingProcessor:
             "gain_db": float(gain if gain is not None else self._settings.GAIN),
             "hostname": self._settings.HOSTNAME,
             "serial": getattr(self._receiver, "serial", None),
+            # The high-sensitivity run in force as the capture starts (a
+            # flagged schedule starts its own HS_LEAD_SEC before).
+            "hs_run": self._hs_run_id(),
         }
 
     def _scheduled_finished(self, run: FinishedRun) -> None:
@@ -3912,6 +3948,7 @@ class StreamingProcessor:
             if last_result is not None and last_result.center_freq_hz != result.center_freq_hz:
                 self.high_sensitivity.end_now("retune")
             self.high_sensitivity.current()  # expires a run that is due
+            self._hs_schedule_tick(time.time())
             if self._tone_detector is not None:
                 self._tone_detector.on_result(
                     result, self._slice_samples / self._settings.BANDWIDTH

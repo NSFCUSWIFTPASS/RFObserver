@@ -95,7 +95,7 @@ async def current(request: Request) -> dict[str, Any]:
     run = hs.current() if hs is not None else None
     db = getattr(request.app.state, "database", None)
     runs = await db.hs_runs() if db is not None else []
-    return {"run": run_json(run, hs.now()) if run is not None else None, "runs": runs}
+    return {"run": run_json(run, hs.now()) if hs is not None and run else None, "runs": runs}
 
 
 @router.get("/{run_id}")

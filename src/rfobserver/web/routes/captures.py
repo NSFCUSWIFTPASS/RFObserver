@@ -566,6 +566,7 @@ async def capture_redetect(request: Request, filename: str) -> dict[str, Any]:
         threshold_high_db=_num(body, "threshold_high_db", s.BURST_THRESHOLD_HIGH_DB),
         threshold_low_ratio=_num(body, "threshold_low_ratio", s.BURST_THRESHOLD_LOW_RATIO),
         noise_floor_percentile=_num(body, "noise_floor_percentile", s.BURST_NOISE_FLOOR_PERCENTILE),
+        grow_depth_db=_num(body, "grow_depth_db", s.BURST_GROW_DEPTH_DB),
         merge_time_sec=_num(body, "merge_time_ms", s.BURST_MERGE_TIME_MS) / 1000.0,
         merge_freq_bins=int(_num(body, "merge_freq_bins", s.BURST_MERGE_FREQ_BINS)),
         min_duration_sec=_num(body, "min_duration_ms", 1.0) / 1000.0,

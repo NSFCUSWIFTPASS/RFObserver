@@ -32,6 +32,9 @@ def _settings(**kw):
         ISOLATION_MAX_PER_SEC=3,
         ISOLATION_MAX_BURST_SEC=0.5,
         ISOLATION_QUEUE_MAX=2,
+        # _cand gives every burst the same timing, so the copy gate would
+        # take the weaker ones; its own tests turn it on.
+        ISOLATION_COPY_DB=0.0,
         _env_file=None,
     )
     base.update(kw)
@@ -841,3 +844,30 @@ def test_a_sweep_batch_in_flight_counts_toward_the_cap(tmp_path, monkeypatch):
     finally:
         release.set()
         st.stop()
+
+
+def test_copy_gate_skips_a_much_weaker_burst_with_the_same_timing(tmp_path):
+    """Near a transmitter each hop also shows up as copies (spurs, the RX
+    image) 20-30 dB down with the same start and length; they would use up the
+    per-second budget that real bursts need."""
+    st, *_ = _stage(tmp_path, ISOLATION_MAX_PER_SEC=10, ISOLATION_COPY_DB=15.0)
+    cands = [
+        _cand(0, 50),  # the hop
+        _cand(1, 30),  # 20 dB down, same timing: a copy
+        _cand(2, 45),  # only 5 dB down: kept
+        _cand(3, 30, 100_000, 110_000),  # another time: kept
+        _cand(4, 30, 10_000, 40_000),  # same start, 3x longer: kept
+        _cand(5, 30, 10_000 + int(FS) // 100, 20_000 + int(FS) // 100),  # starts 10 ms later: kept
+    ]
+    out = st.process_batch(IsolationBatch(cands, 915e6, FS, RingSource(_ring())))
+    assert sorted(bid for bid, _ in out) == ["b0", "b2", "b3", "b4", "b5"]
+    snap = st.stats.snapshot()
+    assert snap["copies"] == 1
+    assert snap["gated_out"] == 1
+
+
+def test_copy_gate_off_at_zero(tmp_path):
+    st, *_ = _stage(tmp_path, ISOLATION_MAX_PER_SEC=10, ISOLATION_COPY_DB=0.0)
+    cands = [_cand(0, 50), _cand(1, 30)]
+    out = st.process_batch(IsolationBatch(cands, 915e6, FS, RingSource(_ring())))
+    assert sorted(bid for bid, _ in out) == ["b0", "b1"]

@@ -369,3 +369,40 @@ def test_extraction_does_not_use_find_objects(monkeypatch):
     config = BurstDetectionConfig(threshold_high_db=10.0, min_duration_sec=0.0)
     result = detect_bursts(grid, config, capture_time=datetime(2026, 1, 1))
     assert len(result.bursts) == 1
+
+
+def _skirted_burst_grid() -> PSDGridResult:
+    """A strong burst (60 dB over the floor, bins 30-33) whose skirt (10 dB
+    over, bins 10-53) rides above the low threshold, as a transmitter close to
+    the sensor raises the floor around its frequency."""
+    grid = _make_grid(n_rows=100, n_bins=64, noise_db=-60.0)
+    _inject_burst(grid, 30, 60, 10, 54, -50.0)
+    _inject_burst(grid, 30, 60, 30, 34, 0.0)
+    return grid
+
+
+def test_grow_depth_limits_a_strong_burst_to_its_core():
+    config = BurstDetectionConfig(threshold_high_db=15.0, min_duration_sec=0.0, grow_depth_db=25.0)
+    result = detect_bursts(_skirted_burst_grid(), config, capture_time=datetime(2026, 1, 1))
+    assert len(result.bursts) == 1
+    bin_hz = 1_000_000 / 64
+    assert abs(result.bursts[0].bandwidth_hz - 3 * bin_hz) < 1.0
+
+
+def test_grow_depth_off_keeps_the_skirt():
+    config = BurstDetectionConfig(threshold_high_db=15.0, min_duration_sec=0.0)
+    result = detect_bursts(_skirted_burst_grid(), config, capture_time=datetime(2026, 1, 1))
+    bin_hz = 1_000_000 / 64
+    assert abs(result.bursts[0].bandwidth_hz - 43 * bin_hz) < 1.0
+
+
+def test_grow_depth_leaves_a_weak_burst_with_its_halo():
+    """Within the depth of its own peak, the halo still counts."""
+    grid = _make_grid(n_rows=100, n_bins=64, noise_db=-60.0)
+    _inject_burst(grid, 30, 50, 15, 35, -52.0)
+    _inject_burst(grid, 35, 45, 20, 30, -40.0)
+    config = BurstDetectionConfig(threshold_high_db=10.0, min_duration_sec=0.0, grow_depth_db=25.0)
+    result = detect_bursts(grid, config, capture_time=datetime(2026, 1, 1))
+    bin_hz = 1_000_000 / 64
+    assert len(result.bursts) == 1
+    assert abs(result.bursts[0].bandwidth_hz - 19 * bin_hz) < 1.0

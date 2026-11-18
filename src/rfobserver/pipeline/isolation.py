@@ -309,8 +309,11 @@ class IsolationStage:
         rebuild, replay loop) starts a new window.
         """
         s = self._s
+        copies = _copies(cands, float(s.ISOLATION_COPY_DB), sample_rate_hz)
+        if copies:
+            self.stats.count("copies", len(copies))
         passed = sorted(
-            (c for c in cands if c.snr_db >= s.ISOLATION_SNR_DB),
+            (c for c in cands if c.snr_db >= s.ISOLATION_SNR_DB and id(c) not in copies),
             key=lambda c: c.snr_db,
             reverse=True,
         )
@@ -624,3 +627,42 @@ def build_isolation(
             decoders=lambda: parse_decoders(settings.ATTRIBUTION_DECODERS),
         )
     return stage, worker, rtl_status
+
+
+# A copy starts within this of the burst it copies, and lasts within
+# COPY_LENGTH_RATIO of it.
+COPY_START_SEC = 0.005
+COPY_LENGTH_RATIO = 0.2
+
+
+def _copies(cands: list[BurstCandidate], min_db: float, sample_rate_hz: float) -> set[int]:
+    """ids of the candidates that copy a stronger one in the batch: at least
+    ``min_db`` weaker at the peak, starting within COPY_START_SEC of it and as
+    long within COPY_LENGTH_RATIO. Near a transmitter each burst also shows up
+    as spurs and the RX image 20-30 dB down; trying them spends the per-second
+    budget real bursts need. ``min_db`` 0 is off; bursts without stream
+    positions are never copies."""
+    if min_db <= 0 or sample_rate_hz <= 0:
+        return set()
+    placed = [
+        c for c in cands if c.burst.start_sample is not None and c.burst.stop_sample is not None
+    ]
+    placed.sort(key=lambda c: c.burst.peak_power_db, reverse=True)
+    tol = COPY_START_SEC * sample_rate_hz
+    out: set[int] = set()
+    for i, c in enumerate(placed):
+        b = c.burst
+        n = b.stop_sample - b.start_sample  # type: ignore[operator]
+        for strong in placed[:i]:
+            sb = strong.burst
+            if sb.peak_power_db - b.peak_power_db < min_db:
+                break
+            sn = sb.stop_sample - sb.start_sample  # type: ignore[operator]
+            if (
+                id(strong) not in out
+                and abs(b.start_sample - sb.start_sample) <= tol  # type: ignore[operator]
+                and abs(n - sn) <= COPY_LENGTH_RATIO * sn
+            ):
+                out.add(id(c))
+                break
+    return out

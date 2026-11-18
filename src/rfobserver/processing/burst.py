@@ -27,6 +27,10 @@ class BurstDetectionConfig:
     merge_freq_bins: int = 5
     merge_time_sec: float = 0.003
     noise_floor_percentile: float = 50.0
+    # A region's extent counts only cells within this many dB of its own peak
+    # (0: off). A transmitter near the sensor lifts its skirt over the low
+    # threshold for a wide span, and the burst is then reported that wide.
+    grow_depth_db: float = 0.0
 
     @property
     def threshold_low_db(self) -> float:
@@ -99,6 +103,7 @@ def detect_bursts(
         center_freq_hz,
         capture_time,
         config.min_duration_sec,
+        config.grow_depth_db,
     )
 
     num_raw = len(raw_bursts)
@@ -128,6 +133,7 @@ def _extract_fingerprints(
     center_freq_hz: float,
     capture_time: datetime,
     min_duration_sec: float,
+    grow_depth_db: float = 0.0,
 ) -> list[BurstFingerprint]:
     """Extract five-parameter fingerprints from labeled regions.
 
@@ -153,15 +159,22 @@ def _extract_fingerprints(
     starts = np.flatnonzero(np.r_[True, lbl[1:] != lbl[:-1]])
 
     n_cols = labeled.shape[1]
+    powers = grid.ravel()[idx]
+    peak = np.maximum.reduceat(powers, starts)
+    group = np.repeat(np.arange(len(starts)), np.diff(np.r_[starts, len(idx)]))
+    if grow_depth_db > 0:
+        # Drop each region's cells deeper than grow_depth_db under its peak;
+        # the peak cell stays, so no region empties and the groups keep their
+        # order.
+        near = powers >= peak[group] - grow_depth_db
+        idx, powers, group = idx[near], powers[near], group[near]
+        starts = np.flatnonzero(np.r_[True, group[1:] != group[:-1]])
     rows = idx // n_cols
     cols = idx % n_cols
     row_min = np.minimum.reduceat(rows, starts)
     row_max = np.maximum.reduceat(rows, starts)
     col_min = np.minimum.reduceat(cols, starts)
     col_max = np.maximum.reduceat(cols, starts)
-    powers = grid.ravel()[idx]
-    peak = np.maximum.reduceat(powers, starts)
-    group = np.repeat(np.arange(len(starts)), np.diff(np.r_[starts, len(idx)]))
     at_peak = np.flatnonzero(powers == peak[group])
     first_peak = at_peak[np.r_[True, group[at_peak][1:] != group[at_peak][:-1]]]
 

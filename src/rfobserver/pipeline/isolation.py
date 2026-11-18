@@ -28,8 +28,8 @@ from rfobserver.pipeline.attribution import (
     ReplayFileSink,
     StrongestQueue,
     db_sink,
+    enabled_decoders,
     find_rtl433,
-    parse_decoders,
 )
 from rfobserver.processing.isolate import (
     BurstRange,
@@ -621,6 +621,6 @@ def build_isolation(
             queue=q,
             sinks=sinks,
             on_outcome=lambda outcome: stage.stats.count(f"attr_{outcome}"),
-            decoders=lambda: parse_decoders(settings.ATTRIBUTION_DECODERS),
+            decoders=lambda: enabled_decoders(settings),
         )
     return stage, worker, rtl_status

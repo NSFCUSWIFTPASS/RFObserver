@@ -270,3 +270,24 @@ def test_tone_is_on_by_default():
 
     assert "tone" in ALL_DECODERS
     assert "tone" in AppSettings(_env_file=None).ATTRIBUTION_DECODERS.split(",")
+
+
+def test_tone_detector_on_takes_tone_out_of_attribution():
+    """With the tone detector on, tones are found and labelled there, so the
+    per-burst tone check (which almost never matches) does not run."""
+    from types import SimpleNamespace
+
+    from rfobserver.pipeline.attribution import enabled_decoders
+
+    on = SimpleNamespace(ATTRIBUTION_DECODERS="ssm,rfid,tone,rtl433", TONE_DETECTOR_ENABLED=True)
+    off = SimpleNamespace(ATTRIBUTION_DECODERS="ssm,rfid,tone,rtl433", TONE_DETECTOR_ENABLED=False)
+    assert enabled_decoders(on) == frozenset({"ssm", "rfid", "rtl433"})
+    assert enabled_decoders(off) == frozenset({"ssm", "rfid", "tone", "rtl433"})
+
+
+def test_tone_detector_is_off_by_default():
+    from rfobserver.config import AppSettings
+
+    s = AppSettings(_env_file=None)
+    assert s.TONE_DETECTOR_ENABLED is False
+    assert s.TONE_DETECTOR_THRESHOLD_DB > 0

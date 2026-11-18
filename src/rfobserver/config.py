@@ -224,6 +224,17 @@ class AppSettings(BaseSettings):
     TONE_CHECK_FREQ_HZ: float = 0.0
     TONE_CHECK_THRESHOLD_DB: float = 10.0
 
+    # Tone detector: finds CW tones too weak for the burst detector (down to
+    # about 5 dB over a PSD bin's floor) in each averaged window's PSD, then
+    # confirms and measures them in the IQ ring, and writes them as Tone
+    # detections (or labels the burst rows that already cover them). Runs
+    # apart from burst detection and isolation; while it is on, attribution
+    # skips its per-burst tone check. TONE_DETECTOR_THRESHOLD_DB: how far a
+    # bin must rise over its own recent level to be looked at. Read when the
+    # pipeline starts.
+    TONE_DETECTOR_ENABLED: bool = False
+    TONE_DETECTOR_THRESHOLD_DB: float = 0.25
+
     # Recording
     RECORDING_MAX_SEC: float = 30.0  # auto-stop after this duration (0 = no limit)
     RECORDING_RAM_BUFFER: bool = False  # buffer entire capture in RAM, flush on stop

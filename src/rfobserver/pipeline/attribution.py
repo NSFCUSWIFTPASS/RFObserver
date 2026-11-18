@@ -41,6 +41,16 @@ def parse_decoders(value: str) -> frozenset[str]:
     return frozenset(n for n in names if n in ALL_DECODERS)
 
 
+def enabled_decoders(settings: Any) -> frozenset[str]:
+    """The decoders attribution runs: ATTRIBUTION_DECODERS, less the tone check
+    while the tone detector is on (it finds and labels tones itself, and the
+    per-burst check almost never matches)."""
+    names = parse_decoders(settings.ATTRIBUTION_DECODERS)
+    if getattr(settings, "TONE_DETECTOR_ENABLED", False):
+        names -= {"tone"}
+    return names
+
+
 def _pass_decoder(extra: list[str]) -> str:
     """Which decoder an rtl_433 pass (its argument list) belongs to."""
     if "-X" in extra:

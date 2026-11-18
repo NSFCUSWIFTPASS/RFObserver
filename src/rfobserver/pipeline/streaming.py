@@ -1082,7 +1082,10 @@ class StreamingProcessor:
         """Start the streaming pipeline."""
         self._running = True
         self._loop = asyncio.get_running_loop()
-        await self._hs_close_left_open()
+        # Off the start path: a database write here delays the threads.
+        self._hs_close_task = self._loop.create_task(
+            self._hs_close_left_open(started_before=time.time())
+        )
         if self._beacon is not None:
             self._beacon.mark()
         # Snapshot the isolation switches for this run (see __init__).
@@ -1550,10 +1553,13 @@ class StreamingProcessor:
         except Exception:
             logger.exception("Saving high-sensitivity run %s failed", run.id)
 
-    async def _hs_close_left_open(self) -> None:
-        """A run is never resumed: close any a restart left open."""
+    async def _hs_close_left_open(self, started_before: float) -> None:
+        """A run is never resumed: close any a restart left open (started
+        before this pipeline did, so a run started since is left alone)."""
         try:
-            n = await self._db.hs_run_close_open("restart", time.time())
+            n = await self._db.hs_run_close_open(
+                "restart", started_before, started_before=started_before
+            )
         except Exception:
             logger.exception("Closing high-sensitivity runs left open failed")
             return

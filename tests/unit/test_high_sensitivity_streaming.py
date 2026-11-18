@@ -74,8 +74,8 @@ class _FakeDB:
     async def hs_run_counts(self, run_id):
         return {"detections": 3, "ssm": {"0200574952470001": 2}, "tones": []}
 
-    async def hs_run_close_open(self, reason, ended):
-        self.closed.append((reason, ended))
+    async def hs_run_close_open(self, reason, ended, started_before=None):
+        self.closed.append((reason, ended, started_before))
         return 1
 
 
@@ -107,8 +107,8 @@ async def test_startup_closes_a_run_left_open_by_a_restart(tmp_path):
     proc = _proc(tmp_path)
     db = _FakeDB()
     proc._db = db
-    await proc._hs_close_left_open()
-    assert db.closed and db.closed[0][0] == "restart"
+    await proc._hs_close_left_open(started_before=123.0)
+    assert db.closed == [("restart", 123.0, 123.0)]
 
 
 class _Book:

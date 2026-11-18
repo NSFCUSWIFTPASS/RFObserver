@@ -2242,11 +2242,16 @@ class SensorDatabase:
         await self._db.commit()
 
     @_guarded_write
-    async def hs_run_close_open(self, reason: str, ended: float) -> int:
-        """Close the runs a restart left open; returns how many."""
+    async def hs_run_close_open(
+        self, reason: str, ended: float, started_before: float | None = None
+    ) -> int:
+        """Close the runs a restart left open (only those started before
+        ``started_before``, when given); returns how many."""
         assert self._db is not None
+        cutoff = float("inf") if started_before is None else float(started_before)
         cur = await self._db.execute(
-            "UPDATE hs_runs SET ended = ?, end_reason = ? WHERE ended IS NULL", (ended, reason)
+            "UPDATE hs_runs SET ended = ?, end_reason = ? WHERE ended IS NULL AND start < ?",
+            (ended, reason, cutoff),
         )
         await self._db.commit()
         return int(cur.rowcount or 0)

@@ -1824,3 +1824,22 @@ async def test_existing_db_gains_hs_run_column(tmp_path):
         assert len(await db.query_detections(hs_run="r1")) == 1
     finally:
         await db.close()
+
+
+async def test_close_open_spares_runs_started_after_the_cutoff(db):
+    for k, start in (("old", 10.0), ("new", 50.0)):
+        await db.hs_run_save(
+            {
+                "id": k,
+                "source": "api",
+                "start": start,
+                "end": start + 60,
+                "ended": None,
+                "end_reason": None,
+                "threshold_db": 15.0,
+                "summary": None,
+            }
+        )
+    assert await db.hs_run_close_open("restart", ended=40.0, started_before=40.0) == 1
+    assert (await db.hs_run_get("old"))["end_reason"] == "restart"
+    assert (await db.hs_run_get("new"))["ended"] is None

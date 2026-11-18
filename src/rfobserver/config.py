@@ -296,6 +296,15 @@ class AppSettings(BaseSettings):
     # budget of their own. See docs/debugging/2026-11-18_ssm-coverage-hcro.md.
     ISOLATION_LONG_MS: float = 20.0
     ISOLATION_LONG_MAX_PER_SEC: int = 10
+
+    # High-sensitivity mode: for a run of at most 5 minutes (the daily status and
+    # linearity check) the burst threshold drops to HS_BURST_THRESHOLD_DB, the
+    # tone detector runs and the isolation budget rises to
+    # HS_ISOLATION_MAX_PER_SEC. Started by API, a schedule flag (HS_LEAD_SEC
+    # before the capture) or the fleet. Never stored; a restart ends it.
+    HS_BURST_THRESHOLD_DB: float = 15.0
+    HS_ISOLATION_MAX_PER_SEC: int = 60
+    HS_LEAD_SEC: float = 2.0
     # Bounded queues into the isolation worker and the rtl_433 worker.
     ISOLATION_QUEUE_MAX: int = 64
     # Cap on saved isolated-burst files (oldest deleted first).

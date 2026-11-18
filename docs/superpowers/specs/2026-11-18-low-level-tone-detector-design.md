@@ -126,3 +126,25 @@ Decided with the owner:
 - **Lost against the IQ design:** the single-line check (narrow modulation inside a
   12.7 kHz bin at a listed frequency would count) and a measured tone frequency.
 - Duplicates with the burst path, the 3 s hold, and the Config toggle are unchanged.
+
+## CORRECTION 2026-11-18 (after the two-tone sweep): no dedupe, guard bins, burst tone check off
+
+Over the air (nano-super, 26 MS/s; `tone_100kHz_-150kHz.bin` from
+hcro-survey-automation/waveforms_final looped 3 s per step from .177's B200mini at
+TX gain 0 to 60): every 3 s transmission from gain 10 up was one ~2996 ms detection
+at each frequency, starting within 1 ms of the transmitter's logged start, and each
+10 dB of TX gain read 9.8 to 10.2 dB (gain 10 was 3.1 to 3.6 dB over the bin floor;
+gain 0 was not found). Three changes followed, decided with the owner:
+
+- **The duplicate rule above is withdrawn.** The detector always writes its own row
+  and leaves burst rows alone. Burst rows run on the burst detector's clock (about
+  0.5 s behind capture) and a steady tone becomes the burst detector's floor, so a
+  strong tone leaves only a fragment at each end (281 ms and 55 ms for a 3 s tone);
+  the 80 % coverage test compared misaligned spans and never applied. The 3 s hold
+  and the overlap query went with it.
+- **Guard bins.** Seven 23 to 42 ms false tones (3 to 8 dB) came from broadband
+  energy passing through the listed bins (once in both at the same instant). Bins 3
+  away on either side are tracked too; a tone is dropped when they rose more than a
+  quarter of its own rise (within 6 dB). A CW tone leaks under -30 dB there.
+- **The per-burst tone check is off by default** (`ATTRIBUTION_DECODERS` no longer
+  lists `tone`); it stays available on the Decoders list.

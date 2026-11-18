@@ -930,46 +930,6 @@ class SensorDatabase:
         await self._db.commit()
         return int(cursor.rowcount)
 
-    async def detections_overlapping(
-        self,
-        start: datetime,
-        stop: datetime,
-        freq_lo_hz: float,
-        freq_hi_hz: float,
-        max_burst_sec: float = 10.0,
-    ) -> list[dict[str, Any]]:
-        """Detections whose time span overlaps [start, stop) and whose band
-        (centre +- half the bandwidth) overlaps [freq_lo_hz, freq_hi_hz], with
-        burst_id, start_time, stop_time (aware datetimes), centre, bandwidth
-        and model. Rows starting more than ``max_burst_sec`` before ``start``
-        are not looked at (the start_time index bounds the scan)."""
-        assert self._db is not None
-        lo = (start - timedelta(seconds=max_burst_sec)).astimezone(timezone.utc).isoformat()
-        hi = (stop + timedelta(seconds=1)).astimezone(timezone.utc).isoformat()
-        async with self._db.execute(
-            "SELECT burst_id, start_time, stop_time, center_freq_hz, bandwidth_hz, model "
-            "FROM detections WHERE start_time >= ? AND start_time < ? "
-            "AND center_freq_hz - bandwidth_hz / 2 <= ? AND center_freq_hz + bandwidth_hz / 2 >= ?",
-            (lo, hi, freq_hi_hz, freq_lo_hz),
-        ) as cursor:
-            rows = await cursor.fetchall()
-        found = []
-        for bid, s, e, f, bw, model in rows:
-            s_dt, e_dt = datetime.fromisoformat(s), datetime.fromisoformat(e)
-            # The string bounds above have slack; times are compared here.
-            if s_dt < stop and e_dt > start:
-                found.append(
-                    {
-                        "burst_id": bid,
-                        "start_time": s_dt,
-                        "stop_time": e_dt,
-                        "center_freq_hz": f,
-                        "bandwidth_hz": bw,
-                        "model": model,
-                    }
-                )
-        return found
-
     @_guarded_write
     async def insert_detections(self, detections: Sequence[Mapping[str, Any]]) -> int:
         """Insert many detections with one executemany and one commit.

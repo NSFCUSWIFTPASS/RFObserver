@@ -376,7 +376,7 @@
                         {% for key, title, detail in [
                             ('ssm', 'SSM', 'Surrogate smart meters (DBPSK), matched on their MAC and text'),
                             ('rfid', 'RFID reader', 'UHF RFID (EPC Gen2) readers: a carrier with PIE pulses'),
-                            ('tone', 'Tone', 'Unmodulated carriers (CW), such as test tones'),
+                            ('tone', 'Tone', 'Unmodulated carriers (CW), such as test tones; skipped while the Tone Detector is on'),
                             ('silverspring', 'SilverSpring-Mesh', 'rtl_433 protocol 383 on wide bursts'),
                             ('ssnmesh', 'ssnmesh-like', 'rtl_433 flex decoder for SSN mesh framing'),
                             ('rtl433', 'Other rtl_433 devices', 'rtl_433 default protocols on narrow bursts'),
@@ -436,6 +436,41 @@
                 <label>Status</label>
                 <div id="isolation-state" style="font-size: 12px; color: var(--text-primary);">--</div>
                 <div id="isolation-counts" style="display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 4px; font-size: 11px; color: var(--text-secondary);"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card" style="margin-bottom: 16px;">
+    <div class="card-header">Tone Detector</div>
+    <div class="card-body">
+        <div class="config-form">
+            <div class="form-row" style="align-items: flex-start;">
+                <div class="form-group">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="tone-detector-enabled" name="tone_detector_enabled" {% if settings.TONE_DETECTOR_ENABLED %}checked{% endif %}>
+                        <span class="toggle-text">Tone Detector</span>
+                    </label>
+                    <span style="font-size: 10px; color: var(--text-secondary); margin-top: 2px; display: block;">Applies at next start (turn Sensor Active off and on).</span>
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Record CW tones at the listed frequencies, down to a few dB over their bin's noise floor, as Tone detections (the RF-chain linearity check). Watches only those bins of the spectrum, apart from burst detection; while on, attribution skips its tone check.</span>
+                </div>
+                <div class="form-group">
+                    <label for="tone-detector-threshold">Threshold (dB)</label>
+                    <input type="number" id="tone-detector-threshold" name="tone_detector_threshold_db" value="{{ settings.TONE_DETECTOR_THRESHOLD_DB }}" step="0.5" min="0.5">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">A 1 ms stretch of the bin must be this far over the bin's noise floor to count as on.</span>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="tone-detector-freqs">Frequencies (Hz)</label>
+                    <input type="text" id="tone-detector-freqs" name="tone_detector_freqs" value="{{ settings.TONE_DETECTOR_FREQS }}" placeholder="914850000,915100000">
+                    <span style="font-size: 10px; opacity: 0.6; margin-top: 2px; display: block;">Comma-separated. Only these are watched; one outside the tuned band is skipped.</span>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Status</label>
+                <div id="tone-detector-state" style="font-size: 12px; color: var(--text-primary);">--</div>
+                <div id="tone-detector-counts" style="display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 4px; font-size: 11px; color: var(--text-secondary);"></div>
             </div>
         </div>
     </div>
@@ -544,7 +579,7 @@
     // absent from FormData, so the entries() loop below cannot see a
     // checked -> unchecked change.
     const boolIds = ['trigger-continuous', 'recording-ram-buffer', 'isolation-enabled', 'attribution-enabled',
-        'burst-detection-enabled'];
+        'burst-detection-enabled', 'tone-detector-enabled'];
     let initialChecks = {};
     function snapshotChecks() {
         boolIds.forEach(id => {
@@ -1059,6 +1094,7 @@ async function refreshStorageBar() {
         const body = await r.json();
         s = body.storage;
         renderIsolation(body.isolation);
+        renderToneDetector(body.tone_detector);
     } catch (e) { return; }
     const bar = document.getElementById('storage-bar');
     const legend = document.getElementById('storage-legend');
@@ -1120,6 +1156,35 @@ function renderIsolation(iso) {
     state.textContent = text;
     const c = iso.counts || {};
     for (const [key, label] of ISOLATION_COUNT_LABELS) {
+        if (!(key in c)) continue;
+        const item = document.createElement('span');
+        const value = document.createElement('span');
+        value.style.color = 'var(--text-primary)';
+        value.style.fontVariantNumeric = 'tabular-nums';
+        value.textContent = String(c[key]);
+        item.append(label + ' ', value);
+        counts.appendChild(item);
+    }
+}
+// Tone detector status from /api/health, like isolation's.
+const TONE_COUNT_LABELS = [
+    ['tones', 'Tones'], ['inserted', 'Recorded'],
+    ['out_of_band', 'Out of band'], ['skipped', 'Chunks skipped'], ['errors', 'Errors'],
+];
+function renderToneDetector(td) {
+    const state = document.getElementById('tone-detector-state');
+    const counts = document.getElementById('tone-detector-counts');
+    if (!state || !counts) return;
+    counts.replaceChildren();
+    if (!td) { state.textContent = 'No pipeline running'; return; }
+    if (td.disabled_reason) state.textContent = 'Disabled: ' + td.disabled_reason;
+    else if (!td.enabled) state.textContent = 'Off';
+    else {
+        const f = Object.entries(td.freqs || {}).map(([hz, st]) => `${(Number(hz) / 1e6).toFixed(3)} MHz ${st}`);
+        state.textContent = 'On' + (f.length ? ': ' + f.join(', ') : '');
+    }
+    const c = td.counts || {};
+    for (const [key, label] of TONE_COUNT_LABELS) {
         if (!(key in c)) continue;
         const item = document.createElement('span');
         const value = document.createElement('span');

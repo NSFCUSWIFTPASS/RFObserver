@@ -265,11 +265,13 @@ async def test_tone_gets_the_burst_frequency(monkeypatch):
     assert seen == [915.0e6]
 
 
-def test_tone_is_on_by_default():
+def test_tone_is_available_but_off_by_default():
+    """The tone detector finds the linearity check's tones; the per-burst
+    check is kept for anyone who wants it, but off by default."""
     from rfobserver.config import AppSettings
 
     assert "tone" in ALL_DECODERS
-    assert "tone" in AppSettings(_env_file=None).ATTRIBUTION_DECODERS.split(",")
+    assert "tone" not in AppSettings(_env_file=None).ATTRIBUTION_DECODERS.split(",")
 
 
 def test_tone_detector_on_takes_tone_out_of_attribution():

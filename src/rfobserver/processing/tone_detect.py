@@ -1,225 +1,186 @@
-"""Low-level tone detector DSP. Pure - no I/O.
+"""Tone tracker for the tone detector. Pure - no I/O.
 
-The burst detector needs a cell 30 dB over its bin's floor; a CW tone 5 dB over
-the floor of a 12.7 kHz PSD bin never gets there, but it is plain once
-integrated. Stage A (``BinBaseline``) flags bins of each averaged-window PSD
-that rise over their own recent level; on 2026-11-18 twenty 100 ms pulses 5 dB
-over the bin floor raised their bin 0.55 dB against about 0.04 dB of
-window-to-window noise. Stage B (``confirm_tones``) takes a narrow channel cut
-from the IQ ring around a flagged bin and confirms a single line in it, then
-measures where it is on and its level.
+The burst detector needs a cell 30 dB over its bin's floor; a test tone 5 dB
+over it never gets there, but it is plain in its own bin over time. The tone
+detector watches only the PSD bins holding the frequencies it is given (a
+daily RF-chain linearity check sends known tones), so for each one a
+``ToneTracker`` takes that bin's power from every row of the PSD grid the
+pipeline already computes (0.2 ms rows at 26 MS/s), averages it into 1 ms
+blocks and tracks where it stands over a rolling floor of the bin's off blocks.
+Bins a few away either side guard against broadband energy passing through.
 
-Levels are medians over the on time: a B200mini receiving at 26 MS/s drops
-5 dB for 3.4 ms every 102.4 ms (docs/debugging/2026-11-18_b200-rx-gain-step.md),
-which a median leaves alone, so a tone's level tracks what was transmitted.
+A tone's level is the median of its on blocks with the floor taken out: a
+B200mini receiving at 26 MS/s drops 5 dB for 3.4 ms every 102.4 ms
+(docs/debugging/2026-11-18_b200-rx-gain-step.md), which a median leaves alone,
+and gaps that short are bridged, so the level tracks what was transmitted.
+See docs/superpowers/specs/2026-11-18-low-level-tone-detector-design.md.
 """
 
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, TypeAlias
+from typing import Any
 
 import numpy as np
 
-IQ: TypeAlias = "np.ndarray[Any, np.dtype[Any]]"
-
-# -- Stage A ---------------------------------------------------------------
-
-# Windows of history per bin, and how many before anything is flagged.
-HISTORY = 60
-MIN_HISTORY = 10
-# A bin must also rise this many of its own robust spreads (a bin near an
-# intermittent signal wanders, and its threshold grows with it).
-SPREAD_K = 6.0
-# More than this share of bins flagged at once is a broad change (gain,
-# temperature, a wideband signal), not a tone: nothing is flagged and the
-# window feeds the baseline.
-BROAD_FRACTION = 0.05
-
-
-@dataclass(frozen=True)
-class Candidate:
-    """Adjacent flagged bins: their range, the bin that rose most, and by how much."""
-
-    lo_bin: int
-    hi_bin: int
-    peak_bin: int
-    rise_db: float
-
-
-class BinBaseline:
-    """Per-bin recent level of the averaged PSD for one tuning, and the bins
-    that rise over it."""
-
-    def __init__(self, threshold_db: float, max_candidates: int = 4) -> None:
-        self.threshold_db = float(threshold_db)
-        self.max_candidates = int(max_candidates)
-        self._key: Any = None
-        self._history: deque[np.ndarray[Any, np.dtype[Any]]] = deque(maxlen=HISTORY)
-
-    def update(self, key: Any, powers: Any) -> list[Candidate]:
-        """Flag this window's rising bins, and learn from the rest of it.
-
-        ``key`` names the tuning (centre, bin count, gain...); a new key starts
-        the history over. ``powers`` is the window's averaged PSD in dB.
-        """
-        p = np.asarray(powers, dtype=np.float32)
-        if key != self._key or (self._history and len(self._history[0]) != len(p)):
-            self._key = key
-            self._history.clear()
-        if len(self._history) < MIN_HISTORY:
-            self._history.append(p)
-            return []
-
-        hist = np.stack(self._history)
-        base = np.median(hist, axis=0)
-        spread = 1.4826 * np.median(np.abs(hist - base), axis=0)
-        rise = p - base
-        # A drift common to all bins (temperature) is not a tone.
-        rise = rise - float(np.median(rise))
-        need = np.maximum(self.threshold_db, SPREAD_K * spread)
-        flag = rise >= need
-        if float(np.mean(flag)) > BROAD_FRACTION:
-            self._history.append(p)
-            return []
-        # Flagged bins do not teach the baseline: a tone that stays on stays found.
-        self._history.append(np.where(flag, base, p).astype(np.float32))
-        if not flag.any():
-            return []
-
-        edges = np.diff(np.r_[0, flag.astype(np.int8), 0])
-        starts = np.flatnonzero(edges == 1)
-        ends = np.flatnonzero(edges == -1)
-        found = []
-        for a, b in zip(starts, ends, strict=True):
-            k = a + int(np.argmax(rise[a:b]))
-            found.append(Candidate(int(a), int(b - 1), int(k), float(rise[k])))
-        found.sort(key=lambda c: c.rise_db, reverse=True)
-        return found[: self.max_candidates]
-
-
-# -- Stage B ---------------------------------------------------------------
-
-# Envelope blocks: coherent means over 1 ms once the line is at DC.
 BLOCK_SEC = 0.001
 MIN_ON_SEC = 0.020
-# Gaps this short inside a tone are bridged (the receiver's 3.4 ms step can
-# drop a weak tone's blocks under the on level).
+# Off gaps up to this long inside a tone are bridged (the receiver's 3.4 ms
+# step can drop a weak tone under the threshold).
 BRIDGE_SEC = 0.006
-# The line's peak over the channel's noise per FFT bin; noise alone peaks about
-# 10 dB over its median in a channel this size.
-MIN_LINE_DB = 15.0
-# Of the signal power (noise taken out) within half a PSD bin of the line, the
-# share within LINE_HZ of it. A 20 ms pulse keeps most of its power within
-# 250 Hz; FSK or a reader's PIE modulation spreads it.
-LINE_HZ = 250.0
-MIN_LINE_FRACTION = 0.8
-# A block is on above this many noise sigmas, and above half the tone's level.
-ON_SIGMA = 3.0
-ON_FRACTION = 0.5
+# The floor is the median of the bin's last FLOOR_SEC of off blocks, known
+# once it has MIN_FLOOR_SEC of them, and recomputed every FLOOR_EVERY blocks.
+FLOOR_SEC = 30.0
+MIN_FLOOR_SEC = 1.0
+FLOOR_EVERY = 1000
+# A tone longer than this is reported in pieces (a stuck carrier at a listed
+# frequency must not grow without bound).
+MAX_TONE_SEC = 60.0
+# Rows more than this out of step with the last ones (a stall, a retune)
+# close any open tone and start the blocks over.
+GAP_SEC = 0.005
+# Guard bins (GUARD_BINS either side of the tone's bin) must rise less than
+# this share of the tone's rise: a CW tone leaks under -30 dB that far out,
+# while broadband energy sweeping through (seen 2026-11-18: 23 to 42 ms,
+# in both listed bins at once) lifts them about as much as the tone's bin.
+GUARD_BINS = 3
+MAX_GUARD_SHARE = 0.25
+
+
+def parse_tone_freqs(value: str) -> list[float]:
+    """Frequencies (Hz) from a comma-separated list; blanks are skipped and
+    anything else that is not a number raises ValueError."""
+    return [float(part) for part in (p.strip() for p in value.split(",")) if part]
 
 
 @dataclass(frozen=True)
-class ToneSegment:
-    """One stretch of a tone in the channel: its frequency offset from the
-    channel centre, start and length (s from the channel's first sample), its
-    level (dB re full scale, median over the on time), its SNR in a PSD bin
-    of ``bin_hz``, and whether it runs into either end of the channel."""
+class ToneMeasure:
+    """A tone in one bin: start and stop (epoch s), level (dB, the bin's power
+    units, floor taken out) and SNR over the bin's floor (dB)."""
 
-    offset_hz: float
-    start_s: float
-    duration_s: float
+    start: float
+    stop: float
     level_db: float
     snr_db: float
-    touches_start: bool
-    touches_end: bool
 
 
-def _segments(on: np.ndarray[Any, np.dtype[Any]], bridge: int) -> list[tuple[int, int]]:
-    edges = np.diff(np.r_[0, on.astype(np.int8), 0])
-    starts = list(np.flatnonzero(edges == 1))
-    ends = list(np.flatnonzero(edges == -1))
-    merged: list[tuple[int, int]] = []
-    for a, b in zip(starts, ends, strict=True):
-        if merged and a - merged[-1][1] <= bridge:
-            merged[-1] = (merged[-1][0], int(b))
-        else:
-            merged.append((int(a), int(b)))
-    return merged
+class ToneTracker:
+    """One bin's tones, fed its grid rows (linear power) in time order, with
+    the mean of its guard bins' power for the same rows."""
 
+    def __init__(self, threshold_db: float) -> None:
+        self._ratio = 10 ** (float(threshold_db) / 10)
+        self._off: deque[float] = deque(maxlen=round(FLOOR_SEC / BLOCK_SEC))
+        self._guard_off: deque[float] = deque(maxlen=round(FLOOR_SEC / BLOCK_SEC))
+        self._floor: float | None = None
+        self._guard_floor = 0.0
+        self._since_floor = 0
+        self._rem = np.zeros((0, 2))
+        self._rem_t: float | None = None  # time of the first remainder row
+        self._next_t: float | None = None  # time the next row should have
+        self._seg_start: float | None = None
+        self._seg_end = 0.0
+        self._seg_on: list[float] = []
+        self._seg_guard: list[float] = []
+        self._gap = 0.0
 
-def confirm_tones(
-    x: IQ, rate_hz: float, bin_hz: float, search_hz: float | None = None
-) -> list[ToneSegment]:
-    """The tone segments in a narrow channel ``x`` (complex, ``rate_hz``),
-    looking for the line within ``search_hz`` (default ``bin_hz``) of its
-    centre; empty when there is no single unmodulated line."""
-    rate = float(rate_hz)
-    n = len(x)
-    if n < MIN_ON_SEC * rate:
-        return []
-    search = float(search_hz if search_hz is not None else bin_hz)
-
-    w = np.hanning(n).astype(np.float32)
-    spec = np.abs(np.fft.fft(x * w)) ** 2
-    f = np.fft.fftfreq(n, 1.0 / rate)
-    near = np.flatnonzero(np.abs(f) <= search)
-    k = int(near[np.argmax(spec[near])])
-    band = np.abs(f - f[k]) <= bin_hz / 2
-    line = np.abs(f - f[k]) <= LINE_HZ
-    # Noise per FFT bin, measured beside the line (the median of an
-    # exponential is ln 2 of its mean): the channelizer's filter rolls off
-    # toward the channel's edges, where a whole-channel median would sit
-    # about 10 % under the noise at the line.
-    beside = band & (np.abs(f - f[k]) > 2 * LINE_HZ)
-    noise = float(np.median(spec[beside])) / np.log(2.0) if beside.any() else 0.0
-    if noise <= 0:
-        return []
-    if spec[k] < noise * 10 ** (MIN_LINE_DB / 10):
-        return []
-    excess_band = float(spec[band].sum()) - noise * int(band.sum())
-    excess_line = float(spec[line].sum()) - noise * int(line.sum())
-    if excess_band <= 0 or excess_line / excess_band < MIN_LINE_FRACTION:
-        return []
-
-    # Parabolic interpolation of the log spectrum around the peak.
-    df = rate / n
-    offset = float(f[k])
-    if 0 < k < n - 1:
-        a, b, c = np.log(spec[k - 1]), np.log(spec[k]), np.log(spec[(k + 1) % n])
-        den = a - 2 * b + c
-        if den != 0:
-            offset += 0.5 * (a - c) / den * df
-
-    block = max(1, round(BLOCK_SEC * rate))
-    nb = n // block
-    t = np.arange(nb * block) / rate
-    y = x[: nb * block] * np.exp(-2j * np.pi * offset * t).astype(np.complex64)
-    amp = np.abs(y.reshape(nb, block).mean(axis=1))
-    sigma2 = noise / float(np.sum(w.astype(np.float64) ** 2))  # per sample
-    sigma_b = np.sqrt(sigma2 / block)
-    first = amp > ON_SIGMA * sigma_b
-    if not first.any():
-        return []
-    thr = max(ON_SIGMA * sigma_b, ON_FRACTION * float(np.median(amp[first])))
-    min_blocks = round(MIN_ON_SEC / BLOCK_SEC)
-    bridge = round(BRIDGE_SEC / BLOCK_SEC)
-
-    found = []
-    for a0, b0 in _segments(amp > thr, bridge):
-        if b0 - a0 < min_blocks:
-            continue
-        level = float(np.median(amp[a0:b0]))
-        found.append(
-            ToneSegment(
-                offset_hz=offset,
-                start_s=a0 * block / rate,
-                duration_s=(b0 - a0) * block / rate,
-                level_db=20.0 * float(np.log10(level)),
-                snr_db=10.0 * float(np.log10(level**2 / (sigma2 * bin_hz / rate))),
-                touches_start=a0 == 0,
-                touches_end=b0 == nb,
-            )
+    def feed(self, rows: Any, guard: Any, t0: float, row_sec: float) -> list[ToneMeasure]:
+        """Take the bin's power (and its guard bins') for consecutive rows
+        starting at ``t0`` (epoch s), each ``row_sec`` long; return the tones
+        that ended."""
+        found: list[ToneMeasure] = []
+        if self._next_t is not None and abs(t0 - self._next_t) > GAP_SEC:
+            found += self.flush()
+        if not len(self._rem):
+            self._rem_t = t0
+        both = np.column_stack(
+            [np.asarray(rows, dtype=np.float64), np.asarray(guard, dtype=np.float64)]
         )
-    return found
+        self._rem = np.concatenate([self._rem, both])
+        self._next_t = t0 + len(rows) * row_sec
+        per = max(1, round(BLOCK_SEC / row_sec))
+        block_sec = per * row_sec
+        n = len(self._rem) // per
+        assert self._rem_t is not None
+        blocks = self._rem[: n * per].reshape(n, per, 2).mean(axis=1)
+        self._rem = self._rem[n * per :]
+        t_first = self._rem_t
+        self._rem_t += n * block_sec
+        # Nearly always nothing is on and no tone is open: learn the floor
+        # from the whole chunk at once.
+        main = blocks[:, 0]
+        quiet = self._floor is not None and not np.any(main >= self._floor * self._ratio)
+        if quiet and self._seg_start is None:
+            self._learn_many(main, blocks[:, 1])
+            return found
+        for i, (p, g) in enumerate(blocks.tolist()):
+            found += self._block(p, g, t_first + i * block_sec, block_sec)
+        return found
+
+    def flush(self) -> list[ToneMeasure]:
+        """Close an open tone (end of data, or a gap) and drop partial blocks."""
+        self._rem = np.zeros((0, 2))
+        self._next_t = None
+        return self._close()
+
+    def _block(self, p: float, g: float, t: float, dt: float) -> list[ToneMeasure]:
+        if self._floor is None:
+            self._learn(p, g)
+            return []
+        if p >= self._floor * self._ratio:
+            if self._seg_start is None:
+                self._seg_start = t
+            self._seg_on.append(p)
+            self._seg_guard.append(g)
+            self._seg_end = t + dt
+            self._gap = 0.0
+            if self._seg_end - self._seg_start >= MAX_TONE_SEC:
+                return self._close()
+            return []
+        if self._seg_start is not None:
+            self._gap += dt
+            if self._gap > BRIDGE_SEC:
+                return self._close()
+            return []
+        self._learn(p, g)
+        return []
+
+    def _learn_many(self, ps: Any, gs: Any) -> None:
+        self._off.extend(ps.tolist())
+        self._guard_off.extend(gs.tolist())
+        self._since_floor += len(ps)
+        if self._since_floor >= FLOOR_EVERY:
+            self._update_floor()
+
+    def _learn(self, p: float, g: float) -> None:
+        self._off.append(p)
+        self._guard_off.append(g)
+        self._since_floor += 1
+        enough = len(self._off) >= round(MIN_FLOOR_SEC / BLOCK_SEC)
+        if enough and (self._floor is None or self._since_floor >= FLOOR_EVERY):
+            self._update_floor()
+
+    def _update_floor(self) -> None:
+        self._floor = float(np.median(self._off))
+        self._guard_floor = float(np.median(self._guard_off))
+        self._since_floor = 0
+
+    def _close(self) -> list[ToneMeasure]:
+        start, on, guard = self._seg_start, self._seg_on, self._seg_guard
+        self._seg_start, self._seg_on, self._seg_guard, self._gap = None, [], [], 0.0
+        if start is None or self._floor is None or self._seg_end - start < MIN_ON_SEC:
+            return []
+        tone = float(np.median(on)) - self._floor
+        if tone <= 0:
+            return []
+        if float(np.median(guard)) - self._guard_floor > MAX_GUARD_SHARE * tone:
+            return []
+        return [
+            ToneMeasure(
+                start=start,
+                stop=self._seg_end,
+                level_db=10.0 * float(np.log10(tone)),
+                snr_db=10.0 * float(np.log10(tone / self._floor)),
+            )
+        ]

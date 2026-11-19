@@ -149,3 +149,42 @@ def test_allow_past_skips_the_check() -> None:
         allow_past=True,
     )
     assert s.start_ms == NOW - 600_000
+
+
+# -- High-sensitivity flag --
+
+
+def test_high_sensitivity_flag_round_trips() -> None:
+    s = parse(
+        {"start": iso(T), "duration_ms": 60_000, "high_sensitivity": True, "hs_threshold_db": 12}
+    )
+    assert s.high_sensitivity is True and s.hs_threshold_db == 12.0
+    assert from_json(to_json(s)) == s
+    plain = parse({"start": iso(T), "duration_ms": 2000})
+    assert plain.high_sensitivity is False and plain.hs_threshold_db is None
+    assert from_json({k: v for k, v in to_json(plain).items() if not k.startswith("h")}) == plain
+
+
+def test_flagged_schedule_longer_than_the_hs_limit_is_refused() -> None:
+    # 2 s lead + 297 s + 2 s tail > 300 s
+    with pytest.raises(ScheduleError, match="high_sensitivity"):
+        parse({"start": iso(T), "duration_ms": 297_000, "high_sensitivity": True})
+    parse({"start": iso(T), "duration_ms": 296_000, "high_sensitivity": True})
+    parse({"start": iso(T), "duration_ms": 299_000})  # unflagged: no limit
+
+
+def test_hs_threshold_needs_the_flag_and_a_range() -> None:
+    with pytest.raises(ScheduleError):
+        parse({"start": iso(T), "duration_ms": 2000, "hs_threshold_db": 12})
+    for bad in (9, 31, "x"):
+        with pytest.raises(ScheduleError):
+            parse(
+                {
+                    "start": iso(T),
+                    "duration_ms": 2000,
+                    "high_sensitivity": True,
+                    "hs_threshold_db": bad,
+                }
+            )
+    with pytest.raises(ScheduleError):
+        parse({"start": iso(T), "duration_ms": 2000, "high_sensitivity": "yes"})

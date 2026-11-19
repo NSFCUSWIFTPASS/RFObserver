@@ -287,3 +287,20 @@ def test_absorb_scales_to_a_noisy_band() -> None:
         det._absorb(burst, a0, a1, f_lo, f_hi, grow)
     elapsed = time.perf_counter() - t0
     assert elapsed < 1.0, f"absorbing 7000 bursts took {elapsed:.2f}s"
+
+
+def test_set_config_changes_the_threshold_without_losing_the_window() -> None:
+    """High-sensitivity mode lowers the threshold mid-stream: a 15 dB burst
+    under the routine 20 dB config is found once the config drops, whole."""
+    from dataclasses import replace
+
+    tres = 0.001
+    det = _detector(window=100, eval_iv=50, num_bins=32, tres_s=tres)
+    grid = np.full((300, 32), -100.0, dtype=np.float32)
+    grid[60:90, 10:13] = -85.0  # 15 dB over the floor, 30 rows
+    first = _feed_grid(det, grid[:50], 50, tres)
+    det.set_config(replace(det._burst_config, threshold_high_db=12.0))
+    rest = _feed_grid(det, grid[50:], 50, tres)
+    assert first == []
+    assert len(rest) == 1
+    assert abs(rest[0].duration_ms - 30.0) <= 2.0

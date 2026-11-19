@@ -38,8 +38,12 @@ class ToneDetector:
         freqs: list[float],
         threshold_db: float,
         meta: Callable[[], dict[str, Any]],
+        hs_run: Callable[[float], str | None] = lambda t: None,
     ) -> None:
         self._db = db
+        # The high-sensitivity run a time fell in (a tone carries the run it
+        # started in, even when it is written after the run ended).
+        self._hs_run = hs_run
         self._freqs = list(dict.fromkeys(float(f) for f in freqs))
         self._threshold = float(threshold_db)
         self._meta = meta
@@ -132,18 +136,24 @@ class ToneDetector:
 
     def _finalize(self, f: float, bin_hz: float, center: float, m: ToneMeasure) -> None:
         self.stats["tones"] += 1
-        task = asyncio.get_running_loop().create_task(self._write(f, bin_hz, center, m))
+        task = asyncio.get_running_loop().create_task(
+            self._write(f, bin_hz, center, m, self._hs_run(m.start))
+        )
         self._finals.add(task)
         task.add_done_callback(self._finals.discard)
 
-    async def _write(self, f: float, bin_hz: float, center: float, m: ToneMeasure) -> None:
+    async def _write(
+        self, f: float, bin_hz: float, center: float, m: ToneMeasure, hs_run: str | None
+    ) -> None:
         try:
-            await self._insert(f, bin_hz, center, m)
+            await self._insert(f, bin_hz, center, m, hs_run)
         except Exception:
             self.stats["errors"] += 1
             logger.exception("Tone detector: writing the tone at %.0f Hz failed", f)
 
-    async def _insert(self, f: float, bin_hz: float, center: float, m: ToneMeasure) -> None:
+    async def _insert(
+        self, f: float, bin_hz: float, center: float, m: ToneMeasure, hs_run: str | None
+    ) -> None:
         start = datetime.fromtimestamp(m.start, tz=timezone.utc)
         stop = datetime.fromtimestamp(m.stop, tz=timezone.utc)
         duration = m.stop - m.start
@@ -184,6 +194,7 @@ class ToneDetector:
                     "gain_db": meta.get("gain_db"),
                     "antenna": "RX2",
                     "device_serial": meta.get("device_serial"),
+                    "hs_run": hs_run,
                 }
             ]
         )

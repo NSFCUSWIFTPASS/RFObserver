@@ -101,6 +101,11 @@ class RollingBurstDetector:
         self._order: dict[int, int] = {}
         self._next_order = 0
 
+    def set_config(self, config: BurstDetectionConfig) -> None:
+        """Use ``config`` from the next evaluation on, keeping the window and
+        the tracked bursts (high-sensitivity mode changes the threshold)."""
+        self._burst_config = config
+
     @property
     def last_detection(self) -> BurstDetectionResult | None:
         return self._last_detection

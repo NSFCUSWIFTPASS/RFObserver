@@ -183,3 +183,33 @@ async def test_a_retune_that_brings_a_frequency_into_band_starts_watching_it(db)
         det.on_result(r, ROW)
     assert det.status_freqs() == {CENTER + RATE: "tracking"}
     await det.stop()
+
+
+async def test_tones_found_in_a_high_sensitivity_run_carry_its_id(db) -> None:
+    det = ToneDetector(
+        db,
+        freqs=[TONE],
+        threshold_db=3.0,
+        meta=lambda: {"sample_rate_hz": RATE, "gain_db": 35.0, "device_serial": "T"},
+        hs_run=lambda t: "r1",
+    )
+    await _run(det, _chunks(4.0, tone=(2.0, 2.1)))
+    assert len(await db.query_detections(hs_run="r1")) == 1
+
+
+async def test_a_tone_still_open_when_the_run_ends_keeps_the_run(db) -> None:
+    """Tagged by when it started, not when it is written."""
+    windows = {"r1": (T0.timestamp() + 1.0, T0.timestamp() + 2.05)}
+
+    def run_at(t: float):
+        return next((k for k, (a, b) in windows.items() if a <= t < b), None)
+
+    det = ToneDetector(
+        db,
+        freqs=[TONE],
+        threshold_db=3.0,
+        meta=lambda: {"sample_rate_hz": RATE, "gain_db": 35.0, "device_serial": "T"},
+        hs_run=run_at,
+    )
+    await _run(det, _chunks(4.0, tone=(2.0, 2.5)))
+    assert len(await db.query_detections(hs_run="r1")) == 1

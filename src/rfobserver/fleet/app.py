@@ -6,10 +6,12 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -21,6 +23,7 @@ from rfobserver.__about__ import __version__
 from rfobserver.fleet.live import LiveHub
 from rfobserver.fleet.registry import Registry, parse_address
 from rfobserver.fleet.sensors import CACHE_CLOSED_SEC, CACHE_OPEN_SEC, SensorHub, proxy_allowed
+from rfobserver.schedules.model import HS_MAX_MS
 from rfobserver.web.app import STATIC_DIR, TEMPLATES_DIR, _RevalidatedStaticFiles
 from rfobserver.web.gzip import SafeGZipMiddleware
 from rfobserver.web.uiprefs import THEME_VALUES
@@ -50,6 +53,11 @@ _DOWNLOAD_HEADERS = (
 
 # Stats points carry only what the fleet charts draw.
 _STATS_FIELDS = ("start_time", "pwr_avg", "kurtosis")
+# Fleet high-sensitivity start: the health probe that sorts out offline
+# sensors, and each start or rollback call.
+_HS_PROBE_TIMEOUT_SEC = 3.0
+_HS_START_TIMEOUT_SEC = 5.0
+_HS_RUN_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
 class _Prefs:
@@ -596,6 +604,167 @@ def create_fleet_app(
         return Response(
             content=json.dumps(content), status_code=status, media_type="application/json"
         )
+
+    # -- High-sensitivity mode (docs/high-sensitivity-api.md) --
+
+    def _hs_targets(ids: Any) -> list[Sensor]:
+        if ids is None:
+            return [s for s in registry.all() if s.enabled]
+        if not isinstance(ids, list) or not ids or not all(isinstance(i, str) for i in ids):
+            raise HTTPException(status_code=400, detail="sensors must list at least one sensor id")
+        unknown = [i for i in ids if registry.get(i) is None]
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"Unknown sensors: {', '.join(unknown)}")
+        return [registry.get(i) for i in dict.fromkeys(ids)]  # type: ignore[misc]
+
+    @app.post("/fleet/api/high-sensitivity")
+    async def fleet_hs_start(request: Request) -> Response:
+        """Start one high-sensitivity run on every reachable target, or on
+        none: sensors that do not answer a health probe are skipped as
+        offline; if any reachable one refuses or times out, or fewer than
+        ``min_sensors`` enter, the run is ended on every sensor that entered
+        or may have (timed out)."""
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="The body must be a JSON object")
+        seconds = body.get("seconds")
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+            raise HTTPException(status_code=400, detail="seconds must be a number")
+        if not 1 <= seconds <= HS_MAX_MS / 1000:
+            raise HTTPException(status_code=400, detail="seconds must be 1 to 300")
+        min_sensors = body.get("min_sensors")
+        if min_sensors is not None and (
+            isinstance(min_sensors, bool) or not isinstance(min_sensors, int) or min_sensors < 1
+        ):
+            raise HTTPException(status_code=400, detail="min_sensors must be a whole number >= 1")
+        targets = _hs_targets(body.get("sensors"))
+        rid = body.get("id") or uuid.uuid4().hex[:12]
+        if not isinstance(rid, str) or not _HS_RUN_ID.match(rid):
+            raise HTTPException(
+                status_code=400, detail="id must be 1 to 64 letters, digits, '.', '-' or '_'"
+            )
+        payload: dict[str, Any] = {"seconds": seconds, "id": rid, "source": "fleet"}
+        if body.get("threshold_db") is not None:
+            payload["threshold_db"] = body["threshold_db"]
+        results: dict[str, dict[str, Any]] = {
+            s.id: {"state": "offline", "detail": None, "run": None} for s in targets
+        }
+
+        async def probe(s: Sensor) -> bool:
+            try:
+                reply = await asyncio.wait_for(
+                    hub.get(s, "health", cache=False), _HS_PROBE_TIMEOUT_SEC
+                )
+            except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+                results[s.id]["detail"] = f"{type(exc).__name__}: {exc}"
+                return False
+            return reply.status == 200
+
+        alive = await asyncio.gather(*map(probe, targets))
+        up = [s for s, ok in zip(targets, alive, strict=True) if ok]
+        if not up:
+            content = {"id": rid, "ok": False, "results": results}
+            return Response(json.dumps(content), status_code=502, media_type="application/json")
+        maybe_on: list[Sensor] = []
+
+        async def enter(s: Sensor) -> None:
+            r = results[s.id]
+            try:
+                reply = await asyncio.wait_for(
+                    hub.send(s, "POST", "api/high-sensitivity", payload), _HS_START_TIMEOUT_SEC
+                )
+            except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+                r.update(state="failed", detail=f"{type(exc).__name__}: {exc}")
+                maybe_on.append(s)  # it may have entered before the answer was lost
+                return
+            data = _reply_json(reply)
+            if reply.status == 200:
+                r.update(state="entered", run=data.get("run") if isinstance(data, dict) else None)
+                maybe_on.append(s)
+            else:
+                r.update(state="failed", detail=_detail(data, reply.status))
+
+        await asyncio.gather(*map(enter, up))
+        entered = sum(1 for s in up if results[s.id]["state"] == "entered")
+        need = len(up) if min_sensors is None else min_sensors
+        ok = entered == len(up) and entered >= need
+        if not ok:
+
+            async def roll_back(s: Sensor) -> None:
+                r = results[s.id]
+                try:
+                    reply = await asyncio.wait_for(
+                        hub.send(s, "DELETE", f"api/high-sensitivity/{quote(rid, safe='')}"),
+                        _HS_START_TIMEOUT_SEC,
+                    )
+                except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+                    r.update(state="rollback_failed", detail=f"{type(exc).__name__}: {exc}")
+                    return
+                if reply.status == 200 or (reply.status == 404 and r["state"] == "entered"):
+                    r["state"] = "rolled_back"
+                elif reply.status == 404:
+                    pass  # timed out before it entered: nothing to undo
+                else:
+                    r.update(
+                        state="rollback_failed", detail=_detail(_reply_json(reply), reply.status)
+                    )
+
+            await asyncio.gather(*map(roll_back, maybe_on))
+        content = {"id": rid, "ok": ok, "results": results}
+        return Response(
+            json.dumps(content), status_code=200 if ok else 409, media_type="application/json"
+        )
+
+    @app.delete("/fleet/api/high-sensitivity/{run_id}")
+    async def fleet_hs_stop(run_id: str) -> Response:
+        """End the run on every enabled sensor that has it."""
+        results: dict[str, dict[str, Any]] = {}
+
+        async def one(s: Sensor) -> None:
+            try:
+                reply = await hub.send(s, "DELETE", f"api/high-sensitivity/{run_id}")
+            except httpx.HTTPError as exc:
+                results[s.id] = {
+                    "ok": False,
+                    "status": 502,
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
+                return
+            ok = reply.status == 200
+            data = _reply_json(reply)
+            results[s.id] = {
+                "ok": ok,
+                "status": reply.status,
+                "detail": None if ok else _detail(data, reply.status),
+            }
+
+        await asyncio.gather(*(one(s) for s in registry.all() if s.enabled))
+        status = 200 if any(r["ok"] for r in results.values()) else 404
+        return Response(
+            json.dumps({"id": run_id, "results": results}),
+            status_code=status,
+            media_type="application/json",
+        )
+
+    @app.get("/fleet/api/high-sensitivity/{run_id}")
+    async def fleet_hs_summary(run_id: str) -> dict[str, Any]:
+        """Each enabled sensor's summary of the run (or its error)."""
+        out: dict[str, Any] = {}
+
+        async def one(s: Sensor) -> None:
+            try:
+                reply = await hub.get(s, f"high-sensitivity/{run_id}", cache=False)
+            except httpx.HTTPError as exc:
+                out[s.id] = {"error": f"{type(exc).__name__}: {exc}"}
+                return
+            data = _reply_json(reply)
+            out[s.id] = data if reply.status == 200 else {"error": _detail(data, reply.status)}
+
+        await asyncio.gather(*(one(s) for s in registry.all() if s.enabled))
+        return {"id": run_id, "sensors": out}
 
     @app.get("/fleet/api/schedules")
     async def fleet_schedule_list() -> dict[str, Any]:

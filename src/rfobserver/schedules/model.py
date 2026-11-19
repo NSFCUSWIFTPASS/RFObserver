@@ -41,6 +41,16 @@ class Schedule:
     label: str
     source: str
     created_ms: int
+    # High-sensitivity mode around each run (pipeline/high_sensitivity.py):
+    # on HS_LEAD_SEC before the capture, off when it ends.
+    high_sensitivity: bool = False
+    hs_threshold_db: float | None = None
+
+
+# High-sensitivity limits (the same as pipeline/high_sensitivity.py's).
+HS_MAX_MS = 300_000
+HS_MIN_THRESHOLD_DB = 10.0
+HS_MAX_THRESHOLD_DB = 30.0
 
 
 def iso_ms(ms: int) -> str:
@@ -89,6 +99,7 @@ def parse_schedule(
     source: str,
     new_id: Callable[[], str],
     allow_past: bool = False,
+    hs_lead_ms: int = 2000,
 ) -> Schedule:
     """A Schedule from an API body, or ScheduleError with the reason.
 
@@ -136,6 +147,26 @@ def parse_schedule(
     label = body.get("label") or ""
     if not isinstance(label, str):
         raise ScheduleError("label must be text")
+
+    hs = body.get("high_sensitivity", False)
+    if not isinstance(hs, bool):
+        raise ScheduleError("high_sensitivity must be true or false")
+    hs_thr = body.get("hs_threshold_db")
+    if hs_thr is not None:
+        if not hs:
+            raise ScheduleError("hs_threshold_db needs high_sensitivity")
+        if isinstance(hs_thr, bool) or not isinstance(hs_thr, (int, float)):
+            raise ScheduleError("hs_threshold_db must be a number")
+        if not HS_MIN_THRESHOLD_DB <= hs_thr <= HS_MAX_THRESHOLD_DB:
+            raise ScheduleError(
+                f"hs_threshold_db must be {HS_MIN_THRESHOLD_DB:.0f} to {HS_MAX_THRESHOLD_DB:.0f}"
+            )
+    if hs and 2 * hs_lead_ms + duration > HS_MAX_MS:
+        raise ScheduleError(
+            f"a high_sensitivity run lasts at most {HS_MAX_MS // 1000} s including its "
+            f"{hs_lead_ms / 1000:g} s lead and tail: duration_ms must be at most "
+            f"{HS_MAX_MS - 2 * hs_lead_ms}"
+        )
     s = Schedule(
         id=sid,
         start_ms=start,
@@ -146,6 +177,8 @@ def parse_schedule(
         label=label.strip()[:_LABEL_MAX],
         source=source,
         created_ms=now_ms,
+        high_sensitivity=hs,
+        hs_threshold_db=None if hs_thr is None else float(hs_thr),
     )
     if total_runs(s) > MAX_RUNS:
         raise ScheduleError(f"a schedule may have at most {MAX_RUNS} runs")
@@ -220,4 +253,6 @@ def from_json(d: dict[str, Any]) -> Schedule:
         label=d.get("label") or "",
         source=d.get("source") or "api",
         created_ms=int(d.get("created_ms") or 0),
+        high_sensitivity=bool(d.get("high_sensitivity", False)),
+        hs_threshold_db=d.get("hs_threshold_db"),
     )

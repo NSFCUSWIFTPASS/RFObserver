@@ -98,6 +98,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         config,
         dashboard,
         detections,
+        high_sensitivity,
         modules,
         schedules,
     )
@@ -111,6 +112,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.include_router(averaged.router)
     app.include_router(collection.router, prefix="/api/collection")
     app.include_router(schedules.router, prefix="/api/schedules")
+    app.include_router(high_sensitivity.router, prefix="/api/high-sensitivity")
     app.include_router(api.router, prefix="/api")
     app.include_router(modules.router, prefix="/api")
 
@@ -156,6 +158,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 body["isolation"] = proc.isolation_status()
             if proc is not None and hasattr(proc, "tone_detector_status"):
                 body["tone_detector"] = proc.tone_detector_status()
+        hs = high_sensitivity.status(app)
+        if hs is not None:
+            body["high_sensitivity"] = hs
         gov = getattr(app.state, "storage_governor", None)
         if gov is not None:
             st = gov.state

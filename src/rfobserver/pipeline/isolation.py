@@ -153,8 +153,12 @@ class IsolationStage:
         refuse_saving: Callable[[], bool] = lambda: False,
         archive_subdir: str | None = None,
         clock: Callable[[], float] = time.monotonic,
+        max_per_sec: Callable[[], int] | None = None,
     ) -> None:
         self._s = settings
+        # The per-second budget, read per batch (high-sensitivity mode raises
+        # it); ISOLATION_MAX_PER_SEC when not given.
+        self._max_per_sec = max_per_sec or (lambda: int(settings.ISOLATION_MAX_PER_SEC))
         self._archive = archive
         self._module_feed = module_feed
         self._handoff = attribution_handoff
@@ -324,7 +328,7 @@ class IsolationStage:
         now = max(stops) / float(sample_rate_hz) if stops and sample_rate_hz > 0 else self._clock()
         if now < self._window_start or now - self._window_start >= 1.0:
             self._window_start, self._window_count, self._window_long = now, 0, 0
-        room = max(0, int(s.ISOLATION_MAX_PER_SEC) - self._window_count)
+        room = max(0, int(self._max_per_sec()) - self._window_count)
         long_room = max(0, int(s.ISOLATION_LONG_MAX_PER_SEC) - self._window_long)
         long_sec = float(s.ISOLATION_LONG_MS) / 1000.0
         picked = []
@@ -583,6 +587,7 @@ def build_isolation(
     refuse_saving: Callable[[], bool],
     replay_source: str | None,
     on_label: Callable[[AttributionResult], None] | None,
+    max_per_sec: Callable[[], int] | None = None,
 ) -> tuple[IsolationStage | None, AttributionWorker | None, str | None]:
     """Build the stage (and the attribution worker when attribution is on).
 
@@ -627,6 +632,7 @@ def build_isolation(
         attribution_handoff=handoff,
         refuse_saving=refuse_saving,
         archive_subdir=subdir,
+        max_per_sec=max_per_sec,
     )
 
     worker: AttributionWorker | None = None

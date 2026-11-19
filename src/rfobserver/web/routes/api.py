@@ -1119,6 +1119,7 @@ async def detections_json(
     until: str | None = None,
     attributed: str | None = None,
     model: str | None = None,
+    hs_run: str | None = None,
 ) -> dict[str, list[dict[str, Any]]] | Response:
     """JSON detections for external tooling (e.g. the OTA burst validator) and
     the fleet's Detections page.
@@ -1129,7 +1130,8 @@ async def detections_json(
     sdr context, model and attribution), newest first. ``since``/``until``
     scope by detection start_time (``until`` exclusive, so the fleet pages
     with it); ``attributed`` ('true'/'false') and ``model`` as on the
-    Detections page.
+    Detections page; ``hs_run`` limits to one high-sensitivity run's rows
+    (``any``: every run's).
     """
     db = _get_db(request)
     if db is None:
@@ -1146,6 +1148,7 @@ async def detections_json(
                 until=_opt_dt(until),
                 attributed=_opt_bool(attributed),
                 model=_opt_str(model),
+                hs_run=_opt_str(hs_run),
             )
         except Exception:
             logger.exception("detections.json query failed")

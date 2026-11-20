@@ -3780,6 +3780,15 @@ class StreamingProcessor:
                     self._burst_grids_done += 1
                     continue
 
+                # A grid on another frequency axis (a bandwidth change: grids
+                # from before it are still queued, with the same bin count)
+                # starts a fresh window on its own axis.
+                if rolling_detector is not None and not np.array_equal(
+                    rolling_detector._freq_axis, psd_grid.freq_axis
+                ):
+                    logger.info("Burst detection: frequency axis changed; new window")
+                    rolling_detector = None
+
                 if rolling_detector is None:
                     freqs = self._build_frequency_list()
                     center_freq = freqs[0] if freqs else s.FREQUENCY_START

@@ -91,12 +91,22 @@ Reproduction after 26 -> 56 -> 26 MS/s:
   the capture clock (+17 to +28 ms). Do not match bursts to transmissions with
   a tight time window.
 
+## Fix (2026-11-20)
+
+The burst loop rebuilds the detector whenever a grid's `freq_axis` differs from
+the one the detector was built with. A stale grid is still read on its own
+(old) axis, and the first grid at the new rate starts a fresh window on the new
+one. Test: `tests/unit/test_burst_freq_axis.py` (56, 26, 26 MS/s grids, same
+bin count; each must be fed to a detector on its own axis), failed before the
+fix with the 26 MS/s grid read on the 56 MS/s axis.
+
+Verified on .177 (the fix's streaming.py copied over, service restarted): the
+26 -> 56 -> 26 MS/s reproduction above, no restart after it, then a daily
+check through the fleet: 2547 rows in the next 5.5 minutes, all within
+902.0-927.98 MHz, and 83/83 SSM hops decoded in both epochs (45 and 30 dB).
+
 ## Open, not yet answered
 
-- Fix not written. Candidate: rebuild the detector when a grid's `freq_axis`
-  differs from the one it was built with (or skip grids whose axis does not
-  match the current `BANDWIDTH`), with a unit test feeding a stale grid after a
-  generation bump.
 - Whether a centre-only retune (sweep mode, schedule-driven retune) has the
   same staleness for the centre: the detector takes its centre from settings,
   not from the grid's `freq_hz`; not checked.

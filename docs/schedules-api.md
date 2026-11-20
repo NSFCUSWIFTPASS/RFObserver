@@ -232,6 +232,10 @@ Run `status`:
   recording), `storage` (storage refused recording; `info.detail` says why).
 - `failed`: the file could not be written (`reason` holds the error).
 
+A high-sensitivity-only schedule (`"capture": false`) writes no file; its runs
+are `running`, then `done` or `partial`, or `missed` (`hs_busy`, `not_running`).
+See docs/high-sensitivity-api.md.
+
 ## Delete a schedule
 
 Cancels its future runs. A run already recording finishes, and recorded files
@@ -375,6 +379,7 @@ PPS into the radios).
 | `created_ms` | When it was created, epoch ms |
 | `high_sensitivity` | Whether high-sensitivity mode runs around each capture: on `HS_LEAD_SEC` (2 s) before it, off when it ends; at most 300 s including the lead (docs/high-sensitivity-api.md) |
 | `hs_threshold_db` | The burst threshold for those runs (10 to 30), or null for `HS_BURST_THRESHOLD_DB` |
+| `capture` | Whether runs record IQ (default true). False: high-sensitivity only, on for the window itself, no file; needs `high_sensitivity`, `duration_ms` at most 300000 (docs/high-sensitivity-api.md) |
 | `next_runs` | The next five runs not yet started |
 | `next_run` | The next run not yet started, or null |
 | `run` | A run's number, from 0 |

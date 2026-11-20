@@ -143,6 +143,8 @@ class ScheduleEngine:
         now_ms = int(capture_time * 1000)
         fresh: dict[str, tuple[Schedule, int | None]] = {}
         for s in schedules:
+            if not s.capture:
+                continue  # high-sensitivity only: the pipeline runs it
             if s.id in self._next:
                 fresh[s.id] = self._next[s.id]
                 continue

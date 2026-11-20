@@ -747,6 +747,9 @@ class StreamingProcessor:
         self._hs_snap: dict[str, dict[str, Any]] = {}
         # Flagged schedule runs already handled (run id -> end, epoch s).
         self._hs_sched_seen: dict[str, float] = {}
+        # High-sensitivity-only schedule runs in progress (run id -> schedule
+        # id, run, start ms): their outcome is reported when the run ends.
+        self._hs_only_runs: dict[str, tuple[str, int, int]] = {}
 
         # Compute chunk sizing from current settings
         self._recompute_chunk_params()
@@ -1446,6 +1449,8 @@ class StreamingProcessor:
     def _on_hs_event(self, event: str, run: Any) -> None:
         """Controller listener (any thread): hand the tone detector's start
         or stop to the event loop."""
+        if event == "end":
+            self._hs_only_end(run)
         loop = self._loop
         if loop is None or loop.is_closed():
             return
@@ -1460,9 +1465,11 @@ class StreamingProcessor:
 
     def _hs_schedule_tick(self, now: float) -> None:
         """Start high-sensitivity mode for a flagged schedule's run that is
-        due within HS_LEAD_SEC; it ends with the capture. A run that finds
-        another one on is skipped (logged; the capture records the run in
-        force). Called on the event loop once per result."""
+        due: a capture's within HS_LEAD_SEC, ending with the capture; a
+        high-sensitivity-only run (capture false) for its window itself, its
+        outcome reported to the book. A run that finds another one on is
+        skipped (logged; the capture records the run in force; an HS-only run
+        is reported missed). Called on the event loop once per result."""
         book = self._schedules
         if book is None:
             return
@@ -1472,16 +1479,19 @@ class StreamingProcessor:
         for s in book.snapshot()[1]:
             if not s.high_sensitivity:
                 continue
-            for k in runs_between(s, now_ms - s.duration_ms - lead_ms + 1, now_ms + lead_ms + 1, 2):
+            lead = lead_ms if s.capture else 0
+            for k in runs_between(s, now_ms - s.duration_ms - lead + 1, now_ms + lead + 1, 2):
                 start_ms = run_start_ms(s, k)
                 # On past the capture's end by the lead too: the pipeline
                 # processes it behind the radio.
-                end = (start_ms + s.duration_ms + lead_ms) / 1000
+                end = (start_ms + s.duration_ms + lead) / 1000
                 # Unique even when a schedule is deleted and made again.
                 run_id = f"{s.id}-{k}-{start_ms}"
-                if run_id in self._hs_sched_seen or not start_ms - lead_ms <= now_ms < end * 1000:
+                if run_id in self._hs_sched_seen or not start_ms - lead <= now_ms < end * 1000:
                     continue
                 self._hs_sched_seen[run_id] = end
+                if not s.capture:
+                    self._hs_only_runs[run_id] = (s.id, k, start_ms)
                 try:
                     self.high_sensitivity.start(
                         end - now,
@@ -1491,6 +1501,37 @@ class StreamingProcessor:
                     )
                 except HSError as exc:
                     logger.warning("High sensitivity for schedule run %s skipped: %s", run_id, exc)
+                    if not s.capture:
+                        del self._hs_only_runs[run_id]
+                        book.report_run(
+                            s.id,
+                            k,
+                            "missed",
+                            start_ms=start_ms,
+                            reason="hs_busy",
+                            info={"detail": str(exc)},
+                        )
+                    continue
+                if not s.capture:
+                    book.report_run(s.id, k, "running", start_ms=start_ms, info={"hs_run": run_id})
+
+    def _hs_only_end(self, run: Any) -> None:
+        """A high-sensitivity-only schedule run ended: done when it ran its
+        window, else partial with the reason (retune, stopped, deleted)."""
+        entry = self._hs_only_runs.pop(run.id, None)
+        book = self._schedules
+        if entry is None or book is None:
+            return
+        sid, k, start_ms = entry
+        reason = None if run.end_reason == "expired" else run.end_reason
+        book.report_run(
+            sid,
+            k,
+            "done" if reason is None else "partial",
+            start_ms=start_ms,
+            reason=reason,
+            info={"hs_run": run.id},
+        )
 
     def _hs_counters(self) -> dict[str, Any]:
         rx = self._receiver

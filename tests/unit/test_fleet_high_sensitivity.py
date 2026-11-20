@@ -151,10 +151,11 @@ def test_fleet_schedule_passes_the_flag_through(fleet: Any) -> None:
         "start": "2026-11-19T16:00:00Z",
         "duration_ms": 60000,
         "high_sensitivity": True,
+        "capture": False,
         "sensors": ["a"],
     }
     assert client.post("/fleet/api/schedules", json=body).status_code == 201
-    assert seen and seen[0]["high_sensitivity"] is True
+    assert seen and seen[0]["high_sensitivity"] is True and seen[0]["capture"] is False
 
 
 def test_fleet_refuses_ids_that_are_not_plain(fleet: Any) -> None:

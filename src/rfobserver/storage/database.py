@@ -2452,12 +2452,13 @@ class SensorDatabase:
 
     @_guarded_write
     async def end_unfinished_runs(self) -> int:
-        """Runs still marked recording (the process ended mid-run) become
-        partial, reason stopped. Returns how many."""
+        """Runs still marked recording or running (a high-sensitivity-only
+        run; the process ended mid-run) become partial, reason stopped.
+        Returns how many."""
         assert self._db is not None
         cursor = await self._db.execute(
             "UPDATE schedule_runs SET status = 'partial', reason = 'stopped' "
-            "WHERE status = 'recording'"
+            "WHERE status IN ('recording', 'running')"
         )
         await self._db.commit()
         return int(cursor.rowcount or 0)

@@ -3282,8 +3282,10 @@ body {
     white-space: nowrap;
 }
 
-.sched-status.recorded { background: rgba(52, 199, 89, 0.16); color: #248a3d; }
-.sched-status.recording { background: rgba(0, 113, 227, 0.14); color: var(--accent); }
+.sched-status.recorded,
+.sched-status.done { background: rgba(52, 199, 89, 0.16); color: #248a3d; }
+.sched-status.recording,
+.sched-status.running { background: rgba(0, 113, 227, 0.14); color: var(--accent); }
 .sched-status.partial { background: rgba(255, 159, 10, 0.18); color: #b25000; }
 .sched-status.missed,
 .sched-status.failed { background: rgba(255, 59, 48, 0.14); color: #d70015; }

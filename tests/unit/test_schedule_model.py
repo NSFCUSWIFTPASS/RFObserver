@@ -188,3 +188,26 @@ def test_hs_threshold_needs_the_flag_and_a_range() -> None:
             )
     with pytest.raises(ScheduleError):
         parse({"start": iso(T), "duration_ms": 2000, "high_sensitivity": "yes"})
+
+
+# -- High-sensitivity only (no capture) --
+
+
+def test_hs_only_schedule_round_trips_and_writes_nothing() -> None:
+    s = parse({"start": iso(T), "duration_ms": 300_000, "capture": False, "high_sensitivity": True})
+    assert s.capture is False and s.high_sensitivity is True
+    assert schedule_bytes(s, 26e6) == 0
+    assert from_json(to_json(s)) == s
+    plain = parse({"start": iso(T), "duration_ms": 2000})
+    assert plain.capture is True
+    assert from_json({k: v for k, v in to_json(plain).items() if k != "capture"}) == plain
+
+
+def test_hs_only_needs_the_flag_and_at_most_300_s() -> None:
+    with pytest.raises(ScheduleError, match="capture"):
+        parse({"start": iso(T), "duration_ms": 2000, "capture": False})
+    with pytest.raises(ScheduleError, match="capture"):
+        parse({"start": iso(T), "duration_ms": 2000, "capture": "no", "high_sensitivity": True})
+    # No lead or tail: the run is the window itself.
+    with pytest.raises(ScheduleError, match="300"):
+        parse({"start": iso(T), "duration_ms": 300_001, "capture": False, "high_sensitivity": True})

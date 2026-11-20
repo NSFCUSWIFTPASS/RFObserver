@@ -429,3 +429,23 @@ async def test_a_repeating_schedule_still_marks_the_runs_after_its_last(
         3,
         4,
     ]
+
+
+async def test_hs_only_schedule_records_nothing(book: ScheduleBook, tmp_path: Path) -> None:
+    await book.add(sched("h", T0_MS + 250, 120, capture=False, high_sensitivity=True))
+    rig = Rig(book, tmp_path)
+    rig.chunks(5)
+    assert rig.writer.opened == {}
+    assert book.latest("h", 0) is None  # its outcome comes from the pipeline's HS side
+
+
+async def test_an_hs_only_run_cut_off_by_a_crash_is_partial_after_reload(
+    book: ScheduleBook,
+) -> None:
+    await book.add(sched("h", T0_MS + 100, 50, capture=False, high_sensitivity=True))
+    book.report_run("h", 0, "running", start_ms=T0_MS + 100, info={"hs_run": "h-0-1"})
+    await asyncio.sleep(0.05)
+    again = ScheduleBook(book.db, now=lambda: T0)
+    await again.load()
+    (run,) = await again.runs("h", 10)
+    assert run["status"] == "partial" and run["reason"] == "stopped"

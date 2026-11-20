@@ -224,6 +224,8 @@
         upcomingEl.innerHTML = rows.map(function (it) {
             const s = it.schedule;
             const sub = [s.duration_ms / 1000 + " s", repeatText(s, it.next.run)];
+            if (s.capture === false) sub.push("High sensitivity only");
+            else if (s.high_sensitivity) sub.push("High sensitivity");
             if (s.label) sub.push(esc(s.label));
             if (it.where) sub.push(it.where);
             return '<div class="sched-item">'

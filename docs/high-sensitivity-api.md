@@ -88,6 +88,36 @@ curl -s -X POST "$SENSOR/api/schedules" -H "Content-Type: application/json" \
 Through the fleet (`POST /fleet/api/schedules`) the flag reaches each sensor
 unchanged; each sensor's result is reported on its own, as for any schedule.
 
+## High sensitivity only, on a schedule
+
+Add `"capture": false` too and the schedule records no IQ: each run turns the
+mode on at its start and off at start + `duration_ms`, with no lead or tail,
+so `duration_ms` may be up to 300000. It repeats like any schedule
+(`every_ms` with `count` or `until`), and takes `hs_threshold_db`.
+
+```bash
+curl -s -X POST "$SENSOR/api/schedules" -H "Content-Type: application/json" \
+  -d '{"id": "daily-hs", "start": "2026-11-20T16:00:00Z", "duration_ms": 300000,
+       "every_ms": 86400000, "count": 30, "high_sensitivity": true, "capture": false}'
+```
+
+The same body with `"sensors": [...]` goes to `POST /fleet/api/schedules` to put
+it on several sensors; each starts its runs from its own clock. Each run's
+outcome is in the schedule's runs (`GET /api/schedules/{id}`), with
+`info.hs_run` naming the run (its summary is at
+`GET /api/high-sensitivity/{hs_run}`):
+
+- `running`: on now.
+- `done`: it ran its whole window.
+- `partial`: it ended early; `reason` is `retune`, `stopped` or `deleted`
+  (`stopped` also after a restart cut it off).
+- `missed`: `reason` `hs_busy` when another run was already on (`info.detail`),
+  or `not_running` when the sensor was off or not processing at the time.
+
+A sensor on 0.16.0b0 or older ignores `capture` and records the window as a
+capture instead (up to 300 s of IQ); check the sensors' versions before
+sending one through the fleet.
+
 ## Through the fleet
 
 `POST /fleet/api/high-sensitivity` starts one run (one `id`) on every sensor

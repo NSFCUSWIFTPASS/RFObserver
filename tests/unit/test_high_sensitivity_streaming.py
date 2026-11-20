@@ -4,6 +4,7 @@ detector for the run, the run ended by a retune, routine state restored."""
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 from tests.unit.test_recording_gaps import _proc
 
@@ -115,11 +116,16 @@ class _Book:
     def __init__(self, schedules) -> None:
         self._s = schedules
 
+        self.reports: list[tuple] = []
+
     def snapshot(self):
         return 1, list(self._s)
 
+    def report_run(self, sid, run, status, *, start_ms, filename=None, reason=None, info=None):
+        self.reports.append((sid, run, status, reason, (info or {}).get("hs_run")))
 
-def _flagged(start_ms: int, duration_ms: int = 60_000, **kw):
+
+def _flagged(start_ms: int, duration_ms: int = 60_000, **kw: Any):
     from rfobserver.schedules.model import Schedule
 
     return Schedule(
@@ -211,3 +217,46 @@ async def test_each_run_summary_uses_its_own_counters(tmp_path, monkeypatch):
         await asyncio.sleep(0)
     a = [r for r in db.saved if r["id"] == "A" and r["summary"]][-1]["summary"]
     assert a["overflow_events"] == 2
+
+
+def test_hs_only_run_is_on_for_its_window_and_reports_its_outcome(tmp_path):
+    proc = _proc(tmp_path)
+    t0 = 1_795_000_000_000
+    book = _Book([_flagged(t0, 120_000, capture=False)])
+    proc._schedules = book
+    proc._hs_schedule_tick(t0 / 1000 - 1.0)  # no lead without a capture
+    assert proc.high_sensitivity.current() is None
+    proc.high_sensitivity._clock = lambda: t0 / 1000 + 0.1
+    proc._hs_schedule_tick(t0 / 1000 + 0.1)
+    run = proc.high_sensitivity.current()
+    assert run is not None and run.id == f"daily-0-{t0}"
+    assert abs(run.end - (t0 / 1000 + 120.0)) < 1e-6  # no tail either
+    assert book.reports == [("daily", 0, "running", None, run.id)]
+    proc.high_sensitivity._clock = lambda: t0 / 1000 + 120.0
+    assert proc.high_sensitivity.current() is None
+    assert book.reports[-1] == ("daily", 0, "done", None, run.id)
+
+
+def test_hs_only_run_cut_short_is_partial(tmp_path):
+    proc = _proc(tmp_path)
+    t0 = 1_795_000_000_000
+    book = _Book([_flagged(t0, 120_000, capture=False)])
+    proc._schedules = book
+    proc.high_sensitivity._clock = lambda: t0 / 1000 + 0.1
+    proc._hs_schedule_tick(t0 / 1000 + 0.1)
+    proc.high_sensitivity.end_now("retune")
+    assert book.reports[-1][2:4] == ("partial", "retune")
+
+
+def test_hs_only_run_while_another_hs_run_is_on_is_missed(tmp_path):
+    proc = _proc(tmp_path)
+    t0 = 1_795_000_000_000
+    proc.high_sensitivity._clock = lambda: t0 / 1000
+    proc.high_sensitivity.start(120, run_id="manual")
+    book = _Book([_flagged(t0, 60_000, capture=False)])
+    proc._schedules = book
+    proc._hs_schedule_tick(t0 / 1000 + 0.1)
+    assert proc.high_sensitivity.current().id == "manual"
+    assert book.reports == [("daily", 0, "missed", "hs_busy", None)]
+    proc._hs_schedule_tick(t0 / 1000 + 0.2)  # reported once
+    assert len(book.reports) == 1

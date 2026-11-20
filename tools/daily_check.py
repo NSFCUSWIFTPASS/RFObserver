@@ -5,7 +5,8 @@ back what each sensor detected and score it.
 1. Stage the run on the TX host: the tone sequence (its steps shifted by
    --tone-offset-db), its waveforms, and an ssm-tx config per SSM gain (one
    epoch, DEBUG so every hop is logged with its time).
-2. Schedule on every sensor: a high-sensitivity-only run from --hs-pre before
+2. Schedule on every sensor, through the fleet (--fleet, as at HCRO) or on each
+   sensor directly (--sensor): a high-sensitivity-only run from --hs-pre before
    the tones for --hs-seconds, and (unless --capture-ms 0) a short IQ capture
    of the tones.
 3. Transmit: the tone sequence starts at T0 with ssm-tx --utc-start; then one
@@ -20,11 +21,12 @@ back what each sensor detected and score it.
 Needs only the Python standard library. ssm-tx runs over ssh on --tx-host
 (key login), or locally without it.
 
-usage:
-  python3 tools/daily_check.py --sensor http://192.168.97.177 \\
+usage (the lab: fleet and sensor on .177, ssm-tx on nano-super):
+  python3 tools/daily_check.py --fleet http://192.168.97.177:8888 \\
       --tx-host ocollaco@192.168.97.153 --ssm-tx '~/GitHub/ssm-tx/.venv/bin/ssm-tx' \\
-      --sequence tone_steps_sequence.json --waveforms DIR \\
-      --tone-offset-db -30 --ssm-gains 60 45
+      --sequence tone_steps_sequence.json --tone-offset-db -14 --ssm-gains 45 30
+
+  --sensor http://192.168.97.177 in place of --fleet talks to the sensor itself.
 """
 
 from __future__ import annotations
@@ -92,61 +94,163 @@ def get(url: str, **params: Any) -> Any:
     return body
 
 
-def preflight_sensor(url: str, seq_freqs: list[float]) -> dict[str, Any]:
-    """Identity, tuning, clock offset; refuse a sensor that cannot do this."""
-    ident = get(url + "/api/identity")
-    name = ident.get("hostname") or url
+def tuning_problems(ident: dict[str, Any]) -> list[str]:
+    """Why a sensor (its identity: tuning, active) cannot run the check."""
     center, rate = float(ident["center_freq_hz"]), float(ident["sample_rate_hz"])
     lo, hi = center - rate / 2, center + rate / 2
     problems = []
     if not ident.get("active"):
         problems.append("sensor is not active")
-    missing = [f for f in seq_freqs if not lo < f < hi]
+    missing = [f / 1e6 for f in TONE_FREQS if not lo < f < hi]
     if missing:
-        problems.append(
-            f"tones {[f / 1e6 for f in missing]} MHz outside {lo / 1e6:.2f}-{hi / 1e6:.2f}"
-        )
+        problems.append(f"tones {missing} MHz outside {lo / 1e6:.2f}-{hi / 1e6:.2f}")
     if not (lo < SSM_BAND[0] and SSM_BAND[1] < hi):
         problems.append(
-            f"SSM band 902.6-927.2 MHz not inside {lo / 1e6:.2f}-{hi / 1e6:.2f} (some hops unseen)"
+            f"SSM band 902.6-927.2 MHz not inside {lo / 1e6:.2f}-{hi / 1e6:.2f} (hops unseen)"
         )
-    hs = get(url + "/api/high-sensitivity")
-    if hs.get("run"):
-        problems.append(f"a high-sensitivity run is on: {hs['run'].get('id')}")
-    # A sensor without high-sensitivity-only schedules would record the whole
-    # window as IQ: probe with a body only such a sensor refuses for `capture`.
-    code, body = http(
-        "POST",
-        url + "/api/schedules",
-        {"start_ms": int((time.time() - 3600) * 1000), "duration_ms": 1000, "capture": "probe"},
-    )
-    if not (code == 400 and "capture" in str(body)):
-        problems.append(
-            "sensor does not support high-sensitivity-only schedules (RFObserver after 0.16.0b0)"
+    return problems
+
+
+# A sensor without high-sensitivity-only schedules would record the whole HS
+# window as IQ. Probe with a body only such a sensor refuses for `capture`
+# (an older one refuses it as past, so nothing is ever stored).
+def _probe_body() -> dict[str, Any]:
+    return {"start_ms": int((time.time() - 3600) * 1000), "duration_ms": 1000, "capture": "x"}
+
+
+NO_HS_ONLY = "no high-sensitivity-only schedules (needs RFObserver after 0.16.0b0)"
+
+
+class Direct:
+    """Sensors reached one by one at their own URLs."""
+
+    kind = "sensor"
+
+    def __init__(self, urls: list[str]) -> None:
+        self.urls = {}
+        for u in urls:
+            u = u.rstrip("/")
+            self.urls[str(get(u + "/api/identity")["id"])] = u
+
+    def preflight(self) -> list[dict[str, Any]]:
+        out = []
+        for sid, url in self.urls.items():
+            ident = get(url + "/api/identity")
+            problems = tuning_problems(ident)
+            run = get(url + "/api/high-sensitivity").get("run")
+            if run:
+                problems.append(f"a high-sensitivity run is on: {run.get('id')}")
+            code, body = http("POST", url + "/api/schedules", _probe_body())
+            if not (code == 400 and "capture" in str(body)):
+                problems.append(NO_HS_ONLY)
+            t0 = time.time()
+            now_ms = get(url + "/api/schedules")["now_ms"]
+            t1 = time.time()
+            out.append(_sensor_info(sid, ident, problems, now_ms / 1000 - (t0 + t1) / 2))
+        return out
+
+    def schedule(self, ids: list[str], body: dict[str, Any]) -> None:
+        for sid in ids:
+            code, resp = http("POST", self.urls[sid] + "/api/schedules", body)
+            if code not in (200, 201):
+                raise RuntimeError(f"{sid}: schedule {body['id']} refused ({code}): {resp}")
+            for w in resp.get("warnings") or []:
+                log(f"  {sid}: {w}")
+
+    def last_run(self, sid: str, sched_id: str) -> dict[str, Any]:
+        runs = get(f"{self.urls[sid]}/api/schedules/{sched_id}").get("runs") or []
+        return runs[0] if runs else {}
+
+    def hs_summary(self, sid: str, run_id: str) -> dict[str, Any]:
+        url = f"{self.urls[sid]}/api/high-sensitivity/{urllib.parse.quote(run_id)}"
+        return get(url).get("summary") or {}
+
+    def detections(self, sid: str, **params: Any) -> list[dict[str, Any]]:
+        return get(f"{self.urls[sid]}/api/detections.json", **params)["detections"]
+
+
+class Fleet:
+    """Sensors reached through a fleet (POST /fleet/api/schedules and the
+    fleet's read-only pass-through to each sensor), as at HCRO."""
+
+    kind = "fleet"
+
+    def __init__(self, url: str, only: list[str] | None) -> None:
+        self.url = url.rstrip("/")
+        listed = {s["id"]: s for s in get(self.url + "/fleet/api/sensors")["sensors"]}
+        unknown = [i for i in only or [] if i not in listed]
+        if unknown:
+            raise SystemExit(f"the fleet has no sensors {unknown}; it has {sorted(listed)}")
+        self.sensors = {
+            i: s for i, s in listed.items() if (i in only if only else s.get("enabled", True))
+        }
+
+    def preflight(self) -> list[dict[str, Any]]:
+        ids = list(self.sensors)
+        code, resp = http(
+            "POST", self.url + "/fleet/api/schedules", {**_probe_body(), "sensors": ids}
         )
-    t0 = time.time()
-    now_ms = get(url + "/api/schedules")["now_ms"]
-    t1 = time.time()
-    skew = now_ms / 1000 - (t0 + t1) / 2
+        probe = (resp or {}).get("results") or {}
+        out = []
+        for sid, s in self.sensors.items():
+            if not s.get("online"):
+                out.append(_sensor_info(sid, {}, [f"offline in the fleet: {s.get('error')}"], None))
+                continue
+            ident = {**s["tuning"], "active": s.get("active"), "version": s.get("version")}
+            problems = tuning_problems(ident)
+            hs = self._proxy(sid, "health").get("high_sensitivity") or {}
+            if hs.get("active"):
+                problems.append(f"a high-sensitivity run is on: {(hs.get('run') or {}).get('id')}")
+            r = probe.get(sid) or {}
+            if not (r.get("status") == 400 and "capture" in str(r.get("detail"))):
+                problems.append(NO_HS_ONLY)
+            out.append(_sensor_info(sid, ident, problems, None))
+        return out
+
+    def clock_offset(self) -> float:
+        t0 = time.time()
+        now_ms = get(self.url + "/fleet/api/schedules")["now_ms"]
+        t1 = time.time()
+        return now_ms / 1000 - (t0 + t1) / 2
+
+    def schedule(self, ids: list[str], body: dict[str, Any]) -> None:
+        code, resp = http("POST", self.url + "/fleet/api/schedules", {**body, "sensors": ids})
+        results = (resp or {}).get("results") or {}
+        bad = {i: r.get("detail") for i, r in results.items() if not r.get("ok")}
+        if code not in (200, 201) or bad:
+            raise RuntimeError(f"fleet: schedule {body['id']} refused ({code}): {bad or resp}")
+        for w in resp.get("warnings") or []:
+            log(f"  {w}")
+
+    def last_run(self, sid: str, sched_id: str) -> dict[str, Any]:
+        for e in get(self.url + "/fleet/api/schedules")["schedules"]:
+            if e["id"] == sched_id:
+                return ((e.get("sensors") or {}).get(sid) or {}).get("last_run") or {}
+        return {}
+
+    def hs_summary(self, sid: str, run_id: str) -> dict[str, Any]:
+        data = get(f"{self.url}/fleet/api/high-sensitivity/{urllib.parse.quote(run_id)}")
+        return (data["sensors"].get(sid) or {}).get("summary") or {}
+
+    def detections(self, sid: str, **params: Any) -> list[dict[str, Any]]:
+        return self._proxy(sid, "detections.json", **params)["detections"]
+
+    def _proxy(self, sid: str, path: str, **params: Any) -> Any:
+        return get(f"{self.url}/fleet/s/{urllib.parse.quote(sid)}/api/{path}", **params)
+
+
+def _sensor_info(
+    sid: str, ident: dict[str, Any], problems: list[str], clock: float | None
+) -> dict[str, Any]:
     return {
-        "url": url,
-        "name": name,
+        "id": sid,
         "version": ident.get("version"),
-        "center_hz": center,
-        "rate_hz": rate,
+        "center_hz": ident.get("center_freq_hz"),
+        "rate_hz": ident.get("sample_rate_hz"),
         "gain_db": ident.get("gain_db"),
-        "clock_offset_s": round(skew, 4),
-        "rtt_s": round(t1 - t0, 4),
+        "clock_offset_s": None if clock is None else round(clock, 4),
         "problems": problems,
     }
-
-
-def post_schedule(url: str, body: dict[str, Any]) -> None:
-    code, resp = http("POST", url + "/api/schedules", body)
-    if code not in (200, 201):
-        raise RuntimeError(f"{url}: schedule {body['id']} refused ({code}): {resp}")
-    for w in resp.get("warnings") or []:
-        log(f"  {url}: {w}")
 
 
 # ---------------------------------------------------------------- TX host
@@ -418,40 +522,35 @@ def check_ssm(
 
 
 def check_sensor(
-    sensor: dict[str, Any],
+    api: Direct | Fleet,
+    sid: str,
     sched_id: str,
+    hs_start_ms: int,
     steps: list[dict[str, Any]],
     epochs: list[dict[str, Any]],
     args: argparse.Namespace,
     win: tuple[float, float],
 ) -> dict[str, Any]:
-    url = sensor["url"]
-    sched = get(f"{url}/api/schedules/{sched_id}")
-    runs = sched.get("runs") or []
-    run = runs[0] if runs else {}
-    hs_id = (run.get("info") or {}).get("hs_run")
+    run = api.last_run(sid, sched_id)
+    # The run's id is <schedule id>-<run>-<start ms> (docs/high-sensitivity-api.md).
+    hs_id = (run.get("info") or {}).get("hs_run") or f"{sched_id}-0-{hs_start_ms}"
     res: dict[str, Any] = {
-        "sensor": sensor["name"],
+        "sensor": sid,
         "schedule_run": {k: run.get(k) for k in ("status", "reason")},
         "hs_run": hs_id,
     }
-    summary = {}
-    if hs_id:
-        summary = (get(f"{url}/api/high-sensitivity/{urllib.parse.quote(hs_id)}") or {}).get(
-            "summary"
-        ) or {}
+    try:
+        summary = api.hs_summary(sid, hs_id)
+    except RuntimeError as exc:
+        log(f"  {sid}: no summary for {hs_id}: {exc}")
+        summary = {}
     res["overflow_events"] = summary.get("overflow_events")
     res["hs_detections"] = summary.get("detections")
-    tones = get(
-        f"{url}/api/detections.json", limit=2000, model="Tone", since=iso(win[0]), until=iso(win[1])
-    )
-    res["tones"] = check_tones(
-        tones["detections"], steps, args.min_tone_steps, args.linearity_tol_db
-    )
-    ssm = get(
-        f"{url}/api/detections.json", limit=5000, model="SSM", since=iso(win[0]), until=iso(win[1])
-    )
-    res["ssm"] = check_ssm(ssm["detections"], epochs, args.min_ssm_frac)
+    span = {"since": iso(win[0]), "until": iso(win[1])}
+    tones = api.detections(sid, limit=2000, model="Tone", **span)
+    res["tones"] = check_tones(tones, steps, args.min_tone_steps, args.linearity_tol_db)
+    ssm = api.detections(sid, limit=5000, model="SSM", **span)
+    res["ssm"] = check_ssm(ssm, epochs, args.min_ssm_frac)
     res["ok"] = bool(run.get("status") == "done" and res["tones"]["ok"] and res["ssm"]["ok"])
     return res
 
@@ -506,8 +605,18 @@ def main() -> int:
     p = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    where = p.add_mutually_exclusive_group(required=True)
+    where.add_argument("--fleet", help="fleet base URL (as at HCRO): schedule and read through it")
+    where.add_argument(
+        "--sensor",
+        action="append",
+        help="a sensor's base URL, without a fleet (repeat for several)",
+    )
     p.add_argument(
-        "--sensor", action="append", required=True, help="sensor base URL (repeat for several)"
+        "--sensors",
+        nargs="+",
+        metavar="ID",
+        help="with --fleet: these sensor ids (default: every enabled sensor)",
     )
     p.add_argument("--tx-host", help="ssh target running ssm-tx (default: this host)")
     p.add_argument(
@@ -604,20 +713,29 @@ def main() -> int:
         tx.dir = tx.check("echo $HOME").strip() + tx.dir[1:]
 
     log("preflight")
-    sensors = [preflight_sensor(u.rstrip("/"), list(TONE_FREQS)) for u in args.sensor]
+    api: Direct | Fleet = Fleet(args.fleet, args.sensors) if args.fleet else Direct(args.sensor)
+    sensors = api.preflight()
     for s in sensors:
+        clock = s["clock_offset_s"]
+        tuning = (
+            f"{s['center_hz'] / 1e6:g} MHz, {s['rate_hz'] / 1e6:g} MS/s, gain {s['gain_db']}"
+            if s["center_hz"]
+            else "no tuning"
+        )
         log(
-            f"  {s['name']} {s['version']}: {s['center_hz'] / 1e6:g} MHz, "
-            f"{s['rate_hz'] / 1e6:g} MS/s, "
-            f"gain {s['gain_db']}, clock {s['clock_offset_s'] * 1000:+.0f} ms"
+            f"  {s['id']} {s['version']}: {tuning}"
+            + ("" if clock is None else f", clock {clock * 1000:+.0f} ms")
         )
         for pr in s["problems"]:
-            log(f"  {s['name']}: {pr}")
+            log(f"  {s['id']}: {pr}")
+    if isinstance(api, Fleet):
+        log(f"  fleet {args.fleet}: clock {api.clock_offset() * 1000:+.0f} ms")
     tx_skew = tx.clock_offset()
     log(f"  TX host {args.tx_host or 'local'}: clock {tx_skew * 1000:+.0f} ms")
     if any(s["problems"] for s in sensors):
         log("refusing to run: fix the sensor problems above")
         return 2
+    ids = [s["id"] for s in sensors]
 
     t0 = math.ceil(time.time() + args.lead)
     steps = tone_steps(seq, t0)
@@ -634,29 +752,29 @@ def main() -> int:
 
     log("staging the TX host")
     stage(tx, seq, waveforms, args.ssm_gains)
-    for s in sensors:
-        post_schedule(
-            s["url"],
+    hs_start_ms = int(hs_start * 1000)
+    api.schedule(
+        ids,
+        {
+            "id": hs_id,
+            "start_ms": hs_start_ms,
+            "duration_ms": int(args.hs_seconds * 1000),
+            "high_sensitivity": True,
+            "capture": False,
+            "label": f"Daily check {stamp}",
+        },
+    )
+    if args.capture_ms:
+        api.schedule(
+            ids,
             {
-                "id": hs_id,
-                "start_ms": int(hs_start * 1000),
-                "duration_ms": int(args.hs_seconds * 1000),
-                "high_sensitivity": True,
-                "capture": False,
-                "label": f"Daily check {stamp}",
+                "id": f"daily-{stamp}-iq",
+                "start_ms": int(t0 * 1000) - 250,
+                "duration_ms": args.capture_ms,
+                "label": f"Daily check tones {stamp}",
             },
         )
-        if args.capture_ms:
-            post_schedule(
-                s["url"],
-                {
-                    "id": f"daily-{stamp}-iq",
-                    "start_ms": int(t0 * 1000) - 250,
-                    "duration_ms": args.capture_ms,
-                    "label": f"Daily check tones {stamp}",
-                },
-            )
-    log(f"scheduled {hs_id} on {len(sensors)} sensor(s)")
+    log(f"scheduled {hs_id} on {', '.join(ids)} ({api.kind})")
 
     log("tones: ssm-tx waits for its --utc-start")
     tones = run_tones(tx, args.center_freq, rate, t0, timeout=args.lead + 60)
@@ -683,12 +801,13 @@ def main() -> int:
         time.sleep(wait)
 
     win = (hs_start - 1, max(hs_end, last) + 2)
-    results = [check_sensor(s, hs_id, steps, epochs, args, win) for s in sensors]
+    results = [check_sensor(api, i, hs_id, hs_start_ms, steps, epochs, args, win) for i in ids]
     for r in results:
         print_result(r)
     report = {
         "stamp": stamp,
         "t0": iso(t0),
+        "via": args.fleet or "sensors",
         "tx_host": args.tx_host,
         "tx_clock_offset_s": round(tx_skew, 4),
         "tone_offset_db": args.tone_offset_db,
